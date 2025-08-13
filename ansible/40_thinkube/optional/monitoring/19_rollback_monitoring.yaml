@@ -1,0 +1,285 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/monitoring/19_rollback_monitoring.yaml
+# Description:
+#   Rollback Prometheus and Grafana deployments and clean up resources
+#
+# Requirements:
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/monitoring/19_rollback_monitoring.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Rollback Monitoring Stack (Prometheus + Grafana)
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  tasks:
+    ###################################################################
+    # Grafana rollback
+    ###################################################################
+    - name: Delete Grafana Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana
+        state: absent
+
+    - name: Delete Grafana Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana
+        state: absent
+
+    - name: Delete Grafana Deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana
+        state: absent
+
+    - name: Delete Grafana PVC
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana-storage
+        state: absent
+
+    - name: Delete Grafana ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana-config
+        state: absent
+
+    - name: Delete Grafana TLS Secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana-tls-secret
+        state: absent
+
+    - name: Delete Grafana credentials Secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana-creds
+        state: absent
+
+    - name: Delete Grafana OAuth Secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana-oauth-secret
+        state: absent
+
+    ###################################################################
+    # Prometheus rollback
+    ###################################################################
+    - name: Delete Prometheus Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus
+        state: absent
+
+    - name: Delete Prometheus Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus
+        state: absent
+
+    - name: Delete Prometheus StatefulSet
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus
+        state: absent
+
+    - name: Delete Prometheus ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus-config
+        state: absent
+
+    - name: Delete Prometheus TLS Secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus-tls-secret
+        state: absent
+
+    - name: Delete Prometheus ClusterRoleBinding
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        name: prometheus
+        state: absent
+
+    - name: Delete Prometheus ClusterRole
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        name: prometheus
+        state: absent
+
+    - name: Delete Prometheus ServiceAccount
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ServiceAccount
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus
+        state: absent
+
+    - name: List Prometheus PVCs to delete
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ monitoring_namespace }}"
+        label_selectors:
+          - app=prometheus
+      register: prometheus_pvcs_to_delete
+
+    - name: Delete Prometheus PVCs
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ monitoring_namespace }}"
+        name: "{{ item.metadata.name }}"
+        state: absent
+      loop: "{{ prometheus_pvcs_to_delete.resources }}"
+      when: prometheus_pvcs_to_delete.resources | length > 0
+
+    ###################################################################
+    # Namespace cleanup
+    ###################################################################
+    - name: Delete monitoring namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ monitoring_namespace }}"
+        state: absent
+        wait: true
+        wait_timeout: 300
+
+    ###################################################################
+    # Keycloak cleanup (optional - comment out if you want to keep)
+    ###################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+      ignore_errors: true
+
+    - name: Get Grafana client UUID
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId=grafana"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: grafana_client_info
+      when: keycloak_token is succeeded
+      ignore_errors: true
+
+    - name: Delete Grafana client from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ grafana_client_info.json[0].id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 204
+      when: 
+        - keycloak_token is succeeded
+        - grafana_client_info is succeeded
+        - grafana_client_info.json | length > 0
+      ignore_errors: true
+
+    - name: Get realm roles
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: realm_roles
+      when: keycloak_token is succeeded
+      ignore_errors: true
+
+    - name: Delete Grafana realm roles
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles/{{ item }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 204
+      loop:
+        - grafana-admin
+        - grafana-editor
+        - grafana-viewer
+      when: 
+        - keycloak_token is succeeded
+        - realm_roles is succeeded
+        - realm_roles.json | selectattr('name', 'equalto', item) | list | length > 0
+      ignore_errors: true
+
+    - name: Rollback complete
+      ansible.builtin.debug:
+        msg:
+          - "Monitoring stack rollback completed"
+          - "All Prometheus and Grafana resources have been removed"
+          - "Namespace {{ monitoring_namespace }} has been deleted"
+          - "Keycloak client and roles have been cleaned up (if accessible)"

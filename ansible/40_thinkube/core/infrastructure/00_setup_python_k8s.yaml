@@ -1,0 +1,126 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Setup Python Kubernetes Module
+#
+# This playbook creates a Python virtual environment and installs the kubernetes 
+# module on all nodes to match the control node setup.
+#
+# Requirements:
+#   - Python 3 installed on the target hosts
+#   - python3-venv package available
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/00_setup_python_k8s.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Setup Python Virtual Environment on All Nodes
+  hosts: baremetal
+  gather_facts: true
+  vars:
+    venv_dir: "/home/{{ system_username }}/.venv"
+    venv_marker: "# Ansible venv auto-activation for: {{ venv_dir }}"
+    
+  tasks:
+    - name: Install Python requirements
+      ansible.builtin.package:
+        name:
+          - python3-venv
+          - python3-pip
+          - python3-full
+        state: present
+      become: true
+
+    - name: Create Python virtual environment
+      ansible.builtin.command: python3 -m venv "{{ venv_dir }}"
+      args:
+        creates: "{{ venv_dir }}/bin/python"
+      become: false
+
+    - name: Ensure pip and packaging are installed in venv (using command module)
+      ansible.builtin.command: "{{ venv_dir }}/bin/python -m pip install --upgrade pip packaging setuptools wheel"
+      become: false
+      register: pip_install
+      changed_when: "'Successfully installed' in pip_install.stdout or 'Requirement already satisfied' in pip_install.stdout"
+      failed_when: pip_install.rc != 0
+
+    - name: Upgrade pip in virtual environment
+      ansible.builtin.pip:
+        name: pip
+        state: latest
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_command: python3 -m venv
+      become: false
+
+    - name: Install Ansible and kubernetes module in virtual environment
+      ansible.builtin.pip:
+        name:
+          - ansible
+          - ansible-lint
+          - kubernetes
+        state: present
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_command: python3 -m venv
+      become: false
+
+    - name: Ensure ~/.bashrc exists
+      ansible.builtin.file:
+        path: "/home/{{ system_username }}/.bashrc"
+        state: touch
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        mode: '0644'
+      become: false
+
+    - name: Check if venv activation already exists in .bashrc
+      ansible.builtin.lineinfile:
+        path: "/home/{{ system_username }}/.bashrc"
+        regexp: "{{ venv_marker | regex_escape }}"
+        state: absent
+      check_mode: true
+      register: bashrc_venv_check
+      become: false
+      changed_when: false
+
+    - name: Add venv activation to .bashrc
+      ansible.builtin.blockinfile:
+        path: "/home/{{ system_username }}/.bashrc"
+        marker: "{{ venv_marker }}"
+        block: |
+          if [ -f "{{ venv_dir }}/bin/activate" ]; then
+              . "{{ venv_dir }}/bin/activate"
+          fi
+      when: not bashrc_venv_check.found
+      become: false
+
+    - name: Verify kubernetes module is installed
+      ansible.builtin.command: "{{ venv_dir }}/bin/python -c 'import kubernetes; print(kubernetes.__version__)'"
+      register: k8s_version
+      changed_when: false
+      become: false
+
+    - name: Display kubernetes module status
+      ansible.builtin.debug:
+        msg: "Kubernetes Python module version: {{ k8s_version.stdout }}"
+
+- name: Update Inventory to Use Virtual Environment
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    inventory_file: "{{ playbook_dir }}/../../../../inventory/inventory.yaml"
+    venv_python: "/home/thinkube/.venv/bin/python3"
+    
+  tasks:
+    - name: Display inventory path for verification
+      ansible.builtin.debug:
+        msg: "Inventory path: {{ inventory_file }}"
+        
+    - name: Update ansible_python_interpreter in inventory
+      ansible.builtin.replace:
+        path: "{{ inventory_file }}"
+        regexp: 'ansible_python_interpreter:.*'
+        replace: "ansible_python_interpreter: {{ venv_python }}"
+      delegate_to: localhost

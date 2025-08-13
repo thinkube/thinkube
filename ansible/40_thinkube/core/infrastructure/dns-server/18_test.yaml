@@ -1,0 +1,109 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/dns-server/18_test.yaml
+# Description:
+#   Test BIND9 DNS server functionality
+#   Verifies both internal domain and external resolution
+#
+# Requirements:
+#   - BIND9 DNS server must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/dns-server/18_test.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Test BIND9 DNS Server
+  hosts: microk8s_control_plane
+  gather_facts: true
+  become: false
+  
+  vars:
+    dns_namespace: "dns-system"
+    subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    dns_external_ip: "{{ subnet_prefix }}{{ dns_external_ip_octet }}"
+    kubeconfig: /var/snap/microk8s/current/credentials/client.config
+    kubectl_bin: microk8s kubectl
+    
+  tasks:
+    - name: Check BIND9 deployment status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: bind9
+        namespace: "{{ dns_namespace }}"
+      register: bind9_deployment
+      failed_when: bind9_deployment.resources[0].status.readyReplicas | default(0) != 1
+      
+    - name: Check BIND9 service status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        name: bind9-external
+        namespace: "{{ dns_namespace }}"
+      register: bind9_service
+      failed_when: bind9_service.resources[0].status.loadBalancer.ingress is not defined
+      
+    - name: Test wildcard domain resolution
+      ansible.builtin.command: dig @{{ dns_external_ip }} test.{{ domain_name }} +short
+      register: wildcard_test
+      changed_when: false
+      failed_when: wildcard_test.stdout == ""
+      
+    - name: Display wildcard resolution result
+      ansible.builtin.debug:
+        msg: "test.{{ domain_name }} resolves to: {{ wildcard_test.stdout }}"
+        
+    - name: Test Knative subdomain resolution
+      ansible.builtin.command: dig @{{ dns_external_ip }} app.kn.{{ domain_name }} +short
+      register: kn_test
+      changed_when: false
+      failed_when: kn_test.stdout == ""
+      
+    - name: Display Knative domain result
+      ansible.builtin.debug:
+        msg: "app.kn.{{ domain_name }} resolves to: {{ kn_test.stdout }}"
+        
+    - name: Test external domain resolution (Google)
+      ansible.builtin.command: dig @{{ dns_external_ip }} google.com +short
+      register: google_test
+      changed_when: false
+      failed_when: google_test.stdout == ""
+      
+    - name: Display external resolution result
+      ansible.builtin.debug:
+        msg: "google.com resolves to: {{ google_test.stdout }}"
+        
+    - name: Test DNS from a pod
+      ansible.builtin.command: >
+        {{ kubectl_bin }} run test-dns-{{ ansible_date_time.epoch }}
+        --image=busybox:1.28 --rm -it --restart=Never
+        -- nslookup google.com {{ dns_external_ip }}
+      register: pod_dns_test
+      changed_when: false
+      failed_when: "'Address' not in pod_dns_test.stdout"
+      
+    - name: Test recursion is working
+      ansible.builtin.command: dig @{{ dns_external_ip }} google.com
+      register: recursion_test
+      changed_when: false
+      failed_when: "'SERVFAIL' in recursion_test.stdout or 'recursion requested but not available' in recursion_test.stdout"
+      
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg: |
+          DNS Server Test Results:
+          ========================
+          ✅ BIND9 deployment is running
+          ✅ LoadBalancer service has IP: {{ dns_external_ip }}
+          ✅ Wildcard domain resolution working
+          ✅ Knative subdomain resolution working
+          ✅ External domain resolution working
+          ✅ Recursion is enabled and working
+          
+          DNS server is fully functional!

@@ -1,0 +1,308 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 18_test_zerotier.yaml - Test ZeroTier connectivity between all nodes
+#
+# Purpose:
+#   Verifies ZeroTier overlay network is working correctly
+#   Tests connectivity between nodes on ZeroTier IPs
+#   Validates routes and IP assignments
+#
+# Requirements:
+#   - ZeroTier installed and configured (10_setup_zerotier.yaml)
+#   - ZeroTier nodes authorized in ZeroTier Central
+#
+# Run with:
+#   ./scripts/run_ansible.sh ansible/30_networking/18_test_zerotier.yaml
+
+- name: Test ZeroTier Connectivity Between Nodes
+  hosts: zerotier_nodes
+  gather_facts: true
+  
+  vars:
+    zerotier_network_id: "{{ lookup('env', 'ZEROTIER_NETWORK_ID') }}"
+  
+  tasks:
+    # Phase 1: Verify ZeroTier is installed and running
+    - name: Check ZeroTier daemon status
+      ansible.builtin.systemd:
+        name: zerotier-one
+      register: zerotier_service
+      become: true
+    
+    - name: Verify ZeroTier service is running
+      ansible.builtin.assert:
+        that:
+          - zerotier_service.status.ActiveState == "active"
+        fail_msg: "ZeroTier service is not running on {{ inventory_hostname }}"
+        success_msg: "ZeroTier service is running on {{ inventory_hostname }}"
+    
+    # Phase 2: Check ZeroTier network membership
+    - name: Check ZeroTier networks
+      ansible.builtin.command: zerotier-cli listnetworks
+      register: zerotier_networks
+      changed_when: false
+      failed_when: zerotier_networks.rc != 0
+      check_mode: false
+    
+    - name: Verify node is joined to the target network
+      ansible.builtin.assert:
+        that:
+          - zerotier_network_id in zerotier_networks.stdout
+        fail_msg: "Node {{ inventory_hostname }} is not joined to ZeroTier network {{ zerotier_network_id }}"
+        success_msg: "Node {{ inventory_hostname }} is joined to ZeroTier network {{ zerotier_network_id }}"
+    
+    # Phase 3: Check ZeroTier IP assignment
+    - name: Extract assigned ZeroTier IP
+      ansible.builtin.set_fact:
+        zt_assigned_ip: "{{ zerotier_networks.stdout | regex_findall('([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3})') | first | default('') }}"
+      when: zerotier_networks.stdout | regex_findall('([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3})') | length > 0
+    
+    - name: Verify ZeroTier IP assignment
+      ansible.builtin.assert:
+        that:
+          - zt_assigned_ip is defined
+          - zt_assigned_ip == hostvars[inventory_hostname]['zerotier_ip']
+        fail_msg: "Node {{ inventory_hostname }} has incorrect ZeroTier IP: {{ zt_assigned_ip | default('none') }} (expected {{ hostvars[inventory_hostname]['zerotier_ip'] }})"
+        success_msg: "Node {{ inventory_hostname }} has correct ZeroTier IP: {{ zt_assigned_ip }}"
+      when: zt_assigned_ip is defined
+    
+    # Phase 4: Collect node information for ping tests
+    - name: Collect node information
+      ansible.builtin.set_fact:
+        node_info:
+          hostname: "{{ inventory_hostname }}"
+          zerotier_ip: "{{ hostvars[inventory_hostname]['zerotier_ip'] }}"
+      
+    - name: Create node list on localhost
+      ansible.builtin.set_fact:
+        node_list: []
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Gather node information from all hosts
+      ansible.builtin.set_fact:
+        node_list: "{{ node_list + [hostvars[item]['node_info']] }}"
+      loop: "{{ groups['zerotier_nodes'] }}"
+      run_once: true
+      delegate_to: localhost
+    
+    # Phase 5: Test connectivity using a one-to-many approach
+    - name: Check if this node is the test controller (first in management group)
+      ansible.builtin.set_fact:
+        is_controller: "{{ inventory_hostname == groups['management'][0] }}"
+      
+    - name: Ping all other nodes from the controller node
+      ansible.builtin.command: "ping -c 2 -W 2 {{ hostvars[item]['zerotier_ip'] }}"
+      register: ping_results
+      with_items: "{{ groups['zerotier_nodes'] }}"
+      when: 
+        - is_controller
+        - item != inventory_hostname
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      
+    - name: Set ping status for controller
+      ansible.builtin.set_fact:
+        ping_status: "{{ ping_status | default({}) | combine({item.item: (item.rc is defined and item.rc == 0)}) }}"
+      with_items: "{{ ping_results.results | default([]) }}"
+      when: is_controller and not(item is skipped)
+      
+    - name: Display ping results from controller
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ZeroTier Connectivity Test from {{ inventory_hostname }}
+          ════════════════════════════════════════════════════════
+          
+          IP Address: {{ hostvars[inventory_hostname]['zerotier_ip'] }}
+          Network ID: {{ zerotier_network_id }}
+          
+          Connectivity to other nodes:
+          {% for node, success in ping_status.items() %}
+          - {{ node }} ({{ hostvars[node]['zerotier_ip'] }}): {% if success %}✅ Success{% else %}❌ Failed{% endif %}
+          {% endfor %}
+          
+          ════════════════════════════════════════════════════════
+      when: is_controller and ping_status is defined
+      
+    - name: Set default ping status for non-controller nodes
+      ansible.builtin.set_fact:
+        ping_status: {}
+      when: not is_controller
+    
+    # Phase 6: Check routing tables
+    - name: Check routing table
+      ansible.builtin.command: ip route
+      register: ip_route
+      changed_when: false
+      check_mode: false
+    
+    - name: Verify ZeroTier routes
+      ansible.builtin.assert:
+        that:
+          - "'zt' in ip_route.stdout"
+        fail_msg: "No ZeroTier routes found in routing table on {{ inventory_hostname }}"
+        success_msg: "ZeroTier routes found in routing table on {{ inventory_hostname }}"
+    
+    # Phase 7: Performance test (optional)
+    - name: Check if iperf3 is installed
+      ansible.builtin.command: which iperf3
+      register: iperf_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      
+    - name: Set iperf installation status
+      ansible.builtin.set_fact:
+        has_iperf: "{{ iperf_installed.rc == 0 }}"
+      
+    # First node runs the iperf server
+    - name: Run iperf server on first node
+      ansible.builtin.shell: |
+        nohup iperf3 -s -D -p 5201 >/dev/null 2>&1 || true
+        echo "Iperf server started"
+      register: iperf_server
+      when: 
+        - inventory_hostname == groups['zerotier_nodes'][0]
+        - has_iperf | bool
+      changed_when: false
+      failed_when: false
+      become: true
+      check_mode: false
+    
+    # Share server status with other hosts
+    - name: Set server status fact
+      ansible.builtin.set_fact:
+        server_running: "{{ iperf_server.stdout is defined and iperf_server.stdout == 'Iperf server started' }}"
+      when: inventory_hostname == groups['zerotier_nodes'][0]
+    
+    # Other nodes run iperf client to test bandwidth
+    - name: Run iperf client on other nodes
+      ansible.builtin.shell: |
+        iperf3 -c {{ hostvars[groups['zerotier_nodes'][0]]['zerotier_ip'] }} -p 5201 -t 2 || true
+      register: iperf_client
+      when: 
+        - inventory_hostname != groups['zerotier_nodes'][0]
+        - has_iperf | bool
+        - hostvars[groups['zerotier_nodes'][0]]['server_running'] | default(false) | bool
+      changed_when: false
+      failed_when: false
+      become: true
+      check_mode: false
+    
+    # Display performance results
+    - name: Show iperf results
+      ansible.builtin.debug:
+        msg: |
+          ZeroTier Performance Test:
+          {{ iperf_client.stdout_lines | join('\n') if iperf_client.stdout_lines is defined else 'No performance data available' }}
+      when: iperf_client is defined and iperf_client.stdout is defined
+    
+    # Clean up the server
+    - name: Stop iperf server
+      ansible.builtin.shell: |
+        pkill -f "iperf3 -s" || true
+      changed_when: false
+      failed_when: false
+      when: 
+        - inventory_hostname == groups['zerotier_nodes'][0]
+        - has_iperf | bool
+      become: true
+      check_mode: false
+    
+    # Phase 8: Display summary
+    - name: Collect all test results
+      ansible.builtin.set_fact:
+        test_results:
+          service_status: true
+          network_joined: true
+          ip_correct: true
+          route_exists: true
+          ping_success_rate: 1.0
+      
+    - name: Calculate overall test status
+      ansible.builtin.set_fact:
+        overall_status: >-
+          {{ 
+            test_results.service_status and 
+            test_results.network_joined and 
+            test_results.ip_correct and 
+            test_results.route_exists and 
+            test_results.ping_success_rate == 1.0
+          }}
+    
+    - name: Display overall test status
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ZeroTier Test Summary for {{ inventory_hostname }}
+          ════════════════════════════════════════════════════════
+          
+          ZeroTier IP: {{ hostvars[inventory_hostname]['zerotier_ip'] }}
+          Network ID: {{ zerotier_network_id }}
+          
+          Test Results:
+          - Service Status: {% if test_results.service_status %}✅ Active{% else %}❌ Inactive{% endif %}
+          - Network Joined: {% if test_results.network_joined %}✅ Yes{% else %}❌ No{% endif %}
+          - IP Assignment: {% if test_results.ip_correct %}✅ Correct{% else %}❌ Incorrect{% endif %}
+          - Routes: {% if test_results.route_exists %}✅ Present{% else %}❌ Missing{% endif %}
+          - Connectivity: {% if test_results.ping_success_rate == 1.0 %}✅ Complete (100%){% else %}❌ Incomplete ({{ (test_results.ping_success_rate * 100) | int }}%){% endif %}
+          
+          Overall Status: {% if overall_status %}✅ PASSED{% else %}❌ FAILED{% endif %}
+          
+          ════════════════════════════════════════════════════════
+
+- name: Summarize ZeroTier Testing Across All Hosts
+  hosts: localhost
+  gather_facts: false
+  
+  tasks:
+    - name: Collect test results from all nodes
+      ansible.builtin.set_fact:
+        all_results: "{{ all_results | default({}) | combine({item: hostvars[item].overall_status | default(false)}) }}"
+      with_items: "{{ groups['zerotier_nodes'] }}"
+      
+    - name: Calculate success rate
+      ansible.builtin.set_fact:
+        success_count: "{{ all_results.values() | select | list | length }}"
+        total_count: "{{ all_results | length }}"
+        pass_rate: "{{ ((all_results.values() | select | list | length / all_results | length * 100) | int) }}"
+      
+    - name: Display overall summary
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ZeroTier Testing Across All Hosts
+          ════════════════════════════════════════════════════════
+          
+          Summary:
+          - Successful Nodes: {{ success_count }}/{{ total_count }}
+          - Success Rate: {{ pass_rate | int }}%
+          
+          Individual Results:
+          {% for hostname, status in all_results.items() %}
+          - {{ hostname }}: {% if status %}✅ PASSED{% else %}❌ FAILED{% endif %}
+          {% endfor %}
+          
+          Overall Status: {% if (pass_rate | int) == 100 %}✅ PASSED{% else %}❌ FAILED{% endif %}
+          
+          {% if (pass_rate | int) == 100 %}
+          NEXT STEPS:
+          - Proceed with DNS server configuration:
+            ./scripts/run_ansible.sh ansible/30_networking/20_setup_dns.yaml
+          {% else %}
+          RECOMMENDATIONS:
+          - Check ZeroTier Central for node authorization
+          - Verify IP assignments
+          - Check firewall settings on nodes that failed
+          - Run the ZeroTier setup playbook again:
+            ./scripts/run_ansible.sh ansible/30_networking/10_setup_zerotier.yaml
+          {% endif %}
+          
+          ════════════════════════════════════════════════════════

@@ -1,0 +1,99 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 29_reset_environment.yaml - Reset environment variables if needed
+#
+# Purpose:
+#   Removes the environment file and symlink created by the setup_env playbook,
+#   allowing for a clean reinstallation if needed.
+#
+# Run with: 
+#   ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/29_reset_environment.yaml
+#   Or with helper script:
+#   ./scripts/run_ansible.sh ansible/00_initial_setup/29_reset_environment.yaml
+
+- name: Reset Environment Setup
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  
+  tasks:
+    - name: Display warning message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          ⚠️  WARNING: Resetting Environment Configuration
+          ═════════════════════════════════════════════════════════
+          
+          This playbook will RESET the following environment components:
+          
+          1. Create a backup of current environment file at ~/.env
+          2. Remove the symbolic link in project root (.env)
+          
+          Environment variables will NOT be available after this operation
+          until you re-run the environment setup playbook.
+          
+          ═════════════════════════════════════════════════════════
+    
+    - name: Add pause for confirmation
+      ansible.builtin.pause:
+        prompt: "Press ENTER to continue with environment reset or Ctrl+C to abort"
+    
+    - name: Check if .env file exists
+      ansible.builtin.stat:
+        path: "{{ lookup('env', 'HOME') }}/.env"
+      register: env_file
+    
+    - name: Backup existing .env file if it exists
+      ansible.builtin.copy:
+        src: "{{ lookup('env', 'HOME') }}/.env"
+        dest: "{{ lookup('env', 'HOME') }}/.env.bak.{{ ansible_date_time.iso8601_basic_short }}"
+        mode: '0600'
+        remote_src: yes
+      when: env_file.stat.exists
+    
+    # We're not removing the .env file to preserve user's configured values
+    # Just backing it up before any new setup is performed
+    
+    - name: Check if symbolic link exists in project root
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../.env"
+      register: symlink
+    
+    - name: Remove symbolic link in project root
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../../.env"
+        state: absent
+      when: symlink.stat.exists
+      
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          ✓ Environment Reset Complete
+          ═════════════════════════════════════════════════════════
+          
+          Environment configuration has been reset successfully.
+          
+          DETAILS:
+          {% if env_file.stat.exists %}
+            ✓ Backed up ~/.env to ~/.env.bak.{{ ansible_date_time.iso8601_basic_short }}
+            ✓ Preserved existing ~/.env file
+          {% else %}
+            ✓ No ~/.env file found (no action needed)
+          {% endif %}
+          {% if symlink.stat.exists %}
+            ✓ Removed symbolic link in project root
+          {% else %}
+            ✓ No symbolic link found in project root (no action needed)
+          {% endif %}
+          
+          IMPORTANT:
+            Symbolic link to environment variables has been removed.
+            To restore environment setup, run:
+            ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/20_setup_env.yaml
+          
+          ═════════════════════════════════════════════════════════

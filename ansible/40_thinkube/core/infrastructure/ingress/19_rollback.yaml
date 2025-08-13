@@ -1,0 +1,105 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Rollback Ingress Controllers deployment
+#
+# This playbook removes the deployed ingress controllers and optionally
+# re-enables the MicroK8s built-in ingress addon.
+#
+# Requirements:
+#   - MicroK8s cluster running
+#   - kubectl access configured
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/ingress/19_rollback.yaml
+
+- name: Rollback Ingress Controllers
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    primary_release: "primary-ingress"
+    secondary_release: "secondary-ingress"
+
+  tasks:
+    - name: Uninstall primary ingress controller
+      ansible.builtin.command: >
+        {{ helm_bin }} uninstall {{ primary_release }}
+        -n {{ ingress_namespace }}
+      become: true
+      ignore_errors: true
+      tags:
+        - rollback
+
+    - name: Uninstall secondary ingress controller
+      ansible.builtin.command: >
+        {{ helm_bin }} uninstall {{ secondary_release }}
+        -n {{ ingress_kn_namespace }}
+      become: true
+      ignore_errors: true
+      tags:
+        - rollback
+
+    - name: Delete IngressClass resources
+      ansible.builtin.command: "{{ kubectl_bin }} delete ingressclass {{ item }}"
+      become: true
+      ignore_errors: true
+      loop:
+        - "{{ primary_ingress_class | default('nginx') }}"
+        - "{{ secondary_ingress_class | default('nginx-kn') }}"
+      tags:
+        - rollback
+
+    - name: Delete namespaces
+      ansible.builtin.command: "{{ kubectl_bin }} delete namespace {{ item }}"
+      become: true
+      ignore_errors: true
+      loop:
+        - "{{ ingress_namespace }}"
+        - "{{ ingress_kn_namespace }}"
+      tags:
+        - rollback
+
+    - name: Wait for namespaces to be deleted
+      ansible.builtin.command: "{{ kubectl_bin }} get namespace {{ item }}"
+      become: true
+      register: ns_check
+      failed_when: false
+      changed_when: false
+      until: ns_check.rc != 0
+      retries: 30
+      delay: 10
+      loop:
+        - "{{ ingress_namespace }}"
+        - "{{ ingress_kn_namespace }}"
+      tags:
+        - rollback
+
+    - name: Remove ingress-nginx Helm repository
+      ansible.builtin.command: "{{ helm_bin }} repo remove ingress-nginx"
+      become: true
+      ignore_errors: true
+      tags:
+        - rollback
+
+    # We don't re-enable the built-in ingress as we are using our custom ingress controllers
+
+    - name: Display rollback summary
+      ansible.builtin.debug:
+        msg:
+          - "==========================================="
+          - "Ingress Controllers Rollback Complete"
+          - "==========================================="
+          - ""
+          - "Removed:"
+          - "  ✓ Primary ingress controller ({{ primary_release }})"
+          - "  ✓ Secondary ingress controller ({{ secondary_release }})"
+          - "  ✓ IngressClass resources"
+          - "  ✓ Namespaces ({{ ingress_namespace }}, {{ ingress_kn_namespace }})"
+          - "  ✓ Helm repository (ingress-nginx)"
+          - ""
+          - "Built-in ingress addon: {{ 'Re-enabled' if enable_builtin_ingress | default(false) else 'Not re-enabled' }}"
+          - ""
+          - "==========================================="
+      tags:
+        - rollback

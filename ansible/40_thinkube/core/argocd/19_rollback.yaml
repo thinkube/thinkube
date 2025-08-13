@@ -1,0 +1,225 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/argocd/19_rollback.yaml
+# Description: 
+#   Rollback ArgoCD deployment
+#   Removes ArgoCD installation along with all related resources:
+#   - Helm release
+#   - ServiceAccount
+#   - ConfigMaps
+#   - Secrets
+#   - Ingress resources
+#   - Namespace
+#
+# Requirements:
+#   - MicroK8s Kubernetes cluster
+#   - kubernetes.core collection
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/argocd/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+#   - kubeconfig: Path to kubeconfig file
+#
+# Dependencies:
+#   - CORE-001: MicroK8s Control Node
+
+- name: Rollback ArgoCD
+  hosts: microk8s_control_plane
+  gather_facts: true
+  become: true
+  vars:
+    argocd_namespace: "argocd"
+    argocd_release_name: "argocd"
+    image_updater_release: "argocd-image-updater"
+    argocd_tls_secret_name: "argocd-tls-secret"
+    argocd_cli_path: "/usr/local/bin/argocd"
+    remove_cli: false  # Set to true to remove the ArgoCD CLI binary
+    force_deletion: true  # Set to false to prevent namespace force deletion
+    
+  tasks:
+    # 1. Delete Ingress resources
+    - name: Delete ArgoCD Ingress resources
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: Ingress
+        name: "{{ item }}"
+        namespace: "{{ argocd_namespace }}"
+      loop:
+        - argocd-grpc-ingress
+        - argocd-http-ingress
+        - argocd-ingress
+      failed_when: false
+
+    # 2. Delete Harbor webhook adapter
+    - name: Delete webhook adapter deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ argocd_namespace }}"
+        name: harbor-webhook-adapter
+      failed_when: false
+
+    - name: Delete webhook adapter service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Service
+        namespace: "{{ argocd_namespace }}"
+        name: harbor-webhook-adapter
+      failed_when: false
+
+    - name: Delete webhook adapter ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ argocd_namespace }}"
+        name: harbor-webhook-adapter
+      failed_when: false
+
+    - name: Delete webhook adapter configmap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ argocd_namespace }}"
+        name: harbor-webhook-adapter-script
+      failed_when: false
+
+    # 3. Delete ArgoCD Helm release
+    - name: Uninstall ArgoCD Helm release
+      ansible.builtin.shell: |
+        if {{ helm_bin }} -n {{ argocd_namespace }} list | grep -q '^{{ argocd_release_name }}'; then
+          {{ helm_bin }} -n {{ argocd_namespace }} uninstall {{ argocd_release_name }}
+        fi
+      register: helm_uninstall
+      changed_when: "'uninstalled' in helm_uninstall.stdout"
+      failed_when: false
+
+    # 4. Delete ArgoCD ServiceAccount
+    - name: Delete ArgoCD ServiceAccount and RBAC resources
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        definition:
+          apiVersion: "{{ item.apiVersion }}"
+          kind: "{{ item.kind }}"
+          metadata:
+            name: "{{ item.name }}"
+            namespace: "{{ item.namespace | default(argocd_namespace) }}"
+      loop:
+        - { apiVersion: v1, kind: ServiceAccount, name: argo-cd-deployer }
+        - { apiVersion: rbac.authorization.k8s.io/v1, kind: ClusterRoleBinding, name: argocd-cli-user-binding }
+        - { apiVersion: rbac.authorization.k8s.io/v1, kind: ClusterRoleBinding, name: argo-cd-deployer-binding }
+      failed_when: false
+
+    # 5. Delete TLS secret
+    - name: Delete ArgoCD TLS secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Secret
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ argocd_tls_secret_name }}"
+      failed_when: false
+
+    # 6. Wait for pod termination
+    - name: Wait for ArgoCD pods to terminate
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ argocd_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/part-of=argocd
+      register: argocd_pods
+      until: argocd_pods.resources | length == 0
+      retries: 30
+      delay: 10
+      failed_when: false
+
+    # 7. Check if namespace can be deleted
+    - name: Check for remaining resources in namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ argocd_namespace }}"
+      register: remaining_pods
+      failed_when: false
+
+    - name: Check for remaining services in namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        namespace: "{{ argocd_namespace }}"
+      register: remaining_services
+      failed_when: false
+
+    # 8. Force delete namespace if needed
+    - name: Force delete namespace if needed
+      ansible.builtin.shell: |
+        # Remove finalizers from any remaining resources
+        for resource in $({{ kubectl_bin }} api-resources --verbs=list --namespaced -o name); do
+          echo "Checking $resource..."
+          {{ kubectl_bin }} get $resource -n {{ argocd_namespace }} -o json 2>/dev/null | \
+            jq -r '.items[] | select(.metadata.finalizers != null) | "\(.kind) \(.metadata.name)"' | \
+            while read kind name; do
+              echo "Removing finalizers from $kind/$name"
+              {{ kubectl_bin }} patch $kind/$name -n {{ argocd_namespace }} -p '{"metadata":{"finalizers":[]}}' --type=merge || true
+            done
+        done
+        
+        # Force delete the namespace
+        {{ kubectl_bin }} delete namespace {{ argocd_namespace }} --ignore-not-found=true --force --grace-period=0
+      when: 
+        - force_deletion
+      register: force_delete
+      changed_when: force_delete.rc == 0
+      failed_when: false
+
+    # 9. Delete namespace if empty (standard way, if not force deleting)
+    - name: Delete ArgoCD namespace if empty
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: Namespace
+        name: "{{ argocd_namespace }}"
+      when:
+        - not force_deletion
+        - remaining_pods.resources | length == 0
+        - remaining_services.resources | length == 0
+      failed_when: false
+
+    # 10. Remove ArgoCD CLI
+    - name: Check if ArgoCD CLI exists
+      ansible.builtin.stat:
+        path: "{{ argocd_cli_path }}"
+      register: argocd_cli
+
+    - name: Remove ArgoCD CLI
+      ansible.builtin.file:
+        path: "{{ argocd_cli_path }}"
+        state: absent
+      when: argocd_cli.stat.exists and remove_cli
+
+    # 11. Final status
+    - name: Display rollback status
+      ansible.builtin.debug:
+        msg:
+          - "ArgoCD Helm release: Uninstalled"
+          - "Webhook Adapter: Uninstalled"
+          - "ArgoCD Namespace: {{ 'Deleted' if force_deletion else ('Deleted' if (remaining_pods.resources | length == 0 and remaining_services.resources | length == 0) else 'Retained (contains other resources)') }}"
+          - "ArgoCD CLI: {{ 'Removed' if (argocd_cli.stat.exists and remove_cli) else 'Retained' }}"
+          - "NOTE: The Keycloak client was not removed. To remove it, use the Keycloak admin console or API."

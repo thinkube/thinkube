@@ -1,0 +1,137 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/monitoring/12_configure_grafana_keycloak.yaml
+# Description:
+#   Configure Keycloak for Grafana authentication and authorization
+#   Migrated from thinkube-core/playbooks/services/91r_setup_grafana_keycloak.yaml
+#
+# Requirements:
+#   - Keycloak must be deployed and accessible
+#   - ADMIN_PASSWORD environment variable set
+#   - MicroK8s cluster with control plane
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/monitoring/12_configure_grafana_keycloak.yaml
+#
+# Variables from inventory:
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username for all applications
+#   - grafana_hostname: Hostname for Grafana access
+#   - kubeconfig: Path to kubectl configuration
+#   - monitoring_namespace: Namespace for monitoring components
+#
+# Dependencies:
+#   - CORE-004: Keycloak must be deployed
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Keycloak "grafana" client and setup OAuth
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    # Keycloak connection info - map to expected variable names
+    keycloak_admin_user: "{{ admin_username }}"
+    keycloak_admin_username: "{{ admin_username }}"  # Role expects this variable name
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    keycloak_validate_certs: false
+    keycloak_debug: true
+
+    # "grafana" client details
+    grafana_client_id: "grafana"
+
+    # Kubernetes secret details
+    grafana_k8s_namespace: "{{ monitoring_namespace }}"
+    grafana_k8s_secret_name: "grafana-oauth-secret"
+
+  tasks:
+    - name: Setup Grafana Keycloak integration
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_setup
+      vars:
+        # Client configuration
+        keycloak_setup_client_id: "{{ grafana_client_id }}"
+        keycloak_setup_client_body:
+          clientId: "{{ grafana_client_id }}"
+          enabled: true
+          protocol: "openid-connect"
+          standardFlowEnabled: true
+          implicitFlowEnabled: false
+          directAccessGrantsEnabled: true
+          publicClient: false
+          redirectUris:
+            - "https://{{ grafana_hostname }}/login/generic_oauth"
+          webOrigins:
+            - "https://{{ grafana_hostname }}"
+            - "+"
+          attributes:
+            "access.token.lifespan": "3600"
+            "post.logout.redirect.uris": "+"
+          defaultClientScopes:
+            - "email"
+            - "profile"
+            - "roles"
+            - "openid"       # Ensure openid scope is included
+            - "offline_access" # Enable offline_access for refresh tokens
+          optionalClientScopes:
+            - "address"
+            - "phone"
+        
+        # Client protocol mappers
+        keycloak_setup_client_mappers:
+          - name: "grafana-realm-role-mapper"
+            protocol: "openid-connect"
+            protocolMapper: "oidc-usermodel-realm-role-mapper"
+            config:
+              "claim.name": "realm_access.roles"  # Standard location for realm roles
+              "id.token.claim": "true"
+              "access.token.claim": "true"
+              "userinfo.token.claim": "true"
+              "multivalued": "true"
+              "jsonType.label": "String"
+          
+          - name: "grafana-audience-mapper"
+            protocol: "openid-connect"
+            protocolMapper: "oidc-audience-mapper"
+            config:
+              "included.client.audience": "grafana"
+              "id.token.claim": "false"
+              "access.token.claim": "true"
+              "included.custom.audience": "grafana"
+          
+          - name: "grafana-client-role-mapper"
+            protocol: "openid-connect"
+            protocolMapper: "oidc-usermodel-client-role-mapper"
+            config:
+              "claim.name": "resource_access.${client_id}.roles"
+              "client.id": "grafana"
+              "id.token.claim": "true"
+              "access.token.claim": "true"
+              "userinfo.token.claim": "true"
+              "multivalued": "true"
+              "jsonType.label": "String"
+        
+        # Realm roles
+        keycloak_setup_bulk_roles:
+          - name: "grafana-admin"
+            description: "Grafana admin realm role"
+          - name: "grafana-editor"
+            description: "Grafana editor realm role"
+          - name: "grafana-viewer"
+            description: "Grafana viewer realm role"
+        
+        # User role assignments
+        keycloak_setup_user_roles:
+          - username: "{{ auth_realm_username }}"  # Use realm user, not admin user
+            role_name: "grafana-admin"
+            role_description: "Grafana admin realm role"
+        
+        # Kubernetes secret
+        keycloak_setup_k8s_secret:
+          namespace: "{{ grafana_k8s_namespace }}"
+          name: "{{ grafana_k8s_secret_name }}"
+          kubeconfig: "{{ kubeconfig }}"

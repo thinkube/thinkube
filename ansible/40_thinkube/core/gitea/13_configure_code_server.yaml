@@ -1,0 +1,380 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/gitea/13_configure_code_server.yaml
+# Description:
+#   Configure Code Server with Gitea integration for CI/CD
+#
+# Requirements:
+#   - Code Server must be deployed (10_deploy.yaml)
+#   - Gitea must be deployed with Runner (core/gitea)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/gitea/13_configure_code_server.yaml
+#
+# Variables from inventory:
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to kubectl configuration
+#   - domain_name: Base domain for all services
+#   - admin_username: Admin username
+#
+# Dependencies:
+#   - CORE-008: Gitea must be deployed
+#   - Gitea Runner should be deployed for CI/CD
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Code Server with Gitea Integration
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    code_server_namespace: "code-server"
+    gitea_host: "{{ gitea_hostname }}"
+    
+    # Shared code directory (accessible from code-server and jupyterhub)
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    code_source_path: "{{ shared_code_path }}"
+
+  tasks:
+
+    ###################################################################
+    # 1) Configure Git for Gitea access
+    ###################################################################
+    - name: Get Gitea admin token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: gitea
+        name: gitea-admin-token
+      register: gitea_token_secret
+      failed_when: gitea_token_secret.resources | length == 0
+
+    - name: Decode Gitea token
+      ansible.builtin.set_fact:
+        gitea_admin_token: "{{ gitea_token_secret.resources[0].data.token | b64decode }}"
+
+    - name: Create .gitconfig for Gitea access
+      ansible.builtin.copy:
+        content: |
+          [user]
+            name = {{ admin_username }}
+            email = {{ admin_username }}@{{ domain_name }}
+          [url "https://{{ admin_username }}:{{ gitea_admin_token }}@{{ gitea_host }}/"]
+            insteadOf = https://{{ gitea_host }}/
+          [push]
+            default = current
+        dest: "{{ code_source_path }}/.gitconfig"
+        owner: "{{ system_username }}"
+        mode: '0600'
+
+    ###################################################################
+    # 2) Create example CI/CD workflows
+    ###################################################################
+    - name: Create example workflows directory
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/examples/gitea-workflows"
+        state: directory
+        owner: "{{ system_username }}"
+        mode: '0755'
+
+    - name: Create example Python workflow
+      ansible.builtin.copy:
+        content: |
+          # Example: Python Application Build with Podman
+          # Place this in your repository at: .gitea/workflows/build.yaml
+          
+          name: Build Python App
+          on:
+            push:
+              branches: [ main, develop ]
+            pull_request:
+              branches: [ main ]
+          
+          jobs:
+            test:
+              runs-on: gitea-runner
+              steps:
+                - uses: actions/checkout@v3
+                
+                - name: Set up Python
+                  uses: actions/setup-python@v4
+                  with:
+                    python-version: '3.11'
+                
+                - name: Install dependencies
+                  run: |
+                    pip install pytest flake8
+                    if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+                
+                - name: Run tests
+                  run: pytest
+                
+                - name: Lint with flake8
+                  run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+            
+            build:
+              needs: test
+              runs-on: gitea-runner
+              steps:
+                - uses: actions/checkout@v3
+                
+                - name: Build container image with Podman
+                  run: |
+                    podman build -t {{ harbor_registry }}/${{ '{{' }} gitea.repository {{ '}}' }}:${{ '{{' }} gitea.sha {{ '}}' }} .
+                    podman tag {{ harbor_registry }}/${{ '{{' }} gitea.repository {{ '}}' }}:${{ '{{' }} gitea.sha {{ '}}' }} \
+                               {{ harbor_registry }}/${{ '{{' }} gitea.repository {{ '}}' }}:latest
+                
+                - name: Login to Harbor
+                  run: |
+                    echo "${{ '{{' }} secrets.HARBOR_PASSWORD {{ '}}' }}" | podman login {{ harbor_registry }} \
+                      --username ${{ '{{' }} secrets.HARBOR_USERNAME {{ '}}' }} --password-stdin
+                
+                - name: Push to Harbor
+                  run: |
+                    podman push {{ harbor_registry }}/${{ '{{' }} gitea.repository {{ '}}' }}:${{ '{{' }} gitea.sha {{ '}}' }}
+                    podman push {{ harbor_registry }}/${{ '{{' }} gitea.repository {{ '}}' }}:latest
+        dest: "{{ code_source_path }}/examples/gitea-workflows/python-build.yaml"
+        owner: "{{ system_username }}"
+
+    - name: Create example Node.js workflow
+      ansible.builtin.copy:
+        content: |
+          # Example: Node.js Application Build with Podman
+          # Place this in your repository at: .gitea/workflows/build.yaml
+          
+          name: Build Node.js App
+          on:
+            push:
+              branches: [ main, develop ]
+          
+          jobs:
+            build:
+              runs-on: gitea-runner
+              steps:
+                - uses: actions/checkout@v3
+                
+                - name: Setup Node.js
+                  uses: actions/setup-node@v3
+                  with:
+                    node-version: '18'
+                    cache: 'npm'
+                
+                - name: Install dependencies
+                  run: npm ci
+                
+                - name: Run tests
+                  run: npm test
+                
+                - name: Build application
+                  run: npm run build
+                
+                - name: Build and push container image
+                  run: |
+                    podman build -t {{ harbor_registry }}/${{ '{{' }} gitea.repository {{ '}}' }}:${{ '{{' }} gitea.sha {{ '}}' }} .
+                    echo "${{ '{{' }} secrets.HARBOR_PASSWORD {{ '}}' }}" | podman login {{ harbor_registry }} \
+                      --username ${{ '{{' }} secrets.HARBOR_USERNAME {{ '}}' }} --password-stdin
+                    podman push {{ harbor_registry }}/${{ '{{' }} gitea.repository {{ '}}' }}:${{ '{{' }} gitea.sha {{ '}}' }}
+        dest: "{{ code_source_path }}/examples/gitea-workflows/nodejs-build.yaml"
+        owner: "{{ system_username }}"
+
+    - name: Create Argo Workflow integration example
+      ansible.builtin.copy:
+        content: |
+          # Example: Trigger Argo Workflow for Complex Builds
+          # Place this in your repository at: .gitea/workflows/argo-build.yaml
+          
+          name: Trigger Argo Workflow
+          on:
+            push:
+              branches: [ main ]
+          
+          jobs:
+            trigger-argo:
+              runs-on: gitea-runner
+              steps:
+                - uses: actions/checkout@v3
+                
+                - name: Install Argo CLI
+                  run: |
+                    curl -sLO https://github.com/argoproj/argo-workflows/releases/latest/download/argo-linux-amd64.gz
+                    gunzip argo-linux-amd64.gz
+                    chmod +x argo-linux-amd64
+                    sudo mv argo-linux-amd64 /usr/local/bin/argo
+                
+                - name: Submit Argo Workflow
+                  run: |
+                    argo submit \
+                      --server grpc-argo.{{ domain_name }}:443 \
+                      --service-account argo-workflows-server-sa \
+                      --token ${{ '{{' }} secrets.ARGO_TOKEN {{ '}}' }} \
+                      --namespace argo \
+                      --from workflowtemplate/build-template \
+                      -p repo_url=https://{{ gitea_host }}/${{ '{{' }} gitea.repository {{ '}}' }} \
+                      -p commit_sha=${{ '{{' }} gitea.sha {{ '}}' }} \
+                      -p image_repo={{ harbor_registry }}/${{ '{{' }} gitea.repository {{ '}}' }}
+        dest: "{{ code_source_path }}/examples/gitea-workflows/argo-integration.yaml"
+        owner: "{{ system_username }}"
+
+    ###################################################################
+    # 3) Create helper scripts
+    ###################################################################
+    - name: Create Gitea repository creation script
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          # Create a new repository in Gitea
+          
+          REPO_NAME="$1"
+          REPO_DESC="${2:-A new repository}"
+          
+          if [ -z "$REPO_NAME" ]; then
+            echo "Usage: $0 <repo-name> [description]"
+            exit 1
+          fi
+          
+          curl -X POST "https://{{ gitea_host }}/api/v1/user/repos" \
+            -H "Authorization: token {{ gitea_admin_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"name\": \"$REPO_NAME\",
+              \"description\": \"$REPO_DESC\",
+              \"private\": false,
+              \"auto_init\": true
+            }"
+          
+          echo ""
+          echo "Repository created: https://{{ gitea_host }}/{{ admin_username }}/$REPO_NAME"
+          echo "Clone with: git clone https://{{ gitea_host }}/{{ admin_username }}/$REPO_NAME.git"
+        dest: "{{ code_source_path }}/create-gitea-repo.sh"
+        owner: "{{ system_username }}"
+        mode: '0755'
+
+    - name: Create workflow setup script
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          # Set up Gitea Actions workflow in current repository
+          
+          if [ ! -d .git ]; then
+            echo "Error: Not in a git repository"
+            exit 1
+          fi
+          
+          echo "Setting up Gitea Actions workflow..."
+          
+          # Create workflow directory
+          mkdir -p .gitea/workflows
+          
+          # Detect project type and copy appropriate workflow
+          if [ -f package.json ]; then
+            echo "Node.js project detected"
+            cp {{ code_source_path }}/examples/gitea-workflows/nodejs-build.yaml .gitea/workflows/build.yaml
+          elif [ -f requirements.txt ] || [ -f setup.py ]; then
+            echo "Python project detected"
+            cp {{ code_source_path }}/examples/gitea-workflows/python-build.yaml .gitea/workflows/build.yaml
+          else
+            echo "Generic project - using Argo integration"
+            cp {{ code_source_path }}/examples/gitea-workflows/argo-integration.yaml .gitea/workflows/build.yaml
+          fi
+          
+          echo "Workflow created at .gitea/workflows/build.yaml"
+          echo "Edit the workflow file to customize for your project"
+          echo ""
+          echo "To use Harbor registry, add these secrets to your Gitea repository:"
+          echo "  HARBOR_USERNAME: {{ admin_username }}"
+          echo "  HARBOR_PASSWORD: (your password)"
+          echo "  HARBOR_REGISTRY: {{ harbor_registry }}"
+        dest: "{{ code_source_path }}/setup-gitea-workflow.sh"
+        owner: "{{ system_username }}"
+        mode: '0755'
+
+    ###################################################################
+    # 4) Distribute code-server SSH public key to control plane nodes
+    ###################################################################
+    - name: Read code-server SSH public key from shared directory
+      ansible.builtin.slurp:
+        src: "{{ code_source_path }}/.ssh/id_ed25519.pub"
+      register: code_server_pubkey_file
+
+    - name: Set SSH public key fact
+      ansible.builtin.set_fact:
+        code_server_pubkey: "{{ code_server_pubkey_file.content | b64decode | trim }}"
+
+    - name: Verify SSH public key was read
+      ansible.builtin.assert:
+        that:
+          - code_server_pubkey is defined
+          - code_server_pubkey | length > 0
+          - "'ssh-ed25519' in code_server_pubkey"
+        fail_msg: |
+          ERROR: Failed to read code-server SSH public key
+          
+          DETAILS:
+          - Expected SSH public key at: {{ code_source_path }}/.ssh/id_ed25519.pub
+          - The key should have been created during deployment
+          
+          REQUIRED ACTION:
+          - Ensure the code-server deployment playbook (10_deploy.yaml) ran successfully
+          - Check that SSH keys exist in {{ code_source_path }}/.ssh/
+
+    - name: Add code-server public key to authorized_keys on current node
+      ansible.posix.authorized_key:
+        user: "{{ system_username }}"
+        key: "{{ code_server_pubkey }}"
+        comment: "coder@code-server"
+        state: present
+
+    - name: Distribute key to all control plane nodes
+      ansible.posix.authorized_key:
+        user: "{{ system_username }}"
+        key: "{{ code_server_pubkey }}"
+        comment: "coder@code-server"
+        state: present
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['microk8s_control_plane'] }}"
+
+    ###################################################################
+    # 5) Display configuration summary
+    ###################################################################
+    - name: Display configuration summary
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Code Server CI/CD Configuration Completed
+          ════════════════════════════════════════════════════════
+          
+          Gitea Integration:
+          - Git configured for: https://{{ gitea_host }}
+          - Admin user: {{ admin_username }}
+          - Auto-authentication enabled
+          
+          Helper Scripts Created:
+          - create-gitea-repo.sh - Create new repositories
+          - setup-gitea-workflow.sh - Add CI/CD to projects
+          
+          Example Workflows:
+          - Python: examples/gitea-workflows/python-build.yaml
+          - Node.js: examples/gitea-workflows/nodejs-build.yaml
+          - Argo: examples/gitea-workflows/argo-integration.yaml
+          
+          Next Steps:
+          1. Create repository: ./create-gitea-repo.sh my-app
+          2. Clone: git clone https://{{ gitea_host }}/{{ admin_username }}/my-app
+          3. Add workflow: cd my-app && ../setup-gitea-workflow.sh
+          4. Push code to trigger builds
+          
+          CI/CD Flow:
+          Code Push → Gitea → Runner → Docker Build → Harbor
+                                    ↘ Argo Workflows (complex builds)
+          
+          SSH Access Configured (via ZeroTier network):
+          - ssh ansible-controller ({{ groups['management'] | first }}.{{ domain_name }} - {{ hostvars[groups['management'][0]]['zerotier_ip'] }})
+          - ssh {{ groups['microk8s_control_plane'] | first }}.{{ domain_name }} ({{ hostvars[groups['microk8s_control_plane'][0]]['zerotier_ip'] }})
+          - GitHub SSH key generated (add ~/.ssh/github_ed25519.pub to GitHub)
+          
+          ════════════════════════════════════════════════════════

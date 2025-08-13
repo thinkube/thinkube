@@ -1,0 +1,178 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# roles/common/github_ssh_keys/tasks/main.yaml
+---
+# Purpose: Centralized management of GitHub SSH keys for repository access
+
+# Debug path variables
+- name: Debug path variables
+  debug:
+    msg:
+      - "Host code path: {{ host_code_path | default(code_source_path) }}"
+      - "Pod code path: {{ pod_code_path | default('/home/coder') }}"
+      - "GitHub repo name: {{ github_repo_name }}"
+      - "SSH paths:"
+      - "  - Host: {{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}"
+      - "  - Pod: {{ pod_code_path | default('/home/coder') }}/.ssh/{{ github_repo_name }}"
+  when: true  # Always show this debug info
+
+- name: Ensure repository-specific SSH directory exists
+  file:
+    path: "{{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}"
+    state: directory
+    mode: '0700'
+
+- name: Check current umask before key generation
+  shell: umask
+  register: current_umask
+  changed_when: false
+
+- name: Debug umask and environment
+  debug:
+    msg:
+      - "Current umask: {{ current_umask.stdout }}"
+      - "User: {{ system_username }}"
+      - "Path: {{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}"
+
+- name: Generate repository-specific SSH key (Ed25519)
+  shell: |
+    ssh-keygen -t ed25519 -f "{{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}/id_ed25519" -N "" -C "{{ github_repo_name }}-deploy-key" || true
+    chmod 600 "{{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}/id_ed25519"
+    chmod 644 "{{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}/id_ed25519.pub"
+  args:
+    creates: "{{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}/id_ed25519"
+
+- name: Check actual permissions after key generation
+  stat:
+    path: "{{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}/id_ed25519"
+  register: key_stat
+
+- name: Debug key permissions
+  debug:
+    msg:
+      - "Key permissions: {{ key_stat.stat.mode }}"
+      - "Key owner: {{ key_stat.stat.pw_name }}"
+      - "Key group: {{ key_stat.stat.gr_name }}"
+  when: key_stat.stat.exists
+
+- name: Set SSH key path facts for both host and pod contexts
+  set_fact:
+    ssh_private_key_path: "{{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}/id_ed25519"
+    pod_ssh_private_key_path: "{{ pod_code_path | default('/home/coder') }}/.ssh/{{ github_repo_name }}/id_ed25519"
+
+- name: Create repository-specific SSH config (host path)
+  template:
+    src: ssh_config.j2
+    dest: "{{ host_code_path | default(code_source_path) }}/.ssh/config_{{ github_repo_name }}"
+    mode: '0600'
+
+# CRITICAL FIX: Create GitHub SSH key secret for Argo Workflows
+# This ensures access from any node with explicit namespace and better content handling
+- name: Check SSH key format before storing in secret
+  shell: |
+    if grep -q "BEGIN .* PRIVATE KEY" "{{ ssh_private_key_path }}"; then
+      echo "SSH key appears to be in correct format"
+    else
+      echo "WARNING: SSH key may not be in correct format - attempting to fix"
+      cp "{{ ssh_private_key_path }}" "{{ ssh_private_key_path }}.bak"
+      cat "{{ ssh_private_key_path }}" | tr -d '\r' > "{{ ssh_private_key_path }}.clean"
+      mv "{{ ssh_private_key_path }}.clean" "{{ ssh_private_key_path }}"
+      chmod 600 "{{ ssh_private_key_path }}"
+    fi
+  register: key_check
+  changed_when: "'attempting to fix' in key_check.stdout"
+  when: ssh_private_key_path is defined and ssh_private_key_path != ""
+
+- name: Debug SSH key format check
+  debug:
+    msg: "{{ key_check.stdout_lines }}"
+  when: key_check is defined
+
+- name: Read SSH private key from remote host
+  ansible.builtin.slurp:
+    src: "{{ ssh_private_key_path }}"
+  register: ssh_key_content
+  when: ssh_private_key_path is defined and ssh_private_key_path != ""
+
+- name: Create GitHub SSH key secret for Argo Workflows
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig | default(omit) }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "github-ssh-key-{{ github_repo_name }}"
+        namespace: "{{ argo_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: workflow-ssh-keys
+          app.kubernetes.io/managed-by: ansible
+          repo-name: "{{ github_repo_name }}"
+      type: Opaque
+      stringData:  # Use stringData instead of data for better handling
+        ssh-privatekey: "{{ ssh_key_content.content | b64decode }}"
+  when: 
+    - ssh_private_key_path is defined and ssh_private_key_path != ""
+    - ssh_key_content is defined
+
+- name: Include repository-specific config in global SSH config (host path)
+  blockinfile:
+    path: "{{ host_code_path | default(code_source_path) }}/.ssh/config"
+    create: yes
+    mode: '0600'
+    marker: "# {mark} ANSIBLE MANAGED BLOCK FOR {{ github_repo_name }}"
+    block: |
+      Include config_{{ github_repo_name }}
+
+# Create a pod-specific SSH config that uses the pod path
+- name: Create Pod-specific SSH config
+  template:
+    src: ssh_config_pod.j2
+    dest: "{{ host_code_path | default(code_source_path) }}/.ssh/config_pod_{{ github_repo_name }}"
+    mode: '0600'
+
+# If GitHub token is provided, add the SSH key as a deploy key to the repo
+- name: Check repository existence via GitHub API (if token provided)
+  uri:
+    url: "{{ github_api_url }}/repos/{{ github_org }}/{{ github_repo_name }}"
+    method: GET
+    headers:
+      Authorization: "token {{ github_token }}"
+      Accept: "application/vnd.github.v3+json"
+    validate_certs: false
+    status_code: [200, 404]
+  register: repo_check
+  when: 
+    - github_token is defined 
+    - github_token | length > 0
+    - github_org is defined
+
+- name: Get public key content
+  shell: cat "{{ ssh_private_key_path }}.pub"
+  register: public_key
+  changed_when: false
+  when: 
+    - repo_check is defined 
+    - repo_check.status is defined
+    - repo_check.status == 200
+
+- name: Add deploy key to GitHub repository
+  uri:
+    url: "{{ github_api_url }}/repos/{{ github_org }}/{{ github_repo_name }}/keys"
+    method: POST
+    headers:
+      Authorization: "token {{ github_token }}"
+      Accept: "application/vnd.github.v3+json"
+    body_format: json
+    body:
+      title: "Ansible Deploy Key ({{ ansible_date_time.iso8601 }})"
+      key: "{{ public_key.stdout }}"
+      read_only: false
+    validate_certs: false
+    status_code: [201, 422]
+  when: 
+    - repo_check is defined
+    - repo_check.status is defined
+    - repo_check.status == 200
+    - public_key is defined

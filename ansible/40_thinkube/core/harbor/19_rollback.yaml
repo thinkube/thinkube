@@ -1,0 +1,210 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/19_rollback.yaml
+# Description:
+#   Removes Harbor container registry installation and cleans up resources
+#   Deletes namespace, Helm release, and associated secrets
+#
+# Requirements:
+#   - MicroK8s cluster must be accessible
+#   - Helm must be available
+#   - kubectl access to the cluster
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/19_rollback.yaml
+#
+# Variables from inventory:
+#   - harbor_namespace: Namespace where Harbor is deployed
+#   - harbor_release: Helm release name for Harbor
+#   - kubeconfig: Path to Kubernetes configuration file
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+
+- name: Rollback Harbor Container Registry
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    # All values must come from inventory
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+  tasks:
+    - name: Check if Harbor namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ harbor_namespace }}"
+      register: namespace_check
+      failed_when: false
+
+    - name: Check if Harbor Helm release exists
+      kubernetes.core.helm_info:
+        binary_path: "{{ helm_bin }}"
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ harbor_release }}"
+        release_namespace: "{{ harbor_namespace }}"
+      register: helm_check
+      failed_when: false
+      when: namespace_check.resources | length > 0
+
+    - name: Remove Harbor Helm release if exists
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ harbor_release }}"
+        state: absent
+        release_namespace: "{{ harbor_namespace }}"
+        wait: true
+        wait_timeout: "300s"
+      when: 
+        - namespace_check.resources | length > 0
+        - helm_check.status is defined
+        - helm_check.status.info is defined
+
+    - name: Delete Harbor namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ harbor_namespace }}"
+        wait: true
+        wait_condition:
+          type: Delete
+        wait_timeout: 300
+      when: namespace_check.resources | length > 0
+
+    - name: Verify cleanup status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ harbor_namespace }}"
+      register: cleanup_check
+      failed_when: cleanup_check.resources | length > 0
+
+    # Retrieve Keycloak token to delete the OIDC client
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: password
+          client_id: "admin-cli"
+        validate_certs: false
+        status_code: [200, 201]
+      register: keycloak_token
+      no_log: true
+      ignore_errors: true
+
+    - name: Get harbor client info
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId=harbor"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: [200, 201, 404]
+        validate_certs: false  # Self-signed certificate during initial deployment
+      register: harbor_client_info
+      ignore_errors: true
+      when: keycloak_token is success
+
+    - name: Extract client ID from response
+      ansible.builtin.set_fact:
+        harbor_client_uuid: "{{ harbor_client_info.json[0].id }}"
+      when: 
+        - keycloak_token is success
+        - harbor_client_info is success 
+        - harbor_client_info.json | length > 0
+
+    - name: Delete harbor client in Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ harbor_client_uuid }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: [204, 404]
+        validate_certs: false  # Self-signed certificate during initial deployment
+      ignore_errors: true
+      when: harbor_client_uuid is defined
+      
+    # Remove the harbor-admins group from Keycloak
+    - name: Get harbor-admins group info
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/groups?search=harbor-admins"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: 200
+        validate_certs: false  # Self-signed certificate during initial deployment
+      register: harbor_admins_group
+      ignore_errors: true
+      when: keycloak_token is success
+      
+    - name: Extract harbor-admins group ID
+      ansible.builtin.set_fact:
+        harbor_admins_group_id: "{{ harbor_admins_group.json[0].id }}"
+      when: 
+        - keycloak_token is success
+        - harbor_admins_group is success
+        - harbor_admins_group.json | length > 0
+        
+    - name: Delete harbor-admins group from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/groups/{{ harbor_admins_group_id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: [204, 404]
+        validate_certs: false  # Self-signed certificate during initial deployment
+      ignore_errors: true
+      when: harbor_admins_group_id is defined
+
+    - name: Remove Harbor OIDC secret file if exists
+      ansible.builtin.file:
+        path: /tmp/harbor_oidc_secret
+        state: absent
+      
+    - name: Remove Harbor values file if exists
+      ansible.builtin.file:
+        path: /tmp/harbor-values.yaml
+        state: absent
+        
+    - name: Get remote home directory
+      ansible.builtin.shell: echo $HOME
+      register: user_home
+      changed_when: false
+
+    - name: Remove Harbor robot token from environment
+      ansible.builtin.lineinfile:
+        path: "{{ user_home.stdout }}/.env"
+        regexp: "^HARBOR_ROBOT_TOKEN="
+        state: absent
+      ignore_errors: true
+      
+    - name: Remove Harbor pull secret from default namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: harbor-pull-secret
+        namespace: default
+      ignore_errors: true
+
+    - name: Display cleanup status
+      ansible.builtin.debug:
+        msg:
+          - "Harbor namespace: {{ 'Deleted' if namespace_check.resources | length == 0 else 'Not found' }}"
+          - "Harbor Helm release: {{ 'Deleted' if helm_check.status is defined else 'Not found' }}"
+          - "Harbor robot token: Removed from environment file"
+          - "Harbor pull secret: Removed from default namespace"
+          - "Harbor OIDC client: {{ 'Deleted' if harbor_client_uuid is defined else 'Not found' }}"
+          - "Harbor-admins group: {{ 'Deleted' if harbor_admins_group_id is defined else 'Not found' }}"
+          - "Cleanup completed successfully"

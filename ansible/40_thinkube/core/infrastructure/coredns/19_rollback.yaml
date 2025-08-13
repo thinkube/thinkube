@@ -1,0 +1,137 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/coredns/19_rollback.yaml
+# Description:
+#   Rollback CoreDNS configuration to default MicroK8s settings
+#   Removes custom DNS forwarding rules and worker node configurations
+#
+# Requirements:
+#   - MicroK8s must be running
+#   - kubectl access to the cluster
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/coredns/19_rollback.yaml
+#
+# Actions:
+#   - Restores default CoreDNS configuration
+#   - Removes domain forwarding rules
+#   - Resets worker node DNS settings
+#   - Removes system certificates ConfigMap
+
+- name: Rollback CoreDNS configuration to default
+  hosts: microk8s_control_plane
+  gather_facts: false
+  become: true
+  vars:
+    kubectl_bin: microk8s kubectl
+    kubeconfig: /var/snap/microk8s/current/credentials/client.config
+
+  tasks:
+    # Restore default CoreDNS configuration
+    - name: Get default MicroK8s CoreDNS configuration
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get configmap coredns-original -n kube-system -o yaml
+      register: original_config
+      failed_when: false
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Restore CoreDNS to MicroK8s default (if backup exists)
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get configmap coredns-original -n kube-system -o json | 
+        jq '.metadata.name = "coredns" | del(.metadata.resourceVersion) | del(.metadata.uid)' | 
+        {{ kubectl_bin }} apply -f -
+      when: original_config.rc == 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Restore CoreDNS to minimal default (if no backup exists)
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: coredns
+          namespace: kube-system
+        data:
+          Corefile: |
+            .:53 {
+                errors
+                health {
+                   lameduck 5s
+                }
+                ready
+                kubernetes cluster.local in-addr.arpa ip6.arpa {
+                    pods insecure
+                    fallthrough in-addr.arpa ip6.arpa
+                    ttl 30
+                }
+                prometheus :9153
+                forward . /etc/resolv.conf {
+                    max_concurrent 1000
+                }
+                cache 30
+                loop
+                reload
+                loadbalance
+            }
+        EOF
+      when: original_config.rc != 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # Restart CoreDNS
+    - name: Restart CoreDNS pods
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system delete pods -l k8s-app=kube-dns
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Wait for CoreDNS pods to be ready
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-dns --timeout=300s
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # Remove system certificates ConfigMap
+    - name: Remove system certificates ConfigMap
+      ansible.builtin.command: >
+        {{ kubectl_bin }} delete configmap system-certificates -n kube-system
+      failed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # Rollback worker node DNS configuration
+    - name: Remove ZeroTier DNS configuration from worker nodes
+      block:
+        - name: Remove systemd-resolved zerotier configuration
+          ansible.builtin.file:
+            path: /etc/systemd/resolved.conf.d/zerotier.conf
+            state: absent
+          delegate_to: "{{ item }}"
+          register: resolved_remove
+          loop: "{{ groups['microk8s_workers'] }}"
+
+        - name: Restart systemd-resolved service
+          ansible.builtin.systemd:
+            name: systemd-resolved
+            state: restarted
+          delegate_to: "{{ item }}"
+          when: resolved_remove.changed
+          loop: "{{ groups['microk8s_workers'] }}"
+
+    - name: Display rollback summary
+      ansible.builtin.debug:
+        msg: |
+          CoreDNS rollback completed:
+          ✓ CoreDNS configuration restored to default
+          ✓ CoreDNS pods restarted
+          ✓ System certificates ConfigMap removed
+          ✓ Worker node DNS configuration reset
+          
+          The cluster is now using the default CoreDNS configuration.

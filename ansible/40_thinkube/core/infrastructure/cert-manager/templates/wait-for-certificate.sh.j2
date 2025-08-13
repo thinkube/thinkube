@@ -1,0 +1,52 @@
+#!/bin/bash
+
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Template for monitoring certificate readiness
+
+CERT_NAME="{{ domain_name | replace('.', '-') }}-tls"
+NAMESPACE="default"
+
+echo "Monitoring certificate: $CERT_NAME in namespace: $NAMESPACE"
+
+# First check if certificate already exists and is ready
+if microk8s kubectl get certificate $CERT_NAME -n $NAMESPACE &>/dev/null; then
+  READY=$(microk8s kubectl get certificate $CERT_NAME -n $NAMESPACE -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+  if [ "$READY" == "True" ]; then
+    echo "Certificate already exists and is ready"
+    
+    # Verify it's a staging certificate
+    ISSUER=$(microk8s kubectl get secret $CERT_NAME -n $NAMESPACE -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -issuer -noout)
+    if echo "$ISSUER" | grep -q "Fake LE"; then
+      echo "✓ Confirmed: Let's Encrypt Staging Certificate"
+    else
+      echo "✓ Certificate is ready (Issuer: $ISSUER)"
+    fi
+    exit 0
+  fi
+fi
+
+# Wait for certificate to be ready using kubectl wait
+echo "Waiting for certificate to be ready..."
+if ! microk8s kubectl wait --for=condition=Ready certificate/$CERT_NAME -n $NAMESPACE --timeout=300s; then
+  echo "Certificate not ready after 5 minutes, checking status..."
+  microk8s kubectl describe certificate $CERT_NAME -n $NAMESPACE
+  
+  # Check cert-manager logs for issues
+  echo -e "\nRecent cert-manager logs:"
+  microk8s kubectl logs -n cert-manager deploy/cert-manager --tail=20
+  
+  exit 1
+fi
+
+# Verify the certificate
+echo "Certificate is ready, verifying it's a staging certificate..."
+ISSUER=$(microk8s kubectl get secret $CERT_NAME -n $NAMESPACE -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -issuer -noout)
+echo "Issuer: $ISSUER"
+
+if echo "$ISSUER" | grep -q "Fake LE"; then
+  echo "✓ Confirmed: Let's Encrypt Staging Certificate"
+else
+  echo "✓ Certificate is ready (may not be staging)"
+fi

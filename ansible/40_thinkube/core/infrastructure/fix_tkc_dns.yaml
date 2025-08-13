@@ -1,0 +1,53 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Fix DNS resolution on tkc container
+# This configures systemd-resolved to use CoreDNS for DNS resolution
+
+- name: Fix DNS resolution on tkc for Keycloak
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  tasks:
+    - name: Get CoreDNS service IP
+      ansible.builtin.command: |
+        microk8s kubectl get svc -n kube-system kube-dns -o jsonpath='{.spec.clusterIP}'
+      register: coredns_ip
+      become: true
+      
+    - name: Configure systemd-resolved to use CoreDNS
+      ansible.builtin.copy:
+        content: |
+          [Resolve]
+          DNS={{ coredns_ip.stdout }}
+          Domains=~{{ domain_name }} ~kn.{{ domain_name }}
+          DNSStubListener=yes
+        dest: /etc/systemd/resolved.conf.d/10-thinkube.conf
+        owner: root
+        group: root
+        mode: '0644'
+      become: true
+      
+    - name: Create resolved.conf.d directory
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      become: true
+      
+    - name: Restart systemd-resolved
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+      become: true
+      
+    - name: Verify DNS resolution works
+      ansible.builtin.command: nslookup keycloak.{{ domain_name }}
+      register: dns_test
+      
+    - name: Show DNS test result
+      ansible.builtin.debug:
+        var: dns_test.stdout_lines

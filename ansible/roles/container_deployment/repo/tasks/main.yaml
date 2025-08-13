@@ -1,0 +1,93 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# IMPORTANT: This file has a duplicate that must be kept in sync!
+# Original: /home/thinkube/thinkube/ansible/roles/container_deployment/repo/tasks/main.yaml
+# Copy: /home/thinkube/thinkube/thinkube-control/ansible/roles/container_deployment/repo/tasks/main.yaml
+# If you modify this file, ensure the changes are reflected in both locations.
+
+- name: Debug Repository Information
+  debug:
+    msg:
+      - "Template URL: {{ template_url }}"
+      - "Target Repo Name: {{ gitea_repo_name }}"
+      - "Local Repo Path: {{ code_source_path }}/{{ gitea_repo_name }}"
+
+- name: Check if Copier is installed in virtualenv
+  ansible.builtin.command:
+    cmd: ~/.venv/bin/pip show copier
+  register: copier_check
+  failed_when: false
+  changed_when: false
+
+- name: Install Copier in virtualenv
+  ansible.builtin.pip:
+    name: copier
+    state: present
+    virtualenv: ~/.venv
+  when: copier_check.rc != 0
+
+- name: Ensure parent directory exists
+  file:
+    path: "{{ code_source_path }}"
+    state: directory
+    mode: '0755'
+
+- name: Use Copier to copy and process template from GitHub
+  ansible.builtin.shell: |
+    cd {{ code_source_path }}
+    
+    # Remove existing directory if it exists
+    if [ -d "{{ gitea_repo_name }}" ]; then
+      rm -rf "{{ gitea_repo_name }}"
+    fi
+    
+    # Clear any existing Copier cache to force fresh clone
+    rm -rf /tmp/copier*
+    
+    # Configure SSH for private repositories if key path is provided
+    {% if ssh_private_key_path is defined and ssh_private_key_path %}
+    export GIT_SSH_COMMAND="ssh -i {{ ssh_private_key_path }} -o StrictHostKeyChecking=no"
+    {% endif %}
+    
+    # Use Copier to copy from GitHub template with fresh clone
+    ~/.venv/bin/copier copy \
+      --trust \
+      --defaults \
+      --vcs-ref=HEAD \
+      --data "project_name={{ app_name }}" \
+      --data "domain_name={{ domain_name }}" \
+      --data "control_subdomain=control" \
+      --data "auth_subdomain=auth" \
+      --data "registry_subdomain=registry" \
+      --data "namespace={{ k8s_namespace }}" \
+      --data "keycloak_realm=thinkube" \
+      --data "github_org={{ github_org }}" \
+      --data "enable_dev_mode=true" \
+      --data "system_username={{ system_username }}" \
+      --data "master_node_name={{ master_node_name }}" \
+      --data "master_node_ip={{ master_node_ip }}" \
+      --data "container_registry={{ container_registry }}" \
+      --data "admin_username={{ admin_username }}" \
+      --data "admin_password={{ admin_password | default(lookup('env', 'ADMIN_PASSWORD'), true) }}" \
+      --data "database_url=postgresql://{{ admin_username }}:{{ admin_password | default(lookup('env', 'ADMIN_PASSWORD'), true) | urlencode }}@postgresql-official.postgres.svc.cluster.local:5432/{{ app_name | replace('-', '_') }}" \
+      --data "author_name={{ author_name }}" \
+      --data "author_email={{ author_email }}" \
+      --data "enable_cicd_monitoring={{ enable_cicd_monitoring | default('true') }}" \
+      "{{ template_url }}" "{{ gitea_repo_name }}"
+  args:
+    executable: /bin/bash
+
+- name: Initialize git repository in the copied directory
+  ansible.builtin.shell: |
+    cd {{ code_source_path }}/{{ gitea_repo_name }}
+    git init -b main
+    
+    # Configure git user for this repository
+    git config user.name "{{ git_user_name | default('Thinkube Automation') }}"
+    git config user.email "{{ git_user_email | default('automation@' + domain_name) }}"
+    
+    git add -A
+    git commit -m "Initial deployment for {{ domain_name }}"
+  args:
+    executable: /bin/bash

@@ -1,0 +1,303 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/12_configure_thinkube.yaml
+# Description:
+#   Creates Harbor project and robot account for Kubernetes deployments
+#   Creates a project named from harbor_project variable
+#   Creates a system-level robot account with pull/push permissions
+#   Stores the robot token in ~/.env for use in Docker/Kubernetes
+#
+# Requirements:
+#   - Harbor registry must be installed and accessible
+#   - Harbor admin credentials must be available
+#   - Harbor must be configured (10_deploy.yaml completed)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/15_configure_thinkube.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Harbor registry domain
+#   - harbor_project: Project name in Harbor registry
+#   - harbor_namespace: Harbor namespace in Kubernetes (defaults to 'registry')
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to Kubernetes configuration file
+#
+# 🤖 [AI-assisted]
+
+- name: Setup Harbor project and create a system-level robot account
+  hosts: microk8s_control_plane
+  gather_facts: yes
+  vars:
+    # Harbor robot account naming - API only needs the base name
+    # harbor_robot_name comes from inventory
+    robot_duration: 36500  # 100 years (effectively never expires)
+    harbor_admin_user: "admin"  # Harbor's built-in admin user
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    - name: Get Harbor admin password
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ harbor_namespace }}"
+        name: harbor-core
+      register: harbor_secret
+      until: harbor_secret.resources | length > 0
+      retries: 30
+      delay: 10
+
+    - name: Note about password
+      ansible.builtin.debug:
+        msg: "Harbor admin password has been changed to our standard admin_password"
+
+    - name: Create Harbor project
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects"
+        method: POST
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          project_name: "{{ harbor_project }}"
+          public: false
+          metadata:
+            public: "false"
+        validate_certs: false
+        status_code: [201, 409]
+      register: project_creation
+      
+    - name: Debug project creation response
+      ansible.builtin.debug:
+        var: project_creation
+        
+    - name: Wait for project to be available in Harbor API
+      ansible.builtin.pause:
+        seconds: 5
+      when: project_creation.status == 201
+
+    - name: Get existing project if already created
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects?name={{ harbor_project }}"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+        validate_certs: false
+        status_code: 200
+      register: existing_project
+
+    - name: Set project ID fact
+      ansible.builtin.set_fact:
+        harbor_project_id: >-
+          {{ existing_project.json[0].project_id if existing_project.json | length > 0 else
+          project_creation.json.id }}
+
+    - name: Check if robot account already exists
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/robots"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+        validate_certs: false
+        status_code: 200
+      register: all_robots
+      
+    - name: Debug all robots
+      ansible.builtin.debug:
+        var: all_robots.json
+        
+    - name: Filter existing robot
+      ansible.builtin.set_fact:
+        existing_robot_list: "{{ all_robots.json | selectattr('name', 'equalto', 'robot$' + harbor_robot_name) | list }}"
+        
+    - name: Debug filtered robot
+      ansible.builtin.debug:
+        var: existing_robot_list
+
+    - name: Create system-level robot account
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/robots"
+        method: POST
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          level: "system"
+          name: "{{ harbor_robot_name }}"
+          duration: "{{ robot_duration }}"
+          description: "System robot for Kubernetes deployments"
+          permissions:
+            - kind: "project"
+              namespace: "{{ harbor_project }}"
+              access:
+                - action: "pull"
+                  resource: "repository"
+                - action: "push"
+                  resource: "repository"
+                - action: "list"
+                  resource: "repository"
+            - kind: "project"
+              namespace: "library"
+              access:
+                - action: "pull"
+                  resource: "repository"
+                - action: "push"
+                  resource: "repository"
+                - action: "list"
+                  resource: "repository"
+        validate_certs: false
+        status_code: [201, 409]
+      register: robot_creation
+
+    - name: Extract robot credentials from creation response
+      ansible.builtin.set_fact:
+        harbor_robot_token: "{{ robot_creation.json.secret }}"
+      when: robot_creation.status == 201
+
+    - name: Get robot token if already exists
+      block:
+        - name: Delete existing robot account
+          ansible.builtin.uri:
+            url: "https://{{ harbor_registry }}/api/v2.0/robots/{{ existing_robot_list[0].id }}"
+            method: DELETE
+            headers:
+              Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+            validate_certs: false
+            status_code: 200
+          register: robot_delete
+          when: existing_robot_list | length > 0
+        
+        - name: Debug robot delete
+          ansible.builtin.debug:
+            var: robot_delete
+          when: robot_delete is defined
+          
+        - name: Create new robot account after deletion
+          ansible.builtin.uri:
+            url: "https://{{ harbor_registry }}/api/v2.0/robots"
+            method: POST
+            headers:
+              Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              level: "system"
+              name: "{{ harbor_robot_name }}"
+              duration: "{{ robot_duration }}"
+              description: "System robot for Kubernetes deployments"
+              permissions:
+                - kind: "project"
+                  namespace: "{{ harbor_project }}"
+                  access:
+                    - action: "pull"
+                      resource: "repository"
+                    - action: "push"
+                      resource: "repository"
+                    - action: "list"
+                      resource: "repository"
+                - kind: "project"
+                  namespace: "library"
+                  access:
+                    - action: "pull"
+                      resource: "repository"
+                    - action: "push"
+                      resource: "repository"
+                    - action: "list"
+                      resource: "repository"
+            validate_certs: false
+            status_code: 201
+          register: robot_recreate
+          when: robot_delete is defined and robot_delete.status == 200
+          
+        - name: Debug robot recreate
+          ansible.builtin.debug:
+            var: robot_recreate
+          when: robot_recreate is defined
+          
+        - name: Set robot token from recreate
+          ansible.builtin.set_fact:
+            harbor_robot_token: "{{ robot_recreate.json.secret }}"
+          when: robot_recreate is defined and robot_recreate.status == 201
+      when: robot_creation.status != 201 and existing_robot_list | length > 0
+
+    - name: Get remote home directory
+      ansible.builtin.shell: echo $HOME
+      register: user_home
+      changed_when: false
+      
+    - name: Save robot credentials to environment file
+      ansible.builtin.lineinfile:
+        path: "{{ user_home.stdout }}/.env"
+        regexp: "^HARBOR_ROBOT_TOKEN="
+        line: "HARBOR_ROBOT_TOKEN={{ harbor_robot_token }}"
+        create: yes
+        mode: '0600'
+      when: harbor_robot_token is defined
+
+    - name: Create Harbor robot credentials secret in kube-system namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: harbor-robot-credentials
+            namespace: kube-system
+          type: Opaque
+          stringData:
+            robot-user: "robot${{ harbor_robot_name }}"
+            robot-token: "{{ harbor_robot_token }}"
+      when: harbor_robot_token is defined
+      
+    - name: Ensure containers config directory exists
+      ansible.builtin.file:
+        path: "{{ user_home.stdout }}/.config/containers"
+        state: directory
+        mode: '0700'
+      when: harbor_robot_token is defined
+      
+    - name: Create auth.json file for podman
+      ansible.builtin.copy:
+        dest: "{{ user_home.stdout }}/.config/containers/auth.json"
+        mode: '0600'
+        content: |
+          {
+            "auths": {
+              "{{ harbor_registry }}": {
+                "auth": "{{ ('robot$' + harbor_robot_name + ':' + harbor_robot_token) | b64encode }}"
+              }
+            }
+          }
+      when: harbor_robot_token is defined
+
+    - name: Create repository pull secret in default namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: harbor-pull-secret
+            namespace: default
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: >-
+              {{ {'auths': {harbor_registry: {'username': 'robot$' + harbor_robot_name, 
+              'password': harbor_robot_token, 'auth': ('robot$' + harbor_robot_name + 
+              ':' + harbor_robot_token) | b64encode}}} | to_json | b64encode }}
+      when: harbor_robot_token is defined
+
+    - name: Display configuration status
+      ansible.builtin.debug:
+        msg:
+          - "Harbor project created/verified: {{ harbor_project }}"
+          - "Robot account created/refreshed: robot${{ harbor_robot_name }}"
+          - "Credentials saved to: ~/.env"
+          - "Pull secret created: harbor-pull-secret (default namespace)"

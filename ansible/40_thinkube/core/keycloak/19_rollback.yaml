@@ -1,0 +1,114 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Rollback playbook for Keycloak component
+# Description:
+#   Removes Keycloak deployment and associated resources
+#   Rollback includes:
+#   - Deleting Keycloak deployment
+#   - Removing services
+#   - Cleaning up ingress
+#   - Removing TLS secrets
+#   - Deleting namespace (optional)
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/keycloak/19_rollback.yaml
+
+- name: Rollback Keycloak Component
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    keycloak_namespace: keycloak
+        
+  tasks:
+    - name: Delete Keycloak ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak
+        
+    - name: Delete Keycloak service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Service
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak
+        
+    - name: Delete Keycloak deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak
+        
+    # Certificate deletion removed - we're using wildcard cert
+    
+    - name: Delete TLS secret (copied from wildcard)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Secret
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak-tls-secret
+        
+    - name: Wait for pod termination
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ keycloak_namespace }}"
+        label_selectors:
+          - app=keycloak
+      register: pod_info
+      until: pod_info.resources | length == 0
+      retries: 30
+      delay: 10
+      
+    - name: Check if namespace has other resources
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ keycloak_namespace }}"
+      register: namespace_pods
+      
+    - name: Check for services in namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ keycloak_namespace }}"
+      register: namespace_services
+      
+    - name: Display namespace status
+      ansible.builtin.debug:
+        msg:
+          - "Pods in namespace: {{ namespace_pods.resources | length }}"
+          - "Services in namespace: {{ namespace_services.resources | length }}"
+          
+    - name: Delete namespace if empty
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ keycloak_namespace }}"
+      when:
+        - namespace_pods.resources | length == 0
+        - namespace_services.resources | length == 0
+        
+    - name: Display rollback completion
+      ansible.builtin.debug:
+        msg:
+          - "Keycloak deployment rolled back successfully"
+          - "Namespace {{ 'deleted' if (namespace_pods.resources | length == 0 and namespace_services.resources | length == 0) else 'retained (contains other resources)' }}"

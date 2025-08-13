@@ -1,0 +1,569 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/monitoring/11_configure_prometheus_scraping.yaml
+# Description:
+#   Configure Prometheus to scrape additional metrics for comprehensive monitoring
+#   including node exporters, ingress controllers, GPU metrics, and more
+#
+# Requirements:
+#   - Prometheus must be deployed (10_deploy_prometheus.yaml)
+#   - Target services must be deployed (node-exporter, GPU operator, etc.)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/monitoring/11_configure_prometheus_scraping.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Prometheus Scraping for All Metrics
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  tasks:
+    ###################################################################
+    # 1) Deploy Node Exporter DaemonSet for node metrics
+    ###################################################################
+    - name: Deploy Node Exporter DaemonSet
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: node-exporter
+            namespace: "{{ monitoring_namespace }}"
+            labels:
+              app: node-exporter
+          spec:
+            selector:
+              matchLabels:
+                app: node-exporter
+            template:
+              metadata:
+                labels:
+                  app: node-exporter
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "9100"
+                  prometheus.io/path: "/metrics"
+              spec:
+                hostNetwork: true
+                hostPID: true
+                containers:
+                - name: node-exporter
+                  image: "{{ harbor_registry }}/library/node-exporter:latest"
+                  ports:
+                  - containerPort: 9100
+                    hostPort: 9100
+                    name: metrics
+                  resources:
+                    requests:
+                      cpu: 100m
+                      memory: 30Mi
+                    limits:
+                      cpu: 200m
+                      memory: 50Mi
+                  volumeMounts:
+                  - name: proc
+                    mountPath: /host/proc
+                    readOnly: true
+                  - name: sys
+                    mountPath: /host/sys
+                    readOnly: true
+                  - name: root
+                    mountPath: /host/root
+                    readOnly: true
+                  args:
+                  - --path.procfs=/host/proc
+                  - --path.sysfs=/host/sys
+                  - --path.rootfs=/host/root
+                  - --collector.filesystem.ignored-mount-points
+                  - ^/(dev|proc|sys|var/lib/docker/.+)($|/)
+                  - --collector.filesystem.ignored-fs-types
+                  - ^(autofs|binfmt_misc|cgroup|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|mqueue|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|sysfs|tracefs)$
+                volumes:
+                - name: proc
+                  hostPath:
+                    path: /proc
+                - name: sys
+                  hostPath:
+                    path: /sys
+                - name: root
+                  hostPath:
+                    path: /
+
+    - name: Create Node Exporter Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: node-exporter
+            namespace: "{{ monitoring_namespace }}"
+            labels:
+              app: node-exporter
+            annotations:
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "9100"
+          spec:
+            type: ClusterIP
+            clusterIP: None  # Headless service
+            ports:
+            - port: 9100
+              targetPort: 9100
+              name: metrics
+            selector:
+              app: node-exporter
+
+    ###################################################################
+    # 2) Deploy kube-state-metrics for Kubernetes object metrics
+    ###################################################################
+    - name: Create kube-state-metrics ServiceAccount
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: kube-state-metrics
+            namespace: "{{ monitoring_namespace }}"
+
+    - name: Create kube-state-metrics ClusterRole
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: kube-state-metrics
+          rules:
+          - apiGroups: [""]
+            resources:
+            - configmaps
+            - secrets
+            - nodes
+            - pods
+            - services
+            - resourcequotas
+            - replicationcontrollers
+            - limitranges
+            - persistentvolumeclaims
+            - persistentvolumes
+            - namespaces
+            - endpoints
+            verbs: ["list", "watch"]
+          - apiGroups: ["apps"]
+            resources:
+            - statefulsets
+            - daemonsets
+            - deployments
+            - replicasets
+            verbs: ["list", "watch"]
+          - apiGroups: ["batch"]
+            resources:
+            - cronjobs
+            - jobs
+            verbs: ["list", "watch"]
+          - apiGroups: ["autoscaling"]
+            resources:
+            - horizontalpodautoscalers
+            verbs: ["list", "watch"]
+          - apiGroups: ["networking.k8s.io"]
+            resources:
+            - ingresses
+            verbs: ["list", "watch"]
+          - apiGroups: ["storage.k8s.io"]
+            resources:
+            - storageclasses
+            verbs: ["list", "watch"]
+
+    - name: Create kube-state-metrics ClusterRoleBinding
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: kube-state-metrics
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: kube-state-metrics
+          subjects:
+          - kind: ServiceAccount
+            name: kube-state-metrics
+            namespace: "{{ monitoring_namespace }}"
+
+    - name: Deploy kube-state-metrics
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: kube-state-metrics
+            namespace: "{{ monitoring_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: kube-state-metrics
+            template:
+              metadata:
+                labels:
+                  app: kube-state-metrics
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "8080"
+              spec:
+                serviceAccountName: kube-state-metrics
+                containers:
+                - name: kube-state-metrics
+                  image: "{{ harbor_registry }}/library/kube-state-metrics:latest"
+                  ports:
+                  - containerPort: 8080
+                    name: metrics
+                  - containerPort: 8081
+                    name: telemetry
+                  resources:
+                    requests:
+                      cpu: 100m
+                      memory: 128Mi
+                    limits:
+                      cpu: 200m
+                      memory: 256Mi
+
+    - name: Create kube-state-metrics Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: kube-state-metrics
+            namespace: "{{ monitoring_namespace }}"
+            labels:
+              app: kube-state-metrics
+            annotations:
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "8080"
+          spec:
+            ports:
+            - port: 8080
+              targetPort: 8080
+              name: metrics
+            - port: 8081
+              targetPort: 8081
+              name: telemetry
+            selector:
+              app: kube-state-metrics
+
+    ###################################################################
+    # 3) Update Prometheus ConfigMap with comprehensive scraping
+    ###################################################################
+    - name: Update Prometheus ConfigMap with additional scrape configs
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ monitoring_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: prometheus-config
+          data:
+            prometheus.yml: |
+              global:
+                scrape_interval: 15s
+                evaluation_interval: 15s
+                
+              alerting:
+                alertmanagers:
+                - static_configs:
+                  - targets:
+                    # - alertmanager:9093
+              
+              rule_files:
+                # - "first_rules.yml"
+                # - "second_rules.yml"
+              
+              scrape_configs:
+                # Default Prometheus self-monitoring
+                - job_name: 'prometheus'
+                  static_configs:
+                  - targets: ['localhost:9090']
+                
+                # Kubernetes API servers
+                - job_name: 'kubernetes-apiservers'
+                  kubernetes_sd_configs:
+                  - role: endpoints
+                  scheme: https
+                  tls_config:
+                    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                    insecure_skip_verify: true
+                  bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+                  relabel_configs:
+                  - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+                    action: keep
+                    regex: default;kubernetes;https
+                
+                # Kubernetes nodes
+                - job_name: 'kubernetes-nodes'
+                  scheme: https
+                  tls_config:
+                    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                    insecure_skip_verify: true
+                  bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+                  kubernetes_sd_configs:
+                  - role: node
+                  relabel_configs:
+                  - action: labelmap
+                    regex: __meta_kubernetes_node_label_(.+)
+                  - target_label: __address__
+                    replacement: kubernetes.default.svc:443
+                  - source_labels: [__meta_kubernetes_node_name]
+                    regex: (.+)
+                    target_label: __metrics_path__
+                    replacement: /api/v1/nodes/${1}/proxy/metrics
+                
+                # Node Exporter
+                - job_name: 'node-exporter'
+                  kubernetes_sd_configs:
+                  - role: endpoints
+                  relabel_configs:
+                  - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+                    action: keep
+                    regex: true
+                  - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+                    action: replace
+                    target_label: __metrics_path__
+                    regex: (.+)
+                  - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+                    action: replace
+                    regex: ([^:]+)(?::\d+)?;(\d+)
+                    replacement: $1:$2
+                    target_label: __address__
+                  - source_labels: [__meta_kubernetes_service_name]
+                    action: keep
+                    regex: node-exporter
+                  - source_labels: [__meta_kubernetes_namespace]
+                    target_label: kubernetes_namespace
+                  - source_labels: [__meta_kubernetes_service_name]
+                    target_label: kubernetes_service_name
+                  - source_labels: [__meta_kubernetes_pod_node_name]
+                    target_label: kubernetes_node
+                
+                # kube-state-metrics
+                - job_name: 'kube-state-metrics'
+                  static_configs:
+                  - targets: ['kube-state-metrics.{{ monitoring_namespace }}.svc.cluster.local:8080']
+                
+                # Kubernetes pods
+                - job_name: 'kubernetes-pods'
+                  kubernetes_sd_configs:
+                  - role: pod
+                  relabel_configs:
+                  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                    action: keep
+                    regex: true
+                  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                    action: replace
+                    target_label: __metrics_path__
+                    regex: (.+)
+                  - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                    action: replace
+                    regex: ([^:]+)(?::\d+)?;(\d+)
+                    replacement: $1:$2
+                    target_label: __address__
+                  - action: labelmap
+                    regex: __meta_kubernetes_pod_label_(.+)
+                  - source_labels: [__meta_kubernetes_namespace]
+                    action: replace
+                    target_label: kubernetes_namespace
+                  - source_labels: [__meta_kubernetes_pod_name]
+                    action: replace
+                    target_label: kubernetes_pod_name
+                
+                # Kubernetes service endpoints
+                - job_name: 'kubernetes-service-endpoints'
+                  kubernetes_sd_configs:
+                  - role: endpoints
+                  relabel_configs:
+                  - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+                    action: keep
+                    regex: true
+                  - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+                    action: replace
+                    target_label: __scheme__
+                    regex: (https?)
+                  - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+                    action: replace
+                    target_label: __metrics_path__
+                    regex: (.+)
+                  - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+                    action: replace
+                    target_label: __address__
+                    regex: ([^:]+)(?::\d+)?;(\d+)
+                    replacement: $1:$2
+                  - action: labelmap
+                    regex: __meta_kubernetes_service_label_(.+)
+                  - source_labels: [__meta_kubernetes_namespace]
+                    action: replace
+                    target_label: kubernetes_namespace
+                  - source_labels: [__meta_kubernetes_service_name]
+                    action: replace
+                    target_label: kubernetes_name
+                
+                # NGINX Ingress Controller
+                - job_name: 'nginx-ingress'
+                  kubernetes_sd_configs:
+                  - role: pod
+                  relabel_configs:
+                  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                    action: keep
+                    regex: true
+                  - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_pod_label_app_kubernetes_io_name]
+                    action: keep
+                    regex: ingress.*;.*nginx.*
+                  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+                    action: replace
+                    regex: (.+)
+                    target_label: __address__
+                    replacement: $1
+                  - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                    action: replace
+                    regex: ([^:]+)(?::\d+)?;(\d+)
+                    replacement: $1:$2
+                    target_label: __address__
+                  - action: labelmap
+                    regex: __meta_kubernetes_pod_label_(.+)
+                  - source_labels: [__meta_kubernetes_namespace]
+                    action: replace
+                    target_label: kubernetes_namespace
+                  - source_labels: [__meta_kubernetes_pod_name]
+                    action: replace
+                    target_label: kubernetes_pod_name
+                
+                # GPU metrics (DCGM)
+                - job_name: 'gpu-metrics'
+                  kubernetes_sd_configs:
+                  - role: endpoints
+                  relabel_configs:
+                  - source_labels: [__meta_kubernetes_service_name]
+                    action: keep
+                    regex: .*dcgm.*|.*gpu.*
+                  - source_labels: [__meta_kubernetes_endpoint_port_name]
+                    action: keep
+                    regex: .*metrics.*
+                  - source_labels: [__meta_kubernetes_namespace]
+                    target_label: namespace
+                  - source_labels: [__meta_kubernetes_service_name]
+                    target_label: service
+                  - source_labels: [__meta_kubernetes_pod_name]
+                    target_label: pod
+                
+                # Kubernetes Cadvisor (container metrics)
+                - job_name: 'kubernetes-cadvisor'
+                  scheme: https
+                  tls_config:
+                    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                    insecure_skip_verify: true
+                  bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+                  kubernetes_sd_configs:
+                  - role: node
+                  relabel_configs:
+                  - action: labelmap
+                    regex: __meta_kubernetes_node_label_(.+)
+                  - target_label: __address__
+                    replacement: kubernetes.default.svc:443
+                  - source_labels: [__meta_kubernetes_node_name]
+                    regex: (.+)
+                    target_label: __metrics_path__
+                    replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+                  metric_relabel_configs:
+                  - source_labels: [__name__]
+                    regex: container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_network_receive_bytes_total|container_network_transmit_bytes_total|container_fs_reads_total|container_fs_writes_total
+                    action: keep
+
+    ###################################################################
+    # 4) Restart Prometheus to apply new configuration
+    ###################################################################
+    - name: Restart Prometheus pods to apply new config
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: "{{ monitoring_namespace }}"
+        label_selectors:
+          - app=prometheus
+
+    - name: Wait for Prometheus to be ready again
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus
+      register: prometheus_deployment
+      until: 
+        - prometheus_deployment.resources[0].status.readyReplicas is defined
+        - prometheus_deployment.resources[0].status.readyReplicas == 1
+      retries: 60
+      delay: 5
+
+    ###################################################################
+    # 5) Summary
+    ###################################################################
+    - name: Configuration summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Prometheus Scraping Configuration Complete
+          ════════════════════════════════════════════════════════
+          
+          The following metric sources are now being scraped:
+          
+          📊 KUBERNETES METRICS:
+          ─────────────────────────
+          • API Server metrics
+          • Node metrics (kubelet)
+          • Pod metrics (annotated with prometheus.io/scrape)
+          • Service endpoints
+          • Container metrics (cAdvisor)
+          
+          🖥️ INFRASTRUCTURE METRICS:
+          ─────────────────────────
+          • Node Exporter (system metrics)
+          • kube-state-metrics (Kubernetes objects)
+          
+          🌐 APPLICATION METRICS:
+          ─────────────────────────
+          • NGINX Ingress Controller
+          • Any pod/service with prometheus.io annotations
+          
+          🎮 GPU METRICS:
+          ─────────────────────────
+          • DCGM Exporter (if deployed)
+          • GPU operator metrics (if available)
+          
+          📝 ANNOTATION GUIDE:
+          ─────────────────────────
+          To scrape your application, add these annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8080"
+            prometheus.io/path: "/metrics"
+          
+          Verify targets at: https://{{ prometheus_hostname }}/targets
+          
+          ════════════════════════════════════════════════════════

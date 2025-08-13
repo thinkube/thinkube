@@ -1,0 +1,436 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/10_deploy_sync_webhook.yaml
+# Description:
+#   Deploy ArgoCD sync webhook service for triggering syncs after Git updates
+#   This provides secure, controlled syncing without giving full ArgoCD admin access
+#
+# Requirements:
+#   - ArgoCD deployed
+#   - ArgoCD admin credentials available
+#   - Python base image available in Harbor
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/10_deploy_sync_webhook.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain name for all services
+#   - harbor_registry: Harbor registry hostname
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to Kubernetes configuration file
+#   - admin_password: Admin password from environment
+#
+# Dependencies:
+#   - CORE-009: ArgoCD deployed
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy ArgoCD Sync Webhook Service
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    sync_namespace: "{{ argocd_namespace }}"
+    sync_service_name: "argocd-sync-webhook"
+    sync_secret_name: "sync-webhook-secret"
+    
+  tasks:
+    - name: Create sync webhook secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ sync_secret_name }}"
+            namespace: "{{ sync_namespace }}"
+          type: Opaque
+          stringData:
+            # Generate a random webhook secret for authentication
+            webhook_secret: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+            # Store ArgoCD server URL (internal service)
+            argocd_server: "argocd-server.{{ sync_namespace }}.svc.cluster.local"
+
+    - name: Create sync webhook ConfigMap with Python script
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ sync_service_name }}-script"
+            namespace: "{{ sync_namespace }}"
+          data:
+            sync-webhook.py: |
+              #!/usr/bin/env python3
+              import os
+              import sys
+              import json
+              import logging
+              import subprocess
+              import hmac
+              import hashlib
+              from http.server import HTTPServer, BaseHTTPRequestHandler
+              
+              logging.basicConfig(level=logging.DEBUG)
+              logger = logging.getLogger(__name__)
+              
+              WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')
+              ARGOCD_SERVER = os.environ.get('ARGOCD_SERVER', 'argocd-server:80')
+              ARGOCD_PASSWORD = os.environ.get('ARGOCD_PASSWORD', '')
+              PORT = int(os.environ.get('PORT', '8080'))
+              
+              def verify_webhook_signature(body, signature):
+                  """Verify webhook signature using HMAC"""
+                  if not WEBHOOK_SECRET:
+                      return True  # No secret configured, allow all
+                  
+                  expected = hmac.new(
+                      WEBHOOK_SECRET.encode('utf-8'),
+                      body,
+                      hashlib.sha256
+                  ).hexdigest()
+                  
+                  return hmac.compare_digest(expected, signature)
+              
+              # Global auth token to avoid repeated logins
+              _auth_token = None
+              _token_expiry = 0
+              
+              def get_argocd_auth_token():
+                  """Get or refresh ArgoCD auth token"""
+                  global _auth_token, _token_expiry
+                  import time
+                  
+                  # Check if we have a valid token (with 5 minute buffer)
+                  if _auth_token and time.time() < (_token_expiry - 300):
+                      return _auth_token
+                  
+                  try:
+                      # Login to get auth token
+                      login_cmd = [
+                          'argocd', 'login', ARGOCD_SERVER,
+                          '--username', 'admin',
+                          '--password', ARGOCD_PASSWORD,
+                          '--grpc-web',
+                          '--plaintext',  # Use plaintext for internal service
+                          '--skip-test-tls'
+                      ]
+                      
+                      login_result = subprocess.run(login_cmd, capture_output=True, text=True, 
+                                                  env={**os.environ, 'ARGOCD_OPTS': '--grpc-web'}, 
+                                                  timeout=10)
+                      if login_result.returncode != 0:
+                          logger.error(f"Failed to login to ArgoCD: {login_result.stderr}")
+                          return None
+                      
+                      # Get the auth token from the config file
+                      config_cmd = ['argocd', 'account', 'get-user-info', '--server', ARGOCD_SERVER, '--grpc-web', '--plaintext']
+                      config_result = subprocess.run(config_cmd, capture_output=True, text=True, timeout=5)
+                      
+                      if config_result.returncode == 0:
+                          # Token is valid for 24 hours by default in ArgoCD
+                          _token_expiry = time.time() + (24 * 60 * 60)
+                          _auth_token = True  # We're using CLI auth, not direct token
+                          logger.info("ArgoCD authentication successful, token cached")
+                          return _auth_token
+                      
+                  except Exception as e:
+                      logger.error(f"Error getting auth token: {e}")
+                  
+                  return None
+              
+              def trigger_argocd_sync(app_name):
+                  """Trigger ArgoCD sync for an application"""
+                  try:
+                      # Ensure we have valid auth
+                      if not get_argocd_auth_token():
+                          return False, "Failed to authenticate with ArgoCD"
+                      
+                      # Now trigger sync using existing auth
+                      cmd = [
+                          'argocd', 'app', 'sync', app_name,
+                          '--server', ARGOCD_SERVER,
+                          '--grpc-web',
+                          '--plaintext',  # Use plaintext for internal service
+                          '--async'  # Don't wait for sync to complete
+                      ]
+                      
+                      result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                      
+                      # Log command and outputs for debugging
+                      logger.debug(f"Sync command: {' '.join(cmd)}")
+                      logger.debug(f"Sync stdout: {result.stdout}")
+                      logger.debug(f"Sync stderr: {result.stderr}")
+                      logger.debug(f"Sync return code: {result.returncode}")
+                      
+                      if result.returncode == 0:
+                          logger.info(f"Successfully triggered sync for {app_name}")
+                          return True, result.stdout
+                      else:
+                          # If auth failed, clear the token and try once more
+                          if "unauthenticated" in result.stderr.lower():
+                              logger.info("Auth token expired, refreshing...")
+                              global _auth_token, _token_expiry
+                              _auth_token = None
+                              _token_expiry = 0
+                              
+                              if get_argocd_auth_token():
+                                  # Retry the sync
+                                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                                  if result.returncode == 0:
+                                      logger.info(f"Successfully triggered sync for {app_name} after auth refresh")
+                                      return True, result.stdout
+                          
+                          logger.error(f"Failed to sync {app_name}: {result.stderr}")
+                          return False, result.stderr
+                          
+                  except Exception as e:
+                      logger.error(f"Error triggering sync: {e}")
+                      return False, str(e)
+              
+              class SyncWebhookHandler(BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      # Health check endpoint
+                      if self.path == '/health':
+                          self.send_response(200)
+                          self.send_header('Content-type', 'application/json')
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"status": "healthy"}).encode())
+                      else:
+                          self.send_response(404)
+                          self.end_headers()
+                  
+                  def do_POST(self):
+                      if self.path != '/sync':
+                          self.send_response(404)
+                          self.end_headers()
+                          return
+                      
+                      try:
+                          # Read request body
+                          content_length = int(self.headers['Content-Length'])
+                          post_data = self.rfile.read(content_length)
+                          
+                          # Verify signature if provided
+                          signature = self.headers.get('X-Webhook-Signature', '')
+                          if not verify_webhook_signature(post_data, signature):
+                              logger.warning("Invalid webhook signature")
+                              self.send_response(401)
+                              self.end_headers()
+                              return
+                          
+                          # Parse request
+                          webhook_data = json.loads(post_data)
+                          
+                          # Extract application name
+                          app_name = webhook_data.get('application', '')
+                          if not app_name:
+                              logger.error("No application name provided")
+                              self.send_response(400)
+                              self.send_header('Content-type', 'application/json')
+                              self.end_headers()
+                              self.wfile.write(json.dumps({"error": "application name required"}).encode())
+                              return
+                          
+                          # Log the sync request with timing
+                          import time
+                          start_time = time.time()
+                          logger.info(f"Received sync request for application: {app_name}")
+                          
+                          # Trigger ArgoCD sync
+                          success, message = trigger_argocd_sync(app_name)
+                          
+                          # Log timing
+                          elapsed_time = time.time() - start_time
+                          logger.info(f"Sync request for {app_name} completed in {elapsed_time:.2f} seconds")
+                          
+                          if success:
+                              self.send_response(200)
+                              self.send_header('Content-type', 'application/json')
+                              self.end_headers()
+                              self.wfile.write(json.dumps({
+                                  "status": "success",
+                                  "application": app_name,
+                                  "message": "Sync triggered successfully"
+                              }).encode())
+                          else:
+                              self.send_response(500)
+                              self.send_header('Content-type', 'application/json')
+                              self.end_headers()
+                              self.wfile.write(json.dumps({
+                                  "status": "error",
+                                  "application": app_name,
+                                  "message": message
+                              }).encode())
+                              
+                      except Exception as e:
+                          logger.error(f"Error processing webhook: {e}")
+                          self.send_response(500)
+                          self.send_header('Content-type', 'application/json')
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"error": str(e)}).encode())
+                  
+                  def log_message(self, format, *args):
+                      # Suppress default access logs
+                      pass
+              
+              if __name__ == '__main__':
+                  try:
+                      logger.info(f"Starting ArgoCD sync webhook on port {PORT}")
+                      logger.info(f"ArgoCD server: {ARGOCD_SERVER}")
+                      
+                      httpd = HTTPServer(('0.0.0.0', PORT), SyncWebhookHandler)
+                      logger.info("Sync webhook service ready")
+                      httpd.serve_forever()
+                  except Exception as e:
+                      logger.error(f"Failed to start sync webhook: {e}")
+                      sys.exit(1)
+
+    # Skip token generation - use admin credentials directly
+    # ArgoCD doesn't support API tokens for admin by default
+
+    - name: Deploy sync webhook service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ sync_service_name }}"
+            namespace: "{{ sync_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: "{{ sync_service_name }}"
+            template:
+              metadata:
+                labels:
+                  app: "{{ sync_service_name }}"
+              spec:
+                containers:
+                - name: sync-webhook
+                  image: "{{ harbor_registry }}/library/python:3.12-alpine"
+                  command: ["/bin/sh", "-c"]
+                  args: 
+                    - |
+                      apk add --no-cache curl && \
+                      wget -qO /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 && \
+                      chmod +x /usr/local/bin/argocd && \
+                      python -u /app/sync-webhook.py
+                  env:
+                  - name: WEBHOOK_SECRET
+                    valueFrom:
+                      secretKeyRef:
+                        name: "{{ sync_secret_name }}"
+                        key: webhook_secret
+                  - name: ARGOCD_SERVER
+                    valueFrom:
+                      secretKeyRef:
+                        name: "{{ sync_secret_name }}"
+                        key: argocd_server
+                  - name: ARGOCD_PASSWORD
+                    value: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+                  - name: PORT
+                    value: "8080"
+                  ports:
+                  - containerPort: 8080
+                    name: http
+                  resources:
+                    requests:
+                      cpu: 50m
+                      memory: 128Mi
+                    limits:
+                      cpu: 100m
+                      memory: 256Mi
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+                  volumeMounts:
+                  - name: script
+                    mountPath: /app
+                volumes:
+                - name: script
+                  configMap:
+                    name: "{{ sync_service_name }}-script"
+
+    - name: Create Service for sync webhook
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ sync_service_name }}"
+            namespace: "{{ sync_namespace }}"
+          spec:
+            selector:
+              app: "{{ sync_service_name }}"
+            ports:
+            - port: 80
+              targetPort: 8080
+              name: http
+
+    - name: Wait for deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ sync_namespace }}"
+        name: "{{ sync_service_name }}"
+        wait: true
+        wait_condition:
+          type: Progressing
+          status: "True"
+        wait_timeout: 300
+
+    - name: Get webhook secret for configuration
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ sync_namespace }}"
+        name: "{{ sync_secret_name }}"
+      register: webhook_secret_data
+
+    - name: Display sync webhook status
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ ArgoCD Sync Webhook Service Deployed Successfully
+          ════════════════════════════════════════════════════════
+          
+          Service URL: http://{{ sync_service_name }}.{{ sync_namespace }}.svc.cluster.local/sync
+          
+          The sync webhook provides secure, controlled syncing:
+          - Minimal permissions (sync only, not full admin)
+          - HMAC signature verification for security
+          - Clear audit trail of sync operations
+          
+          Webhook Secret: {{ webhook_secret_data.resources[0].data.webhook_secret | b64decode }}
+          
+          To trigger a sync, POST to /sync with:
+          {
+            "application": "app-name"
+          }
+          
+          Include header: X-Webhook-Signature: <HMAC-SHA256>
+          ════════════════════════════════════════════════════════

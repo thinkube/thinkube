@@ -1,0 +1,485 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/argo-workflows/15_configure_gitea_events.yaml
+# Description:
+#   Configure Argo Events to receive webhooks from Gitea repositories
+#   Creates EventSource and Sensor to trigger Argo Workflows on git push
+#
+# Requirements:
+#   - Argo Workflows and Argo Events must be deployed (11_deploy.yaml)
+#   - Gitea must be deployed with admin API access
+#   - Environment variable: ADMIN_PASSWORD
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/argo-workflows/15_configure_gitea_events.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain for services
+#   - argo_namespace: Namespace for Argo components
+#   - kubeconfig: Path to kubeconfig file
+#   - admin_username: Admin username
+#
+# Dependencies:
+#   - CORE-010: Argo Workflows must be deployed
+#   - CORE-012: Gitea must be deployed
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Argo Events for Gitea webhook integration
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    # Webhook configuration
+    webhook_service_name: "gitea-webhook-eventsource"
+    webhook_port: 12000
+    webhook_endpoint: "/gitea"
+    webhook_url: "https://argo-events.{{ domain_name }}/gitea"
+    
+    # Argo Events resources
+    eventbus_name: "default"
+    eventsource_name: "gitea-webhook"
+    sensor_name: "gitea-push"
+    
+    # Secret for webhook (optional authentication)
+    webhook_secret: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+    
+  pre_tasks:
+    - name: Set admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+        
+    - name: Verify Argo Events is running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ argo_namespace }}"
+        name: argo-events-controller-manager
+      register: argo_events_check
+      failed_when: 
+        - argo_events_check.resources | length == 0
+        - argo_events_check.resources[0].status.readyReplicas != 1
+
+  tasks:
+    ###################################################################
+    # 1) Create EventBus (if not exists)
+    ###################################################################
+    - name: Create default EventBus
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: EventBus
+          metadata:
+            name: "{{ eventbus_name }}"
+            namespace: "{{ argo_namespace }}"
+          spec:
+            nats:
+              native:
+                replicas: 3
+                auth: token
+
+    - name: Wait for EventBus to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: argoproj.io/v1alpha1
+        kind: EventBus
+        namespace: "{{ argo_namespace }}"
+        name: "{{ eventbus_name }}"
+      register: eventbus_status
+      until: eventbus_status.resources[0].status.conditions | selectattr('type', 'equalto', 'Deployed') | selectattr('status', 'equalto', 'True') | list | length > 0
+      retries: 30
+      delay: 10
+
+    ###################################################################
+    # 2) Create webhook secret
+    ###################################################################
+    - name: Create webhook secret for authentication
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: gitea-webhook-secret
+            namespace: "{{ argo_namespace }}"
+          type: Opaque
+          stringData:
+            secret: "{{ webhook_secret }}"
+
+    ###################################################################
+    # 3) Create EventSource for Gitea webhooks
+    ###################################################################
+    - name: Create Gitea webhook EventSource
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: EventSource
+          metadata:
+            name: "{{ eventsource_name }}"
+            namespace: "{{ argo_namespace }}"
+          spec:
+            eventBusName: "{{ eventbus_name }}"
+            webhook:
+              gitea:
+                port: "{{ webhook_port | string }}"
+                endpoint: "{{ webhook_endpoint }}"
+                method: POST
+                webhookSecret:
+                  name: gitea-webhook-secret
+                  key: secret
+
+    - name: Wait for EventSource deployment to be created
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ argo_namespace }}"
+        label_selectors:
+          - "eventsource-name={{ eventsource_name }}"
+      register: eventsource_deployment
+      until: eventsource_deployment.resources | length > 0
+      retries: 30
+      delay: 10
+
+    - name: Wait for EventSource to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ argo_namespace }}"
+        label_selectors:
+          - "eventsource-name={{ eventsource_name }}"
+      register: eventsource_status
+      until: 
+        - eventsource_status.resources | length > 0
+        - eventsource_status.resources[0].status.readyReplicas is defined
+        - eventsource_status.resources[0].status.readyReplicas >= 1
+      retries: 30
+      delay: 10
+
+    ###################################################################
+    # 4) Create Service for webhook endpoint
+    ###################################################################
+    - name: Create Service for webhook EventSource
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ webhook_service_name }}"
+            namespace: "{{ argo_namespace }}"
+          spec:
+            selector:
+              eventsource-name: "{{ eventsource_name }}"
+            ports:
+            - name: webhook
+              port: 12000  # Use direct integer value
+              targetPort: 12000  # Use direct integer value
+              protocol: TCP
+
+    ###################################################################
+    # 5) Create Ingress for webhook endpoint
+    ###################################################################
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to argo namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "argo-events-tls-secret"
+            namespace: "{{ argo_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Create Ingress for webhook endpoint
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: argo-events-webhook-ingress
+            namespace: "{{ argo_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+              cert-manager.io/cluster-issuer: "letsencrypt-prod"
+          spec:
+            ingressClassName: nginx
+            tls:
+            - hosts:
+              - "argo-events.{{ domain_name }}"
+              secretName: argo-events-tls-secret
+            rules:
+            - host: "argo-events.{{ domain_name }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: "{{ webhook_service_name }}"
+                      port:
+                        number: 12000  # Use direct integer value
+
+    ###################################################################
+    # 6) Create Sensor to trigger Argo Workflows
+    ###################################################################
+    - name: Create Sensor for Gitea push events
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: Sensor
+          metadata:
+            name: "{{ sensor_name }}"
+            namespace: "{{ argo_namespace }}"
+          spec:
+            eventBusName: "{{ eventbus_name }}"
+            dependencies:
+            - name: gitea-push
+              eventSourceName: "{{ eventsource_name }}"
+              eventName: gitea
+              filters:
+                data:
+                - path: header.X-Gitea-Event
+                  type: string
+                  value:
+                  - "push"
+                script: |-
+                  -- Check if push contains only .argocd-source files
+                  if event.body.commits == nil or #event.body.commits == 0 then
+                    return true  -- Allow events with no commits (tags, etc)
+                  end
+                  
+                  -- Check each commit for non-.argocd-source files
+                  for _, commit in ipairs(event.body.commits) do
+                    local hasNonArgocdFile = false
+                    
+                    -- Check added files
+                    if commit.added ~= nil then
+                      for _, file in ipairs(commit.added) do
+                        if not string.match(file, "^k8s/%.argocd%-source%-.*%.yaml$") then
+                          hasNonArgocdFile = true
+                          break
+                        end
+                      end
+                    end
+                    
+                    -- Check modified files
+                    if not hasNonArgocdFile and commit.modified ~= nil then
+                      for _, file in ipairs(commit.modified) do
+                        if not string.match(file, "^k8s/%.argocd%-source%-.*%.yaml$") then
+                          hasNonArgocdFile = true
+                          break
+                        end
+                      end
+                    end
+                    
+                    -- Check removed files
+                    if not hasNonArgocdFile and commit.removed ~= nil then
+                      for _, file in ipairs(commit.removed) do
+                        if not string.match(file, "^k8s/%.argocd%-source%-.*%.yaml$") then
+                          hasNonArgocdFile = true
+                          break
+                        end
+                      end
+                    end
+                    
+                    -- If any commit has non-argocd files, trigger the build
+                    if hasNonArgocdFile then
+                      return true
+                    end
+                  end
+                  
+                  -- All files are .argocd-source files, skip the event
+                  return false
+            triggers:
+            - template:
+                name: trigger-workflow
+                k8s:
+                  operation: create
+                  source:
+                    resource:
+                      apiVersion: argoproj.io/v1alpha1
+                      kind: Workflow
+                      metadata:
+                        generateName: webhook-build-
+                        namespace: "{{ argo_namespace }}"
+                        labels:
+                          source: webhook
+                          repository: ""  # Will be set by parameter
+                      spec:
+                        entrypoint: execute-build
+                        serviceAccountName: default
+                        # Force webhook adapter to run on control plane node
+                        nodeSelector:
+                          kubernetes.io/hostname: "{{ inventory_hostname }}"
+                        arguments:
+                          parameters:
+                          - name: repo-url
+                            value: ""
+                          - name: repo-name
+                            value: ""
+                          - name: repo-org
+                            value: ""
+                          - name: webhook-timestamp
+                            value: ""
+                        templates:
+                        - name: execute-build
+                          script:
+                            image: bitnami/kubectl:latest
+                            command: [bash]
+                            source: |
+                              #!/bin/bash
+                              set -e
+                              
+                              REPO_NAME="{{ '{{workflow.parameters.repo-name}}' }}"
+                              REPO_ORG="{{ '{{workflow.parameters.repo-org}}' }}"
+                              REPO_URL="{{ '{{workflow.parameters.repo-url}}' }}"
+                              
+                              echo "Webhook triggered for: $REPO_ORG/$REPO_NAME"
+                              echo "DEBUG: webhook-timestamp parameter value: '{{ '{{workflow.parameters.webhook-timestamp}}' }}'"
+                              echo "DEBUG: This timestamp is from context.time (when webhook was received by Argo Events)"
+                              
+                              # Convert HTTPS URL to SSH format if needed
+                              if [[ "$REPO_URL" =~ ^https:// ]]; then
+                                # Extract host and path from HTTPS URL
+                                # https://git.thinkube.com/org/repo.git -> git@git.thinkube.com:org/repo.git
+                                SSH_URL=$(echo "$REPO_URL" | sed 's|https://\([^/]*\)/|git@\1:|')
+                                echo "Converted HTTPS URL to SSH: $SSH_URL"
+                                REPO_URL="$SSH_URL"
+                              fi
+                              
+                              # Determine the app name from repository name
+                              APP_NAME="${REPO_NAME%-deployment}"
+                              
+                              echo "Looking for WorkflowTemplate for app: $APP_NAME"
+                              
+                              # Find template using labels
+                              TEMPLATE_NAME=$(kubectl get workflowtemplate -n {{ argo_namespace }} \
+                                -l "app.kubernetes.io/name=$APP_NAME,app.kubernetes.io/part-of=thinkube,thinkube.io/trigger=webhook" \
+                                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+                              
+                              if [ -n "$TEMPLATE_NAME" ]; then
+                                echo "Found template: $TEMPLATE_NAME, submitting workflow..."
+                                
+                                # Get labels from the workflow template
+                                TEMPLATE_LABELS=$(kubectl get workflowtemplate $TEMPLATE_NAME -n {{ argo_namespace }} \
+                                  -o jsonpath='{.metadata.labels.thinkube\.io/app-name} {.metadata.labels.thinkube\.io/namespace}')
+                                read APP_NAME_LABEL NAMESPACE_LABEL <<< "$TEMPLATE_LABELS"
+                                
+                                # Create workflow from template with labels
+                                kubectl create -f - <<EOF
+                              apiVersion: argoproj.io/v1alpha1
+                              kind: Workflow
+                              metadata:
+                                generateName: ${REPO_NAME%-deployment}-build-
+                                namespace: {{ argo_namespace }}
+                                labels:
+                                  thinkube.io/app-name: "$APP_NAME_LABEL"
+                                  thinkube.io/namespace: "$NAMESPACE_LABEL"
+                              spec:
+                                workflowTemplateRef:
+                                  name: $TEMPLATE_NAME
+                                arguments:
+                                  parameters:
+                                  - name: repo-url
+                                    value: "$REPO_URL"  # Now using the SSH URL
+                                  - name: repo-name
+                                    value: "{{ '{{workflow.parameters.repo-name}}' }}"
+                                  - name: repo-org
+                                    value: "{{ '{{workflow.parameters.repo-org}}' }}"
+                                  - name: webhook-timestamp
+                                    value: "{{ '{{workflow.parameters.webhook-timestamp}}' }}"
+                              EOF
+                              else
+                                echo "ERROR: No WorkflowTemplate found for app '$APP_NAME'"
+                                echo "Searched for labels: app.kubernetes.io/name=$APP_NAME, app.kubernetes.io/part-of=thinkube, thinkube.io/trigger=webhook"
+                                echo ""
+                                echo "Available Thinkube CI/CD templates:"
+                                kubectl get workflowtemplate -n {{ argo_namespace }} \
+                                  -l "app.kubernetes.io/part-of=thinkube,thinkube.io/trigger=webhook" \
+                                  -o custom-columns=NAME:.metadata.name,APP:.metadata.labels.app\\.kubernetes\\.io/name
+                                echo ""
+                                echo "The application must deploy its build template with proper labels during installation"
+                                exit 1
+                              fi
+                  parameters:
+                  - src:
+                      dependencyName: gitea-push
+                      dataKey: body.repository.clone_url
+                    dest: spec.arguments.parameters.0.value
+                  - src:
+                      dependencyName: gitea-push
+                      dataKey: body.repository.name
+                    dest: spec.arguments.parameters.1.value
+                  - src:
+                      dependencyName: gitea-push
+                      dataKey: body.repository.owner.login
+                    dest: spec.arguments.parameters.2.value
+                  - src:
+                      dependencyName: gitea-push
+                      dataKey: body.repository.name
+                    dest: metadata.labels.repository
+                  # Use event context time (when webhook was received by Argo Events)
+                  - src:
+                      dependencyName: gitea-push
+                      contextKey: time
+                    dest: spec.arguments.parameters.3.value
+
+
+    - name: Display setup summary
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Argo Events Infrastructure Ready for Gitea Webhooks
+          ════════════════════════════════════════════════════════
+          
+          EventBus: {{ eventbus_name }}
+          EventSource: {{ eventsource_name }}
+          Sensor: {{ sensor_name }}
+          
+          Webhook Endpoint: {{ webhook_url }}
+          Webhook Secret: Created in {{ argo_namespace }}/gitea-webhook-secret
+          
+          Infrastructure Components:
+          - EventSource listening on port 12000
+          - Service: gitea-webhook-eventsource
+          - Ingress: https://argo-events.{{ domain_name }}/gitea
+          
+          Next Steps:
+          - Run Gitea webhook configuration playbook after Gitea is deployed
+          - This will configure repositories to send webhooks to this endpoint
+          
+          Monitor workflows:
+          kubectl -n {{ argo_namespace }} get workflows -w
+          
+          ════════════════════════════════════════════════════════

@@ -1,0 +1,299 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/knative/18_test.yaml
+# Description:
+#   Test and validate Knative deployment
+#   Performs comprehensive testing of all Knative components
+#
+# Requirements:
+#   - Knative must be deployed (run 10_deploy.yaml first)
+#   - Harbor registry must be accessible
+#   - DNS resolution must be working
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/knative/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to kubeconfig file
+#   - harbor_registry: Harbor registry URL
+#   - secondary_ingress_ip: IP for secondary ingress controller
+#   - zerotier_subnet_prefix: Prefix for ZeroTier network
+#   - secondary_ingress_ip_octet: Octet for secondary ingress IP
+#
+# Dependencies:
+#   - OPT-007: Knative deployment must be complete
+#
+# 🤖 [AI-assisted]
+
+- name: Test Knative deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    kn_namespace: kn
+    kn_subdomain: "kn"
+    kn_domain: "{{ kn_subdomain }}.{{ domain_name }}"
+    sample_service_url: "https://helloworld-go.{{ kn_domain }}"
+    secondary_ingress_ip: "{{ zerotier_subnet_prefix }}{{ secondary_ingress_ip_octet }}"
+
+  tasks:
+    # --- PHASE 1: COMPONENT HEALTH CHECKS ---
+    
+    - name: Check Knative Serving deployments
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Deployment
+        namespace: knative-serving
+        name: "{{ item }}"
+      register: serving_deployments
+      failed_when: serving_deployments.resources | length == 0 or serving_deployments.resources[0].status.availableReplicas | default(0) == 0
+      with_items:
+        - controller
+        - webhook
+        - autoscaler
+        - activator
+        - net-kourier-controller
+
+    - name: Check Knative Eventing deployments
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Deployment
+        namespace: knative-eventing
+      register: eventing_deployments
+      failed_when: eventing_deployments.resources | length == 0
+
+    - name: Check Kourier service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        namespace: kourier-system
+        name: kourier
+      register: kourier_service
+      failed_when: kourier_service.resources | length == 0
+
+    - name: Display component health summary
+      ansible.builtin.debug:
+        msg: |
+          Knative Component Health Check:
+          ✅ Serving Components: {{ serving_deployments.results | selectattr('resources', 'defined') | list | length }} deployments ready
+          ✅ Eventing Components: {{ eventing_deployments.resources | length }} deployments found
+          ✅ Kourier Service: Available at {{ kourier_service.resources[0].spec.clusterIP }}
+
+    # --- PHASE 2: DNS AND CONNECTIVITY TESTS ---
+    
+    - name: Test DNS resolution for Knative services
+      ansible.builtin.shell: |
+        echo "=== DNS RESOLUTION TESTS ==="
+        
+        # Test internal service resolution
+        {{ kubectl_bin }} run dns-test-{{ 100000 | random }} --image=busybox:1.28 -n default --rm -i --restart=Never -- \
+          sh -c "
+            echo 'Testing Kourier DNS resolution...'
+            nslookup kourier.kourier-system.svc.cluster.local
+            echo
+            echo 'Testing Autoscaler DNS resolution...'
+            nslookup autoscaler.knative-serving.svc.cluster.local
+            echo
+            echo 'Testing sample service wildcard domain...'
+            nslookup helloworld-go.{{ kn_domain }}
+          "
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: dns_test
+      changed_when: false
+      failed_when: "'cant resolve' in dns_test.stdout"
+
+    - name: Display DNS test results
+      ansible.builtin.debug:
+        msg: "{{ dns_test.stdout_lines }}"
+
+    # --- PHASE 3: SAMPLE SERVICE VALIDATION ---
+    
+    - name: Check if sample service exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: serving.knative.dev/v1
+        kind: Service
+        namespace: "{{ kn_namespace }}"
+        name: helloworld-go
+      register: sample_service
+      failed_when: sample_service.resources | length == 0
+
+    - name: Get sample service status
+      ansible.builtin.shell: |
+        echo "=== KNATIVE SERVICE STATUS ==="
+        {{ kubectl_bin }} get ksvc helloworld-go -n {{ kn_namespace }}
+        echo
+        echo "=== SERVICE DETAILS ==="
+        {{ kubectl_bin }} get ksvc helloworld-go -n {{ kn_namespace }} -o jsonpath='{.status.conditions[?(@.type=="Ready")]}' | jq .
+        echo
+        echo "=== SERVICE URL ==="
+        {{ kubectl_bin }} get ksvc helloworld-go -n {{ kn_namespace }} -o jsonpath='{.status.url}'
+        echo
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: service_status
+      changed_when: false
+
+    - name: Display service status
+      ansible.builtin.debug:
+        msg: "{{ service_status.stdout_lines }}"
+
+    # --- PHASE 4: INTERNAL CONNECTIVITY TEST ---
+    
+    - name: Test internal connectivity to Knative service
+      ansible.builtin.shell: |
+        echo "=== INTERNAL CONNECTIVITY TEST ==="
+        
+        # Get Kourier service IP
+        KOURIER_IP=$({{ kubectl_bin }} get svc kourier -n kourier-system -o jsonpath='{.spec.clusterIP}')
+        echo "Kourier ClusterIP: $KOURIER_IP"
+        
+        # Test direct connection with proper Host header
+        echo "Testing direct connection to Kourier..."
+        {{ kubectl_bin }} run curl-test-{{ 100000 | random }} --image=curlimages/curl:latest -n default -i --rm --restart=Never -- \
+          curl -sv -H "Host: helloworld-go.{{ kn_domain }}" http://$KOURIER_IP --max-time 10
+        
+        # Check response
+        if [ $? -eq 0 ]; then
+          echo "✅ Internal connectivity: SUCCESS"
+        else
+          echo "❌ Internal connectivity: FAILED"
+          exit 1
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: internal_test
+      failed_when: "'Hello from Knative!' not in internal_test.stdout"
+
+    # --- PHASE 5: EXTERNAL CONNECTIVITY TEST ---
+    
+    - name: Test external connectivity via ingress
+      ansible.builtin.shell: |
+        echo "=== EXTERNAL CONNECTIVITY TEST ==="
+        
+        # Test via the secondary ingress IP with proper Host header
+        echo "Testing HTTPS access via ingress..."
+        {{ kubectl_bin }} run curl-test-{{ 100000 | random }} --image=curlimages/curl:latest -n default -i --rm --restart=Never -- \
+          curl -svk -H "Host: helloworld-go.{{ kn_domain }}" https://{{ secondary_ingress_ip }} --max-time 10
+        
+        # Check response
+        if [ $? -eq 0 ]; then
+          echo "✅ External connectivity: SUCCESS"
+        else
+          echo "❌ External connectivity: FAILED"
+          exit 1
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: external_test
+      failed_when: "'Hello from Knative!' not in external_test.stdout"
+
+    # --- PHASE 6: AUTOSCALING TEST ---
+    
+    - name: Test Knative autoscaling functionality
+      ansible.builtin.shell: |
+        echo "=== AUTOSCALING TEST ==="
+        
+        # Check current pod count
+        echo "Initial pod count:"
+        {{ kubectl_bin }} get pods -n {{ kn_namespace }} -l serving.knative.dev/service=helloworld-go --no-headers | wc -l
+        
+        # The service is configured with min-scale=1, max-scale=1 in deployment
+        # So we just verify it maintains exactly 1 pod
+        echo "Waiting 30 seconds to verify stable pod count..."
+        sleep 30
+        
+        echo "Pod count after wait:"
+        POD_COUNT=$({{ kubectl_bin }} get pods -n {{ kn_namespace }} -l serving.knative.dev/service=helloworld-go --no-headers | grep Running | wc -l)
+        echo "$POD_COUNT"
+        
+        if [ "$POD_COUNT" -eq "1" ]; then
+          echo "✅ Autoscaling: Service correctly maintains 1 pod (min-scale=1)"
+        else
+          echo "❌ Autoscaling: Expected 1 pod but found $POD_COUNT"
+          exit 1
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: autoscaling_test
+      changed_when: false
+
+    # --- PHASE 7: INGRESS AND TLS VALIDATION ---
+    
+    - name: Validate ingress configuration
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: kourier-system
+      register: ingresses
+
+    - name: Validate TLS configuration
+      ansible.builtin.shell: |
+        echo "=== TLS CERTIFICATE VALIDATION ==="
+        
+        # Check TLS secret exists
+        {{ kubectl_bin }} get secret -n kourier-system | grep tls-secret
+        
+        # Test TLS connection
+        echo "Testing TLS handshake..."
+        {{ kubectl_bin }} run openssl-test-{{ 100000 | random }} --image=curlimages/curl:latest -n default -i --rm --restart=Never -- \
+          curl -svk --resolve "helloworld-go.{{ kn_domain }}:443:{{ secondary_ingress_ip }}" https://helloworld-go.{{ kn_domain }} -o /dev/null 2>&1 | grep -E "SSL connection|subject:|issuer:"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: tls_test
+      changed_when: false
+
+    # --- PHASE 8: COMPREHENSIVE TEST SUMMARY ---
+    
+    - name: Run comprehensive test summary
+      ansible.builtin.set_fact:
+        test_results:
+          components_healthy: "{{ serving_deployments.results | selectattr('failed', 'equalto', false) | list | length == 5 }}"
+          dns_working: "{{ 'cant resolve' not in dns_test.stdout }}"
+          internal_access: "{{ 'Hello from Knative!' in internal_test.stdout }}"
+          external_access: "{{ 'Hello from Knative!' in external_test.stdout }}"
+          autoscaling_working: "{{ '✅ Autoscaling' in autoscaling_test.stdout }}"
+          tls_configured: "{{ 'tls-secret' in tls_test.stdout }}"
+
+    - name: Display comprehensive test results
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          KNATIVE TEST RESULTS SUMMARY
+          ==========================================
+          
+          Component Health:
+          {% if test_results.components_healthy %}✅{% else %}❌{% endif %} All Knative components are healthy
+          
+          DNS Resolution:
+          {% if test_results.dns_working %}✅{% else %}❌{% endif %} DNS resolution is working correctly
+          
+          Connectivity:
+          {% if test_results.internal_access %}✅{% else %}❌{% endif %} Internal access (via ClusterIP) is working
+          {% if test_results.external_access %}✅{% else %}❌{% endif %} External access (via Ingress) is working
+          
+          Features:
+          {% if test_results.autoscaling_working %}✅{% else %}❌{% endif %} Autoscaling is functioning properly
+          {% if test_results.tls_configured %}✅{% else %}❌{% endif %} TLS/HTTPS is configured correctly
+          
+          Service URLs:
+          - Internal: http://helloworld-go.{{ kn_namespace }}.svc.cluster.local
+          - External: {{ sample_service_url }}
+          
+          {% set all_tests_passed = test_results.values() | select('equalto', true) | list | length == test_results.values() | list | length %}
+          {% if all_tests_passed %}
+          ✅ OVERALL: ALL TESTS PASSED - Knative is fully operational!
+          {% else %}
+          ❌ OVERALL: SOME TESTS FAILED - Please check the failures above
+          {% endif %}
+
+    - name: Fail if any tests failed
+      ansible.builtin.fail:
+        msg: "One or more Knative tests failed. Please check the test results above."
+      when: not (test_results.values() | select('equalto', true) | list | length == test_results.values() | list | length)

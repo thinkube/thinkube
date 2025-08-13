@@ -1,0 +1,68 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Argo Workflow to build and push base images to Harbor library
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: build-base-images-
+  namespace: argo
+spec:
+  entrypoint: build-all
+  serviceAccountName: kaniko-builder
+  
+  volumes:
+  - name: docker-config
+    secret:
+      secretName: docker-config
+  - name: dockerfiles
+    configMap:
+      name: base-dockerfiles
+      
+  templates:
+  - name: build-all
+    dag:
+      tasks:
+      - name: build-python-base
+        template: build-image
+        arguments:
+          parameters:
+          - name: dockerfile
+            value: "python-base.Dockerfile"
+          - name: image
+            value: "registry.thinkube.com/library/python-base"
+          - name: tags
+            value: "3.11-slim,latest"
+            
+      - name: build-node-base
+        template: build-image
+        arguments:
+          parameters:
+          - name: dockerfile
+            value: "node-base.Dockerfile"
+          - name: image
+            value: "registry.thinkube.com/library/node-base"
+          - name: tags
+            value: "18-alpine,latest"
+            
+  - name: build-image
+    inputs:
+      parameters:
+      - name: dockerfile
+      - name: image
+      - name: tags
+    container:
+      image: registry.thinkube.com/library/kaniko-executor:latest
+      args:
+        - --dockerfile=/dockerfiles/{{inputs.parameters.dockerfile}}
+        - --context=/dockerfiles
+        - --destination={{inputs.parameters.image}}:{{item}}
+        - --cache=true
+        - --cache-repo=registry.thinkube.com/library/cache
+        - --cache-ttl=2160h
+      withItems: "{{inputs.parameters.tags}}"
+      volumeMounts:
+      - name: docker-config
+        mountPath: /kaniko/.docker
+      - name: dockerfiles
+        mountPath: /dockerfiles

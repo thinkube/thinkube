@@ -1,0 +1,280 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/code-server/18_test.yaml
+# Description:
+#   Test Code Server deployment and verify all components are working
+#
+# Requirements:
+#   - Code Server must be deployed (10_deploy.yaml)
+#   - kubectl access to the cluster
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/code-server/18_test.yaml
+#
+# 🤖 [AI-generated]
+
+- name: Test Code Server Deployment
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    code_server_namespace: "code-server"
+    code_server_hostname: "code.{{ domain_name }}"
+    test_timeout: 300
+
+  tasks:
+    ###################################################################
+    # 1) Check namespace and pods
+    ###################################################################
+    - name: Check if namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ code_server_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check Code Server deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ code_server_namespace }}"
+        name: code-server
+      register: deployment_check
+      failed_when: 
+        - deployment_check.resources | length == 0
+        - deployment_check.resources[0].status.readyReplicas != 1
+
+    - name: Check OAuth2 Proxy deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ code_server_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=oauth2-proxy"
+      register: oauth_deployment
+      failed_when: 
+        - oauth_deployment.resources | length == 0
+        - oauth_deployment.resources[0].status.readyReplicas is not defined
+
+    - name: Check Valkey deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ code_server_namespace }}"
+        name: ephemeral-valkey
+      register: valkey_deployment
+      failed_when: 
+        - valkey_deployment.resources | length == 0
+        - valkey_deployment.resources[0].status.readyReplicas != 1
+
+    ###################################################################
+    # 2) Check services
+    ###################################################################
+    - name: Check Code Server service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ code_server_namespace }}"
+        name: code-server
+      register: service_check
+      failed_when: service_check.resources | length == 0
+
+    - name: Check OAuth2 Proxy service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ code_server_namespace }}"
+        name: oauth2-proxy
+      register: oauth_service
+      failed_when: oauth_service.resources | length == 0
+
+    ###################################################################
+    # 3) Check ingress
+    ###################################################################
+    - name: Check Code Server ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ code_server_namespace }}"
+        name: code-server
+      register: ingress_check
+      failed_when: 
+        - ingress_check.resources | length == 0
+        - code_server_hostname not in ingress_check.resources[0].spec.rules[0].host
+
+    - name: Check OAuth2 ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ code_server_namespace }}"
+        name: oauth2-proxy
+      register: oauth_ingress
+      failed_when: oauth_ingress.resources | length == 0
+
+    ###################################################################
+    # 4) Check secrets
+    ###################################################################
+    - name: Check OAuth secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ code_server_namespace }}"
+        name: code-server-oauth-secret
+      register: oauth_secret
+      failed_when: oauth_secret.resources | length == 0
+
+    - name: Check TLS secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ code_server_namespace }}"
+        name: code-server-tls-secret
+      register: tls_secret
+      failed_when: tls_secret.resources | length == 0
+
+    ###################################################################
+    # 5) Check Keycloak configuration
+    ###################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+      no_log: true
+
+    - name: Check Code Server client in Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId=code-server"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_client
+      failed_when: keycloak_client.json | length == 0
+
+    ###################################################################
+    # 6) Test HTTP connectivity
+    ###################################################################
+    - name: Test Code Server URL (should redirect to auth)
+      ansible.builtin.uri:
+        url: "https://{{ code_server_hostname }}/"
+        follow_redirects: none
+        validate_certs: false
+        status_code: [302, 303]
+      register: url_test
+      failed_when: false
+
+    - name: Verify auth redirect
+      ansible.builtin.assert:
+        that:
+          - url_test.status in [302, 303]
+          - "'oauth2' in url_test.location or 'auth' in url_test.location"
+        fail_msg: "Code Server is not properly redirecting to authentication"
+
+    ###################################################################
+    # 7) Check repository monitor (if configured)
+    ###################################################################
+    - name: Check if repository monitor is running
+      ansible.builtin.systemd:
+        name: repo-monitor
+      register: monitor_status
+      failed_when: false
+      become: true
+
+    - name: Report monitor status
+      ansible.builtin.debug:
+        msg: "Repository monitor is {{ 'running' if monitor_status.status.ActiveState == 'active' else 'not configured' }}"
+      when: monitor_status.status is defined
+
+    ###################################################################
+    # 8) Check installed extensions
+    ###################################################################
+    - name: Get code-server pod
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        label_selectors:
+          - app=code-server
+      register: code_server_pod_info
+
+    - name: Check installed extensions
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        pod: "{{ code_server_pod_info.resources[0].metadata.name }}"
+        command: code-server --list-extensions
+      register: installed_extensions
+      when: code_server_pod_info.resources | length > 0
+      failed_when: false
+
+    ###################################################################
+    # 9) Summary report
+    ###################################################################
+    - name: Test summary
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Code Server Test Results
+          ════════════════════════════════════════════════════════
+          
+          Namespace: {{ code_server_namespace }}
+          URL: https://{{ code_server_hostname }}
+          
+          Component Status:
+          ✓ Code Server deployment: Running
+          ✓ OAuth2 Proxy: Running
+          ✓ Valkey session store: Running
+          ✓ Ingress configured: Yes
+          ✓ TLS certificate: Present
+          ✓ Keycloak client: Configured
+          ✓ Authentication redirect: Working
+          {{ '✓ Repository monitor: Running' if monitor_status.status is defined and monitor_status.status.ActiveState == 'active' else '○ Repository monitor: Not configured' }}
+          
+          Installed Extensions:
+          {% if installed_extensions is defined and installed_extensions.stdout_lines is defined %}
+          {% for ext in installed_extensions.stdout_lines %}
+          {% if ext and not ext.startswith('[') %}
+          - {{ ext }}
+          {% endif %}
+          {% endfor %}
+          {% else %}
+          - Unable to check extensions
+          {% endif %}
+          
+          Access Instructions:
+          1. Navigate to https://{{ code_server_hostname }}
+          2. Login with Keycloak credentials
+          3. VS Code interface should load
+          
+          Troubleshooting Commands:
+          - kubectl -n {{ code_server_namespace }} get pods
+          - kubectl -n {{ code_server_namespace }} logs deployment/code-server
+          - kubectl -n {{ code_server_namespace }} logs deployment/oauth2-proxy
+          
+          ════════════════════════════════════════════════════════

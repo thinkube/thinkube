@@ -1,0 +1,149 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/gitea/16_configure_ssh_keys.yaml
+# Description:
+#   Configure SSH keys for Gitea access
+#   Creates a single SSH key for all Gitea repositories
+#   Makes it available in shared-code directory for code-server access
+#
+# Requirements:
+#   - Gitea must be deployed (CORE-002)
+#   - shared-code directory must exist
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/gitea/16_configure_ssh_keys.yaml
+
+- name: Configure SSH keys for Gitea access
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    gitea_namespace: gitea
+    argo_namespace: argo
+    shared_code_path: /home/{{ system_username }}/shared-code
+    ssh_key_name: gitea
+    gitea_hostname: "git.{{ domain_name }}"
+    
+  tasks:
+    - name: Create .ssh directory structure in shared-code
+      ansible.builtin.file:
+        path: "{{ shared_code_path }}/.ssh/{{ ssh_key_name }}"
+        state: directory
+        mode: '0700'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Check if Gitea SSH key already exists
+      ansible.builtin.stat:
+        path: "{{ shared_code_path }}/.ssh/{{ ssh_key_name }}/id_ed25519"
+      register: ssh_key_stat
+
+    - name: Generate SSH key for Gitea
+      ansible.builtin.openssh_keypair:
+        path: "{{ shared_code_path }}/.ssh/{{ ssh_key_name }}/id_ed25519"
+        type: ed25519
+        comment: "gitea@{{ domain_name }}"
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      when: not ssh_key_stat.stat.exists
+
+    - name: Read SSH public key
+      ansible.builtin.slurp:
+        src: "{{ shared_code_path }}/.ssh/{{ ssh_key_name }}/id_ed25519.pub"
+      register: ssh_public_key
+
+    - name: Get Gitea admin token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ gitea_namespace }}"
+        name: gitea-admin-token
+      register: gitea_token_secret
+
+    - name: Set Gitea token fact
+      ansible.builtin.set_fact:
+        gitea_token: "{{ gitea_token_secret.resources[0].data.token | b64decode }}"
+
+    - name: Add SSH key to Gitea admin user
+      ansible.builtin.uri:
+        url: "https://{{ gitea_hostname }}/api/v1/user/keys"
+        method: POST
+        headers:
+          Authorization: "token {{ gitea_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          title: "Thinkube CI/CD Key"
+          key: "{{ ssh_public_key.content | b64decode }}"
+          read_only: false
+        status_code: [201, 422]  # 422 if key already exists
+        validate_certs: yes
+      register: ssh_key_result
+
+    - name: Create SSH config for Gitea
+      ansible.builtin.copy:
+        content: |
+          Host git.{{ domain_name }}
+              HostName git.{{ domain_name }}
+              User git
+              Port 2222
+              IdentityFile ~/.ssh/{{ ssh_key_name }}/id_ed25519
+              StrictHostKeyChecking accept-new
+        dest: "{{ shared_code_path }}/.ssh/{{ ssh_key_name }}/config"
+        mode: '0644'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Include Gitea config in main SSH config
+      ansible.builtin.lineinfile:
+        path: "{{ shared_code_path }}/.ssh/config"
+        line: "Include {{ ssh_key_name }}/config"
+        create: yes
+        mode: '0644'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Read SSH private key for Kubernetes secret
+      ansible.builtin.slurp:
+        src: "{{ shared_code_path }}/.ssh/{{ ssh_key_name }}/id_ed25519"
+      register: ssh_private_key
+
+    - name: Create SSH key secret in Argo namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: gitea-ssh-key
+            namespace: "{{ argo_namespace }}"
+          type: Opaque
+          data:
+            ssh-privatekey: "{{ ssh_private_key.content }}"
+            ssh-publickey: "{{ ssh_public_key.content }}"
+
+    - name: Display SSH key configuration summary
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Gitea SSH Key Configuration Complete
+          ════════════════════════════════════════════════════════
+          
+          SSH Key Location: {{ shared_code_path }}/.ssh/{{ ssh_key_name }}/
+          - Available in code-server at: /home/coder/.ssh/{{ ssh_key_name }}/
+          - Kubernetes secret: {{ argo_namespace }}/gitea-ssh-key
+          
+          The SSH key has been added to the Gitea admin user ({{ admin_username }})
+          and can access all repositories.
+          
+          To use in Git:
+          git clone git@git.{{ domain_name }}:org/repo.git
+          
+          ════════════════════════════════════════════════════════

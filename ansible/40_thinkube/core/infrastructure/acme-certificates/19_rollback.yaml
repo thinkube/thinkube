@@ -1,0 +1,67 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/acme-certificates/19_rollback.yaml
+# Description:
+#   Removes acme.sh and associated certificates
+#
+# 🤖 [AI-assisted]
+
+- name: Rollback ACME Certificates
+  hosts: microk8s_control_plane
+  become: true
+  gather_facts: true
+  vars:
+    cert_dir: "/etc/ssl/thinkube"
+    kubeconfig: "/var/snap/microk8s/current/credentials/kubelet.config"
+    acme_home: "/home/{{ system_username }}/.acme.sh"
+
+  tasks:
+    - name: Remove cron job
+      ansible.builtin.cron:
+        name: "acme.sh auto renewal"
+        user: "{{ system_username }}"
+        state: absent
+
+    - name: Remove Kubernetes TLS secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "{{ domain_name | replace('.', '-') }}-tls"
+        namespace: default
+
+    - name: Uninstall acme.sh
+      ansible.builtin.shell: |
+        {{ acme_home }}/acme.sh --uninstall
+      args:
+        executable: /bin/bash
+      become: false
+      become_user: "{{ system_username }}"
+      ignore_errors: true
+      when: acme_home is defined
+
+    - name: Remove acme.sh directory
+      ansible.builtin.file:
+        path: "{{ acme_home }}"
+        state: absent
+
+    - name: Remove certificate directory
+      ansible.builtin.file:
+        path: "{{ cert_dir }}"
+        state: absent
+
+    - name: Remove acme.sh installer
+      ansible.builtin.file:
+        path: "/tmp/acme.sh"
+        state: absent
+
+    - name: Display rollback status
+      ansible.builtin.debug:
+        msg:
+          - "✅ Removed cron job"
+          - "✅ Removed Kubernetes secret"
+          - "✅ Uninstalled acme.sh"
+          - "✅ Removed certificate files"

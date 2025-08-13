@@ -1,0 +1,233 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# JupyterHub Helm chart values configured for primary ingress controller
+# This file will be used as a template for the Ansible playbook
+
+hub:
+  config:
+{% if auth_type == 'generic-oauth' %}
+    GenericOAuthenticator:
+      client_id: "{{ client_id }}"
+      client_secret: "{{ client_secret }}"
+      oauth_callback_url: "{{ oauth_callback_url }}"
+      authorize_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/auth"
+      token_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
+      userdata_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/userinfo"
+      login_service: "Keycloak"
+      username_claim: "preferred_username"
+      scope:
+        - "openid"
+        - "profile"
+        - "email"
+      allow_all: true
+{% endif %}
+    
+    JupyterHub:
+      authenticator_class: {{ auth_type }}
+      admin_access: true
+      allow_named_servers: true
+      shutdown_on_logout: true
+      template_paths:
+        - /etc/jupyterhub/templates
+
+  extraConfig:
+    00-dns-settings: |
+      # Set DNS settings for spawned pods to access ZeroTier services
+      c.KubeSpawner.extra_pod_config = {
+          'dnsPolicy': 'ClusterFirst',
+          'dnsConfig': {
+              'searches': [
+                  'svc.cluster.local',
+                  'cluster.local'
+              ]
+          }
+      }
+    
+    01-default-url: |
+      # Set default URL to JupyterLab
+      c.Spawner.default_url = '/lab'
+    
+    02-shared-volume: |
+      # Mount shared volume for notebooks and code
+      c.KubeSpawner.volumes = [
+        {
+          'name': 'shared-source',
+          'hostPath': {
+            'path': '{{ code_source_path }}',
+            'type': 'Directory'
+          }
+        }
+      ]
+      c.KubeSpawner.volume_mounts = [
+        {
+          'name': 'shared-source',
+          'mountPath': '/home/jovyan/shared-source'
+        }
+      ]
+    
+    03-websocket-config: |
+      c.Spawner.args = ['--NotebookApp.allow_origin=*']
+      
+    04-allow-config: |
+      # Explicitly set allow configuration to avoid warnings
+      c.Authenticator.allow_all = True
+    
+    05-profile-list: |
+      # Define available environments
+      c.KubeSpawner.profile_list = [
+        {
+          'display_name': 'Default Environment',
+          'description': 'Default JupyterLab with pre-installed packages',
+          'default': True,
+          'kubespawner_override': {
+            'image': '{{ jupyterhub_custom_image_full }}'
+          }
+        },
+        {
+          'display_name': 'TensorFlow Environment',
+          'description': 'JupyterLab optimized for TensorFlow with GPU support',
+          'kubespawner_override': {
+            'image': '{{ harbor_registry }}/library/jupyter-tensorflow-notebook:latest',
+            'cpu_limit': 4,
+            'mem_limit': '8G'
+          }
+        },
+        {
+          'display_name': 'Minimal Environment',
+          'description': 'Minimal JupyterLab for lightweight tasks',
+          'kubespawner_override': {
+            'image': '{{ harbor_registry }}/library/jupyter-minimal-notebook:latest',
+            'cpu_limit': 1,
+            'mem_limit': '2G'
+          }
+        }
+      ]
+
+proxy:
+  # This token must be a random value
+  secretToken: "{{ proxy_secretToken }}"
+  
+  # Use ClusterIP service type instead of LoadBalancer (default)
+  service:
+    type: ClusterIP
+  
+  # Don't enable HTTPS at proxy level (handled at ingress)
+  https:
+    enabled: false
+  
+  # Configuration for the ConfigurableHTTPProxy
+  chp:
+    # We need to explicitly define pdb (Pod Disruption Budget)
+    pdb:
+      enabled: false
+    # No command line flags that might not be supported
+    extraCommandLineFlags: []
+
+singleuser:
+  # Default to JupyterLab
+  defaultUrl: "/lab"
+  
+  # Use your Harbor custom image as default instead of Docker Hub
+  image:
+    name: "{{ harbor_registry }}/{{ harbor_project }}/{{ jupyterhub_custom_image }}"
+    tag: "{{ jupyterhub_custom_image_tag }}"
+    pullPolicy: Always
+  
+  # Profile list - users can choose their environment
+  profileList:
+    - display_name: "Standard Environment (No GPU)"
+      description: "Standard JupyterLab environment without GPU"
+      default: true
+      kubespawner_override:
+        node_selector:
+          kubernetes.io/hostname: {{ control_plane_hostname }}
+    - display_name: "GPU Environment"
+      description: "JupyterLab environment with GPU support"
+      kubespawner_override:
+        node_selector:
+          kubernetes.io/hostname: {{ control_plane_hostname }}
+        extra_resource_limits:
+          nvidia.com/gpu: "1"
+        extra_resource_guarantees:
+          nvidia.com/gpu: "1"
+  
+  # Default node selector (can be overridden by profiles)
+  nodeSelector:
+    kubernetes.io/hostname: {{ control_plane_hostname }}
+    
+  # Explicit node affinity to ensure pod lands on same node as code-server
+  extraNodeAffinity:
+    required:
+      - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+              - {{ control_plane_hostname }}
+            
+  # Resource limits
+  cpu:
+    limit: 2
+    guarantee: 0.5
+  memory:
+    limit: 4G
+    guarantee: 1G
+  
+  # Storage configuration
+  storage:
+    type: static
+    extraVolumes:
+      - name: source-code
+        hostPath:
+          path: "{{ code_source_path }}"
+          type: Directory
+      - name: pip-cache
+        persistentVolumeClaim:
+          claimName: pip-cache-pvc
+    extraVolumeMounts:
+      - name: source-code
+        mountPath: /home/jovyan/work
+      - name: pip-cache
+        mountPath: /home/jovyan/.cache/pip
+        
+  # Add lifecycle hooks to enable package persistence
+  lifecycleHooks:
+    postStart:
+      exec:
+        command: 
+          - "sh"
+          - "-c"
+          - >
+            if [ -f /home/jovyan/.user-packages ]; then
+              pip install --user -r /home/jovyan/.user-packages;
+            fi
+
+# Ingress configuration - configured for primary ingress controller
+ingress:
+  enabled: true
+  ingressClassName: {{ primary_ingress_class }}  # Using variable from inventory
+  hosts:
+    - "{{ hostname }}"
+  annotations:
+    # Standard annotations for NGINX ingress
+    nginx.ingress.kubernetes.io/proxy-body-size: "1024m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "8k"
+    # Essential for WebSockets
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    # WebSocket upgrade headers
+    nginx.ingress.kubernetes.io/proxy-set-headers: "{{ ingress_namespace }}/websocket-headers"
+  tls:
+    - hosts:
+        - "{{ hostname }}"
+      secretName: "{{ tls_secret }}"
+
+# Scheduling configuration
+scheduling:
+  userScheduler:
+    enabled: false
+  podPriority:
+    enabled: false
+  userPlaceholder:
+    enabled: false

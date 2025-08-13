@@ -1,0 +1,134 @@
+#!/bin/bash
+
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# ZeroTier setup script for MicroK8s VMs
+# This script installs and configures ZeroTier for overlay networking
+
+# Exit on any error
+set -e
+
+# Function to log with timestamp
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log "Starting ZeroTier setup for {{ inventory_hostname }}"
+
+# Install ZeroTier
+log "Installing ZeroTier..."
+if ! command -v zerotier-cli &> /dev/null; then
+    # Updated installation process for Ubuntu 24.04
+    apt-get update
+    apt-get install -y curl gnupg
+    
+    # Add ZeroTier repository using the current recommended method
+    curl -s 'https://raw.githubusercontent.com/zerotier/ZeroTierOne/master/doc/contact%40zerotier.com.gpg' | \
+      gpg --dearmor | tee /usr/share/keyrings/zerotier.gpg > /dev/null
+    
+    echo "deb [signed-by=/usr/share/keyrings/zerotier.gpg] http://download.zerotier.com/debian/jammy jammy main" | \
+      tee /etc/apt/sources.list.d/zerotier.list
+    
+    # Update and install
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y zerotier-one
+    
+    log "ZeroTier installed successfully"
+else
+    log "ZeroTier already installed"
+fi
+
+# Make sure ZeroTier service is enabled and started
+systemctl enable zerotier-one
+systemctl restart zerotier-one
+
+# Wait for ZeroTier service to start
+log "Waiting for ZeroTier service to start..."
+for i in $(seq 1 30); do
+    if systemctl is-active zerotier-one > /dev/null; then
+        log "ZeroTier service is active"
+        break
+    fi
+    
+    if [ $i -eq 30 ]; then
+        log "ERROR: ZeroTier service failed to start in time"
+        exit 1
+    fi
+    
+    log "Waiting for ZeroTier service... ($i/30)"
+    sleep 2
+done
+
+# Join the ZeroTier network
+log "Joining ZeroTier network: {{ zerotier_network_id }}"
+zerotier-cli join {{ zerotier_network_id }}
+
+# Configure IP forwarding for proper routing
+log "Configuring IP forwarding..."
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/90-zerotier.conf
+sysctl -p /etc/sysctl.d/90-zerotier.conf
+
+# Configure firewall rules to allow ZeroTier traffic
+log "Configuring firewall rules for ZeroTier..."
+iptables -A FORWARD -i zt+ -j ACCEPT || true
+iptables -A FORWARD -o zt+ -j ACCEPT || true
+iptables -A INPUT -i zt+ -j ACCEPT || true
+
+# Save iptables rules to persist across reboots
+if command -v iptables-save &> /dev/null; then
+    log "Saving firewall rules..."
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4
+    
+    # Create systemd service to restore iptables rules on boot
+    cat > /etc/systemd/system/iptables-restore.service << EOF
+[Unit]
+Description=Restore iptables rules
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/iptables-restore /etc/iptables/rules.v4
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl enable iptables-restore.service
+fi
+
+# Check ZeroTier status
+log "ZeroTier status:"
+zerotier-cli info
+zerotier-cli listnetworks
+
+log "ZeroTier setup completed for {{ inventory_hostname }}"
+log "Expected ZeroTier IP: {{ hostvars[inventory_hostname]['zerotier_ip'] | default('auto-assigned') }}"
+
+# Wait for ZeroTier network to be authorized and get an IP
+log "Waiting for ZeroTier network authorization..."
+authorized=false
+for i in $(seq 1 30); do
+    if zerotier-cli listnetworks | grep -q "{{ zerotier_network_id }}" | grep -q "OK"; then
+        authorized=true
+        break
+    fi
+    
+    if [ $i -eq 30 ]; then
+        log "WARNING: ZeroTier network not authorized in time"
+        log "Please authorize this node in the ZeroTier Central web interface!"
+    fi
+    
+    log "Waiting for ZeroTier network authorization... ($i/30)"
+    sleep 5
+done
+
+if [ "$authorized" = true ]; then
+    log "✅ ZeroTier network authorized successfully"
+else
+    log "⚠️ Please manually authorize this node in the ZeroTier Central web interface"
+fi
+
+exit 0

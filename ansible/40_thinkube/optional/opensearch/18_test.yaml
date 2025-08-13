@@ -1,0 +1,337 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/opensearch/18_test.yaml
+# Description:
+#   Test OpenSearch deployment including health checks, authentication, and OIDC
+#
+# Requirements:
+#   - OpenSearch deployed via 10_deploy.yaml
+#   - ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   export ADMIN_PASSWORD='your-secure-password'
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/opensearch/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - admin_username: Administrator username
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+
+- name: Test OpenSearch deployment
+  hosts: microk8s_control_plane
+  gather_facts: false
+  vars:
+    namespace: opensearch
+    opensearch_hostname: "opensearch.{{ domain_name }}"
+    opensearch_dashboards_hostname: "osd.{{ domain_name }}"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    opensearch_client_id: "opensearch"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  pre_tasks:
+    - name: Verify required passwords are set
+      ansible.builtin.fail:
+        msg: "{{ item }} environment variable must be set"
+      when: lookup('env', item) == ''
+      loop:
+        - ADMIN_PASSWORD
+
+  tasks:
+    ###################################################################
+    # 1. Check namespace and deployments
+    ###################################################################
+    - name: Check if namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check OpenSearch pods
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=opensearch"
+      register: opensearch_pods
+
+    - name: Verify OpenSearch pods are running
+      ansible.builtin.assert:
+        that:
+          - opensearch_pods.resources | length > 0
+          - opensearch_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+        fail_msg: "OpenSearch pods are not running properly"
+        success_msg: "OpenSearch pods are running"
+
+    - name: Check OpenSearch Dashboards pods
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=opensearch-dashboards"
+      register: dashboards_pods
+
+    - name: Verify OpenSearch Dashboards pods are running
+      ansible.builtin.assert:
+        that:
+          - dashboards_pods.resources | length > 0
+          - dashboards_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+        fail_msg: "OpenSearch Dashboards pods are not running properly"
+        success_msg: "OpenSearch Dashboards pods are running"
+
+    ###################################################################
+    # 2. Check services and ingresses
+    ###################################################################
+    - name: Check OpenSearch service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ namespace }}"
+        name: "opensearch-cluster-master"
+      register: opensearch_service
+
+    - name: Verify OpenSearch service exists
+      ansible.builtin.assert:
+        that:
+          - opensearch_service.resources | length > 0
+        fail_msg: "OpenSearch service not found"
+        success_msg: "OpenSearch service exists"
+
+    - name: Check OpenSearch Dashboards service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ namespace }}"
+        name: "gato-opensearch-dashboards"
+      register: dashboards_service
+
+    - name: Verify OpenSearch Dashboards service exists
+      ansible.builtin.assert:
+        that:
+          - dashboards_service.resources | length > 0
+        fail_msg: "OpenSearch Dashboards service not found"
+        success_msg: "OpenSearch Dashboards service exists"
+
+    - name: Check ingresses
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ namespace }}"
+      register: ingresses
+
+    - name: Verify ingresses exist
+      ansible.builtin.assert:
+        that:
+          - ingresses.resources | length >= 2
+        fail_msg: "Expected 2 ingresses, found {{ ingresses.resources | length }}"
+        success_msg: "All ingresses configured"
+
+    ###################################################################
+    # 3. Test OpenSearch health and authentication
+    ###################################################################
+    - name: Test OpenSearch cluster health via kubectl exec
+      ansible.builtin.shell: >
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch --
+        curl -ks -u admin:'{{ admin_password }}' https://localhost:9200/_cluster/health
+      register: cluster_health
+      failed_when: cluster_health.rc != 0 or 'Unauthorized' in cluster_health.stdout
+      become: true
+
+    - name: Parse cluster health
+      ansible.builtin.set_fact:
+        health_json: "{{ cluster_health.stdout | from_json }}"
+      when: cluster_health.stdout != "" and 'Unauthorized' not in cluster_health.stdout
+
+    - name: Verify cluster health is green or yellow
+      ansible.builtin.assert:
+        that:
+          - health_json.status in ['green', 'yellow']
+        fail_msg: "Cluster health is {{ health_json.status }}, expected green or yellow"
+        success_msg: "Cluster health is {{ health_json.status }}"
+
+    - name: Test OpenSearch authentication info
+      ansible.builtin.shell: >
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch --
+        curl -ks -u admin:'{{ admin_password }}' https://localhost:9200/_plugins/_security/authinfo
+      register: auth_info
+      become: true
+
+    - name: Verify authentication response
+      ansible.builtin.assert:
+        that:
+          - auth_info.rc == 0
+          - "'admin' in auth_info.stdout"
+        fail_msg: "Authentication test failed"
+        success_msg: "Authentication test passed"
+
+    ###################################################################
+    # 4. Test OpenSearch API endpoints
+    ###################################################################
+    - name: List indices
+      ansible.builtin.shell: >
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch --
+        curl -ks -u admin:'{{ admin_password }}' https://localhost:9200/_cat/indices?v
+      register: indices_list
+      become: true
+
+    - name: Display indices
+      ansible.builtin.debug:
+        msg: "Indices: {{ indices_list.stdout_lines }}"
+
+    - name: Test security plugin status
+      ansible.builtin.shell: >
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch --
+        curl -ks -u admin:'{{ admin_password }}' https://localhost:9200/_cat/plugins?v | grep security
+      register: security_plugin
+      become: true
+
+    - name: Verify security plugin is installed
+      ansible.builtin.assert:
+        that:
+          - security_plugin.rc == 0
+          - "'opensearch-security' in security_plugin.stdout"
+        fail_msg: "Security plugin not found"
+        success_msg: "Security plugin verified"
+
+    ###################################################################
+    # 5. Test Keycloak integration
+    ###################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: "password"
+        validate_certs: false
+      register: keycloak_token
+      no_log: true
+
+    - name: Check OpenSearch client in Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ opensearch_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+      register: client_check
+
+    - name: Verify OpenSearch client exists in Keycloak
+      ansible.builtin.assert:
+        that:
+          - client_check.json | length > 0
+          - client_check.json[0].clientId == opensearch_client_id
+        fail_msg: "OpenSearch client not found in Keycloak"
+        success_msg: "OpenSearch client configured in Keycloak"
+
+    - name: Check opensearch-authorization scope
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/client-scopes"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+      register: scopes_check
+
+    - name: Verify opensearch-authorization scope exists
+      ansible.builtin.assert:
+        that:
+          - scopes_check.json | selectattr('name', 'equalto', 'opensearch-authorization') | list | length > 0
+        fail_msg: "opensearch-authorization scope not found"
+        success_msg: "opensearch-authorization scope configured"
+
+    ###################################################################
+    # 6. Test external connectivity
+    ###################################################################
+    - name: Test OpenSearch external connectivity
+      ansible.builtin.uri:
+        url: "https://{{ opensearch_hostname }}/_cluster/health"
+        method: GET
+        user: admin
+        password: "{{ admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: external_health
+      ignore_errors: true
+
+    - name: Display external connectivity result
+      ansible.builtin.debug:
+        msg:
+          - "OpenSearch external URL test: {{ 'PASSED' if external_health is not failed else 'FAILED' }}"
+          - "URL: https://{{ opensearch_hostname }}"
+
+    - name: Test OpenSearch Dashboards external connectivity
+      ansible.builtin.uri:
+        url: "https://{{ opensearch_dashboards_hostname }}/api/status"
+        method: GET
+        validate_certs: false
+        status_code: [200, 302]
+      register: dashboards_external
+      ignore_errors: true
+
+    - name: Display Dashboards external connectivity result
+      ansible.builtin.debug:
+        msg:
+          - "OpenSearch Dashboards external URL test: {{ 'PASSED' if dashboards_external is not failed else 'FAILED' }}"
+          - "URL: https://{{ opensearch_dashboards_hostname }}"
+
+    ###################################################################
+    # 7. Test persistent storage
+    ###################################################################
+    - name: Check PersistentVolumeClaims
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ namespace }}"
+      register: pvcs
+
+    - name: Verify PVCs are bound
+      ansible.builtin.assert:
+        that:
+          - pvcs.resources | length > 0
+          - pvcs.resources | selectattr('status.phase', 'equalto', 'Bound') | list | length == pvcs.resources | length
+        fail_msg: "Not all PVCs are bound"
+        success_msg: "All PVCs are bound"
+
+    ###################################################################
+    # 8. Display test summary
+    ###################################################################
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "===== OpenSearch Test Summary ====="
+          - "Namespace: {{ namespace }} - OK"
+          - "OpenSearch pods: {{ opensearch_pods.resources | length }} running"
+          - "Dashboards pods: {{ dashboards_pods.resources | length }} running"
+          - "Cluster health: {{ health_json.status }}"
+          - "Authentication: Working"
+          - "Keycloak integration: Configured"
+          - "External access: {{ 'Available' if external_health is not failed else 'Check ingress configuration' }}"
+          - "Storage: {{ pvcs.resources | length }} PVCs bound"
+          - "=================================="
+          - "OpenSearch URL: https://{{ opensearch_hostname }}"
+          - "Dashboards URL: https://{{ opensearch_dashboards_hostname }}"
+          - "Login: admin / [ADMIN_PASSWORD from environment]"
+          - "SSO Login: {{ auth_realm_username }} via Keycloak"

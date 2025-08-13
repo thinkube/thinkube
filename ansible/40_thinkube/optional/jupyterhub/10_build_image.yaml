@@ -1,0 +1,228 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/jupyterhub/10_build_image.yaml
+# Description:
+#   Build custom JupyterHub image with Podman and push to Harbor registry
+#
+# Requirements:
+#   - Podman installed on control node
+#   - Access to Harbor registry
+#   - HARBOR_ROBOT_TOKEN environment variable set
+#   - Harbor registry project created
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/10_build_image.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Registry domain for container images
+#   - harbor_project: Harbor project name
+#   - harbor_robot_user: Robot account name for Harbor authentication
+#   - admin_username: Admin username
+#
+# Dependencies:
+#   - CORE-004 (Harbor) must be complete
+#
+# 🤖 [AI-assisted]
+
+- name: Build and Manage JupyterHub Custom Image
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Image settings
+    jupyterhub_custom_image: "jupyterhub-custom"
+    jupyterhub_custom_image_tag: "latest"
+    
+    # Package management path
+    package_management_path: "{{ ansible_env.HOME }}/jupyterhub-packages"
+    requirements_template: "{{ package_management_path }}/requirements-template.txt"
+    
+    # Environment file location
+    env_file_path: "{{ ansible_env.HOME }}/.env"
+
+  pre_tasks:
+    # Debug the env file to ensure it exists
+    - name: Check if .env file exists
+      ansible.builtin.stat:
+        path: "{{ env_file_path }}"
+      register: env_file_stat
+
+    - name: Show env file status
+      ansible.builtin.debug:
+        msg: "Environment file status: {{ 'exists' if env_file_stat.stat.exists else 'does not exist' }}"
+    
+    - name: Ensure Podman is installed
+      ansible.builtin.package:
+        name: podman
+        state: present
+      become: true
+
+  tasks:
+    # Setup package management directory structure
+    - name: Create package management directory
+      ansible.builtin.file:
+        path: "{{ package_management_path }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create scripts directory
+      ansible.builtin.file:
+        path: "{{ package_management_path }}/scripts"
+        state: directory
+        mode: '0755'
+
+    # Create Dockerfile for custom image
+    - name: Create Dockerfile for custom JupyterLab image
+      ansible.builtin.template:
+        src: templates/jupyterhub-dockerfile.j2
+        dest: "{{ package_management_path }}/Dockerfile"
+        mode: '0644'
+
+    # Create requirements template
+    - name: Create requirements template
+      ansible.builtin.template:
+        src: templates/jupyterhub-requirements.j2
+        dest: "{{ requirements_template }}"
+        mode: '0644'
+
+    # Create user package management script
+    - name: Create user package management script
+      ansible.builtin.template:
+        src: templates/user-package-manager.sh.j2
+        dest: "{{ package_management_path }}/scripts/user-package-manager.sh"
+        mode: '0755'
+
+    # Direct method for building, tagging, and pushing the image
+    - name: Build the image directly with Podman
+      ansible.builtin.shell: |
+        cd {{ package_management_path }} && podman build -t {{ jupyterhub_custom_image }}:{{ jupyterhub_custom_image_tag }} .
+      register: build_result
+      changed_when: build_result.rc == 0
+      failed_when: build_result.rc != 0
+
+    - name: Show build result
+      ansible.builtin.debug:
+        msg: "{{ build_result.stdout_lines }}"
+
+    - name: Tag the image for Harbor
+      ansible.builtin.shell: |
+        podman tag {{ jupyterhub_custom_image }}:{{ jupyterhub_custom_image_tag }} {{ harbor_registry }}/library/{{ jupyterhub_custom_image }}:{{ jupyterhub_custom_image_tag }}
+      when: build_result.rc == 0
+      register: tag_result
+      changed_when: tag_result.rc == 0
+      failed_when: tag_result.rc != 0
+
+    # Login to Harbor registry
+    - name: Check for HARBOR_ROBOT_TOKEN in environment variables
+      ansible.builtin.shell: |
+        if [ -f "{{ env_file_path }}" ]; then
+          grep -q "HARBOR_ROBOT_TOKEN" {{ env_file_path }} && echo "found" || echo "not_found"
+        else
+          echo "no_env_file"
+        fi
+      register: check_token
+      changed_when: false
+
+    - name: Show token status
+      ansible.builtin.debug:
+        msg: "HARBOR_ROBOT_TOKEN in .env file: {{ check_token.stdout }}"
+
+    - name: Prompt for token if not found
+      ansible.builtin.pause:
+        prompt: "Please enter your HARBOR_ROBOT_TOKEN (input will be hidden)"
+      register: token_input
+      when: check_token.stdout != "found"
+      no_log: true
+
+    - name: Login to Harbor registry
+      ansible.builtin.shell: |
+        {% if check_token.stdout == "found" %}
+        # Extract token from env file
+        TOKEN=$(grep HARBOR_ROBOT_TOKEN {{ env_file_path }} | sed -E 's/HARBOR_ROBOT_TOKEN="?([^"]*)"?/\1/')
+        {% else %}
+        # Use token from prompt
+        TOKEN="{{ token_input.user_input }}"
+        {% endif %}
+        
+        # Login to registry
+        echo $TOKEN | podman login {{ harbor_registry }} --username '{{ harbor_robot_user }}' --password-stdin
+      register: login_result
+      changed_when: login_result.rc == 0
+      when: build_result.rc == 0 and tag_result.rc == 0
+      failed_when: login_result.rc != 0
+      no_log: true
+
+    - name: Show login result
+      ansible.builtin.debug:
+        msg: "Login {{ 'successful' if login_result.rc == 0 else 'failed - check logs for details' }}"
+      when: build_result.rc == 0 and tag_result.rc == 0
+
+    # Push image if login was successful
+    - name: Push image to Harbor
+      ansible.builtin.shell: |
+        podman push {{ harbor_registry }}/library/{{ jupyterhub_custom_image }}:{{ jupyterhub_custom_image_tag }}
+      register: push_result
+      changed_when: push_result.rc == 0
+      when: build_result.rc == 0 and tag_result.rc == 0 and login_result.rc == 0
+      failed_when: push_result.rc != 0
+
+    - name: Show push result
+      ansible.builtin.debug:
+        msg: "{{ push_result.stdout_lines if push_result.stdout_lines is defined else push_result.stderr }}"
+      when: build_result.rc == 0 and tag_result.rc == 0 and login_result.rc == 0
+
+    # Create maintenance script for rebuilding
+    - name: Create rebuild script
+      ansible.builtin.copy:
+        dest: "{{ package_management_path }}/rebuild_image.sh"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          
+          # Run the Ansible playbook to rebuild the image
+          ansible-playbook {{ ansible_env.HOME }}/thinkube/ansible/40_thinkube/optional/jupyterhub/10_build_image.yaml
+          
+          # Optionally restart JupyterHub pods
+          read -p "Do you want to restart JupyterHub user pods? (y/n) " -n 1 -r
+          echo
+          if [[ $REPLY =~ ^[Yy]$ ]]; then
+            microk8s kubectl -n jupyterhub delete pod -l component=singleuser-server
+            echo "User pods have been restarted. New image will be used for new sessions."
+          else
+            echo "Pods were not restarted. Users will need to restart their servers to use the new image."
+          fi
+
+    # Create documentation
+    - name: Create documentation for image management
+      ansible.builtin.template:
+        src: templates/jupyterhub-image-readme.md.j2
+        dest: "{{ package_management_path }}/README.md"
+        mode: '0644'
+        
+    # Display build information
+    - name: Display build information
+      ansible.builtin.debug:
+        msg:
+          - "=============================================================="
+          - "JupyterHub image build {{ 'complete!' if build_result.rc == 0 and login_result.rc == 0 and push_result.rc == 0 else 'failed - see errors above' }}"
+          - ""
+          - "Image information:"
+          - "  Registry: {{ harbor_registry }}"
+          - "  Project: library (public)"
+          - "  Image: {{ jupyterhub_custom_image }}"
+          - "  Tag: {{ jupyterhub_custom_image_tag }}"
+          - "  Full path: {{ harbor_registry }}/library/{{ jupyterhub_custom_image }}:{{ jupyterhub_custom_image_tag }}"
+          - ""
+          - "Documentation:"
+          - "  {{ package_management_path }}/README.md"
+          - ""
+          - "To rebuild the image:"
+          - "  {{ package_management_path }}/rebuild_image.sh"
+          - ""
+          - "To deploy JupyterHub:"
+          - "  ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/12_deploy.yaml"
+          - "=============================================================="
+      when: build_result.rc == 0

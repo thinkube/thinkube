@@ -1,0 +1,309 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/cert-manager/letsencrypt/29_rollback_to_staging.yaml
+# Description:
+#   Emergency rollback from production to staging certificates
+#   Use this if production certificates are causing issues
+#
+# Requirements:
+#   - cert-manager must be deployed
+#   - Should only be used in emergency situations
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/cert-manager/letsencrypt/29_rollback_to_staging.yaml
+#
+# Variables from inventory:
+#   - domain_name: The domain for certificates
+#
+# 🤖 [AI-assisted]
+
+- name: Emergency Rollback to Staging Certificates
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    cert_manager_namespace: cert-manager
+    confirm_rollback: "{{ skip_confirmation | default(true) }}"
+    create_backup: "{{ backup_before_rollback | default(true) }}"
+    
+  tasks:
+    - name: Pre-rollback checks
+      block:
+        - name: Check current certificate type
+          ansible.builtin.shell: |
+            CERT_NAME="{{ domain_name.replace('.', '-') }}-tls"
+            
+            if ! microk8s kubectl get secret $CERT_NAME -n default >/dev/null 2>&1; then
+              echo "none"
+              exit 0
+            fi
+            
+            ISSUER=$(microk8s kubectl get secret $CERT_NAME -n default -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -issuer -noout)
+            if echo "$ISSUER" | grep -q "Fake LE"; then
+              echo "staging"
+            elif echo "$ISSUER" | grep -q "Let's Encrypt Authority"; then
+              echo "production"
+            else
+              echo "unknown"
+            fi
+          register: current_cert_type
+          become: true
+        
+        - name: Display rollback warning
+          ansible.builtin.debug:
+            msg:
+              - "════════════════════════════════════════════════════════"
+              - "⚠️  EMERGENCY ROLLBACK WARNING"
+              - "════════════════════════════════════════════════════════"
+              - ""
+              - "Current certificate type: {{ current_cert_type.stdout }}"
+              - ""
+              - "This playbook will:"
+              - "1. Backup current production certificate (if exists)"
+              - "2. Switch to Let's Encrypt STAGING certificates"
+              - "3. Trigger immediate certificate sync"
+              - ""
+              - "⚠️  STAGING certificates are NOT trusted by browsers!"
+              - "   This should only be used for troubleshooting"
+              - ""
+              - "After fixing issues, run 20_request_production.yaml"
+              - "to return to production certificates"
+              - "════════════════════════════════════════════════════════"
+        
+        - name: Fail if already using staging
+          ansible.builtin.fail:
+            msg: "Already using staging certificates! No rollback needed."
+          when: current_cert_type.stdout == "staging"
+        
+        - name: Confirm rollback
+          ansible.builtin.pause:
+            prompt: "\n⚠️  Press Enter to rollback to STAGING certificates or Ctrl+C to cancel"
+          when: confirm_rollback
+
+    - name: Backup current production certificate
+      when: 
+        - current_cert_type.stdout == "production"
+        - create_backup
+      block:
+        - name: Get current certificate
+          kubernetes.core.k8s_info:
+            kubeconfig: "{{ kubeconfig }}"
+            api_version: v1
+            kind: Secret
+            name: "{{ domain_name.replace('.', '-') }}-tls"
+            namespace: default
+          register: current_cert
+        
+        - name: Create emergency backup
+          kubernetes.core.k8s:
+            kubeconfig: "{{ kubeconfig }}"
+            state: present
+            definition:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: "{{ domain_name.replace('.', '-') }}-tls-emergency-backup"
+                namespace: default
+                annotations:
+                  backup-date: "{{ ansible_date_time.iso8601 }}"
+                  backup-reason: "Emergency rollback to staging"
+                  original-issuer: "production"
+              type: kubernetes.io/tls
+              data:
+                tls.crt: "{{ current_cert.resources[0].data['tls.crt'] }}"
+                tls.key: "{{ current_cert.resources[0].data['tls.key'] }}"
+          when: current_cert.resources | length > 0
+
+    - name: Update Certificate to use staging issuer
+      ansible.builtin.copy:
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: {{ domain_name.replace('.', '-') }}-tls
+            namespace: default
+            annotations:
+              cert-manager.io/issue-temporary-certificate: "true"
+              cert-manager.io/dns01-recursive-nameservers: "8.8.8.8:53,1.1.1.1:53"
+              cert-manager.io/dns01-recursive-nameservers-only: "true"
+              acme.cert-manager.io/dns01-check-interval: "10s"
+              acme.cert-manager.io/dns01-propagation-timeout: "180s"
+          spec:
+            secretName: {{ domain_name.replace('.', '-') }}-tls
+            issuerRef:
+              name: letsencrypt-staging
+              kind: ClusterIssuer
+            commonName: "*.{{ domain_name }}"
+            dnsNames:
+            - "*.{{ domain_name }}"
+            - "*.kn.{{ domain_name }}"
+            duration: 2160h  # 90 days
+            renewBefore: 720h  # 30 days
+        dest: /tmp/certificate-staging-rollback.yaml
+    
+    - name: Apply staging certificate request
+      ansible.builtin.command: microk8s kubectl apply -f /tmp/certificate-staging-rollback.yaml
+      become: true
+
+    - name: Monitor staging certificate request
+      ansible.builtin.shell: |
+        CERT_NAME="{{ domain_name.replace('.', '-') }}-tls"
+        NAMESPACE="default"
+        MAX_WAIT=300  # 5 minutes for rollback
+        START_TIME=$(date +%s)
+        
+        echo "════════════════════════════════════════════════════════"
+        echo "Monitoring Staging Certificate Rollback"
+        echo "════════════════════════════════════════════════════════"
+        
+        # Wait for new certificate request
+        echo "Waiting for new certificate request..."
+        INITIAL_CR_COUNT=$(microk8s kubectl get certificaterequest -n $NAMESPACE -l cert-manager.io/certificate-name=$CERT_NAME --no-headers 2>/dev/null | wc -l)
+        
+        while true; do
+          CURRENT_CR_COUNT=$(microk8s kubectl get certificaterequest -n $NAMESPACE -l cert-manager.io/certificate-name=$CERT_NAME --no-headers 2>/dev/null | wc -l)
+          if [ $CURRENT_CR_COUNT -gt $INITIAL_CR_COUNT ]; then
+            echo "✓ New certificate request created"
+            break
+          fi
+          
+          ELAPSED=$(($(date +%s) - START_TIME))
+          if [ $ELAPSED -gt 60 ]; then
+            echo "⚠ No new request after 60 seconds"
+            break
+          fi
+          
+          sleep 5
+        done
+        
+        # Wait for staging certificate
+        echo ""
+        echo "Waiting for staging certificate..."
+        while true; do
+          CERT_DATA=$(microk8s kubectl get secret $CERT_NAME -n $NAMESPACE -o jsonpath='{.data.tls\.crt}' | base64 -d 2>/dev/null)
+          if [ -n "$CERT_DATA" ]; then
+            ISSUER=$(echo "$CERT_DATA" | openssl x509 -issuer -noout 2>/dev/null)
+            
+            if echo "$ISSUER" | grep -q "Fake LE"; then
+              echo "✓ Staging certificate obtained!"
+              echo "  Issuer: $ISSUER"
+              break
+            fi
+          fi
+          
+          ELAPSED=$(($(date +%s) - START_TIME))
+          if [ $ELAPSED -gt $MAX_WAIT ]; then
+            echo "✗ Timeout waiting for staging certificate"
+            exit 1
+          fi
+          
+          echo -n "."
+          sleep 5
+        done
+        
+        echo ""
+        echo "Rollback completed successfully!"
+      register: rollback_status
+      become: true
+
+    - name: Trigger immediate certificate sync
+      ansible.builtin.shell: |
+        JOB_NAME="cert-sync-rollback-{{ ansible_date_time.epoch }}"
+        
+        echo "Triggering certificate sync..."
+        microk8s kubectl create job \
+          --from=cronjob/cert-sync \
+          "$JOB_NAME" \
+          -n {{ cert_manager_namespace }} || echo "Failed to create sync job"
+        
+        # Wait for job to complete
+        echo "Waiting for sync to complete..."
+        microk8s kubectl wait \
+          --for=condition=complete \
+          job/$JOB_NAME \
+          -n {{ cert_manager_namespace }} \
+          --timeout=120s || echo "Sync job timed out"
+      register: sync_job
+      become: true
+
+    # Re-add TLS verification workarounds for critical services
+    - name: Re-add containerd workaround for Harbor (staging certs)
+      delegate_to: "{{ item }}"
+      block:
+        - name: Create registry configuration directory
+          ansible.builtin.file:
+            path: "/var/snap/microk8s/current/args/certs.d/{{ harbor_registry }}"
+            state: directory
+            mode: '0755'
+          become: true
+
+        - name: Configure containerd to skip TLS verification
+          ansible.builtin.copy:
+            content: |
+              server = "https://{{ harbor_registry }}"
+              
+              [host."https://{{ harbor_registry }}"]
+                skip_verify = true
+            dest: "/var/snap/microk8s/current/args/certs.d/{{ harbor_registry }}/hosts.toml"
+            mode: '0644'
+          become: true
+          register: containerd_config
+
+        - name: Restart containerd if configuration changed
+          ansible.builtin.command: snap restart microk8s.daemon-containerd
+          become: true
+          when: containerd_config.changed
+      loop: "{{ groups['microk8s'] }}"
+      when: groups['microk8s'] is defined
+
+    - name: Create rollback record
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "cert-rollback-{{ ansible_date_time.epoch }}"
+            namespace: "{{ cert_manager_namespace }}"
+            labels:
+              type: certificate-rollback
+          data:
+            timestamp: "{{ ansible_date_time.iso8601 }}"
+            from_type: "{{ current_cert_type.stdout }}"
+            to_type: "staging"
+            reason: "Emergency rollback requested by operator"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Emergency Rollback Complete
+          ════════════════════════════════════════════════════════
+          
+          Previous certificate type: {{ current_cert_type.stdout }}
+          Current certificate type: staging
+          
+          {% if create_backup and current_cert_type.stdout == "production" %}
+          Production certificate backed up as:
+            {{ domain_name.replace('.', '-') }}-tls-emergency-backup
+          {% endif %}
+          
+          ⚠️  IMPORTANT NOTES:
+          - Now using STAGING certificates (not browser-trusted)
+          - Containerd workaround re-applied for Harbor
+          - All services should continue functioning
+          
+          📋 Next Steps:
+          1. Investigate and fix the issue that required rollback
+          2. Test thoroughly with staging certificates
+          3. When ready, run 20_request_production.yaml
+          
+          🔍 Troubleshooting:
+          - Check rollback history: kubectl get cm -n cert-manager -l type=certificate-rollback
+          - View backup: kubectl get secret {{ domain_name.replace('.', '-') }}-tls-emergency-backup -n default
+          ════════════════════════════════════════════════════════

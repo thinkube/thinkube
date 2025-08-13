@@ -1,0 +1,144 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Test MicroK8s Worker Nodes Installation
+#
+# This playbook verifies that MicroK8s worker nodes are properly installed and configured.
+# It checks that nodes have joined the cluster and can communicate with the control node.
+#
+# Prerequisites:
+#   - Control node must be installed and running (CORE-001)
+#   - Worker node VMs must be accessible
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/microk8s/28_test_worker.yaml
+
+- name: Test MicroK8s Worker Node Installation
+  hosts: microk8s_workers
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    required_addons:
+      - dns
+      - storage
+
+  tasks:
+    - name: Check if MicroK8s is installed
+      ansible.builtin.command: "snap list microk8s"
+      register: microk8s_snap
+      changed_when: false
+      failed_when: microk8s_snap.rc != 0
+
+    - name: Check MicroK8s status
+      ansible.builtin.command: "microk8s status"
+      register: microk8s_status
+      changed_when: false
+      become: true
+      failed_when: microk8s_status.rc != 0
+
+    - name: Verify user is in microk8s group
+      ansible.builtin.command: "groups {{ user }}"
+      register: user_groups
+      changed_when: false
+      failed_when: "'microk8s' not in user_groups.stdout"
+
+    - name: Check node status on control plane
+      ansible.builtin.shell: |
+        microk8s kubectl get nodes -o name | grep -E "({{ inventory_hostname }}|{{ ansible_hostname }})"
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+      register: node_check
+      changed_when: false
+      become: true
+      failed_when: node_check.rc != 0
+      
+    - name: Get node details
+      ansible.builtin.shell: |
+        microk8s kubectl get nodes -o wide | grep -E '({{ inventory_hostname }}|{{ ansible_hostname }}|{{ inventory_hostname }}.{{ domain_name }})'
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+      register: node_status
+      changed_when: false
+      become: true
+      failed_when: false
+
+    - name: Verify node is Ready
+      ansible.builtin.assert:
+        that:
+          - "'Ready' in node_status.stdout"
+        fail_msg: "Worker node {{ inventory_hostname }} is not in Ready state"
+        success_msg: "Worker node {{ inventory_hostname }} is Ready"
+
+    - name: Verify node can run pods
+      ansible.builtin.shell: |
+        # Find actual node name in cluster
+        NODE_NAME=$(microk8s kubectl get nodes -o name | grep -E "({{ inventory_hostname }}|{{ ansible_hostname }})" | cut -d'/' -f2)
+        POD_NAME="test-pod-$(echo $NODE_NAME | tr '.' '-')"
+        
+        # Delete pod if it exists
+        microk8s kubectl delete pod $POD_NAME --ignore-not-found=true
+        
+        # Create test pod
+        microk8s kubectl run $POD_NAME \
+          --image=busybox:latest \
+          --restart=Never \
+          --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"'$NODE_NAME'"}}}' \
+          --command -- sleep 10
+        
+        # Wait for pod to be running
+        sleep 5
+        
+        # Verify pod is on correct node
+        POD_NODE=$(microk8s kubectl get pod $POD_NAME -o jsonpath='{.spec.nodeName}')
+        if [ "$POD_NODE" = "$NODE_NAME" ]; then
+          echo "SUCCESS: Pod scheduled on correct node: $NODE_NAME"
+          exit 0
+        else
+          echo "FAIL: Pod on wrong node. Expected: $NODE_NAME, Got: $POD_NODE"
+          exit 1
+        fi
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+      register: pod_test
+      changed_when: false
+      become: true
+      failed_when: pod_test.rc != 0
+
+    - name: Cleanup test pod
+      ansible.builtin.shell: |
+        NODE_NAME=$(microk8s kubectl get nodes -o name | grep -E "({{ inventory_hostname }}|{{ ansible_hostname }})" | cut -d'/' -f2)
+        POD_NAME="test-pod-$(echo $NODE_NAME | tr '.' '-')"
+        microk8s kubectl delete pod $POD_NAME --ignore-not-found=true
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+      changed_when: true
+      become: true
+
+    - name: Check required addons are enabled
+      ansible.builtin.command: "microk8s status --addon {{ item }}"
+      loop: "{{ required_addons }}"
+      register: addon_status
+      changed_when: false
+      become: true
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+      failed_when: "'enabled' not in addon_status.stdout"
+
+    - name: Verify cluster communication
+      ansible.builtin.shell: |
+        set -o pipefail
+        microk8s kubectl get nodes -o wide | grep -E '({{ inventory_hostname }}|{{ ansible_hostname }}|{{ inventory_hostname }}.{{ domain_name }})'
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+      register: node_info
+      changed_when: false
+      become: true
+      failed_when: node_info.rc != 0
+
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "Worker Node Status: PASS"
+          - "Node {{ ansible_hostname }} joined cluster: PASS"
+          - "Node is Ready: PASS"
+          - "Pod scheduling works: PASS"
+          - "Required addons enabled: PASS"
+          - "Cluster communication: PASS"

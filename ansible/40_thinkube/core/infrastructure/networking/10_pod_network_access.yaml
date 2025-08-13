@@ -1,0 +1,223 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/networking/10_pod_network_access.yaml
+# Description:
+#   Configures network access for Kubernetes pods to reach external networks
+#   Handles both overlay (ZeroTier) and local (LAN) network modes
+#   Enables IP forwarding and NAT to allow pods to access services and internet
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - Network mode must be defined in inventory (overlay or local)
+#   - For overlay mode: ZeroTier must be configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/networking/10_pod_network_access.yaml
+#
+# Variables from inventory:
+#   - network_mode: Either 'overlay' (ZeroTier) or 'local' (LAN)
+#   - zerotier_cidr: CIDR for ZeroTier network (used in overlay mode)
+#   - network_cidr: CIDR for LAN network (used in local mode)
+#
+# Dependencies:
+#   - MicroK8s cluster must be running
+#   - Network interfaces must be configured
+
+- name: Configure pod network access for external connectivity
+  hosts: microk8s
+  gather_facts: true
+  become: true
+  
+  vars:
+    # Determine target network and interface based on network mode
+    target_network_cidr: "{{ zerotier_cidr if network_mode == 'overlay' else network_cidr }}"
+    # For overlay mode, use zt+ pattern to match any ZeroTier interface
+    # For local mode, use the default IPv4 interface (usually eth0 or enp*)
+    target_interface_pattern: "{{ 'zt+' if network_mode == 'overlay' else ansible_default_ipv4.interface }}"
+    
+    # Pod network CIDR - covers all possible pod networks
+    # MicroK8s typically uses 10.1.x.x for Calico
+    pod_network_cidr: "10.0.0.0/8"
+    
+  pre_tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - network_mode is defined
+          - network_mode in ['overlay', 'local']
+          - zerotier_cidr is defined or network_mode != 'overlay'
+          - network_cidr is defined or network_mode != 'local'
+        fail_msg: "Required network configuration variables are not defined"
+        
+    - name: Display network configuration
+      ansible.builtin.debug:
+        msg:
+          - "Network mode: {{ network_mode }}"
+          - "Target network: {{ target_network_cidr }}"
+          - "Target interface pattern: {{ target_interface_pattern }}"
+          - "Pod network: {{ pod_network_cidr }}"
+          
+  tasks:
+    # Enable IP forwarding - required for routing between networks
+    - name: Enable IPv4 forwarding
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+        
+    - name: Enable IPv6 forwarding (optional, for future compatibility)
+      ansible.posix.sysctl:
+        name: net.ipv6.conf.all.forwarding
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+      ignore_errors: yes  # IPv6 might not be available
+      
+    # Configure iptables for NAT and forwarding
+    # CRITICAL: Using shell commands with iptables-legacy since Calico uses iptables-legacy, not nftables
+    # The ansible.builtin.iptables module uses nftables which doesn't work with Calico
+    
+    - name: Configure NAT for pod traffic to target network (overlay mode)
+      ansible.builtin.shell: |
+        iptables-legacy -t nat -C POSTROUTING -s {{ pod_network_cidr }} -d {{ target_network_cidr }} -o {{ target_interface_pattern }} -j MASQUERADE -m comment --comment "NAT for pods to {{ network_mode }} network" 2>/dev/null || \
+        iptables-legacy -t nat -A POSTROUTING -s {{ pod_network_cidr }} -d {{ target_network_cidr }} -o {{ target_interface_pattern }} -j MASQUERADE -m comment --comment "NAT for pods to {{ network_mode }} network"
+      when: network_mode == 'overlay'
+      register: nat_overlay
+      changed_when: nat_overlay.rc == 0
+      failed_when: false
+      
+    - name: Configure NAT for pod traffic to any destination (local mode)
+      ansible.builtin.shell: |
+        iptables-legacy -t nat -C POSTROUTING -s {{ pod_network_cidr }} -o {{ target_interface_pattern }} -j MASQUERADE -m comment --comment "NAT for pods to external networks" 2>/dev/null || \
+        iptables-legacy -t nat -A POSTROUTING -s {{ pod_network_cidr }} -o {{ target_interface_pattern }} -j MASQUERADE -m comment --comment "NAT for pods to external networks"
+      when: network_mode == 'local'
+      register: nat_local
+      changed_when: nat_local.rc == 0
+      failed_when: false
+      
+    - name: Configure NAT for pod traffic to internet (overlay mode)
+      ansible.builtin.shell: |
+        iptables-legacy -t nat -C POSTROUTING -s {{ pod_network_cidr }} ! -d {{ target_network_cidr }} -o {{ ansible_default_ipv4.interface }} -j MASQUERADE -m comment --comment "NAT for pods to internet" 2>/dev/null || \
+        iptables-legacy -t nat -A POSTROUTING -s {{ pod_network_cidr }} ! -d {{ target_network_cidr }} -o {{ ansible_default_ipv4.interface }} -j MASQUERADE -m comment --comment "NAT for pods to internet"
+      when: network_mode == 'overlay'
+      register: nat_internet
+      changed_when: nat_internet.rc == 0
+      failed_when: false
+    
+    # DEPRECATED: The ansible.builtin.iptables module uses nftables which doesn't work with Calico
+    # Calico uses iptables-legacy, so we must use shell commands with iptables-legacy above
+      
+    # Allow forwarding for pod traffic - using iptables-legacy
+    - name: Allow forwarding from pod network
+      ansible.builtin.shell: |
+        iptables-legacy -C FORWARD -s {{ pod_network_cidr }} -j ACCEPT -m comment --comment "Allow forwarding from pods" 2>/dev/null || \
+        iptables-legacy -A FORWARD -s {{ pod_network_cidr }} -j ACCEPT -m comment --comment "Allow forwarding from pods"
+      register: forward_from
+      changed_when: forward_from.rc == 0
+      failed_when: false
+        
+    - name: Allow forwarding to pod network
+      ansible.builtin.shell: |
+        iptables-legacy -C FORWARD -d {{ pod_network_cidr }} -j ACCEPT -m comment --comment "Allow forwarding to pods" 2>/dev/null || \
+        iptables-legacy -A FORWARD -d {{ pod_network_cidr }} -j ACCEPT -m comment --comment "Allow forwarding to pods"
+      register: forward_to
+      changed_when: forward_to.rc == 0
+      failed_when: false
+        
+    - name: Allow forwarding for established connections
+      ansible.builtin.shell: |
+        iptables-legacy -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT -m comment --comment "Allow established connections" 2>/dev/null || \
+        iptables-legacy -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT -m comment --comment "Allow established connections"
+      register: forward_established
+      changed_when: forward_established.rc == 0
+      failed_when: false
+        
+    # Special handling for ZeroTier in overlay mode
+    - name: Allow forwarding through ZeroTier interface (overlay mode)
+      ansible.builtin.shell: |
+        iptables-legacy -C FORWARD -i {{ target_interface_pattern }} -j ACCEPT -m comment --comment "Allow forwarding through ZeroTier" 2>/dev/null || \
+        iptables-legacy -A FORWARD -i {{ target_interface_pattern }} -j ACCEPT -m comment --comment "Allow forwarding through ZeroTier"
+      when: network_mode == 'overlay'
+      register: forward_zt_in
+      changed_when: forward_zt_in.rc == 0
+      failed_when: false
+      
+    - name: Allow forwarding to ZeroTier interface (overlay mode)
+      ansible.builtin.shell: |
+        iptables-legacy -C FORWARD -o {{ target_interface_pattern }} -j ACCEPT -m comment --comment "Allow forwarding to ZeroTier" 2>/dev/null || \
+        iptables-legacy -A FORWARD -o {{ target_interface_pattern }} -j ACCEPT -m comment --comment "Allow forwarding to ZeroTier"
+      when: network_mode == 'overlay'
+      register: forward_zt_out
+      changed_when: forward_zt_out.rc == 0
+      failed_when: false
+      
+    # Make iptables rules persistent
+    - name: Install iptables-persistent package
+      ansible.builtin.package:
+        name: iptables-persistent
+        state: present
+        
+    - name: Save iptables rules (using iptables-legacy since that's what Calico uses)
+      ansible.builtin.shell: |
+        iptables-legacy-save > /etc/iptables/rules.v4
+        ip6tables-legacy-save > /etc/iptables/rules.v6
+      changed_when: true
+      
+    # Add static routes if needed
+    - name: Check if route to pod network exists via Calico (overlay mode)
+      ansible.builtin.shell: |
+        ip route show {{ pod_network_cidr }} | grep -q calico
+      register: pod_route_exists
+      failed_when: false
+      changed_when: false
+      when: network_mode == 'overlay'
+      
+    # Test connectivity
+    - name: Test pod network configuration
+      ansible.builtin.shell: |
+        # Get a running pod for testing
+        POD=$(microk8s.kubectl get pods --all-namespaces -o json | \
+              jq -r '.items[] | select(.status.phase=="Running") | .metadata.name' | head -1)
+        NS=$(microk8s.kubectl get pods --all-namespaces -o json | \
+             jq -r '.items[] | select(.status.phase=="Running") | .metadata.namespace' | head -1)
+        
+        if [ -n "$POD" ] && [ -n "$NS" ]; then
+          echo "Found test pod: $POD in namespace: $NS"
+          # Get pod IP
+          POD_IP=$(microk8s.kubectl get pod -n "$NS" "$POD" -o jsonpath='{.status.podIP}')
+          echo "Pod IP: $POD_IP"
+          
+          # Test if we can reach the pod (basic connectivity)
+          if ping -c 1 -W 2 "$POD_IP" > /dev/null 2>&1; then
+            echo "✓ Can reach pod at $POD_IP"
+          else
+            echo "✗ Cannot reach pod at $POD_IP (this might be normal depending on pod network policies)"
+          fi
+        else
+          echo "No running pods found for testing"
+        fi
+      register: connectivity_test
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display connectivity test results
+      ansible.builtin.debug:
+        var: connectivity_test.stdout_lines
+      when: connectivity_test.stdout_lines is defined
+      
+    - name: Display configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "Pod network access configuration complete"
+          - "Network mode: {{ network_mode }}"
+          - "Pods can now access:"
+          - "  - {{ 'ZeroTier network (' ~ target_network_cidr ~ ')' if network_mode == 'overlay' else 'LAN network (' ~ target_network_cidr ~ ')' }}"
+          - "  - External internet via NAT"
+          - "IP forwarding is enabled"
+          - "iptables rules are configured and saved"

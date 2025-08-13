@@ -1,0 +1,464 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/argo-workflows/11_deploy.yaml
+# Description:
+#   Deploy Argo Workflows and Argo Events with OIDC authentication and TLS Ingress
+#
+# Requirements:
+#   - MicroK8s Kubernetes cluster
+#   - Keycloak instance running with Argo client configured (run 10_configure_keycloak.yaml first)
+#   - Cert-Manager deployed and configured with wildcard certificate (CORE-003)
+#   - ADMIN_PASSWORD environment variable set for Keycloak admin access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/argo-workflows/11_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain name for all services
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username for application access
+#   - kubeconfig: Path to Kubernetes configuration
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+#
+# Dependencies:
+#   - CORE-001: MicroK8s Control Node
+#   - CORE-002: MicroK8s Worker Nodes
+#   - CORE-003: Cert-Manager (for TLS)
+#   - CORE-004: Keycloak (for SSO)
+
+- name: Deploy Argo Workflows and Argo Events using official Argo helm charts with OIDC login and Ingress TLS
+  hosts: microk8s_control_plane
+  become: false
+  vars:
+    # Temporary file paths (not from inventory)
+    argo_values_file: "/tmp/argo-values.yaml"
+    argo_events_values_file: "/tmp/argo-events-values.yaml"
+    
+    # TLS secret name
+    argo_tls_secret_name: "{{ argo_namespace }}-tls-secret"
+    
+    # Keycloak admin credentials
+    keycloak_admin_user: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+    # OIDC URLs constructed from inventory variables
+    argo_oidc_redirect_uri: "https://{{ argo_domain }}/oauth2/callback"
+    argo_oidc_web_origins:
+      - "https://{{ argo_domain }}"
+    argo_redirect_uris:
+      - "https://{{ argo_domain }}/oauth2/callback"
+      - "https://{{ argo_domain }}/*"
+    
+    # OIDC configuration for Argo Server console
+    oidc_enabled: true
+    oidc_issuer: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+    oidc_client_id: "{{ argo_oidc_client_id }}"
+    oidc_client_secret: ""  # This will be set below
+    oidc_redirect_url: "{{ argo_oidc_redirect_uri }}"
+
+  tasks:
+    - name: Ensure Argo Workflows namespace exists
+      ansible.builtin.shell: |
+        if ! {{ kubectl_bin }} get namespace {{ argo_namespace }}; then
+          {{ kubectl_bin }} create namespace {{ argo_namespace }}
+        fi
+      register: ensure_ns
+      changed_when: ensure_ns.stdout != ""
+      failed_when: ensure_ns.rc != 0
+
+    # --- Keycloak Client Secret Retrieval (client must already exist) ---
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ keycloak_admin_user }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+      no_log: true
+      failed_when: keycloak_token is failed
+
+    - name: Query Keycloak for existing "argo" client
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ argo_oidc_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: existing_argo_client
+      failed_when: existing_argo_client is failed
+
+    - name: Fail if "argo" client is not found in Keycloak
+      ansible.builtin.fail:
+        msg: "Argo client '{{ argo_oidc_client_id }}' not found in realm '{{ keycloak_realm }}'. Please run 10_configure_keycloak.yaml first."
+      when: existing_argo_client.json | length == 0
+
+    - name: Query Keycloak for final "argo" client details
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ argo_oidc_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: final_argo_client
+      failed_when: final_argo_client is failed
+
+    - name: Set fact for argo_client_uuid
+      ansible.builtin.set_fact:
+        argo_client_uuid: "{{ final_argo_client.json[0].id }}"
+
+    - name: Update Keycloak client redirect URIs
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ argo_client_uuid }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          redirectUris: "{{ argo_redirect_uris }}"
+          webOrigins: "{{ argo_oidc_web_origins }}"
+        validate_certs: false
+        status_code: 204
+      register: update_client
+      failed_when: update_client is failed
+
+    - name: Retrieve Argo client secret from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ argo_client_uuid }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        validate_certs: false
+        status_code: 200
+      register: argo_secret_resp
+      failed_when: argo_secret_resp is failed
+
+    - name: Set OIDC client secret for Argo
+      ansible.builtin.set_fact:
+        oidc_client_secret: "{{ argo_secret_resp.json.value }}"
+
+    # Add required protocol mappers for Argo client
+    - name: Add required protocol mappers for Argo client
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ argo_client_uuid }}/protocol-mappers/models"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: "{{ item }}"
+        validate_certs: false
+        status_code: [201, 409]
+      loop:
+        - {
+            "name": "username",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-usermodel-property-mapper",
+            "config": {
+              "user.attribute": "username",
+              "claim.name": "preferred_username",
+              "id.token.claim": "true",
+              "access.token.claim": "true",
+              "userinfo.token.claim": "true"
+            }
+          }
+        - {
+            "name": "email",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-usermodel-property-mapper",
+            "config": {
+              "user.attribute": "email",
+              "claim.name": "email",
+              "id.token.claim": "true",
+              "access.token.claim": "true",
+              "userinfo.token.claim": "true"
+            }
+          }
+      failed_when: false
+
+    - name: Display Keycloak client configuration for Argo
+      ansible.builtin.debug:
+        msg:
+          - "Keycloak realm: {{ keycloak_realm }}"
+          - "Argo client ID: {{ argo_oidc_client_id }}"
+          - "Argo client UUID: {{ argo_client_uuid }}"
+          - "Allowed Redirect URIs: {{ argo_redirect_uris }}"
+          - "Retrieved Client Secret: {{ oidc_client_secret }}"
+
+    # --- End Keycloak tasks ---
+
+    # --- Get wildcard TLS certificate from default namespace ---
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to argo namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ argo_tls_secret_name }}"
+            namespace: "{{ argo_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Add official Argo helm repository if not present
+      ansible.builtin.shell: |
+        if ! {{ helm_bin }} repo list | grep -q 'argo-helm'; then
+          {{ helm_bin }} repo add argo-helm {{ argo_chart_repo }}
+        fi
+      register: helm_repo_status
+      changed_when: helm_repo_status.stdout != ""
+      failed_when: helm_repo_status.rc != 0
+
+    - name: Update Helm repositories
+      ansible.builtin.shell: "{{ helm_bin }} repo update"
+      changed_when: false
+      failed_when: false
+
+    - name: Create Argo SSO secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: argo-server-sso
+            namespace: "{{ argo_namespace }}"
+          type: Opaque
+          stringData:
+            clientId: "{{ oidc_client_id }}"
+            clientSecret: "{{ oidc_client_secret }}"
+
+    - name: Create Argo Workflows values file with OIDC configuration
+      ansible.builtin.copy:
+        dest: "{{ argo_values_file }}"
+        content: |
+          server:
+            extraArgs:
+              - --auth-mode=sso
+              - --auth-mode=server
+            sso:
+              enabled: true
+              issuer: "{{ oidc_issuer }}"
+              clientId:
+                name: argo-server-sso
+                key: clientId
+              clientSecret:
+                name: argo-server-sso
+                key: clientSecret
+              redirectUrl: "{{ argo_oidc_redirect_uri }}"
+              scopes: ["openid", "profile", "email"]
+              rbac:
+                enabled: false
+            resources:
+              limits:
+                cpu: 500m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+          service:
+            type: "{{ argo_service_type }}"
+          controller:
+            resources:
+              limits:
+                cpu: 1000m
+                memory: 512Mi
+              requests:
+                cpu: 500m
+                memory: 256Mi
+
+    - name: Create Argo Events values file
+      ansible.builtin.copy:
+        dest: "{{ argo_events_values_file }}"
+        content: |
+          crds:
+            install: true
+            keep: true
+          eventbus:
+            enable: true
+          eventsource:
+            enable: true
+          sensor:
+            enable: true
+          controller:
+            resources:
+              limits:
+                cpu: 100m
+                memory: 128Mi
+              requests:
+                cpu: 50m
+                memory: 64Mi
+
+    - name: Deploy or upgrade Argo Workflows using Helm
+      ansible.builtin.shell: |
+        if {{ helm_bin }} list -n {{ argo_namespace }} | grep -q '^{{ argo_release_name }}'; then
+          {{ helm_bin }} upgrade {{ argo_release_name }} argo-helm/{{ argo_chart_name }} \
+            --namespace {{ argo_namespace }} \
+            -f {{ argo_values_file }}
+        else
+          {{ helm_bin }} install {{ argo_release_name }} argo-helm/{{ argo_chart_name }} \
+            --namespace {{ argo_namespace }} \
+            -f {{ argo_values_file }}
+        fi
+      args:
+        chdir: "/tmp"
+      register: argo_deploy
+      changed_when: "'STATUS: deployed' in argo_deploy.stdout"
+
+    # --- Begin Argo Events installation ---
+    - name: Deploy or upgrade Argo Events using Helm
+      ansible.builtin.shell: |
+        if {{ helm_bin }} list -n {{ argo_namespace }} | grep -q '^{{ argo_events_release_name }}'; then
+          {{ helm_bin }} upgrade {{ argo_events_release_name }} argo-helm/{{ argo_events_chart_name }} \
+            --namespace {{ argo_namespace }} \
+            -f {{ argo_events_values_file }}
+        else
+          {{ helm_bin }} install {{ argo_events_release_name }} argo-helm/{{ argo_events_chart_name }} \
+            --namespace {{ argo_namespace }} \
+            -f {{ argo_events_values_file }}
+        fi
+      args:
+        chdir: "/tmp"
+      register: argo_events_deploy
+      changed_when: "'STATUS: deployed' in argo_events_deploy.stdout"
+    # --- End Argo Events installation ---
+
+    - name: Wait for Argo Workflows pods to be ready
+      ansible.builtin.shell: |
+        while [ $({{ kubectl_bin }} get pods -n {{ argo_namespace }} -l app.kubernetes.io/instance=argo-workflows --no-headers | awk '{print $2}' | grep -vc "1/1") -gt 0 ]; do
+          echo "Waiting for Argo Workflows pods to be ready..."
+          sleep 5
+        done
+      register: wait_argo
+      failed_when: wait_argo.rc != 0
+
+    - name: Wait for Argo Events pods to be ready
+      ansible.builtin.shell: |
+        while [ $({{ kubectl_bin }} get pods -n {{ argo_namespace }} -l app.kubernetes.io/instance=argo-events --no-headers | awk '{print $2}' | grep -vc "1/1") -gt 0 ]; do
+          echo "Waiting for Argo Events pods to be ready..."
+          sleep 5
+        done
+      register: wait_argo_events
+      failed_when: wait_argo_events.rc != 0
+
+    - name: Verify Argo Events CRDs are installed
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get crd | grep -E "eventbus|eventsources|sensors"
+      register: crd_check
+      changed_when: false
+      failed_when: crd_check.rc != 0
+
+    - name: Display Argo Events CRD status
+      ansible.builtin.debug:
+        var: crd_check.stdout_lines
+
+    ##############################################################################
+    # (1) HTTP/HTTPS UI Ingress at 'argo_domain'
+    ##############################################################################
+    - name: Create Ingress for Argo Workflows (UI)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: argo-ingress
+            namespace: "{{ argo_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          spec:
+            tls:
+              - hosts:
+                  - "{{ argo_domain }}"
+                secretName: "{{ argo_tls_secret_name }}"
+            rules:
+              - host: "{{ argo_domain }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: "{{ argo_release_name }}-server"
+                          port:
+                            number: 2746
+
+    ##############################################################################
+    # (2) gRPC Ingress at 'argo_grpc_domain'
+    ##############################################################################
+    - name: Create gRPC Ingress for Argo Workflows
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: argo-grpc-ingress
+            namespace: "{{ argo_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+              nginx.ingress.kubernetes.io/enable-http2: "true"
+          spec:
+            tls:
+              - hosts:
+                  - "{{ argo_grpc_domain }}"
+                secretName: "{{ argo_tls_secret_name }}"
+            rules:
+              - host: "{{ argo_grpc_domain }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: "{{ argo_release_name }}-server"
+                          port:
+                            number: 2746
+
+    - name: Display Argo Workflows and Events installation details
+      ansible.builtin.shell: |
+        echo "==== Argo Workflows Pods ===="
+        {{ kubectl_bin }} get pods -n {{ argo_namespace }} -l app.kubernetes.io/instance={{ argo_release_name }}
+        echo "==== Argo Events Pods ===="
+        {{ kubectl_bin }} get pods -n {{ argo_namespace }} -l app.kubernetes.io/instance={{ argo_events_release_name }}
+        echo "==== Argo Events CRDs ===="
+        {{ kubectl_bin }} get crd | grep -E "eventbus|eventsources|sensors"
+        echo "==== Argo Ingress ===="
+        {{ kubectl_bin }} get ingress -n {{ argo_namespace }}
+      register: installation_summary
+      changed_when: false
+      failed_when: installation_summary.rc != 0
+
+    - name: Show Argo Workflows and Events installation summary
+      ansible.builtin.debug:
+        var: installation_summary.stdout_lines

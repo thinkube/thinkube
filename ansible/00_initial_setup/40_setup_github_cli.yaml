@@ -1,0 +1,191 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 40_setup_github_cli.yaml - Setup GitHub CLI (gh) configuration
+#
+# Purpose:
+#   Install GitHub CLI and configure authentication and settings
+#   for effective GitHub workflow integration
+#
+# Requirements:
+#   - Requires sudo access to install packages
+#   - Requires valid GitHub credentials (token or username/password)
+#   - Environment variables should include GITHUB_TOKEN
+#
+# Variables:
+#   - github_user: GitHub username (default from inventory)
+#   - github_email: GitHub email (default from inventory)
+#   - github_token: GitHub token for authentication (from environment variable)
+#
+# Run with:
+#   ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/40_setup_github_cli.yaml
+
+- name: Setup GitHub CLI (gh) and Configuration
+  hosts: management
+  gather_facts: true
+  become: false
+  
+  vars:
+    # Technical variables with defaults
+    gh_version: "latest"  # Use latest GitHub CLI version
+    
+    # The token should be set in the environment
+    github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+    
+  tasks:
+    - name: Display setup information
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          🔧 Setting up GitHub CLI ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          This playbook will configure GitHub CLI (gh) for repository management
+          and workflow integration. It includes installation and authentication.
+          
+          ═════════════════════════════════════════════════════════
+    
+    # Phase 1: Prerequisites - Verify required environment variables
+    - name: Verify GitHub token is available
+      ansible.builtin.assert:
+        that:
+          - github_token is defined and github_token | length > 0
+        fail_msg: |
+          ERROR: GitHub Token Not Found
+          
+          DETAILS:
+          - GitHub token is required for authentication
+          - The token should be set in your .env file
+          
+          REQUIRED ACTION:
+          - Add GITHUB_TOKEN to your ~/.env file
+          - Source the file with: source ~/.env
+          
+          REFERENCE: See docs/architecture/VARIABLE_HANDLING.md
+    
+    # Check for optional variables
+    - name: Check if GitHub user is defined in environment
+      ansible.builtin.set_fact:
+        github_user: "{{ lookup('env', 'GITHUB_USER') }}"
+    
+    - name: Check if GitHub email is defined in environment
+      ansible.builtin.set_fact:
+        github_email: "{{ lookup('env', 'GITHUB_EMAIL') }}"
+        
+    - name: Show GitHub user status
+      ansible.builtin.debug:
+        msg: "GitHub username {{ 'is defined' if github_user | length > 0 else 'is not defined. Will use git config if available.' }}"
+      changed_when: false
+      
+    # Phase 2: Install GitHub CLI
+    - name: Check if GitHub CLI is already installed
+      ansible.builtin.command: which gh
+      register: gh_installed
+      changed_when: false
+      failed_when: false
+      
+    - name: Add GitHub CLI apt repository key
+      ansible.builtin.apt_key:
+        url: https://cli.github.com/packages/githubcli-archive-keyring.gpg
+        state: present
+      become: true
+      when: gh_installed.rc != 0
+      
+    - name: Add GitHub CLI apt repository
+      ansible.builtin.apt_repository:
+        repo: deb [arch=amd64] https://cli.github.com/packages stable main
+        state: present
+        filename: github-cli
+      become: true
+      when: gh_installed.rc != 0
+      
+    - name: Install GitHub CLI
+      ansible.builtin.apt:
+        name: gh
+        state: present
+        update_cache: yes
+      become: true
+      when: gh_installed.rc != 0
+      
+    # Phase 3: Configure Git and GitHub CLI
+    - name: Configure Git username if provided
+      ansible.builtin.command: git config --global user.name "{{ github_user }}"
+      when: github_user is defined and github_user | length > 0
+      changed_when: false
+      
+    - name: Configure Git email if provided
+      ansible.builtin.command: git config --global user.email "{{ github_email }}"
+      when: github_email is defined and github_email | length > 0
+      changed_when: false
+      
+    - name: Create GitHub CLI config directory
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/.config/gh"
+        state: directory
+        mode: '0700'
+        
+    - name: Setup GitHub CLI config file
+      ansible.builtin.template:
+        src: templates/gh_config.yml.j2
+        dest: "{{ ansible_env.HOME }}/.config/gh/config.yml"
+        mode: '0600'
+      register: gh_config
+      
+    - name: Configure GitHub CLI hosts
+      ansible.builtin.template:
+        src: templates/gh_hosts.yml.j2
+        dest: "{{ ansible_env.HOME }}/.config/gh/hosts.yml"
+        mode: '0600'
+      register: gh_hosts
+      
+    - name: Verify GitHub CLI authentication
+      ansible.builtin.command: gh auth status
+      register: gh_auth
+      changed_when: false
+      failed_when: false
+      
+    # Phase 4: Set up GitHub CLI aliases and extensions
+    - name: Configure GitHub CLI aliases
+      ansible.builtin.command: "gh alias set {{ item.alias }} '{{ item.command }}' --clobber"
+      loop:
+        - { alias: 'co', command: 'pr checkout' }
+        - { alias: 'pv', command: 'pr view' }
+        - { alias: 'pc', command: 'pr create' }
+        - { alias: 'is', command: 'issue status' }
+        - { alias: 'il', command: 'issue list' }
+        - { alias: 'iv', command: 'issue view' }
+      changed_when: false
+      when: gh_auth.rc == 0
+      
+    - name: Install GitHub CLI extensions
+      ansible.builtin.command: "gh extension install {{ item }}"
+      loop:
+        - github/gh-copilot
+        - dlvhdr/gh-dash
+      changed_when: false
+      failed_when: false
+      when: gh_auth.rc == 0
+      
+    # Phase 5: Output useful information
+    - name: Display GitHub CLI configuration completion message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          ✅ GitHub CLI Configuration Complete ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          GitHub CLI (gh) has been installed and configured successfully:
+          - Authentication: {% if gh_auth.rc == 0 %}Successful{% else %}Failed - please check your token{% endif %}
+          - Configuration: {% if gh_config.changed %}Created{% else %}Already exists{% endif %}
+          - Hosts file: {% if gh_hosts.changed %}Created{% else %}Already exists{% endif %}
+          
+          Usage examples:
+            - gh issue list - List repository issues
+            - gh pr list - List pull requests
+            - gh repo view - Show repository information
+            - gh auth status - Check authentication status
+          
+          ═════════════════════════════════════════════════════════

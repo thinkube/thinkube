@@ -1,0 +1,88 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/postgresql/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for PostgreSQL by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - PostgreSQL must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/postgresql/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Configure PostgreSQL service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  tasks:
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: postgres
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "core"
+              thinkube.io/service-name: "postgresql"
+          data:
+            service.yaml: |
+              service:
+                name: postgresql
+                display_name: "PostgreSQL"
+                description: "Relational database management system"
+                type: core
+                category: storage
+                icon: /icons/tk_data.svg
+                
+                endpoints:
+                  - name: postgres
+                    type: postgres
+                    port: 5432
+                    description: "PostgreSQL database connection"
+                    primary: true
+                    internal: true
+                    
+                  - name: metrics
+                    type: http
+                    url: "postgresql-metrics.postgres.svc.cluster.local"
+                    port: 9187
+                    health_path: "/metrics"
+                    description: "PostgreSQL exporter metrics"
+                    internal: true
+                    
+                dependencies: []
+                  
+                scaling:
+                  resource_type: statefulset
+                  resource_name: postgresql-official
+                  namespace: postgres
+                  min_replicas: 1
+                  can_disable: false
+                  
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: postgres
+      register: configmap_info
+      
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for PostgreSQL"
+      when: configmap_info.resources | length > 0

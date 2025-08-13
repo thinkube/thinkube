@@ -1,0 +1,104 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Rollback MicroK8s Worker Nodes
+#
+# This playbook removes MicroK8s from worker nodes and removes them from the cluster.
+# It cleanly removes all MicroK8s components and related configurations.
+#
+# Prerequisites:
+#   - Worker nodes must be accessible
+#   - Control node must be accessible to remove node references
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/microk8s/29_rollback_workers.yaml
+
+- name: Rollback MicroK8s Worker Nodes
+  hosts: microk8s_workers
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+
+  tasks:
+    - name: Check if MicroK8s is installed
+      ansible.builtin.command: "snap list microk8s"
+      register: microk8s_check
+      changed_when: false
+      failed_when: false
+
+    - name: Leave cluster gracefully
+      when: microk8s_check.rc == 0
+      block:
+        - name: Check node status on control plane
+          ansible.builtin.command: "microk8s kubectl get node {{ ansible_hostname }}"
+          delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+          register: node_exists
+          changed_when: false
+          failed_when: false
+          become: true
+
+        - name: Drain node if it exists
+          ansible.builtin.command: >
+            microk8s kubectl drain {{ ansible_hostname }}
+            --ignore-daemonsets --delete-emptydir-data --force
+          delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+          when: node_exists.rc == 0
+          become: true
+          changed_when: true
+
+        - name: Remove node from cluster
+          ansible.builtin.command: "microk8s kubectl delete node {{ ansible_hostname }}"
+          delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+          when: node_exists.rc == 0
+          become: true
+          changed_when: true
+
+    - name: Stop MicroK8s if running
+      ansible.builtin.command: microk8s stop
+      become: true
+      when: microk8s_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Get current groups for user
+      ansible.builtin.command: "id -nG {{ user }}"
+      register: current_groups
+      changed_when: false
+      become: true
+
+    - name: Remove microk8s from user groups
+      ansible.builtin.user:
+        name: "{{ user }}"
+        groups: "{{ (current_groups.stdout.split() | reject('equalto', 'microk8s')) | join(',') }}"
+        append: false
+        state: present
+      become: true
+      when: "'microk8s' in current_groups.stdout"
+      failed_when: false
+
+    - name: Remove MicroK8s snap
+      ansible.builtin.command: snap remove microk8s --purge
+      become: true
+      when: microk8s_check.rc == 0
+      changed_when: true
+
+    - name: Clean up MicroK8s data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      become: true
+      loop:
+        - /var/snap/microk8s
+        - /var/lib/microk8s
+      failed_when: false
+
+    - name: Display rollback status
+      ansible.builtin.debug:
+        msg:
+          - "MicroK8s worker rollback completed"
+          - "Removed from host: {{ ansible_hostname }}"
+          - "Node removed from cluster"
+          - "All MicroK8s data cleaned up"

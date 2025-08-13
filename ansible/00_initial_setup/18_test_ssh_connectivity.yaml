@@ -1,0 +1,171 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 18_test_ssh_connectivity.yaml - Tests SSH connectivity between all servers
+#
+# Purpose:
+#   Validates that SSH key-based authentication is properly configured between all servers
+#   and that all hosts are accessible without password.
+#
+# Requirements:
+#   - SSH keys must be set up by 10_setup_ssh_keys.yaml
+#   - All hosts must be reachable by IP address
+#
+# Variables:
+#   Required (from inventory):
+#     - ansible_host: IP address of each server in inventory
+#
+# Run with: 
+#   ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/18_test_ssh_connectivity.yaml
+#   Or with helper script:
+#   ./scripts/run_ansible.sh ansible/00_initial_setup/18_test_ssh_connectivity.yaml
+
+- name: Test SSH Connectivity Between Servers
+  hosts: baremetal
+  gather_facts: true
+  become: false
+  vars:
+    ssh_key_name: "thinkube_cluster_key"
+    
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - ansible_host is defined
+        fail_msg: |
+          ERROR: Missing Required Variables
+          
+          DETAILS:
+          - The following variables must be defined in inventory:
+            - ansible_host: {% if ansible_host is defined %}✓{% else %}✗ missing{% endif %}
+          
+          REQUIRED ACTION:
+          - Add missing variables to your inventory file at inventory/inventory.yaml
+          - Or define them in inventory/group_vars/all.yml
+          
+          REFERENCE: See docs/architecture/VARIABLE_HANDLING.md
+          
+    - name: Ensure .ssh directory exists
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir }}/.ssh"
+        state: directory
+        mode: '0700'
+
+    - name: Verify SSH key exists
+      ansible.builtin.stat:
+        path: "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}"
+      register: ssh_key_check
+      
+    - name: Fail if SSH key does not exist
+      ansible.builtin.fail:
+        msg: |
+          ERROR: SSH Key Not Found
+          
+          DETAILS:
+          - SSH key {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }} not found on {{ inventory_hostname }}
+          - This key is required for passwordless authentication
+          
+          REQUIRED ACTION:
+          - Run the SSH key setup playbook first:
+            ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/10_setup_ssh_keys.yaml --ask-pass
+          
+          REFERENCE: See docs/architecture/00_initial_setup/README.md
+      when: not ssh_key_check.stat.exists
+
+    - name: Verify SSH config file exists
+      ansible.builtin.stat:
+        path: "{{ ansible_user_dir }}/.ssh/config"
+      register: ssh_config_check
+      
+    - name: Check for Thinkube baremetal section in SSH config
+      ansible.builtin.shell: |
+        grep -q "BEGIN-THINKUBE-BAREMETAL" "{{ ansible_user_dir }}/.ssh/config" && echo "found" || echo "not found"
+      register: baremetal_section_check
+      changed_when: false
+      when: ssh_config_check.stat.exists
+      
+    - name: Fail if SSH config does not exist
+      ansible.builtin.fail:
+        msg: |
+          ERROR: SSH Config Not Found
+          
+          DETAILS:
+          - SSH config file {{ ansible_user_dir }}/.ssh/config not found on {{ inventory_hostname }}
+          - This file is required for hostname resolution and connection parameters
+          
+          REQUIRED ACTION:
+          - Run the SSH key setup playbook first:
+            ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/10_setup_ssh_keys.yaml --ask-pass
+          
+          REFERENCE: See docs/architecture/00_initial_setup/README.md
+      when: not ssh_config_check.stat.exists
+      
+    - name: Fail if SSH config doesn't have Thinkube baremetal section
+      ansible.builtin.fail:
+        msg: |
+          ERROR: Thinkube Baremetal Section Not Found
+          
+          DETAILS:
+          - Thinkube baremetal section is missing in SSH config on {{ inventory_hostname }}
+          - This section is required for proper connections to baremetal hosts
+          
+          REQUIRED ACTION:
+          - Run the SSH key setup playbook first:
+            ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/10_setup_ssh_keys.yaml
+          
+          REFERENCE: See docs/architecture/00_initial_setup/README.md
+      when: ssh_config_check.stat.exists and baremetal_section_check.stdout == "not found"
+
+    - name: Test SSH connection to all other hosts
+      ansible.builtin.shell: |
+        if [ "{{ item }}" != "{{ inventory_hostname }}" ]; then
+          echo "Testing SSH connection to {{ item }}..."
+          ssh -i {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }} -o ConnectTimeout=5 -o StrictHostKeyChecking=no {{ item }} "echo 'SSH connection from {{ inventory_hostname }} to {{ item }} successful'" 
+          exit $?
+        else
+          echo "Skipping test to self ({{ inventory_hostname }})"
+          exit 0
+        fi
+      register: ssh_test
+      changed_when: false
+      failed_when: "ssh_test.rc != 0"
+      loop: "{{ groups['baremetal'] }}"
+    
+    - name: Test SSH IP address connection to all other hosts
+      ansible.builtin.shell: |
+        if [ "{{ item }}" != "{{ inventory_hostname }}" ]; then
+          echo "Testing SSH connection to {{ hostvars[item]['ansible_host'] }}..."
+          ssh -i {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }} -o ConnectTimeout=5 -o StrictHostKeyChecking=no {{ hostvars[item]['ansible_host'] }} "echo 'SSH connection from {{ inventory_hostname }} to {{ item }} ({{ hostvars[item]['ansible_host'] }}) successful'"
+          exit $?
+        else
+          echo "Skipping test to self ({{ inventory_hostname }})"
+          exit 0
+        fi
+      register: ssh_ip_test
+      changed_when: false
+      failed_when: "ssh_ip_test.rc != 0"
+      loop: "{{ groups['baremetal'] }}"
+
+    - name: Display successful test message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          ✓ SSH Connectivity Test Passed ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          All SSH connectivity tests have passed successfully.
+          
+          DETAILS:
+            ✓ SSH key found: {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}
+            ✓ SSH config found: {{ ansible_user_dir }}/.ssh/config
+            ✓ Thinkube baremetal section found in SSH config
+            ✓ All host connections successful (by hostname)
+            ✓ All IP connections successful (by IP address)
+          
+          RESULT:
+            The SSH configuration is correct and working properly.
+            Passwordless SSH is enabled between all servers.
+          
+          ═════════════════════════════════════════════════════════

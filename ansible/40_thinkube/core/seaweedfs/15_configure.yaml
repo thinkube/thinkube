@@ -1,0 +1,175 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/seaweedfs/15_configure.yaml
+# Description:
+#   Configure SeaweedFS S3 access and create initial buckets
+#   Sets up S3 credentials and creates buckets for Argo, Harbor, etc.
+#
+# Requirements:
+#   - SeaweedFS must be deployed (10_deploy.yaml)
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/seaweedfs/15_configure.yaml
+#
+# Variables from inventory:
+#   - seaweedfs_namespace: SeaweedFS namespace
+#   - s3_access_key: S3 access key to configure
+#   - s3_secret_key: S3 secret key to configure
+
+- name: Configure SeaweedFS S3 access and buckets
+  hosts: microk8s_control_plane
+  become: false
+  gather_facts: true
+  
+  vars:
+    # S3 credentials - will be fetched from secret
+    # Buckets to create
+    s3_buckets:
+      - name: argo-artifacts
+        description: "Argo Workflows artifacts"
+      - name: harbor-storage
+        description: "Harbor registry storage"
+      - name: backup
+        description: "System backups"
+      - name: data
+        description: "General data storage"
+    
+    # S3 endpoint
+    s3_endpoint: "https://{{ seaweedfs_s3_hostname }}"
+    s3_endpoint_internal: "http://seaweedfs-filer.{{ seaweedfs_namespace }}.svc.cluster.local:8333"
+
+  tasks:
+    - name: Check if SeaweedFS filer is ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        name: seaweedfs-filer
+        namespace: "{{ seaweedfs_namespace }}"
+      register: filer_status
+      failed_when: 
+        - filer_status.resources | length == 0 or filer_status.resources[0].status.readyReplicas != filer_status.resources[0].spec.replicas
+
+    - name: Get filer pod name
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ seaweedfs_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=seaweedfs
+          - app.kubernetes.io/component=filer
+      register: filer_pods
+
+    - name: Get S3 credentials from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: seaweedfs-s3-config
+        namespace: "{{ seaweedfs_namespace }}"
+      register: s3_config_secret
+      failed_when: s3_config_secret.resources | length == 0
+      
+    - name: Set S3 credentials from secret
+      ansible.builtin.set_fact:
+        s3_access_key: "{{ s3_config_secret.resources[0].data.access_key | b64decode }}"
+        s3_secret_key: "{{ s3_config_secret.resources[0].data.secret_key | b64decode }}"
+
+    - name: Check if S3 config is already mounted
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ seaweedfs_namespace }} {{ filer_pods.resources[0].metadata.name }} -- test -f /etc/seaweedfs/s3-config.json && echo "exists" || echo "missing"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: s3_config_check
+
+    - name: Configure S3 auth using s3.configure (fallback if config mount failed)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ seaweedfs_namespace }} {{ filer_pods.resources[0].metadata.name }} -- sh -c 'echo "s3.configure -access_key={{ s3_access_key }} -secret_key={{ s3_secret_key }} -user=admin -actions=Admin,Read,Write,List,Tagging -apply" | weed shell -master=seaweedfs-master:9333'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: s3_config_result
+      when: s3_config_check.stdout == "missing"
+
+    - name: Create S3 configuration secret for other services
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: seaweedfs-s3-credentials
+            namespace: "{{ seaweedfs_namespace }}"
+          type: Opaque
+          stringData:
+            access_key: "{{ s3_access_key }}"
+            secret_key: "{{ s3_secret_key }}"
+            endpoint: "{{ s3_endpoint }}"
+            endpoint_internal: "{{ s3_endpoint_internal }}"
+
+    - name: Install s3cmd for bucket operations
+      ansible.builtin.package:
+        name: s3cmd
+        state: present
+      become: true
+      delegate_to: localhost
+
+    - name: Create s3cmd config file
+      ansible.builtin.template:
+        src: s3cmd.cfg.j2
+        dest: "/tmp/s3cmd-{{ seaweedfs_namespace }}.cfg"
+        mode: '0600'
+      delegate_to: localhost
+
+    - name: Wait for S3 API to be ready
+      ansible.builtin.uri:
+        url: "{{ s3_endpoint }}"
+        validate_certs: false
+        status_code: [200, 403]
+      retries: 30
+      delay: 5
+      delegate_to: localhost
+
+    - name: Create S3 buckets
+      ansible.builtin.shell: |
+        s3cmd -c /tmp/s3cmd-{{ seaweedfs_namespace }}.cfg mb s3://{{ item.name }} || true
+      loop: "{{ s3_buckets }}"
+      delegate_to: localhost
+      register: bucket_creation
+
+    - name: List created buckets
+      ansible.builtin.shell: |
+        s3cmd -c /tmp/s3cmd-{{ seaweedfs_namespace }}.cfg ls
+      delegate_to: localhost
+      register: bucket_list
+
+    - name: Clean up s3cmd config
+      ansible.builtin.file:
+        path: "/tmp/s3cmd-{{ seaweedfs_namespace }}.cfg"
+        state: absent
+      delegate_to: localhost
+
+    - name: Display configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "SeaweedFS S3 configuration complete"
+          - "-----------------------------------"
+          - "S3 Access Key: {{ s3_access_key }}"
+          - "S3 Endpoint (external): {{ s3_endpoint }}"
+          - "S3 Endpoint (internal): {{ s3_endpoint_internal }}"
+          - "-----------------------------------"
+          - "Created buckets:"
+          - "{{ bucket_list.stdout_lines }}"
+          - "-----------------------------------"
+          - "S3 credentials stored in:"
+          - "  - Secret: {{ seaweedfs_namespace }}/seaweedfs-s3-credentials"
+          - "  - Argo secret: argo/argo-artifacts-s3"
+          - "-----------------------------------"
+          - "To use with s3cmd:"
+          - "  s3cmd --access_key={{ s3_access_key }} --secret_key=<secret> --host={{ seaweedfs_s3_hostname }} --host-bucket=%(bucket)s.{{ seaweedfs_s3_hostname }} ls"
+

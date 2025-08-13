@@ -1,0 +1,375 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/opensearch/16_deploy_fluent_bit.yaml
+# Description:
+#   Deploy Fluent Bit as a DaemonSet to continuously collect and ship logs to OpenSearch
+#   This provides real-time log ingestion from all containers in the cluster
+#
+# Requirements:
+#   - OpenSearch deployed via 10_deploy.yaml
+#   - ADMIN_PASSWORD environment variable set
+#   - MicroK8s cluster with kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   export ADMIN_PASSWORD='your-secure-password'
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/opensearch/16_deploy_fluent_bit.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy Fluent Bit for continuous log shipping to OpenSearch
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    namespace: opensearch
+    fluent_bit_namespace: opensearch
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    opensearch_host: "opensearch-cluster-master.{{ namespace }}.svc.cluster.local"
+    opensearch_port: "9200"
+    
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  pre_tasks:
+    - name: Verify required passwords are set
+      ansible.builtin.fail:
+        msg: "{{ item }} environment variable must be set"
+      when: lookup('env', item) == ''
+      loop:
+        - ADMIN_PASSWORD
+
+  tasks:
+    ###################################################################
+    # 1. Create Fluent Bit configuration
+    ###################################################################
+    - name: Create Fluent Bit ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: fluent-bit-config
+            namespace: "{{ fluent_bit_namespace }}"
+            labels:
+              k8s-app: fluent-bit
+          data:
+            fluent-bit.conf: |
+              [SERVICE]
+                  Daemon Off
+                  Flush 5
+                  Log_Level info
+                  Parsers_File custom_parsers.conf
+                  HTTP_Server On
+                  HTTP_Listen 0.0.0.0
+                  HTTP_Port 2020
+                  Health_Check On
+
+              [INPUT]
+                  Name tail
+                  Path /var/log/containers/*.log
+                  multiline.parser docker, cri
+                  Tag kube.*
+                  Mem_Buf_Limit 5MB
+                  Skip_Long_Lines On
+                  Refresh_Interval 10
+
+              [FILTER]
+                  Name kubernetes
+                  Match kube.*
+                  Kube_URL https://kubernetes.default.svc:443
+                  Kube_CA_File /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                  Kube_Token_File /var/run/secrets/kubernetes.io/serviceaccount/token
+                  Kube_Tag_Prefix kube.var.log.containers.
+                  Merge_Log On
+                  K8S-Logging.Parser On
+                  K8S-Logging.Exclude Off
+                  Annotations Off
+
+              [FILTER]
+                  Name nest
+                  Match kube.*
+                  Operation lift
+                  Nested_under kubernetes
+                  Add_prefix k8s_
+
+              [OUTPUT]
+                  Name opensearch
+                  Match kube.*
+                  Host {{ opensearch_host }}
+                  Port {{ opensearch_port }}
+                  HTTP_User admin
+                  HTTP_Passwd {{ admin_password }}
+                  TLS On
+                  TLS.Verify Off
+                  Suppress_Type_Name On
+                  Logstash_Format On
+                  Logstash_Prefix fluent-bit-kube
+                  Logstash_DateFormat %Y.%m.%d
+                  Time_Key @timestamp
+                  Retry_Limit 5
+                  Buffer_Size 5M
+
+            custom_parsers.conf: |
+              [PARSER]
+                  Name docker_no_time
+                  Format json
+                  Time_Keep Off
+                  Time_Key time
+                  Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+
+              [PARSER]
+                  Name syslog
+                  Format regex
+                  Regex ^\<(?<pri>[0-9]+)\>(?<time>[^ ]* {1,2}[^ ]* [^ ]*) (?<host>[^ ]*) (?<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?<message>.*)$
+                  Time_Key time
+                  Time_Format %b %d %H:%M:%S
+
+    ###################################################################
+    # 2. Create ServiceAccount and RBAC
+    ###################################################################
+    - name: Create Fluent Bit ServiceAccount
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: fluent-bit
+            namespace: "{{ fluent_bit_namespace }}"
+            labels:
+              k8s-app: fluent-bit
+
+    - name: Create Fluent Bit ClusterRole
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: fluent-bit-read
+            labels:
+              k8s-app: fluent-bit
+          rules:
+          - apiGroups: [""]
+            resources:
+            - namespaces
+            - pods
+            - nodes
+            verbs: ["get", "list", "watch"]
+
+    - name: Create Fluent Bit ClusterRoleBinding
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: fluent-bit-read
+            labels:
+              k8s-app: fluent-bit
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: fluent-bit-read
+          subjects:
+          - kind: ServiceAccount
+            name: fluent-bit
+            namespace: "{{ fluent_bit_namespace }}"
+
+    ###################################################################
+    # 3. Deploy Fluent Bit DaemonSet
+    ###################################################################
+    - name: Deploy Fluent Bit DaemonSet
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: fluent-bit
+            namespace: "{{ fluent_bit_namespace }}"
+            labels:
+              k8s-app: fluent-bit
+              kubernetes.io/cluster-service: "true"
+          spec:
+            selector:
+              matchLabels:
+                k8s-app: fluent-bit
+            template:
+              metadata:
+                labels:
+                  k8s-app: fluent-bit
+                  kubernetes.io/cluster-service: "true"
+              spec:
+                serviceAccountName: fluent-bit
+                tolerations:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                  effect: NoSchedule
+                - key: node-role.kubernetes.io/master
+                  operator: Exists
+                  effect: NoSchedule
+                containers:
+                - name: fluent-bit
+                  image: fluent/fluent-bit:2.2.0
+                  imagePullPolicy: IfNotPresent
+                  ports:
+                    - containerPort: 2020
+                  resources:
+                    limits:
+                      memory: 200Mi
+                    requests:
+                      cpu: 100m
+                      memory: 200Mi
+                  volumeMounts:
+                  - name: varlog
+                    mountPath: /var/log
+                  - name: varlibdockercontainers
+                    mountPath: /var/lib/docker/containers
+                    readOnly: true
+                  - name: fluent-bit-config
+                    mountPath: /fluent-bit/etc/
+                  - name: systemd-journal
+                    mountPath: /run/log/journal
+                    readOnly: true
+                volumes:
+                - name: varlog
+                  hostPath:
+                    path: /var/log
+                - name: varlibdockercontainers
+                  hostPath:
+                    path: /var/lib/docker/containers
+                - name: fluent-bit-config
+                  configMap:
+                    name: fluent-bit-config
+                - name: systemd-journal
+                  hostPath:
+                    path: /run/log/journal
+
+    ###################################################################
+    # 4. Wait for Fluent Bit to be ready
+    ###################################################################
+    - name: Wait for Fluent Bit pods to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ fluent_bit_namespace }}"
+        label_selectors:
+          - "k8s-app=fluent-bit"
+      register: fluent_bit_pods
+      until: fluent_bit_pods.resources | length > 0 and fluent_bit_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length == fluent_bit_pods.resources | length
+      retries: 30
+      delay: 10
+
+    ###################################################################
+    # 5. Create index template for Fluent Bit logs
+    ###################################################################
+    - name: Get OpenSearch pod
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=opensearch"
+      register: opensearch_pods
+      failed_when: opensearch_pods.resources | length == 0
+
+    - name: Create index template for Fluent Bit logs
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch -- \
+        curl -ks -u admin:'{{ admin_password }}' -X PUT https://localhost:9200/_index_template/fluent-bit-kube \
+        -H 'Content-Type: application/json' \
+        -d '{
+          "index_patterns": ["fluent-bit-kube-*"],
+          "template": {
+            "settings": {
+              "number_of_shards": 1,
+              "number_of_replicas": 0,
+              "index.refresh_interval": "5s"
+            },
+            "mappings": {
+              "properties": {
+                "@timestamp": { "type": "date" },
+                "service": { "type": "keyword" },
+                "namespace": { "type": "keyword" },
+                "pod": { "type": "keyword" },
+                "container": { "type": "keyword" },
+                "host": { "type": "keyword" },
+                "log": { "type": "text" },
+                "stream": { "type": "keyword" },
+                "labels": { "type": "object" }
+              }
+            }
+          }
+        }'
+      become: true
+
+    ###################################################################
+    # 6. Verify Fluent Bit is shipping logs
+    ###################################################################
+    - name: Wait for initial logs to be shipped
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: Check if Fluent Bit indices are created
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch -- \
+        curl -ks -u admin:'{{ admin_password }}' https://localhost:9200/_cat/indices/fluent-bit-kube-*?v
+      register: fluent_indices
+      become: true
+      ignore_errors: true
+
+    - name: Get document count from Fluent Bit
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch -- \
+        curl -ks -u admin:'{{ admin_password }}' https://localhost:9200/fluent-bit-kube-*/_count
+      register: fluent_count
+      become: true
+      ignore_errors: true
+
+    ###################################################################
+    # 7. Display deployment information
+    ###################################################################
+    - name: Parse document count
+      ansible.builtin.set_fact:
+        doc_count: "{{ ((fluent_count.stdout | default('{}') | from_json).count) | default(0) }}"
+      ignore_errors: true
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "===== Fluent Bit Deployment Complete ====="
+          - ""
+          - "Fluent Bit is now continuously shipping logs to OpenSearch"
+          - ""
+          - "Fluent Bit Status:"
+          - "  Pods running: {{ fluent_bit_pods.resources | length }}"
+          - ""
+          - "Index information:"
+          - "{{ fluent_indices.stdout | default('No indices created yet') }}"
+          - ""
+          - "Document count: {{ doc_count | default('Unable to parse count') }}"
+          - ""
+          - "To view logs in OpenSearch Dashboards:"
+          - "1. Go to https://osd.{{ domain_name }}"
+          - "2. Create new index pattern: fluent-bit-kube-*"
+          - "3. Select @timestamp as time field"
+          - "4. Go to Discover to see real-time logs"
+          - ""
+          - "The logs are now being collected continuously from all containers!"
+          - "=========================================="

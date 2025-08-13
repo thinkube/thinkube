@@ -1,0 +1,144 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Test playbook for MicroK8s control node installation
+# Description:
+#   Verifies MicroK8s installation and configuration on control node
+#   Tests include:
+#   - MicroK8s service status
+#   - kubectl accessibility
+#   - Node readiness
+#   - Required addons status
+#   - Alias functionality across shells
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/microk8s/18_test_control.yaml
+
+- name: Test MicroK8s Control Node Installation
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    required_addons:
+      - dns
+      - storage
+      - helm3
+
+    # Alias file paths
+    kubectl_aliases_file: "{{ user_home }}/.thinkube_shared_shell/aliases/kubectl_aliases.json"
+    helm_aliases_file: "{{ user_home }}/.thinkube_shared_shell/aliases/helm_aliases.json"
+
+  tasks:
+    - name: Check if MicroK8s is installed
+      ansible.builtin.command: "snap list microk8s"
+      register: microk8s_snap
+      changed_when: false
+      failed_when: microk8s_snap.rc != 0
+
+    - name: Check MicroK8s status
+      ansible.builtin.command: "microk8s status"
+      register: microk8s_status
+      changed_when: false
+      become: true
+
+    - name: Verify kubectl wrapper exists
+      ansible.builtin.stat:
+        path: "{{ ansible_env.HOME }}/.local/bin/kubectl"
+      register: kubectl_wrapper
+      failed_when: not kubectl_wrapper.stat.exists
+
+    - name: Verify helm wrapper exists
+      ansible.builtin.stat:
+        path: "{{ ansible_env.HOME }}/.local/bin/helm"
+      register: helm_wrapper
+      failed_when: not helm_wrapper.stat.exists
+
+    - name: Check kubectl functionality
+      ansible.builtin.command: "/snap/bin/microk8s.kubectl get nodes"
+      register: kubectl_nodes
+      changed_when: false
+      failed_when: kubectl_nodes.rc != 0
+      become: true  # Added because group membership isn't active yet
+
+    - name: Verify node is Ready
+      ansible.builtin.assert:
+        that:
+          - "'Ready' in kubectl_nodes.stdout"
+        fail_msg: "Node is not in Ready state"
+        success_msg: "Node is Ready"
+
+    - name: Check required addons are enabled
+      ansible.builtin.command: "microk8s status --addon {{ item }}"
+      loop: "{{ required_addons }}"
+      register: addon_status
+      changed_when: false
+      become: true
+      failed_when: "'enabled' not in addon_status.stdout"
+
+    - name: Verify user is in microk8s group
+      ansible.builtin.command: "groups {{ user }}"
+      register: user_groups
+      changed_when: false
+      failed_when: "'microk8s' not in user_groups.stdout"
+
+    - name: Check kubectl aliases file exists
+      ansible.builtin.stat:
+        path: "{{ kubectl_aliases_file }}"
+      register: kubectl_aliases_stat
+      failed_when: not kubectl_aliases_stat.stat.exists
+
+    - name: Check helm aliases file exists
+      ansible.builtin.stat:
+        path: "{{ helm_aliases_file }}"
+      register: helm_aliases_stat
+      failed_when: not helm_aliases_stat.stat.exists
+
+    - name: Test kubectl alias in bash
+      ansible.builtin.shell: |
+        # Test k8s aliases directly
+        if [ -f ~/.thinkube_shared_shell/aliases/k8s_aliases.sh ]; then
+          source ~/.thinkube_shared_shell/aliases/k8s_aliases.sh
+          alias k && echo "Alias k exists" || echo "Alias k not found"
+        else
+          echo "K8s aliases file not found"
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      register: bash_alias_test
+      changed_when: false
+      failed_when: "'Alias k not found' in bash_alias_test.stdout or bash_alias_test.rc != 0"
+
+    - name: Test kubectl alias in zsh (if available)
+      ansible.builtin.shell: |
+        source ~/.zshrc
+        type k >/dev/null 2>&1
+      args:
+        executable: /usr/bin/zsh
+      register: zsh_alias_test
+      changed_when: false
+      failed_when: false  # Don't fail if zsh is not installed
+      when: ansible_facts.packages is defined and 'zsh' in ansible_facts.packages
+
+    - name: Test kubectl alias in fish (if available)
+      ansible.builtin.shell: |
+        type k >/dev/null 2>&1
+      args:
+        executable: /usr/bin/fish
+      register: fish_alias_test
+      changed_when: false
+      failed_when: false  # Don't fail if fish is not installed
+      when: ansible_facts.packages is defined and 'fish' in ansible_facts.packages
+
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "MicroK8s Status: {{ 'PASS' if microk8s_status.rc == 0 else 'FAIL' }}"
+          - "kubectl Accessible: {{ 'PASS' if kubectl_nodes.rc == 0 else 'FAIL' }}"
+          - "Node Ready: {{ 'PASS' if 'Ready' in kubectl_nodes.stdout else 'FAIL' }}"
+          - "Required Addons Enabled: PASS"
+          - "Alias System Integrated: {{ 'PASS' if kubectl_aliases_stat.stat.exists else 'FAIL' }}"
+          - "Bash Aliases: {{ 'PASS' if bash_alias_test.rc == 0 else 'FAIL' }}"

@@ -1,0 +1,184 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 39_rollback_gpu_reservation.yaml - Completely remove GPU reservations
+#
+# Purpose:
+#   Removes all GPU reservations and VFIO configurations
+#   Reverts changes made by 30_reserve_gpus.yaml
+#
+# Run with: 
+#   ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/39_rollback_gpu_reservation.yaml
+#   Or with helper script:
+#   ./scripts/run_ansible.sh ansible/00_initial_setup/39_rollback_gpu_reservation.yaml
+
+- name: Rollback All GPU Reservations
+  hosts: baremetal
+  gather_facts: true
+  become: true
+  
+  tasks:
+    - name: Display rollback information
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          🔄 Rolling Back ALL GPU Reservations ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          This playbook will completely remove all GPU reservations
+          and VFIO configurations set up by 30_reserve_gpus.yaml.
+          
+          After running this playbook and rebooting, all GPUs will
+          be available for direct use by the host operating system.
+          
+          ═════════════════════════════════════════════════════════
+    
+    # Phase 1: Remove VFIO configuration
+    - name: Remove VFIO configuration file
+      ansible.builtin.file:
+        path: /etc/modprobe.d/vfio.conf
+        state: absent
+      register: vfio_removed
+      
+    # Remove VFIO bind scripts and services
+    - name: Find any VFIO binding scripts
+      ansible.builtin.find:
+        paths: /usr/local/bin
+        patterns: "vfio-bind-*.sh"
+      register: vfio_scripts
+      
+    - name: Remove VFIO binding scripts
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ vfio_scripts.files }}"
+      when: vfio_scripts.matched > 0
+      
+    - name: Find any VFIO binding services
+      ansible.builtin.find:
+        paths: /etc/systemd/system
+        patterns: "vfio-bind-*.service"
+      register: vfio_services
+      
+    - name: Disable and remove VFIO binding services
+      ansible.builtin.systemd:
+        name: "{{ item.path | basename }}"
+        enabled: no
+        state: stopped
+      loop: "{{ vfio_services.files }}"
+      when: vfio_services.matched > 0
+      
+    - name: Remove VFIO binding service files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ vfio_services.files }}"
+      when: vfio_services.matched > 0
+    
+    # Phase 2: Remove GPU driver blacklists
+    - name: Remove NVIDIA driver blacklist files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/modprobe.d/blacklist-nvidia.conf
+        - /etc/modprobe.d/blacklist-nouveau.conf
+        - /etc/modprobe.d/nvidia-vfio.conf
+      register: nvidia_blacklist_removed
+    
+    - name: Remove AMD driver blacklist
+      ansible.builtin.file:
+        path: /etc/modprobe.d/blacklist-amdgpu.conf
+        state: absent
+      register: amd_blacklist_removed
+    
+    - name: Remove any VFIO override configuration
+      ansible.builtin.file:
+        path: /etc/modprobe.d/vfio-pci-override.conf
+        state: absent
+      register: vfio_override_removed
+    
+    # Phase 3: Remove IOMMU parameters from GRUB
+    - name: Remove IOMMU parameters from GRUB
+      ansible.builtin.replace:
+        path: /etc/default/grub
+        regexp: '(GRUB_CMDLINE_LINUX_DEFAULT=")(.*)( (amd|intel)_iommu=on iommu=pt)(.*)(")'
+        replace: '\1\2\5\6'
+        backup: yes
+      register: grub_updated
+    
+    # Phase 4: Remove VFIO modules from initramfs
+    - name: Remove VFIO modules from initramfs
+      ansible.builtin.lineinfile:
+        path: /etc/initramfs-tools/modules
+        line: "{{ item }}"
+        state: absent
+      loop:
+        - "vfio"
+        - "vfio_iommu_type1"
+        - "vfio_pci"
+        - "vfio_virqfd"
+      register: initramfs_updated
+    
+    # Phase 5: Remove X.org configuration if it exists
+    - name: Check if X.org configuration exists
+      ansible.builtin.stat:
+        path: /etc/X11/xorg.conf
+      register: xorg_conf
+    
+    - name: Remove X.org configuration
+      ansible.builtin.file:
+        path: /etc/X11/xorg.conf
+        state: absent
+      when: xorg_conf.stat.exists
+      register: xorg_removed
+    
+    # Phase 6: Update system if any changes were made
+    - name: Update initramfs
+      ansible.builtin.command: update-initramfs -u
+      when: >
+        vfio_removed.changed or 
+        nvidia_blacklist_removed.changed or 
+        amd_blacklist_removed.changed or 
+        vfio_override_removed.changed or 
+        initramfs_updated.changed
+    
+    - name: Update GRUB
+      ansible.builtin.command: update-grub
+      when: grub_updated.changed
+    
+    # Phase 7: Display completion message
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          ✅ GPU Reservation Rollback Complete ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          All GPU reservations have been successfully removed:
+          {% if vfio_removed.changed %}
+          - VFIO configuration removed
+          {% endif %}
+          {% if nvidia_blacklist_removed.changed or amd_blacklist_removed.changed %}
+          - GPU driver blacklists removed
+          {% endif %}
+          {% if grub_updated.changed %}
+          - IOMMU parameters removed from GRUB
+          {% endif %}
+          {% if initramfs_updated.changed %}
+          - VFIO modules removed from initramfs
+          {% endif %}
+          {% if xorg_removed.changed %}
+          - X.org configuration removed
+          {% endif %}
+          
+          ⚠️ IMPORTANT: A system reboot is required for changes to take effect.
+          
+          NEXT STEPS:
+          1. Reboot the system: sudo reboot
+          2. After reboot, run 30_reserve_gpus.yaml again if needed with your desired configuration
+          
+          ═════════════════════════════════════════════════════════

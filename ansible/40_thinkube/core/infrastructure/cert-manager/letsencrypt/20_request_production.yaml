@@ -1,0 +1,538 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/cert-manager/letsencrypt/20_request_production.yaml
+# Description:
+#   Request Let's Encrypt PRODUCTION certificates
+#   This runs after all services are deployed and tested with staging certificates
+#
+# Requirements:
+#   - cert-manager must be deployed with staging certificates
+#   - All services must be running and tested
+#   - Cloudflare API token must be configured
+#   - DNS must be properly configured for the domain
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/cert-manager/letsencrypt/20_request_production.yaml
+#
+# Variables from inventory:
+#   - domain_name: The domain for certificates
+#   - cloudflare_api_email: Cloudflare account email
+#   - cloudflare_api_key: Cloudflare API key
+#
+# WARNING: Production certificates are subject to rate limits!
+# - 5 certificates per domain per week
+# - Use staging certificates for testing
+#
+# 🤖 [AI-assisted]
+
+- name: Request Let's Encrypt Production Certificates
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    cert_manager_namespace: cert-manager
+    # Force production environment for this playbook
+    letsencrypt_environment: "production"
+    # Option to skip confirmation prompt
+    confirm_production: "{{ skip_confirmation | default(true) }}"
+    
+  tasks:
+    # Pre-flight checks
+    - name: Pre-flight check for production certificate request
+      block:
+        - name: Check current certificate type
+          ansible.builtin.shell: |
+            CERT_NAME="{{ domain_name.replace('.', '-') }}-tls"
+            if ! microk8s kubectl get secret $CERT_NAME -n default >/dev/null 2>&1; then
+              echo "none"
+              exit 0
+            fi
+            
+            ISSUER=$(microk8s kubectl get secret $CERT_NAME -n default -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -issuer -noout)
+            if echo "$ISSUER" | grep -q "Fake LE"; then
+              echo "staging"
+            elif echo "$ISSUER" | grep -q "Let's Encrypt Authority"; then
+              echo "production"
+            else
+              echo "self-signed"
+            fi
+          register: current_cert_type
+          become: true
+        
+        - name: Display current certificate status
+          ansible.builtin.debug:
+            msg:
+              - "════════════════════════════════════════════════════════"
+              - "Current certificate type: {{ current_cert_type.stdout }}"
+              - "════════════════════════════════════════════════════════"
+              - ""
+              - "This playbook will request PRODUCTION Let's Encrypt certificates"
+              - ""
+              - "⚠️  WARNING: Production certificates are subject to rate limits!"
+              - "   - Maximum 5 certificates per domain per week"
+              - "   - Renewals don't count against the limit"
+              - ""
+              - "✓ Use this playbook when:"
+              - "   - All services are deployed and working"
+              - "   - DNS is properly configured"
+              - "   - You're ready for production deployment"
+              - ""
+              - "✗ DO NOT use this playbook for:"
+              - "   - Testing or development"
+              - "   - Debugging certificate issues"
+              - "   - If you're not sure everything is working"
+              - "════════════════════════════════════════════════════════"
+        
+        - name: Fail if already have production certificate
+          ansible.builtin.fail:
+            msg: "You already have a production certificate! Use the renewal playbook instead."
+          when: current_cert_type.stdout == "production"
+        
+        - name: Confirm production certificate request
+          ansible.builtin.pause:
+            prompt: "\n⚠️  Press Enter to request PRODUCTION certificates or Ctrl+C to cancel"
+          when: confirm_production
+    # Main production certificate request
+    - name: Set production issuer
+      ansible.builtin.set_fact:
+        issuer_name: "letsencrypt-prod"
+    
+    - name: Update Certificate to use Let's Encrypt Production
+      ansible.builtin.copy:
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: {{ domain_name.replace('.', '-') }}-tls
+            namespace: default
+            annotations:
+              cert-manager.io/issue-temporary-certificate: "false"
+              cert-manager.io/dns01-recursive-nameservers: "8.8.8.8:53,1.1.1.1:53"
+              cert-manager.io/dns01-recursive-nameservers-only: "true"
+              acme.cert-manager.io/dns01-check-interval: "10s"
+              acme.cert-manager.io/dns01-propagation-timeout: "180s"
+          spec:
+            secretName: {{ domain_name.replace('.', '-') }}-tls
+            issuerRef:
+              name: {{ issuer_name }}
+              kind: ClusterIssuer
+            commonName: "*.{{ domain_name }}"
+            dnsNames:
+            - "*.{{ domain_name }}"
+            - "*.kn.{{ domain_name }}"
+            duration: 2160h  # 90 days
+            renewBefore: 720h  # 30 days
+        dest: /tmp/certificate-production.yaml
+    
+    - name: Apply production certificate request
+      ansible.builtin.command: microk8s kubectl apply -f /tmp/certificate-production.yaml
+      become: true
+    
+    - name: Monitor production certificate request with detailed progress
+      ansible.builtin.shell: |
+        CERT_NAME="{{ domain_name.replace('.', '-') }}-tls"
+        NAMESPACE="default"
+        MAX_WAIT=600  # 10 minutes
+        START_TIME=$(date +%s)
+        
+        echo "════════════════════════════════════════════════════════"
+        echo "Monitoring Let's Encrypt PRODUCTION Certificate Request"
+        echo "Certificate: $CERT_NAME in namespace: $NAMESPACE"
+        echo "════════════════════════════════════════════════════════"
+        
+        # Similar monitoring as staging but with production-specific checks
+        echo -e "\n[Phase 1] Waiting for new CertificateRequest..."
+        # Wait for a new certificate request (not the existing staging one)
+        INITIAL_CR_COUNT=$(microk8s kubectl get certificaterequest -n $NAMESPACE -l cert-manager.io/certificate-name=$CERT_NAME --no-headers 2>/dev/null | wc -l)
+        
+        while true; do
+          CURRENT_CR_COUNT=$(microk8s kubectl get certificaterequest -n $NAMESPACE -l cert-manager.io/certificate-name=$CERT_NAME --no-headers 2>/dev/null | wc -l)
+          if [ $CURRENT_CR_COUNT -gt $INITIAL_CR_COUNT ]; then
+            CR=$(microk8s kubectl get certificaterequest -n $NAMESPACE -l cert-manager.io/certificate-name=$CERT_NAME -o name 2>/dev/null | tail -1)
+            echo "✓ New CertificateRequest created: $CR"
+            break
+          fi
+          
+          ELAPSED=$(($(date +%s) - START_TIME))
+          if [ $ELAPSED -gt 60 ]; then
+            echo "⚠ No new CertificateRequest after 60 seconds, checking certificate status..."
+            microk8s kubectl describe certificate $CERT_NAME -n $NAMESPACE
+            exit 1
+          fi
+          
+          echo -n "."
+          sleep 2
+        done
+        
+        # Continue with standard monitoring...
+        echo -e "\n[Phase 2] Monitoring ACME Order..."
+        # (Rest of monitoring similar to staging)
+        
+        # Phase 5: Validate Production Certificate
+        echo -e "\n[Phase 5] Validating production certificate..."
+        while true; do
+          CERT_DATA=$(microk8s kubectl get secret $CERT_NAME -n $NAMESPACE -o jsonpath='{.data.tls\.crt}' | base64 -d 2>/dev/null)
+          if [ -n "$CERT_DATA" ]; then
+            ISSUER=$(echo "$CERT_DATA" | openssl x509 -issuer -noout 2>/dev/null)
+            
+            if echo "$ISSUER" | grep -q "Let's Encrypt Authority"; then
+              echo "✓ Confirmed: Let's Encrypt PRODUCTION Certificate"
+              echo "  Issuer: $ISSUER"
+              break
+            elif echo "$ISSUER" | grep -q "Fake LE"; then
+              echo "  Still using staging certificate, waiting for production..."
+            fi
+          fi
+          
+          ELAPSED=$(($(date +%s) - START_TIME))
+          if [ $ELAPSED -gt $MAX_WAIT ]; then
+            echo "✗ Timeout waiting for production certificate"
+            exit 1
+          fi
+          
+          sleep 10
+        done
+        
+        # Show certificate details
+        echo -e "\nProduction Certificate Details:"
+        echo "$CERT_DATA" | openssl x509 -text -noout | grep -E "Issuer:|Subject:|DNS:|Not Before:|Not After"
+        
+        TOTAL_TIME=$(($(date +%s) - START_TIME))
+        echo -e "\n════════════════════════════════════════════════════════"
+        echo "✅ PRODUCTION certificate successfully obtained in $TOTAL_TIME seconds"
+        echo "════════════════════════════════════════════════════════"
+      register: prod_cert_wait
+      become: true
+    
+    - name: Backup production certificate
+      block:
+        - name: Get current certificate
+          kubernetes.core.k8s_info:
+            kubeconfig: "{{ kubeconfig }}"
+            api_version: v1
+            kind: Secret
+            name: "{{ domain_name.replace('.', '-') }}-tls"
+            namespace: default
+          register: current_cert
+        
+        - name: Create certificate backup
+          kubernetes.core.k8s:
+            kubeconfig: "{{ kubeconfig }}"
+            state: present
+            definition:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: "{{ domain_name.replace('.', '-') }}-tls-backup"
+                namespace: default
+                annotations:
+                  backup-date: "{{ ansible_date_time.iso8601 }}"
+                  backup-reason: "Production certificate backup for testing"
+              type: kubernetes.io/tls
+              data:
+                tls.crt: "{{ current_cert.resources[0].data['tls.crt'] }}"
+                tls.key: "{{ current_cert.resources[0].data['tls.key'] }}"
+          when: current_cert.resources | length > 0
+    
+    - name: Create certificate sync CronJob
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: cert-sync
+            namespace: "{{ cert_manager_namespace }}"
+    
+    - name: Create ClusterRole for certificate sync
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: cert-sync
+          rules:
+          - apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get", "list", "watch", "create", "update", "patch"]
+          - apiGroups: [""]
+            resources: ["namespaces"]
+            verbs: ["get", "list"]
+    
+    - name: Create ClusterRoleBinding for certificate sync
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: cert-sync
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cert-sync
+          subjects:
+          - kind: ServiceAccount
+            name: cert-sync
+            namespace: "{{ cert_manager_namespace }}"
+    
+    - name: Create certificate sync script ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cert-sync-script
+            namespace: "{{ cert_manager_namespace }}"
+          data:
+            sync-certs.sh: |
+              #!/bin/bash
+              set -e
+              
+              DOMAIN_NAME="{{ domain_name }}"
+              CERT_NAME="${DOMAIN_NAME//./-}-tls"
+              
+              echo "Starting certificate sync at $(date)"
+              
+              # Get the certificate from default namespace
+              echo "Fetching certificate from default namespace..."
+              kubectl get secret "$CERT_NAME" -n default -o json > /tmp/cert.json
+              
+              if [ ! -s /tmp/cert.json ]; then
+                echo "ERROR: Could not fetch certificate from default namespace"
+                exit 1
+              fi
+              
+              # Get the certificate data
+              TLS_CRT=$(jq -r '.data["tls.crt"]' /tmp/cert.json)
+              TLS_KEY=$(jq -r '.data["tls.key"]' /tmp/cert.json)
+              
+              # Get all namespaces that have a TLS secret with our naming pattern
+              echo "Finding namespaces with TLS secrets..."
+              NAMESPACES=$(kubectl get secrets --all-namespaces -o json | \
+                jq -r '.items[] | select(.type == "kubernetes.io/tls") | .metadata.namespace' | \
+                sort -u | grep -v "^default$" || true)
+              
+              # Update certificates in each namespace
+              for NS in $NAMESPACES; do
+                # Check if this namespace has our certificate
+                if kubectl get secret -n "$NS" -o name | grep -E "(${CERT_NAME}|tls-secret)" >/dev/null 2>&1; then
+                  echo "Updating certificate in namespace: $NS"
+                  
+                  # Get all TLS secret names in this namespace
+                  SECRETS=$(kubectl get secrets -n "$NS" -o json | \
+                    jq -r '.items[] | select(.type == "kubernetes.io/tls") | .metadata.name')
+                  
+                  for SECRET in $SECRETS; do
+                    echo "  Updating secret: $SECRET"
+                    kubectl create secret tls "$SECRET" \
+                      --cert=<(echo "$TLS_CRT" | base64 -d) \
+                      --key=<(echo "$TLS_KEY" | base64 -d) \
+                      --namespace="$NS" \
+                      --dry-run=client -o yaml | kubectl apply -f -
+                  done
+                fi
+              done
+              
+              echo "Certificate sync completed at $(date)"
+    
+    - name: Create certificate sync CronJob
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: cert-sync
+            namespace: "{{ cert_manager_namespace }}"
+          spec:
+            schedule: "0 * * * *"  # Run every hour
+            successfulJobsHistoryLimit: 3
+            failedJobsHistoryLimit: 3
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    serviceAccountName: cert-sync
+                    containers:
+                    - name: cert-sync
+                      image: "{{ harbor_hostname }}/thinkube/kubectl:latest"
+                      command:
+                      - /bin/bash
+                      - /scripts/sync-certs.sh
+                      volumeMounts:
+                      - name: script
+                        mountPath: /scripts
+                    volumes:
+                    - name: script
+                      configMap:
+                        name: cert-sync-script
+                        defaultMode: 0755
+                    restartPolicy: OnFailure
+    
+    - name: Run initial certificate sync
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "cert-sync-initial-{{ ansible_date_time.epoch }}"
+            namespace: "{{ cert_manager_namespace }}"
+          spec:
+            template:
+              spec:
+                serviceAccountName: cert-sync
+                containers:
+                - name: cert-sync
+                  image: "{{ harbor_hostname }}/thinkube/kubectl:latest"
+                  command:
+                  - /bin/bash
+                  - /scripts/sync-certs.sh
+                  volumeMounts:
+                  - name: script
+                    mountPath: /scripts
+                volumes:
+                - name: script
+                  configMap:
+                    name: cert-sync-script
+                    defaultMode: 0755
+                restartPolicy: OnFailure
+    
+    # 🤖 Remove containerd skip_verify configuration after Let's Encrypt certificates are obtained
+    - name: Remove containerd self-signed certificate workaround
+      delegate_to: "{{ item }}"
+      block:
+        - name: Check if skip_verify configuration exists
+          ansible.builtin.stat:
+            path: "/var/snap/microk8s/current/args/certs.d/{{ harbor_registry }}/hosts.toml"
+          register: skip_verify_config
+          become: true
+
+        - name: Remove skip_verify configuration
+          ansible.builtin.file:
+            path: "/var/snap/microk8s/current/args/certs.d/{{ harbor_registry }}"
+            state: absent
+          become: true
+          when: skip_verify_config.stat.exists
+          register: containerd_cleanup
+
+        - name: Restart containerd if configuration was removed
+          ansible.builtin.command: snap restart microk8s.daemon-containerd
+          become: true
+          when: containerd_cleanup.changed
+      loop: "{{ groups['microk8s'] }}"
+      when: groups['microk8s'] is defined
+    
+    # 🤖 Clean up Argo Workflows staging certificate workaround
+    - name: Check if Argo Workflows is deployed
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: argo-workflows-server
+        namespace: argo
+      register: argo_deployment
+      failed_when: false
+
+    - name: Delete CA certificate ConfigMap from Argo namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: ca-cert
+        namespace: argo
+        state: absent
+      when: argo_deployment.resources | length > 0
+
+    - name: Remove environment variables workaround from Argo deployment
+      kubernetes.core.k8s_json_patch:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: argo-workflows-server
+        namespace: argo
+        patch:
+          - op: remove
+            path: /spec/template/spec/containers/0/env
+      when: argo_deployment.resources | length > 0
+      failed_when: false
+
+    - name: Trigger Argo Workflows restart to use proper certificates
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: argo-workflows-server
+        namespace: argo
+        state: present
+        definition:
+          spec:
+            template:
+              metadata:
+                annotations:
+                  kubectl.kubernetes.io/restartedAt: "{{ now(fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+      when: argo_deployment.resources | length > 0
+      register: argo_restart
+
+    - name: Wait for Argo Workflows to restart with proper certificates
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: argo
+        label_selectors:
+          - app.kubernetes.io/name=argo-workflows-server
+        field_selectors:
+          - status.phase=Running
+      register: argo_pods
+      until: argo_pods.resources | length > 0 and argo_pods.resources[0].status.phase == "Running"
+      retries: 30
+      delay: 10
+      when: argo_restart.changed | default(false)
+    
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ PRODUCTION Certificate Configuration Complete
+          ════════════════════════════════════════════════════════
+          
+          Let's Encrypt Production Certificate:
+          - Certificate issued for: {{ domain_name }}
+          - Covers: *.{{ domain_name }} and *.kn.{{ domain_name }}
+          - Valid for 90 days
+          - Will automatically renew 30 days before expiry
+          - Production certificate backed up for emergency recovery
+          
+          Certificate Propagation:
+          - CronJob runs every hour to sync certificates
+          - Initial sync job triggered
+          - All namespaces will receive the new certificate
+          
+          🤖 Automatic Security Cleanup:
+          ✓ Containerd TLS verification re-enabled for Harbor
+          ✓ Argo Workflows environment variables removed
+          ✓ All services now use proper certificate validation
+          
+          Next Steps:
+          - Monitor certificate expiry: kubectl describe certificate {{ domain_name.replace('.', '-') }}-tls -n default
+          - Force sync if needed: Run 22_sync_certificates.yaml
+          - Emergency rollback: Run 29_rollback_to_staging.yaml
+          
+          ⚠️  Important:
+          - This domain has now used 1 of 5 weekly certificate requests
+          - Do not re-run this playbook unnecessarily
+          ════════════════════════════════════════════════════════

@@ -1,0 +1,498 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Install and Configure MicroK8s Control Node
+# Description:
+#   Installs MicroK8s on the control node and configures it for Thinkube
+#   - Installs MicroK8s snap package
+#   - Configures node IP
+#   - Enables required addons
+#   - Sets up kubectl/helm wrappers
+#   - Integrates with Thinkube alias system
+#
+# Requirements:
+#   - Ubuntu 22.04+ or compatible OS
+#   - Snapd installed and running
+#   - User account exists
+#   - Thinkube shell environment setup
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/microk8s/10_install_microk8s.yaml
+
+- name: Install and Configure MicroK8s on Control Node
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    node_ip: "{{ lan_ip }}"
+    user: "{{ system_username }}"
+    kube_config_dir: "{{ user_home }}/.kube"
+
+    # MicroK8s addons configuration
+    microk8s_addons:
+      required:
+        - dns
+        - storage
+        - helm3
+      optional:
+        - dashboard
+
+    # Thinkube alias system integration
+    user_home: "/home/{{ user }}"
+    thinkube_alias_dir: "{{ user_home }}/.thinkube_shared_shell/aliases"
+    kubectl_aliases_file: "{{ thinkube_alias_dir }}/kubectl_aliases.json"
+    helm_aliases_file: "{{ thinkube_alias_dir }}/helm_aliases.json"
+
+    # Wrapper script locations
+    local_bin_dir: "{{ user_home }}/.local/bin"
+
+  pre_tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - metallb_ip_start_octet is defined
+          - metallb_ip_end_octet is defined
+          - primary_ingress_ip_octet is defined
+          - secondary_ingress_ip_octet is defined
+          - dns_external_ip_octet is defined
+          - zerotier_subnet_prefix is defined
+        fail_msg: "Required inventory variables for MetalLB configuration are not defined"
+
+  tasks:
+    - name: Ensure snapd is running
+      ansible.builtin.systemd:
+        name: snapd
+        state: started
+        enabled: true
+      become: true
+      tags:
+        - setup
+        - snapd
+
+    - name: Wait for snapd initialization
+      ansible.builtin.wait_for:
+        timeout: 10
+      tags:
+        - setup
+        - snapd
+
+    - name: Install MicroK8s
+      ansible.builtin.command: snap install microk8s --classic
+      register: snap_install
+      changed_when: "'already installed' not in snap_install.stderr"
+      become: true
+      tags:
+        - setup
+        - microk8s
+
+    - name: Add user to microk8s group
+      ansible.builtin.user:
+        name: "{{ user }}"
+        groups: microk8s
+        append: true
+      become: true
+      notify: Refresh user groups
+      tags:
+        - setup
+        - config
+
+    - name: Create .kube directory with proper permissions
+      ansible.builtin.file:
+        path: "{{ kube_config_dir }}"
+        state: directory
+        mode: '0700'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+      tags:
+        - config
+
+    - name: Create .local/bin directory
+      ansible.builtin.file:
+        path: "{{ local_bin_dir }}"
+        state: directory
+        mode: '0755'
+      tags:
+        - config
+
+    # Configure firewall for MicroK8s
+    - name: Check if ufw is active
+      ansible.builtin.command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+      become: true
+      tags:
+        - firewall
+
+    - name: Allow MicroK8s API server port
+      ansible.builtin.ufw:
+        rule: allow
+        port: '16443'
+        proto: tcp
+        comment: 'MicroK8s API server'
+      become: true
+      when: "'Status: active' in ufw_status.stdout"
+      tags:
+        - firewall
+
+    - name: Allow MicroK8s cluster-agent port
+      ansible.builtin.ufw:
+        rule: allow
+        port: '25000'
+        proto: tcp
+        comment: 'MicroK8s cluster-agent'
+      become: true
+      when: "'Status: active' in ufw_status.stdout"
+      tags:
+        - firewall
+
+    - name: Allow MicroK8s dqlite port
+      ansible.builtin.ufw:
+        rule: allow
+        port: '19001'
+        proto: tcp
+        comment: 'MicroK8s dqlite'
+      become: true
+      when: "'Status: active' in ufw_status.stdout"
+      tags:
+        - firewall
+
+    - name: Allow kubelet port
+      ansible.builtin.ufw:
+        rule: allow
+        port: '10250'
+        proto: tcp
+        comment: 'MicroK8s kubelet'
+      become: true
+      when: "'Status: active' in ufw_status.stdout"
+      tags:
+        - firewall
+
+    - name: Allow traffic from other cluster nodes
+      ansible.builtin.ufw:
+        rule: allow
+        src: "{{ hostvars[item]['lan_ip'] }}"
+        comment: "Allow {{ item }} cluster node"
+      loop: "{{ groups['microk8s'] | default([]) }}"
+      become: true
+      when: 
+        - "'Status: active' in ufw_status.stdout"
+        - hostvars[item]['lan_ip'] is defined
+        - hostvars[item]['lan_ip'] != node_ip
+      tags:
+        - firewall
+
+    - name: Stop MicroK8s for configuration
+      ansible.builtin.command: microk8s stop
+      register: stop_result
+      changed_when: stop_result.rc == 0
+      become: true
+      tags:
+        - config
+
+    - name: Configure node IP for kubelet
+      ansible.builtin.lineinfile:
+        path: /var/snap/microk8s/current/args/kubelet
+        line: "--node-ip={{ node_ip }}"
+        create: true
+        mode: '0644'
+      become: true
+      notify: Restart kubelite
+      tags:
+        - config
+        
+    - name: Configure API server advertise address
+      ansible.builtin.lineinfile:
+        path: /var/snap/microk8s/current/args/kube-apiserver
+        line: "--advertise-address={{ node_ip }}"
+        create: false
+        mode: '0644'
+      become: true
+      notify: Restart kubelite
+      tags:
+        - config
+        
+    # Note: k8s-dqlite uses Unix socket internally, don't modify its listen configuration
+    # The external access is handled by the API server configuration above
+        
+    - name: Configure etcd to use correct IP  
+      ansible.builtin.replace:
+        path: /var/snap/microk8s/current/args/etcd
+        regexp: '\$\{DEFAULT_INTERFACE_IP_ADDR\}'
+        replace: '{{ node_ip }}'
+      become: true
+      notify: Restart kubelite
+      when: node_ip is defined
+      failed_when: false  # File might not exist in newer MicroK8s versions
+      tags:
+        - config
+
+    - name: Start MicroK8s
+      ansible.builtin.command: microk8s start
+      register: start_result
+      changed_when: start_result.rc == 0
+      become: true
+      tags:
+        - config
+
+    - name: Wait for MicroK8s to be ready
+      ansible.builtin.command: microk8s status --wait-ready
+      register: status_result
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: status_result.rc == 0
+      failed_when: status_result.rc != 0
+      become: true
+      tags:
+        - config
+        - verify
+
+    - name: Verify MicroK8s installation
+      ansible.builtin.command: "/snap/bin/microk8s.kubectl version --client"
+      register: kubectl_version
+      changed_when: false
+      failed_when: kubectl_version.rc != 0
+      become: true  # Added because group membership isn't active yet
+      tags:
+        - verify
+
+    - name: Enable required MicroK8s addons
+      ansible.builtin.command: "microk8s enable {{ item }}"
+      loop: "{{ microk8s_addons.required }}"
+      register: addon_result
+      changed_when: addon_result.rc == 0
+      become: true
+      tags:
+        - addons
+
+    - name: Enable optional MicroK8s addons
+      ansible.builtin.command: "microk8s enable {{ item }}"
+      loop: "{{ microk8s_addons.optional }}"
+      register: optional_addon_result
+      changed_when: optional_addon_result.rc == 0
+      become: true
+      ignore_errors: true
+      tags:
+        - addons
+        - optional
+
+    # Enable MetalLB for LoadBalancer services
+    - name: Build MetalLB IP range
+      ansible.builtin.set_fact:
+        metallb_ip_range: "{{ zerotier_subnet_prefix }}{{ metallb_ip_start_octet }}-{{ zerotier_subnet_prefix }}{{ metallb_ip_end_octet }}"
+      tags:
+        - metallb
+
+    - name: Enable MetalLB addon for LoadBalancer services
+      ansible.builtin.command: "microk8s enable metallb:{{ metallb_ip_range }}"
+      register: metallb_enable
+      changed_when: "'Addon metallb is already enabled' not in metallb_enable.stdout"
+      failed_when: metallb_enable.rc != 0
+      become: true
+      tags:
+        - metallb
+        - addons
+
+    - name: Wait for MetalLB pods to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: /var/snap/microk8s/current/credentials/client.config
+        api_version: v1
+        kind: Pod
+        namespace: metallb-system
+        label_selectors:
+          - app=metallb
+      register: metallb_pods
+      until: metallb_pods.resources | length > 0 and metallb_pods.resources | map(attribute='status.phase') | select('equalto', 'Running') | list | length == metallb_pods.resources | length
+      retries: 30
+      delay: 10
+      become: true
+      tags:
+        - metallb
+        - verify
+
+    - name: Display MetalLB configuration
+      ansible.builtin.debug:
+        msg: |
+          MetalLB has been enabled with IP range: {{ metallb_ip_range }}
+          Available IPs for LoadBalancer services:
+          - Primary Ingress: {{ zerotier_subnet_prefix }}{{ primary_ingress_ip_octet }}
+          - Secondary Ingress: {{ zerotier_subnet_prefix }}{{ secondary_ingress_ip_octet }}
+          - DNS External: {{ zerotier_subnet_prefix }}{{ dns_external_ip_octet }}
+          Total range: {{ zerotier_subnet_prefix }}{{ metallb_ip_start_octet }} to {{ zerotier_subnet_prefix }}{{ metallb_ip_end_octet }}
+          - DNS Server: {{ zerotier_subnet_prefix }}{{ dns_external_ip_octet }}
+      tags:
+        - metallb
+
+    - name: Create kubectl wrapper script
+      ansible.builtin.copy:
+        dest: "{{ local_bin_dir }}/kubectl"
+        mode: '0755'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        content: |
+          #!/bin/bash
+          exec /snap/bin/microk8s.kubectl "$@"
+      tags:
+        - wrapper
+
+    - name: Create helm wrapper script
+      ansible.builtin.copy:
+        dest: "{{ local_bin_dir }}/helm"
+        mode: '0755'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        content: |
+          #!/bin/bash
+          exec /snap/bin/microk8s.helm3 "$@"
+      tags:
+        - wrapper
+
+    - name: Ensure thinkube alias directory exists
+      ansible.builtin.file:
+        path: "{{ thinkube_alias_dir }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+      tags:
+        - aliases
+
+    - name: Create kubectl aliases configuration
+      ansible.builtin.copy:
+        dest: "{{ kubectl_aliases_file }}"
+        mode: '0644'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        content: |
+          [
+            { "name": "k", "command": "kubectl", "description": "Shortcut for kubectl" },
+            { "name": "kns", "command": "kubectl config set-context --current --namespace", "description": "Set current namespace" },
+            { "name": "kctx", "command": "kubectl config use-context", "description": "Switch context" },
+            { "name": "kgp", "command": "kubectl get pods", "description": "Get pods" },
+            { "name": "kgs", "command": "kubectl get services", "description": "Get services" },
+            { "name": "kgd", "command": "kubectl get deployments", "description": "Get deployments" },
+            { "name": "kga", "command": "kubectl get all", "description": "Get all resources" },
+            { "name": "kaf", "command": "kubectl apply -f", "description": "Apply file" },
+            { "name": "kdf", "command": "kubectl delete -f", "description": "Delete from file" },
+            { "name": "kl", "command": "kubectl logs", "description": "View logs" },
+            { "name": "ke", "command": "kubectl exec -it", "description": "Execute in pod" },
+            { "name": "kdesc", "command": "kubectl describe", "description": "Describe resource" }
+          ]
+      tags:
+        - aliases
+
+    - name: Create helm aliases configuration
+      ansible.builtin.copy:
+        dest: "{{ helm_aliases_file }}"
+        mode: '0644'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        content: |
+          [
+            { "name": "h", "command": "helm", "description": "Shortcut for helm" },
+            { "name": "hl", "command": "helm list", "description": "List releases" },
+            { "name": "hi", "command": "helm install", "description": "Install chart" },
+            { "name": "hu", "command": "helm upgrade", "description": "Upgrade release" },
+            { "name": "hd", "command": "helm delete", "description": "Delete release" },
+            { "name": "hs", "command": "helm search", "description": "Search for charts" }
+          ]
+      tags:
+        - aliases
+
+    - name: Create a generate script for kubectl and helm aliases
+      ansible.builtin.copy:
+        dest: "{{ user_home }}/.thinkube_shared_shell/aliases/generate_k8s_aliases.sh"
+        mode: '0755'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        content: |
+          #!/bin/bash
+          # Generate kubectl and helm aliases for Bash/Zsh
+          
+          KUBECTL_JSON="{{ kubectl_aliases_file }}"
+          HELM_JSON="{{ helm_aliases_file }}"
+          OUTPUT_FILE="{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh"
+          
+          echo "#!/bin/bash" > "$OUTPUT_FILE"
+          echo "# Auto-generated kubectl and helm aliases" >> "$OUTPUT_FILE"
+          echo "" >> "$OUTPUT_FILE"
+          
+          # Generate kubectl aliases
+          echo "# kubectl aliases" >> "$OUTPUT_FILE"
+          jq -r '.[] | "alias " + .name + "=\"" + .command + "\"  # " + .description' "$KUBECTL_JSON" >> "$OUTPUT_FILE"
+          
+          echo "" >> "$OUTPUT_FILE"
+          
+          # Generate helm aliases
+          echo "# helm aliases" >> "$OUTPUT_FILE"
+          jq -r '.[] | "alias " + .name + "=\"" + .command + "\"  # " + .description' "$HELM_JSON" >> "$OUTPUT_FILE"
+          
+          chmod 644 "$OUTPUT_FILE"
+          echo "Generated K8s aliases"
+      tags:
+        - aliases
+
+    - name: Run K8s alias generation
+      ansible.builtin.command: "{{ user_home }}/.thinkube_shared_shell/aliases/generate_k8s_aliases.sh"
+      changed_when: true
+      tags:
+        - aliases
+
+    - name: Ensure generated_aliases.sh exists
+      ansible.builtin.file:
+        path: "{{ user_home }}/.thinkube_shared_shell/aliases/generated_aliases.sh"
+        state: touch
+        mode: '0644'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+      tags:
+        - aliases
+
+    - name: Include K8s aliases in main aliases
+      ansible.builtin.blockinfile:
+        path: "{{ user_home }}/.thinkube_shared_shell/aliases/generated_aliases.sh"
+        marker: "# {mark} K8S ALIASES"
+        block: |
+          # Source K8s aliases if file exists
+          if [ -f {{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh ]; then
+            source {{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh
+          fi
+      tags:
+        - aliases
+
+    - name: Wait for API server
+      ansible.builtin.command: "/snap/bin/microk8s.kubectl get nodes"
+      register: nodes_result
+      retries: 12
+      delay: 5
+      until: nodes_result.rc == 0
+      changed_when: false
+      become: true  # Added because group membership isn't active yet
+      tags:
+        - verify
+
+    - name: Display installation status
+      ansible.builtin.debug:
+        msg:
+          - "MicroK8s installed successfully"
+          - "Node IP: {{ node_ip }}"
+          - "Kubectl path: {{ local_bin_dir }}/kubectl"
+          - "Helm path: {{ local_bin_dir }}/helm"
+          - "Aliases configured in: {{ thinkube_alias_dir }}"
+          - ""
+          - "NOTE: Log out and back in for group membership to take effect"
+
+  handlers:
+    - name: Refresh user groups
+      ansible.builtin.debug:
+        msg: "User added to microk8s group - logout/login required"
+
+    - name: Restart kubelite
+      ansible.builtin.shell: |
+        microk8s stop
+        microk8s start
+      become: true
+      when: not ansible_check_mode
+      changed_when: true

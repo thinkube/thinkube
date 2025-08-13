@@ -1,0 +1,297 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 19_reset_zerotier.yaml - Remove ZeroTier configuration if needed
+#
+# Purpose:
+#   Removes ZeroTier network membership
+#   Disables and stops ZeroTier service
+#   Optionally uninstalls ZeroTier completely
+#
+# Requirements:
+#   - ZeroTier previously configured with 10_setup_zerotier.yaml
+#
+# Variables:
+#   - zerotier_network_id: ZeroTier network ID to leave
+#   - uninstall_zerotier: Set to true to completely remove ZeroTier
+#
+# Run with:
+#   ./scripts/run_ansible.sh ansible/30_networking/19_reset_zerotier.yaml
+
+- name: Reset ZeroTier Configuration
+  hosts: zerotier_nodes
+  gather_facts: true
+  
+  vars:
+    zerotier_network_id: "{{ lookup('env', 'ZEROTIER_NETWORK_ID') }}"
+    uninstall_zerotier: false
+  
+  tasks:
+    # Phase 1: Confirm reset operation
+    - name: Display warning message
+      ansible.builtin.debug:
+        msg: |
+          
+          ═══════════════════════════════════════════════════════════════════
+          ⚠️  WARNING: ZeroTier Reset ({{ inventory_hostname }})
+          ═══════════════════════════════════════════════════════════════════
+          
+          This playbook will remove your ZeroTier network configuration:
+          - Leave the ZeroTier network: {{ zerotier_network_id }}
+          - Remove IP assignments and routes
+          {% if uninstall_zerotier %}
+          - COMPLETELY UNINSTALL ZeroTier from the system
+          {% endif %}
+          
+          This will affect overlay networking connectivity!
+          To cancel, press Ctrl+C now.
+          
+          ═══════════════════════════════════════════════════════════════════
+      
+    - name: Pause for 10 seconds to allow cancellation
+      ansible.builtin.pause:
+        seconds: 10
+        prompt: "Proceeding with ZeroTier reset in 10 seconds... Press Ctrl+C to abort"
+    
+    # Phase 2: Check ZeroTier status
+    - name: Check if ZeroTier is installed
+      ansible.builtin.command: which zerotier-cli
+      register: zerotier_check
+      changed_when: false
+      failed_when: false
+    
+    - name: Check ZeroTier networks
+      ansible.builtin.command: zerotier-cli listnetworks
+      register: zerotier_networks
+      changed_when: false
+      failed_when: false
+      when: zerotier_check.rc == 0
+    
+    # Phase 3: Leave ZeroTier network
+    - name: Leave ZeroTier network
+      ansible.builtin.command: zerotier-cli leave {{ zerotier_network_id }}
+      register: leave_network
+      failed_when: false
+      changed_when: leave_network.rc == 0
+      when: 
+        - zerotier_check.rc == 0
+        - zerotier_networks is defined
+        - zerotier_networks.stdout is defined
+        - zerotier_network_id in zerotier_networks.stdout
+      become: true
+    
+    # Phase 4: Stop and disable ZeroTier service
+    - name: Stop and disable ZeroTier service
+      ansible.builtin.systemd:
+        name: zerotier-one
+        state: stopped
+        enabled: no
+      when: zerotier_check.rc == 0
+      become: true
+      
+    # Phase 5: Uninstall ZeroTier if requested
+    - name: Uninstall ZeroTier
+      block:
+        - name: Purge ZeroTier packages
+          ansible.builtin.apt:
+            name: zerotier-one
+            state: absent
+            purge: yes
+          become: true
+          
+        - name: Remove ZeroTier configuration
+          ansible.builtin.file:
+            path: "/var/lib/zerotier-one"
+            state: absent
+          become: true
+          
+        - name: Remove ZeroTier repository files
+          ansible.builtin.file:
+            path: "/etc/apt/sources.list.d/zerotier.list"
+            state: absent
+          become: true
+      when: 
+        - zerotier_check.rc == 0
+        - uninstall_zerotier | bool
+      
+    # Phase 6: Remove iptables rules
+    - name: Remove ZeroTier iptables rules
+      ansible.builtin.iptables:
+        action: delete
+        chain: FORWARD
+        in_interface: zt+
+        jump: ACCEPT
+      failed_when: false
+      when: '"baremetal" in group_names'
+      become: true
+      
+    - name: Remove ZeroTier outbound iptables rules
+      ansible.builtin.iptables:
+        action: delete
+        chain: FORWARD
+        out_interface: zt+
+        jump: ACCEPT
+      failed_when: false
+      when: '"baremetal" in group_names'
+      become: true
+      
+    - name: Make iptables changes persistent
+      ansible.builtin.shell: |
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+          netfilter-persistent save
+        elif command -v iptables-save >/dev/null 2>&1; then
+          iptables-save > /etc/iptables/rules.v4
+        fi
+      become: true
+      changed_when: true
+      failed_when: false
+      when: '"baremetal" in group_names'
+    
+    # Phase 7: Display completion message
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ ZeroTier Reset Completed ({{ inventory_hostname }})
+          ════════════════════════════════════════════════════════
+          
+          Actions performed:
+          - Left ZeroTier network: {{ zerotier_network_id }}
+          - Stopped and disabled ZeroTier service
+          {% if uninstall_zerotier | bool %}
+          - Completely uninstalled ZeroTier
+          {% else %}
+          - ZeroTier software remains installed but inactive
+          {% endif %}
+          
+          To reconfigure ZeroTier:
+          ./scripts/run_ansible.sh ansible/30_networking/10_setup_zerotier.yaml
+          
+          ════════════════════════════════════════════════════════
+
+- name: Remove Nodes from ZeroTier Central
+  hosts: management
+  gather_facts: false
+  
+  vars:
+    zerotier_network_id: "{{ lookup('env', 'ZEROTIER_NETWORK_ID') }}"
+    zerotier_api_token: "{{ lookup('env', 'ZEROTIER_API_TOKEN') }}"
+    zerotier_central_url: "https://api.zerotier.com/api/v1"
+    remove_from_central: false  # Only remove members when explicitly requested
+  
+  tasks:
+    - name: Verify ZeroTier API token
+      ansible.builtin.fail:
+        msg: "ZeroTier API token not found. Please set ZEROTIER_API_TOKEN environment variable."
+      when: 
+        - zerotier_api_token is not defined or zerotier_api_token == ""
+        - remove_from_central | bool
+        
+    - name: Verify ZeroTier network ID
+      ansible.builtin.fail:
+        msg: "ZeroTier network ID not found. Please set ZEROTIER_NETWORK_ID environment variable or define in inventory."
+      when: 
+        - zerotier_network_id is not defined or zerotier_network_id == ""
+        - remove_from_central | bool
+    
+    - name: Get all members from ZeroTier Central
+      ansible.builtin.uri:
+        url: "{{ zerotier_central_url }}/network/{{ zerotier_network_id }}/member"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ zerotier_api_token }}"
+        status_code: 200
+        validate_certs: yes
+      register: members
+      when: remove_from_central | bool
+      failed_when: false
+    
+    - name: Display members to remove
+      ansible.builtin.debug:
+        msg: |
+          Found {{ members.json | length }} members to remove from ZeroTier Central:
+          {% for member in members.json %}
+          - {{ member.nodeId }} ({{ member.name }})
+          {% endfor %}
+      when: 
+        - remove_from_central | bool
+        - members is defined
+        - members.status == 200
+    
+    - name: Remove each member from ZeroTier network
+      ansible.builtin.uri:
+        url: "{{ zerotier_central_url }}/network/{{ zerotier_network_id }}/member/{{ item.nodeId }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ zerotier_api_token }}"
+        status_code: [200, 204]
+        validate_certs: yes
+      loop: "{{ members.json }}"
+      loop_control:
+        label: "{{ item.nodeId }}"
+      when: 
+        - remove_from_central | bool
+        - members is defined
+        - members.status == 200
+      register: delete_results
+      failed_when: false
+    
+    - name: Verify members were removed
+      ansible.builtin.uri:
+        url: "{{ zerotier_central_url }}/network/{{ zerotier_network_id }}/member"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ zerotier_api_token }}"
+        status_code: 200
+        validate_certs: yes
+      register: verify_members
+      when: remove_from_central | bool and delete_results is defined
+      failed_when: false
+      
+    - name: Display results of cleanup
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ZeroTier Central Cleanup Results
+          ════════════════════════════════════════════════════════
+          
+          Network ID: {{ zerotier_network_id }}
+          
+          Initial members: {{ members.json | length if members is defined and members.status == 200 else 'Unknown' }}
+          Remaining members: {{ verify_members.json | length if verify_members is defined and verify_members.status == 200 else 'Unknown' }}
+          
+          Removal status: {% if verify_members is defined and verify_members.status == 200 and verify_members.json | length == 0 %}✅ ALL REMOVED{% else %}⚠️ SOME MEMBERS REMAIN{% endif %}
+          
+          ════════════════════════════════════════════════════════
+      when: remove_from_central | bool
+      run_once: true
+    
+# Network deletion task has been removed to prevent accidental network deletion
+      
+    - name: Display ZeroTier Central cleanup status
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ZeroTier Central Cleanup
+          ════════════════════════════════════════════════════════
+          
+          {% if remove_from_central | bool %}
+          Network ID: {{ zerotier_network_id }}
+          
+          Members removed: {{ members.json | length if members is defined and members.status == 200 else 'Failed to get members' }}
+          NOTE: Network was NOT deleted, only specified members were removed
+          {% else %}
+          NOTE: ZeroTier Central cleanup was not performed.
+          
+          To remove nodes from ZeroTier Central (but NOT delete the network),
+          run this playbook with remove_from_central=true:
+          
+          ./scripts/run_ansible.sh ansible/30_networking/19_reset_zerotier.yaml -e "remove_from_central=true"
+          {% endif %}
+          
+          ════════════════════════════════════════════════════════
+      run_once: true

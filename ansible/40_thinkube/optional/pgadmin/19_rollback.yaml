@@ -1,0 +1,142 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/pgadmin/19_rollback.yaml
+# Description:
+#   Cleanup script for PgAdmin deployment
+#   Removes all PgAdmin resources from the cluster
+#
+# Requirements:
+#   - MicroK8s with kubectl installed
+#   - PgAdmin components deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/pgadmin/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to kubeconfig file
+#
+# Dependencies:
+#   - None (this is a cleanup playbook)
+#
+# 🤖 [AI-assisted]
+
+- name: Cleanup PgAdmin deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    pgadmin_namespace: "pgadmin"
+
+  tasks:
+    - name: Display cleanup warning
+      ansible.builtin.debug:
+        msg: |
+          WARNING: This will completely remove PgAdmin from your cluster.
+          All PgAdmin configurations and resources will be deleted.
+          
+          Starting cleanup process...
+
+    - name: Delete PgAdmin ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        name: pgadmin-ingress
+        namespace: "{{ pgadmin_namespace }}"
+        state: absent
+      failed_when: false
+
+    - name: Delete PgAdmin service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        name: pgadmin
+        namespace: "{{ pgadmin_namespace }}"
+        state: absent
+      failed_when: false
+
+    - name: Delete PgAdmin deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: pgadmin
+        namespace: "{{ pgadmin_namespace }}"
+        state: absent
+      failed_when: false
+
+    - name: Delete PgAdmin ConfigMaps
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: "{{ item }}"
+        namespace: "{{ pgadmin_namespace }}"
+        state: absent
+      failed_when: false
+      loop:
+        - pgadmin-oauth-config
+        - pgadmin-init-script
+        - pgadmin-proxy-headers
+        - pgadmin-servers
+
+    - name: Delete PgAdmin secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: pgadmin-tls-secret
+        namespace: "{{ pgadmin_namespace }}"
+        state: absent
+      failed_when: false
+
+    - name: Delete PgAdmin namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ pgadmin_namespace }}"
+        state: absent
+        wait: true
+        wait_timeout: 120
+      failed_when: false
+
+    - name: Verify removal of PgAdmin components
+      ansible.builtin.shell: |
+        echo "=== VERIFICATION RESULTS ==="
+        
+        echo "Checking for PgAdmin namespace..."
+        if {{ kubectl_bin }} get namespace {{ pgadmin_namespace }} &>/dev/null; then
+          echo "Warning: PgAdmin namespace still exists"
+        else
+          echo "✅ PgAdmin namespace has been removed"
+        fi
+        
+        echo "Checking for any remaining PgAdmin resources..."
+        REMAINING_RESOURCES=$({{ kubectl_bin }} get all -A | grep -i pgadmin || true)
+        if [ -n "$REMAINING_RESOURCES" ]; then
+          echo "Warning: Some PgAdmin resources still exist:"
+          echo "$REMAINING_RESOURCES"
+        else
+          echo "✅ All PgAdmin resources have been removed"
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: verification
+      changed_when: false
+
+    - name: Display cleanup results
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          PGADMIN CLEANUP RESULTS
+          ==========================================
+          
+          {{ verification.stdout_lines | join('\n') }}
+          
+          The PgAdmin cleanup is complete. You can now reinstall PgAdmin using:
+          ./scripts/run_ansible.sh ansible/40_thinkube/optional/pgadmin/10_deploy.yaml

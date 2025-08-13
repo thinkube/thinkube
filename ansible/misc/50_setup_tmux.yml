@@ -1,0 +1,325 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Set up tmux (Improved Configuration with Clipboard Integration)
+  hosts: baremetal:lxd_containers
+  become: false  # Only become root when needed
+  vars:
+    tmux_config_dir: "{{ ansible_env.HOME }}/.config/tmux"
+  
+  tasks:
+    - name: Update apt cache
+      become: true
+      apt:
+        update_cache: yes
+    
+    - name: Install tmux and clipboard tools
+      become: true
+      apt:
+        name: 
+          - tmux
+          - xclip  # Required for X11 clipboard integration
+        state: present
+    
+    - name: Create tmux config directory
+      file:
+        path: "{{ tmux_config_dir }}"
+        state: directory
+        mode: '0755'
+    
+    - name: Configure tmux
+      copy:
+        dest: "{{ tmux_config_dir }}/tmux.conf"
+        content: |
+          # Improve colors
+          set -g default-terminal "screen-256color"
+          set -ga terminal-overrides ",*256col*:Tc"
+          
+          # Set scrollback buffer to 10000
+          set -g history-limit 10000
+          
+          # Customize the status bar
+          set -g status-style fg=white,bg=black
+          set -g status-left "#[fg=green]#S "
+          set -g status-right "#[fg=yellow]%d %b %Y #[fg=green]%H:%M"
+          set -g status-right-length 50
+          set -g status-left-length 20
+          
+          # Highlight active window
+          set -g window-status-current-style fg=black,bg=white
+          
+          # Set the prefix to Ctrl+a
+          unbind C-b
+          set -g prefix C-a
+          bind C-a send-prefix
+          
+          # Split panes using | and -
+          bind | split-window -h
+          bind - split-window -v
+          unbind '"'
+          unbind %
+          
+          # Reload config file
+          bind r source-file {{ tmux_config_dir }}/tmux.conf \; display "Reloaded!"
+          
+          # Switch panes using Alt-arrow without prefix
+          bind -n M-Left select-pane -L
+          bind -n M-Right select-pane -R
+          bind -n M-Up select-pane -U
+          bind -n M-Down select-pane -D
+          
+          # Enable mouse control
+          set -g mouse on
+          
+          # Start window numbering at 1
+          set -g base-index 1
+          setw -g pane-base-index 1
+          
+          # Automatically rename windows
+          setw -g automatic-rename on
+          
+          # Don't rename windows automatically that have been renamed manually
+          set -g allow-rename off
+          
+          # Faster command sequences
+          set -sg escape-time 0
+          
+          # Add shortcut to create a new detached session
+          bind N command-prompt -p "New detached session name:" "new-session -d -s '%%'"
+          
+          # Show tmux session chooser
+          bind S choose-session
+          
+          # ===== Clipboard Integration for X11 (Standard-style) =====
+          
+          # Use emacs-style key bindings (more similar to standard copy/paste)
+          setw -g mode-keys emacs
+          
+          # Use Ctrl+Space to begin selection (similar to standard highlighting)
+          bind-key -T copy-mode C-Space send -X begin-selection
+          
+          # Ctrl+c copies text to system clipboard
+          bind-key -T copy-mode C-c send -X copy-pipe-and-cancel "xclip -selection clipboard -i"
+          
+          # Update default binding of Enter to also use copy-pipe
+          unbind -T copy-mode Enter
+          bind-key -T copy-mode Enter send -X copy-pipe-and-cancel "xclip -selection clipboard -i"
+          
+          # Make mouse drags copy to clipboard as well
+          bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"
+          
+          # Right-click to paste from clipboard
+          bind-key -n MouseDown3Pane run "tmux set-buffer \"$(xclip -o -selection clipboard)\"; tmux paste-buffer"
+          
+          # Ctrl+v to paste from system clipboard (outside copy mode)
+          bind C-v run "tmux set-buffer \"$(xclip -o -selection clipboard)\"; tmux paste-buffer"
+          
+          # Space to start selection in copy mode (another intuitive option)
+          bind-key -T copy-mode Space send -X begin-selection
+    
+    - name: Check if .bashrc exists
+      stat:
+        path: "{{ ansible_env.HOME }}/.bashrc"
+      register: bashrc_file
+    
+    - name: Create .bashrc if it doesn't exist
+      file:
+        path: "{{ ansible_env.HOME }}/.bashrc"
+        state: touch
+        mode: '0644'
+      when: not bashrc_file.stat.exists
+    
+    - name: Configure Bash for tmux (improved)
+      blockinfile:
+        path: "{{ ansible_env.HOME }}/.bashrc"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - tmux configuration"
+        block: |
+          # tmux configuration - No automatic startup
+          # Helpful aliases for tmux management
+          alias tn='tmux new -s'            # Create new named session: tn project1
+          alias ta='tmux attach -t'         # Attach to existing session: ta project1
+          alias tl='tmux list-sessions'     # List active sessions
+          alias td='tmux detach'            # Detach from current session
+          alias tk='tmux kill-session -t'   # Kill a session: tk project1
+          
+          # Quick session start (doesn't auto-attach)
+          alias ts='tmux new -d -s default 2>/dev/null || echo "Default session already exists"; echo "Run \"ta default\" to attach"'
+          
+          # Set TERM for proper colors in tmux
+          export TERM=xterm-256color
+          
+          # TMUX USAGE GUIDE:
+          # - Start a new project: tn project_name
+          # - Resume a project: ta project_name
+          # - See all sessions: tl
+          # - Start working in default session: ts && ta default
+    
+    - name: Check if .zshrc exists
+      stat:
+        path: "{{ ansible_env.HOME }}/.zshrc"
+      register: zshrc_file
+    
+    - name: Create .zshrc if it doesn't exist
+      file:
+        path: "{{ ansible_env.HOME }}/.zshrc"
+        state: touch
+        mode: '0644'
+      when: not zshrc_file.stat.exists
+    
+    - name: Configure Zsh for tmux (improved)
+      blockinfile:
+        path: "{{ ansible_env.HOME }}/.zshrc"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - tmux configuration"
+        block: |
+          # tmux configuration - No automatic startup
+          # Helpful aliases for tmux management
+          alias tn='tmux new -s'            # Create new named session: tn project1
+          alias ta='tmux attach -t'         # Attach to existing session: ta project1
+          alias tl='tmux list-sessions'     # List active sessions
+          alias td='tmux detach'            # Detach from current session
+          alias tk='tmux kill-session -t'   # Kill a session: tk project1
+          
+          # Quick session start (doesn't auto-attach)
+          alias ts='tmux new -d -s default 2>/dev/null || echo "Default session already exists"; echo "Run \"ta default\" to attach"'
+          
+          # Set TERM for proper colors in tmux
+          export TERM=xterm-256color
+          
+          # TMUX USAGE GUIDE:
+          # - Start a new project: tn project_name
+          # - Resume a project: ta project_name
+          # - See all sessions: tl
+          # - Start working in default session: ts && ta default
+    
+    - name: Create fish config directory
+      file:
+        path: "{{ ansible_env.HOME }}/.config/fish"
+        state: directory
+        mode: '0755'
+    
+    - name: Check if fish config exists
+      stat:
+        path: "{{ ansible_env.HOME }}/.config/fish/config.fish"
+      register: fish_config_file
+    
+    - name: Create fish config if it doesn't exist
+      file:
+        path: "{{ ansible_env.HOME }}/.config/fish/config.fish"
+        state: touch
+        mode: '0644'
+      when: not fish_config_file.stat.exists
+    
+    - name: Configure Fish for tmux (improved)
+      blockinfile:
+        path: "{{ ansible_env.HOME }}/.config/fish/config.fish"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - tmux configuration"
+        block: |
+          # tmux configuration - No automatic startup
+          # Helpful aliases for tmux management
+          alias tn='tmux new -s'            # Create new named session: tn project1
+          alias ta='tmux attach -t'         # Attach to existing session: ta project1
+          alias tl='tmux list-sessions'     # List active sessions
+          alias td='tmux detach'            # Detach from current session
+          alias tk='tmux kill-session -t'   # Kill a session: tk project1
+          
+          # Quick session start (doesn't auto-attach)
+          function ts
+              tmux new -d -s default 2>/dev/null; or echo "Default session already exists"
+              echo "Run \"ta default\" to attach"
+          end
+          
+          # Set TERM for proper colors in tmux
+          set -x TERM xterm-256color
+          
+          # TMUX USAGE GUIDE:
+          # - Start a new project: tn project_name
+          # - Resume a project: ta project_name
+          # - See all sessions: tl
+          # - Start working in default session: ts; and ta default
+    
+    - name: Create tmux cheatsheet
+      copy:
+        dest: "{{ ansible_env.HOME }}/.tmux-cheatsheet.md"
+        content: |
+          # TMUX CHEATSHEET
+          
+          ## Session Management
+          
+          | Command | Description |
+          |---------|-------------|
+          | `tn projectname` | Start new named session |
+          | `ta projectname` | Attach to existing session |
+          | `td` | Detach from current session |
+          | `tl` | List all sessions |
+          | `tk projectname` | Kill/delete a session |
+          | `ts` | Create default session (without attaching) |
+          
+          ## Window Management (prefix: Ctrl+a)
+          
+          | Command | Description |
+          |---------|-------------|
+          | `Ctrl+a c` | Create new window |
+          | `Ctrl+a ,` | Rename current window |
+          | `Ctrl+a n` | Next window |
+          | `Ctrl+a p` | Previous window |
+          | `Ctrl+a 1...9` | Switch to window number |
+          | `Ctrl+a w` | List all windows |
+          | `Ctrl+a &` | Kill current window |
+          
+          ## Pane Management (prefix: Ctrl+a)
+          
+          | Command | Description |
+          |---------|-------------|
+          | `Ctrl+a \|` | Split pane vertically |
+          | `Ctrl+a -` | Split pane horizontally |
+          | `Alt+Arrow` | Navigate between panes |
+          | `Ctrl+a z` | Zoom in/out of a pane |
+          | `Ctrl+a x` | Close current pane |
+          | `Ctrl+a {` | Move pane left |
+          | `Ctrl+a }` | Move pane right |
+          | `Ctrl+a Ctrl+o` | Rotate panes |
+          
+          ## Copy and Paste (X11 Clipboard Integration with Standard Keys)
+          
+          | Command | Description |
+          |---------|-------------|
+          | `Ctrl+a [` | Enter copy mode |
+          | `Ctrl+Space` or `Space` | Start selection in copy mode |
+          | `Ctrl+c` | Copy selection to system clipboard |
+          | `Enter` | Copy selection to system clipboard |
+          | `Ctrl+a ]` | Paste from tmux buffer |
+          | `Ctrl+a C-v` | Paste from system clipboard |
+          | `Right-click` | Paste from system clipboard |
+          | Mouse selection | Automatically copies to clipboard |
+          
+          ## Other Useful Commands
+          
+          | Command | Description |
+          |---------|-------------|
+          | `Ctrl+a r` | Reload config |
+          | `Ctrl+a ?` | Show all keybindings |
+          | `Ctrl+a N` | Create new detached session |
+          | `Ctrl+a S` | Choose session from list |
+          
+          ## Mouse Support
+          
+          Mouse is enabled - you can:
+          - Click to select panes
+          - Drag pane borders to resize
+          - Scroll to view history
+          - Select text to copy to clipboard
+          - Right click to paste from clipboard
+        mode: '0644'
+    
+    - name: Installation complete message
+      debug:
+        msg: 
+          - "tmux setup complete with X11 clipboard integration!"
+          - "Your tmux is now configured, but will no longer start automatically."
+          - "Use these commands:"
+          - "  - tn projectname  # Start a new tmux session"
+          - "  - ta projectname  # Attach to existing session"
+          - "  - tl              # List all active sessions"
+          - "A detailed cheatsheet has been created at ~/.tmux-cheatsheet.md"
+          - "Clipboard integration is enabled - select text with mouse to copy, right-click to paste"

@@ -1,0 +1,383 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/devpi/10_deploy.yaml
+# Description:
+#   Simple DevPi deployment using podman build and direct kubectl deployment
+#   No Argo Workflows or ArgoCD dependency
+#
+# Requirements:
+#   - MicroK8s cluster must be running
+#   - Podman installed
+#   - Harbor registry accessible
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/devpi/10_deploy.yaml
+
+- name: Deploy DevPi using simple podman build approach
+  hosts: microk8s_control_plane
+  become: false
+  gather_facts: true
+  
+  vars:
+    # Application settings
+    app_name: devpi
+    devpi_namespace: devpi
+    devpi_index_name: stable
+    
+    # Use a simple version tag instead of timestamp
+    image_tag: "latest"
+    
+    # OAuth2 proxy settings for Keycloak integration
+    oauth2_proxy_enabled: true
+    oauth2_proxy_provider: "keycloak-oidc"
+    oauth2_proxy_client_id: "oauth2-proxy-{{ app_name }}"
+    oauth2_proxy_redirect_url: "https://{{ devpi_dashboard_hostname }}/oauth2/callback"
+    oauth2_proxy_kubeconfig: "{{ kubeconfig }}"
+    oauth2_proxy_helm_bin: "{{ helm_bin }}"
+    
+    # Keycloak admin credentials
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+    # Redis session configuration
+    oauth2_proxy_session_store_type: "redis"
+    oauth2_proxy_redis_service: "ephemeral-redis"
+    
+    # TLS settings
+    tls_secret_name: "{{ devpi_namespace }}-tls-secret"
+    
+    # Repository paths - local to ansible controller
+    local_repo_path: "/tmp/devpi-deployment"
+
+  tasks:
+    - name: Ensure application namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ devpi_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to DevPi namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ tls_secret_name }}"
+            namespace: "{{ devpi_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Get Harbor pull secret from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: harbor-pull-secret
+      register: harbor_pull_secret
+      failed_when: harbor_pull_secret.resources | length == 0
+
+    - name: Copy Harbor pull secret to DevPi namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: harbor-pull-secret
+            namespace: "{{ devpi_namespace }}"
+          type: "{{ harbor_pull_secret.resources[0].type }}"
+          data: "{{ harbor_pull_secret.resources[0].data }}"
+
+    # Setup GitHub SSH keys on the microk8s control plane for repository access
+    - name: Check if GitHub SSH key exists on control plane
+      ansible.builtin.stat:
+        path: "{{ ansible_env.HOME }}/.ssh/id_ed25519_github"
+      register: github_ssh_key
+
+    - name: Generate GitHub SSH key on control plane
+      ansible.builtin.command:
+        cmd: ssh-keygen -t ed25519 -f {{ ansible_env.HOME }}/.ssh/id_ed25519_github -N "" -C "thinkube-github-access"
+      when: not github_ssh_key.stat.exists
+
+    - name: Configure SSH for GitHub access on control plane
+      ansible.builtin.blockinfile:
+        path: "{{ ansible_env.HOME }}/.ssh/config"
+        create: yes
+        mode: '0600'
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - GitHub Access"
+        block: |
+          Host github.com
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/id_ed25519_github
+              StrictHostKeyChecking accept-new
+
+    - name: Get GitHub public key
+      ansible.builtin.command:
+        cmd: cat {{ ansible_env.HOME }}/.ssh/id_ed25519_github.pub
+      register: github_public_key
+      changed_when: false
+
+    - name: Add SSH key to GitHub via API
+      ansible.builtin.uri:
+        url: "https://api.github.com/user/keys"
+        method: POST
+        headers:
+          Authorization: "token {{ github_token }}"
+          Accept: "application/vnd.github.v3+json"
+        body_format: json
+        body:
+          title: "Thinkube MicroK8s Control Plane - {{ ansible_hostname }}"
+          key: "{{ github_public_key.stdout }}"
+        status_code: [201, 422]  # 422 means key already exists
+      when: 
+        - not github_ssh_key.stat.exists  # Only add if we just created it
+        - github_token is defined
+        - github_token | length > 0
+
+    - name: Test GitHub SSH connection
+      ansible.builtin.command:
+        cmd: ssh -T git@github.com -o ConnectTimeout=5
+      register: github_ssh_test
+      failed_when: false
+      changed_when: false
+
+    - name: Verify GitHub SSH authentication
+      ansible.builtin.fail:
+        msg: |
+          GitHub SSH connection failed. This usually means:
+          - The SSH key was not added to GitHub successfully
+          - Network connectivity issues
+          
+          You can manually add this key at https://github.com/settings/keys:
+          {{ github_public_key.stdout }}
+      when: 
+        - github_ssh_test.rc != 1
+        - "'successfully authenticated' not in github_ssh_test.stderr"
+
+    - name: Clone DevPi repository on control plane
+      ansible.builtin.git:
+        repo: "git@github.com:thinkube/devpi-deployment.git"
+        dest: "/tmp/devpi-deployment"
+        version: main
+        force: yes
+        accept_hostkey: yes
+
+    - name: Build DevPi image with podman on control plane
+      ansible.builtin.shell: |
+        cd /tmp/devpi-deployment
+        podman build -f dockerfile/Dockerfile -t {{ harbor_registry }}/{{ harbor_project }}/{{ app_name }}:{{ image_tag }} .
+      register: build_result
+
+    - name: Push image to Harbor from control plane
+      ansible.builtin.shell: |
+        podman push {{ harbor_registry }}/{{ harbor_project }}/{{ app_name }}:{{ image_tag }} --tls-verify=false
+      register: push_result
+
+    - name: Create PVC for DevPi packages
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: devpi-data-pvc
+            namespace: "{{ devpi_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 5Gi
+
+    # Deploy Redis for OAuth2 session storage
+    - name: Deploy Valkey
+      include_role:
+        name: valkey/ephemeral_valkey
+      vars:
+        valkey_namespace: "{{ devpi_namespace }}"
+        valkey_registry: "{{ harbor_registry }}/library"
+        valkey_deployment_name: ephemeral-redis
+        valkey_service_name: ephemeral-redis
+        valkey_kubeconfig: "{{ kubeconfig }}"
+
+    # Deploy OAuth2 Proxy
+    - name: Debug OAuth2 variables
+      ansible.builtin.debug:
+        msg:
+          - "keycloak_url defined: {{ keycloak_url is defined }}"
+          - "keycloak_realm defined: {{ keycloak_realm is defined }}" 
+          - "keycloak_admin_username defined: {{ keycloak_admin_username is defined }}"
+          - "keycloak_admin_password defined: {{ keycloak_admin_password is defined }}"
+          - "oauth2_proxy_client_id defined: {{ oauth2_proxy_client_id is defined }}"
+          - "oauth2_proxy_dashboard_host would be: {{ devpi_dashboard_hostname }}"
+
+    - name: Deploy OAuth2 Proxy
+      include_role:
+        name: oauth2_proxy
+      vars:
+        oauth2_proxy_namespace: "{{ devpi_namespace }}"
+        oauth2_proxy_dashboard_host: "{{ devpi_dashboard_hostname }}"
+        oauth2_proxy_oidc_issuer_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+        oauth2_proxy_cookie_domain: "{{ domain_name }}"
+        oauth2_proxy_ingress_host: "{{ devpi_dashboard_hostname }}"
+        oauth2_proxy_ingress_tls_secret_name: "{{ tls_secret_name }}"
+
+    # Create deployment manifest from template
+    - name: Create DevPi deployment manifest
+      ansible.builtin.template:
+        src: deployment.yaml.j2
+        dest: "/tmp/devpi-deployment.yaml"
+      vars:
+        devpi_image: "{{ harbor_registry }}/{{ harbor_project }}/{{ app_name }}:{{ image_tag }}"
+
+    - name: Apply DevPi deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        src: "/tmp/devpi-deployment.yaml"
+
+    - name: Create DevPi service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ app_name }}"
+            namespace: "{{ devpi_namespace }}"
+          spec:
+            selector:
+              app: "{{ app_name }}"
+            ports:
+            - port: 3141
+              targetPort: 3141
+              protocol: TCP
+
+    - name: Create nginx headers ConfigMap for DevPi
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: nginx-headers
+            namespace: "{{ devpi_namespace }}"
+          data:
+            X-Real-IP: "$remote_addr"
+            X-Forwarded-For: "$proxy_add_x_forwarded_for"
+            X-Forwarded-Proto: "$scheme"
+            X-Forwarded-Host: "$host"
+            X-Outside-URL: "https://$host"
+
+    - name: Create DevPi HTTP Ingress (secured with OAuth2 Proxy)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: "{{ app_name }}-http-ingress"
+            namespace: "{{ devpi_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/auth-url: "http://oauth2-proxy.{{ devpi_namespace }}.svc.cluster.local/oauth2/auth"
+              nginx.ingress.kubernetes.io/auth-signin: "https://{{ devpi_dashboard_hostname }}/oauth2/start?rd=$escaped_request_uri"
+              nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+              nginx.ingress.kubernetes.io/proxy-set-headers: "devpi/nginx-headers"
+              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+          spec:
+            ingressClassName: nginx
+            tls:
+            - hosts:
+              - "{{ devpi_dashboard_hostname }}"
+              secretName: "{{ tls_secret_name }}"
+            rules:
+            - host: "{{ devpi_dashboard_hostname }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: "{{ app_name }}"
+                      port:
+                        number: 3141
+
+    - name: Create DevPi API Ingress (no auth required)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: "{{ app_name }}-api-ingress"
+            namespace: "{{ devpi_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+              nginx.ingress.kubernetes.io/proxy-set-headers: "devpi/nginx-headers"
+          spec:
+            ingressClassName: nginx
+            tls:
+            - hosts:
+              - "{{ devpi_api_hostname }}"
+              secretName: "{{ tls_secret_name }}"
+            rules:
+            - host: "{{ devpi_api_hostname }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: "{{ app_name }}"
+                      port:
+                        number: 3141
+
+    - name: Wait for DevPi deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ app_name }}"
+        namespace: "{{ devpi_namespace }}"
+        wait: true
+        wait_condition:
+          type: Progressing
+          status: "True"
+        wait_timeout: 300
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "DevPi deployment complete"
+          - "-----------------------------------"
+          - "Web interface (Keycloak protected): https://{{ devpi_dashboard_hostname }}"
+          - "API endpoint (direct access): https://{{ devpi_api_hostname }}"
+          - "Container image: {{ harbor_registry }}/{{ harbor_project }}/{{ app_name }}:{{ image_tag }}"
+          - "-----------------------------------"

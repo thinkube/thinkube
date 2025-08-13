@@ -1,0 +1,424 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/code-server/15_configure_environment.yaml
+# Description:
+#   Configure code-server environment after deployment using kubectl exec
+#   This runs IN the actual container, so all changes persist
+#
+# Requirements:
+#   - code-server must be deployed (10_deploy.yaml)
+#   - Pod must be running and ready
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/15_configure_environment.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Configure code-server environment
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    code_server_namespace: "code-server"
+    kubectl_bin: "microk8s.kubectl"
+    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
+    
+  tasks:
+    - name: Get code-server pod name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
+          -l app=code-server \
+          -o jsonpath='{.items[0].metadata.name}'
+      register: pod_name
+      failed_when: pod_name.stdout == ""
+      
+    - name: Wait for pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        name: "{{ pod_name.stdout }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+        
+    - name: Check Node.js version
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "if command -v node >/dev/null 2>&1; then node --version | grep -oE '[0-9]+' | head -1; else echo '0'; fi"
+      register: node_version
+      changed_when: false
+      
+    - name: Install or upgrade Node.js in the container
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            set -e
+            echo '===== Installing/Upgrading Node.js ====='
+            
+            # Install Node.js 20 from NodeSource (includes navigator global)
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+            
+            # Verify installation
+            echo 'Node.js version:' \$(node --version)
+            echo 'npm version:' \$(npm --version)
+          "
+      when: node_version.stdout | int < 20
+      
+    - name: Create code symlink for Claude Code IDE integration
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            # Create symlink for Claude Code IDE integration in /usr/bin
+            if [ ! -L /usr/bin/code ]; then
+              echo 'Creating symlink for Claude Code IDE integration...'
+              sudo ln -s /usr/bin/code-server /usr/bin/code
+              echo '✅ Symlink created: /usr/bin/code -> /usr/bin/code-server'
+            else
+              echo 'Symlink /usr/bin/code already exists'
+            fi
+            
+            # Also ensure remote-cli directory has the symlink (for compatibility)
+            if [ -d /usr/lib/code-server/lib/vscode/bin/remote-cli ] && [ ! -L /usr/lib/code-server/lib/vscode/bin/remote-cli/code ]; then
+              sudo ln -s /usr/lib/code-server/lib/vscode/bin/remote-cli/code-server /usr/lib/code-server/lib/vscode/bin/remote-cli/code
+              echo '✅ Remote-cli symlink also created'
+            fi
+            
+            # Verify the symlink works
+            if command -v code >/dev/null 2>&1; then
+              echo '✅ Verified: code command is available in PATH'
+            else
+              echo '❌ ERROR: code command not found in PATH'
+              exit 1
+            fi
+          "
+      register: symlink_result
+      failed_when: symlink_result.rc != 0
+      
+    - name: Configure npm for global installations
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            mkdir -p /home/coder/.npm-global
+            npm config set prefix '/home/coder/.npm-global'
+            
+            # Add to PATH in shell configs only if not already present
+            if ! grep -q '/home/coder/.npm-global/bin' /home/coder/.bashrc 2>/dev/null; then
+              echo 'export PATH=/home/coder/.npm-global/bin:\$PATH' >> /home/coder/.bashrc
+            fi
+            
+            if ! grep -q '/home/coder/.npm-global/bin' /home/coder/.profile 2>/dev/null; then
+              echo 'export PATH=/home/coder/.npm-global/bin:\$PATH' >> /home/coder/.profile
+            fi
+          "
+          
+    - name: Install Claude Code
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            export PATH=/home/coder/.npm-global/bin:\$PATH
+            npm install -g @anthropic-ai/claude-code
+          "
+          
+    - name: Create claude wrapper script content
+      ansible.builtin.set_fact:
+        claude_wrapper_content: |
+          #!/bin/bash
+          # Wrapper script for Claude Code to ensure PATH is set correctly
+          export PATH="/home/coder/.npm-global/bin:$PATH"
+          exec /home/coder/.npm-global/bin/claude "$@"
+          
+    - name: Copy claude wrapper script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /tmp/claude-wrapper.sh << "EOF"
+          {{ claude_wrapper_content }}
+          EOF'
+          
+    - name: Install claude wrapper script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "sudo mv /tmp/claude-wrapper.sh /usr/local/bin/claude && sudo chmod +x /usr/local/bin/claude"
+          
+    - name: Install Python and dependencies
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            set -e
+            echo '===== Installing Python and dependencies ====='
+            
+            # Install Python and dependencies
+            sudo apt-get update -qq
+            sudo apt-get install -y python3 python3-pip python3-venv git
+          "
+          
+    - name: Create Python virtual environment for Ansible
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "python3 -m venv /home/coder/.venv"
+          
+    - name: Install Ansible in virtual environment
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            /home/coder/.venv/bin/pip install --upgrade pip setuptools wheel
+            /home/coder/.venv/bin/pip install ansible ansible-core kubernetes
+          "
+          
+    - name: Install Ansible collections
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "/home/coder/.venv/bin/ansible-galaxy collection install kubernetes.core community.general ansible.posix"
+          
+    - name: Create wrapper directories
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/coder/.local/bin /home/coder/.ansible"
+          
+    - name: Create ansible wrapper scripts content
+      ansible.builtin.set_fact:
+        ansible_wrapper_content: |
+          #!/bin/bash
+          # Wrapper script for Ansible to use virtual environment
+          source /home/coder/.venv/bin/activate
+          exec ansible "$@"
+        ansible_playbook_wrapper_content: |
+          #!/bin/bash
+          # Wrapper script for ansible-playbook to use virtual environment
+          source /home/coder/.venv/bin/activate
+          exec ansible-playbook "$@"
+          
+    - name: Copy ansible wrapper script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/coder/.local/bin/ansible << "EOF"
+          {{ ansible_wrapper_content }}
+          EOF'
+          
+    - name: Copy ansible-playbook wrapper script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/coder/.local/bin/ansible-playbook << "EOF"
+          {{ ansible_playbook_wrapper_content }}
+          EOF'
+          
+    - name: Make wrapper scripts executable
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "chmod +x /home/coder/.local/bin/ansible /home/coder/.local/bin/ansible-playbook"
+          
+    - name: Create Ansible configuration content
+      ansible.builtin.set_fact:
+        ansible_cfg_content: |
+          [defaults]
+          host_key_checking = False
+          inventory = /home/coder/thinkube-platform/thinkube/inventory/hosts.yaml
+          remote_user = {{ system_username }}
+          private_key_file = /host-ssh/thinkube_cluster_key
+          interpreter_python = auto_silent
+          
+          [ssh_connection]
+          ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no
+          
+    - name: Copy Ansible configuration
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/coder/.ansible.cfg << "EOF"
+          {{ ansible_cfg_content }}
+          EOF'
+          
+    - name: Create thinkube-platform directory structure
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/coder/thinkube-platform"
+          
+    - name: Clone platform repositories
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            set -e
+            echo '===== Cloning platform repositories ====='
+            
+            # Check if SSH key exists
+            if [ -f /home/coder/.ssh/github_ed25519 ]; then
+              echo 'GitHub SSH key found at /home/coder/.ssh/github_ed25519'
+              chmod 600 /home/coder/.ssh/github_ed25519
+              
+              # Define repositories to clone
+              REPOS=(
+                'thinkube/thinkube'
+                'thinkube/thinkube-control'
+                'thinkube/thinkube-cicd-monitor'
+                'thinkube/thinkube-ai-integration'
+                'thinkube/tkt-webapp-vue-fastapi'
+              )
+              
+              # Clone or update each repository
+              for repo in \"\${REPOS[@]}\"; do
+                repo_name=\$(basename \$repo)
+                if [ ! -d \"/home/coder/thinkube-platform/\$repo_name\" ]; then
+                  echo \"Cloning \$repo...\"
+                  GIT_SSH_COMMAND='ssh -i /home/coder/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
+                    git clone \"git@github.com:\$repo.git\" \"/home/coder/thinkube-platform/\$repo_name\" || \
+                    echo \"Warning: Failed to clone \$repo (may be private or not exist)\"
+                else
+                  echo \"\$repo_name already exists, pulling latest changes...\"
+                  cd \"/home/coder/thinkube-platform/\$repo_name\"
+                  # Reset any local changes to avoid merge conflicts
+                  git reset --hard HEAD
+                  GIT_SSH_COMMAND='ssh -i /home/coder/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
+                    git pull || echo \"Warning: Failed to pull latest changes for \$repo_name\"
+                fi
+              done
+            else
+              echo 'ERROR: No SSH key found at /home/coder/.ssh/github_ed25519'
+              echo 'Please ensure GitHub SSH key is properly configured'
+            fi
+          "
+          
+    - name: Create VS Code workspace settings content
+      ansible.builtin.set_fact:
+        vscode_workspace_settings: |
+          {
+            "files.exclude": {
+              "**/.cache": true,
+              "**/.config": true,
+              "**/.local": true,
+              "**/.npm": true,
+              "**/.npm-global": true,
+              "**/.vscode-server": true,
+              "**/.ansible": true,
+              "**/.venv": true,
+              "**/.ansible.cfg": true,
+              "**/.ssh": true,
+              "**/.gitconfig": true,
+              "**/.npmrc": true,
+              "**/.profile": true,
+              "**/.bashrc": true,
+              "**/.bash_history": true,
+              "**/.claude.json": true,
+              "**/claude.json": true,
+              "**/ansible/.ansible": true,
+              "**/tmp": true,
+              "**/node_modules": true,
+              "**/create-gitea-repo.sh": true,
+              "**/setup-gitea-workflow.sh": true,
+              "**/.git": false,
+              "**/.gitignore": false
+            },
+            "explorer.excludeGitIgnore": false,
+            "search.exclude": {
+              "**/.cache": true,
+              "**/.config": true,
+              "**/.local": true,
+              "**/.npm": true,
+              "**/.npm-global": true,
+              "**/.vscode-server": true,
+              "**/.venv": true,
+              "**/node_modules": true,
+              "**/tmp": true,
+              "**/.bash_history": true
+            },
+            "terminal.integrated.defaultProfile.linux": "bash",
+            "terminal.integrated.profiles.linux": {
+              "bash": {
+                "path": "/bin/bash",
+                "args": ["-l"]
+              }
+            }
+          }
+          
+    - name: Create .vscode directory
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/coder/.vscode"
+          
+    - name: Copy VS Code workspace settings
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/coder/.vscode/settings.json << "EOF"
+          {{ vscode_workspace_settings }}
+          EOF'
+          
+    - name: Create extension installation script from template
+      ansible.builtin.template:
+        src: templates/install-extensions.sh.j2
+        dest: /tmp/install-extensions-{{ ansible_date_time.epoch }}.sh
+        mode: '0755'
+      register: install_script
+      
+    - name: Copy installation script to pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ install_script.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/install-extensions.sh \
+          -c code-server
+          
+    - name: Install VS Code extensions
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash /tmp/install-extensions.sh
+      register: extension_install
+      
+    - name: Clean up temporary script
+      ansible.builtin.file:
+        path: "{{ install_script.dest }}"
+        state: absent
+      
+    - name: Display extension installation output
+      ansible.builtin.debug:
+        var: extension_install.stdout_lines
+      when: extension_install is defined
+      
+    - name: Create temporary settings file from template
+      ansible.builtin.template:
+        src: templates/vscode-settings.json.j2
+        dest: /tmp/vscode-settings-{{ ansible_date_time.epoch }}.json
+        mode: '0644'
+      register: temp_settings_file
+      
+    - name: Ensure VS Code user settings directory exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          mkdir -p /home/coder/.local/share/code-server/User
+          
+    - name: Copy settings file to pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ temp_settings_file.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/coder/.local/share/code-server/User/settings.json \
+          -c code-server
+      register: extension_config
+      
+    - name: Clean up temporary file
+      ansible.builtin.file:
+        path: "{{ temp_settings_file.dest }}"
+        state: absent
+      
+    - name: Display extension configuration output
+      ansible.builtin.debug:
+        var: extension_config.stdout_lines
+      when: extension_config is defined
+      
+    - name: Display setup summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ Code-server environment configured successfully"
+          - "✅ Node.js and npm installed"
+          - "✅ Claude Code installed and available"
+          - "✅ Python and Ansible installed"
+          - "✅ Repository cloned (if SSH key available)"
+          - "✅ VS Code extensions installed (if repositories available)"
+          - "✅ VS Code workspace configured with clean file explorer"
+          - ""
+          - "The 'claude' command should now work in any new terminal session"
+          - ""
+          - "Extensions installed:"
+          - "  - thinkube-ai-integration (via symlink from platform repo)"
+          - "  - thinkube-cicd-monitor (via symlink from platform repo)" 
+          - "  - Hooks are configured for Ansible playbook review"

@@ -1,0 +1,576 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/jupyterhub/12_deploy.yaml
+# Description:
+#   Deploy JupyterHub with Keycloak authentication and custom container image
+#
+# Requirements:
+#   - MicroK8s cluster with Helm enabled
+#   - Custom JupyterHub image already pushed to Harbor registry
+#   - Keycloak client configured (run 11_configure_keycloak.yaml)
+#   - HARBOR_ROBOT_TOKEN environment variable set
+#   - TLS certificates available
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/12_deploy.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Registry domain for container images
+#   - harbor_project: Harbor project name
+#   - harbor_robot_user: Robot account name for Harbor authentication
+#   - keycloak_hostname: Keycloak server hostname
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username
+#   - domain_name: Base domain name
+#   - kubeconfig: Path to kubectl configuration
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+#   - tls_crt_path: Path to TLS certificate
+#   - tls_key_path: Path to TLS key
+#
+# Dependencies:
+#   - CORE-001 (MicroK8s) must be complete
+#   - CORE-002 (Keycloak) must be complete
+#   - CORE-004 (Harbor) must be complete
+#   - 10_build_image.yaml must be run first
+#   - 11_configure_keycloak.yaml should be run first
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy JupyterHub with Helm
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Common settings
+    jupyterhub_namespace: "jupyterhub"
+    jupyterhub_hostname: "jupyter.{{ domain_name }}"
+    jupyterhub_release_name: "jupyterhub"
+    
+    # Helm chart settings
+    jupyterhub_chart_repo: "https://jupyterhub.github.io/helm-chart/"
+    jupyterhub_chart_name: "jupyterhub/jupyterhub"
+    
+    # TLS configuration
+    jupyterhub_tls_secret_name: "jupyterhub-tls-secret"
+    
+    # Keycloak configuration
+    keycloak_url: "https://{{ keycloak_hostname }}"
+    keycloak_admin_user: "{{ admin_username }}"
+    keycloak_validate_certs: false
+    jupyterhub_client_id: "jupyterhub"
+    
+    # Storage settings - aligned with code-server
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    code_source_path: "{{ shared_code_path }}"
+    pip_cache_path: "{{ ansible_env.HOME }}/pip-cache"
+    
+    # Values file for Helm chart
+    jupyterhub_values_file: "/tmp/jupyterhub-values.yaml"
+    
+    # Default client secret (will be used if Keycloak client creation fails)
+    default_client_secret: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=32') }}"
+    
+    # Custom image settings
+    jupyterhub_custom_image: "jupyterhub-custom"
+    jupyterhub_custom_image_tag: "latest"
+    
+    # Full image reference
+    jupyterhub_custom_image_full: "{{ harbor_registry }}/{{ harbor_project }}/{{ jupyterhub_custom_image }}:{{ jupyterhub_custom_image_tag }}"
+    
+    # Package management path
+    package_management_path: "{{ ansible_env.HOME }}/jupyterhub-packages"
+
+  pre_tasks:
+    - name: Get Kubernetes node name for current host
+      ansible.builtin.shell: |
+        # Get all node names and find the one that matches our hostname
+        HOSTNAME=$(hostname)
+        for node in $({{ kubectl_bin }} get nodes -o jsonpath='{.items[*].metadata.name}'); do
+          if echo "$node" | grep -q "$HOSTNAME"; then
+            echo "$node"
+            exit 0
+          fi
+        done
+        # This should not happen - fail loudly
+        echo "ERROR: Could not find node matching hostname $HOSTNAME" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: k8s_node_result
+      changed_when: false
+      failed_when: k8s_node_result.rc != 0
+      
+    - name: Set k8s_controller_node fact
+      ansible.builtin.set_fact:
+        k8s_controller_node: "{{ k8s_node_result.stdout }}"
+        
+    - name: Debug node name
+      ansible.builtin.debug:
+        msg: "Kubernetes node name: {{ k8s_controller_node }}"
+
+    - name: Set environment file path
+      ansible.builtin.set_fact:
+        env_file_path: "{{ ansible_env.HOME }}/.env"
+
+    # Load Harbor robot token from .env file
+    - name: Check for HARBOR_ROBOT_TOKEN in .env file
+      ansible.builtin.shell: |
+        if [ -f "{{ env_file_path }}" ]; then
+          grep HARBOR_ROBOT_TOKEN {{ env_file_path }} | sed -E 's/HARBOR_ROBOT_TOKEN="?([^"]*)"?/\1/' || echo ""
+        else
+          echo ""
+        fi
+      register: harbor_token_result
+      changed_when: false
+      no_log: true
+
+    - name: Set harbor_robot_token fact
+      ansible.builtin.set_fact:
+        harbor_robot_token: "{{ harbor_token_result.stdout }}"
+    
+
+    # Ensure jupyterhub namespace exists
+    - name: Create JupyterHub namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ jupyterhub_namespace }}"
+
+  tasks:
+    # Ensure shared code directory exists
+    - name: Show source path
+      ansible.builtin.debug:
+        msg: 
+          - "Using shared code path: {{ code_source_path }}"
+          - "This directory is shared with code-server"
+        
+    - name: Ensure shared code directory exists
+      ansible.builtin.file:
+        path: "{{ code_source_path }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    # Verify Harbor token is available from environment role
+    - name: Verify Harbor token is available
+      ansible.builtin.assert:
+        that:
+          - harbor_robot_token is defined
+          - harbor_robot_token | length > 0
+        fail_msg: "HARBOR_ROBOT_TOKEN environment variable must be set for pulling images from Harbor"
+        success_msg: "Harbor robot token is available"
+
+    # Create Harbor registry secret using direct shell approach
+    - name: Create Harbor registry secret with direct shell approach
+      ansible.builtin.shell: |
+        # Create a temporary JSON file for the Docker config
+        CONFIG_FILE=$(mktemp)
+        
+        # Create the JSON content with the token from environment variables
+        cat > $CONFIG_FILE << EOF
+        {
+          "auths": {
+            "{{ harbor_registry }}": {
+              "auth": "$(echo -n '{{ harbor_robot_user }}:{{ harbor_robot_token }}' | base64 -w 0)"
+            }
+          }
+        }
+        EOF
+        
+        # Create or update the secret
+        {{ kubectl_bin }} create secret docker-registry harbor-registry-credentials \
+          --namespace {{ jupyterhub_namespace }} \
+          --from-file=.dockerconfigjson=$CONFIG_FILE \
+          --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
+        
+        # Clean up
+        rm -f $CONFIG_FILE
+      register: create_secret_result
+      changed_when: create_secret_result.rc == 0
+      failed_when: create_secret_result.rc != 0
+
+    # Create StorageClass for JupyterHub
+    - name: Create StorageClass for JupyterHub
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: jupyterhub-user-storage
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "false"
+          provisioner: microk8s.io/hostpath
+          reclaimPolicy: Delete
+          volumeBindingMode: Immediate
+          allowVolumeExpansion: true
+    
+    # Create persistent volumes and claims
+    - name: Create persistent volume for pip cache
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: pip-cache-pv
+            labels:
+              type: hostPath
+              app: jupyterhub-pip-cache
+          spec:
+            capacity:
+              storage: 5Gi
+            accessModes:
+              - ReadWriteMany
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: manual
+            hostPath:
+              path: "{{ pip_cache_path }}"
+              type: DirectoryOrCreate
+            nodeAffinity:
+              required:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                    - "{{ k8s_controller_node }}"
+
+    - name: Create persistent volume claim for pip cache
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ jupyterhub_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: pip-cache-pvc
+          spec:
+            accessModes:
+              - ReadWriteMany
+            storageClassName: manual
+            resources:
+              requests:
+                storage: 5Gi
+            selector:
+              matchLabels:
+                type: hostPath
+                app: jupyterhub-pip-cache
+    
+    # Create persistent volume for shared notebooks
+    - name: Create persistent volume for shared notebooks
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: jupyterhub-shared-notebooks
+            labels:
+              type: hostPath
+              app: jupyterhub-shared-notebooks
+          spec:
+            capacity:
+              storage: 10Gi
+            accessModes:
+              - ReadWriteMany
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: manual
+            hostPath:
+              path: "{{ code_source_path }}/notebooks"
+              type: DirectoryOrCreate
+            nodeAffinity:
+              required:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                    - "{{ k8s_controller_node }}"
+
+    - name: Create persistent volume claim for shared notebooks
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ jupyterhub_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: jupyterhub-shared-notebooks
+          spec:
+            accessModes:
+              - ReadWriteMany
+            storageClassName: manual
+            resources:
+              requests:
+                storage: 10Gi
+            selector:
+              matchLabels:
+                type: hostPath
+                app: jupyterhub-shared-notebooks
+    
+    # Ensure directories exist with proper permissions
+    - name: Ensure pip cache directory exists
+      ansible.builtin.file:
+        path: "{{ pip_cache_path }}"
+        state: directory
+        mode: '0755'
+        owner: "1000"  # jovyan user ID
+        group: "100"   # users group
+      become: true
+
+    - name: Ensure notebooks directory exists
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/notebooks"
+        state: directory
+        mode: '0775'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Set shared directories permissions for JupyterHub access
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0777'  # Allow all users to write
+        recurse: yes
+      become: true
+      loop:
+        - "{{ code_source_path }}"
+        - "{{ code_source_path }}/notebooks"
+
+    # Check if Keycloak secret exists
+    - name: Check if Keycloak OIDC secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: jupyterhub-oidc-secret
+        namespace: "{{ jupyterhub_namespace }}"
+      register: keycloak_secret
+
+    - name: Set auth type based on Keycloak secret existence
+      ansible.builtin.set_fact:
+        auth_type: "{{ 'generic-oauth' if keycloak_secret.resources | length > 0 else 'dummy' }}"
+        jupyterhub_client_secret: "{{ keycloak_secret.resources[0].data.client_secret | b64decode if keycloak_secret.resources | length > 0 else default_client_secret }}"
+
+    # Get wildcard certificate from default namespace
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    # Copy wildcard certificate to JupyterHub namespace
+    - name: Copy wildcard certificate to JupyterHub namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ jupyterhub_tls_secret_name }}"
+            namespace: "{{ jupyterhub_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+      
+    # Add Helm repo and update
+    - name: Add JupyterHub Helm repo
+      ansible.builtin.command: "{{ helm_bin }} repo add jupyterhub {{ jupyterhub_chart_repo }}"
+      register: add_repo
+      changed_when: add_repo.rc == 0 and not add_repo.stderr | regex_search('already exists')
+      failed_when: add_repo.rc != 0 and not add_repo.stderr | regex_search('already exists')
+
+    - name: Update Helm repos
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+      register: update_repo
+      changed_when: update_repo.rc == 0
+
+    - name: Get latest JupyterHub Helm chart version
+      ansible.builtin.shell: |
+        LATEST_VERSION=$({{ helm_bin }} search repo jupyterhub/jupyterhub -o json | jq -r '.[0].version')
+        echo $LATEST_VERSION
+      register: latest_version
+      changed_when: false
+
+    - name: Set Helm chart version to use
+      ansible.builtin.set_fact:
+        jupyterhub_chart_version: "{{ latest_version.stdout | trim }}"
+      when: latest_version.stdout | trim != ""
+
+    - name: Show JupyterHub chart version to be installed
+      ansible.builtin.debug:
+        msg: "Installing JupyterHub chart version: {{ jupyterhub_chart_version }}"
+
+    # Generate random tokens for the JupyterHub deployment
+    - name: Generate random token for proxy
+      ansible.builtin.set_fact:
+        proxy_token: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=32') }}"
+
+    # Create JupyterHub values file
+    - name: Create JupyterHub Helm values file
+      ansible.builtin.template:
+        src: templates/jupyterhub-values.yaml.j2
+        dest: "{{ jupyterhub_values_file }}"
+      vars:
+        auth_type: "{{ auth_type }}"
+        client_id: "{{ jupyterhub_client_id }}"
+        client_secret: "{{ jupyterhub_client_secret }}"
+        oauth_callback_url: "https://{{ jupyterhub_hostname }}/hub/oauth_callback"
+        hostname: "{{ jupyterhub_hostname }}"
+        proxy_secretToken: "{{ proxy_token }}"
+        tls_secret: "{{ jupyterhub_tls_secret_name }}"
+        control_plane_hostname: "{{ k8s_controller_node }}"
+
+    # Create ConfigMap for WebSocket headers in the ingress namespace
+    - name: Create WebSocket headers ConfigMap for ingress controller
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: websocket-headers
+            namespace: "{{ ingress_namespace }}"
+          data:
+            Upgrade: $http_upgrade
+            Connection: $connection_upgrade
+      register: websocket_headers
+      ignore_errors: true
+
+    # Install JupyterHub using Helm
+    - name: Install JupyterHub using Helm
+      ansible.builtin.command: >
+        {{ helm_bin }} upgrade --install 
+        {{ jupyterhub_release_name }} 
+        {{ jupyterhub_chart_name }} 
+        --namespace {{ jupyterhub_namespace }} 
+        --version {{ jupyterhub_chart_version }}
+        --values {{ jupyterhub_values_file }}
+        --timeout 15m
+        --set singleuser.image.pullSecrets[0]=harbor-registry-credentials
+      register: helm_install
+      changed_when: helm_install.rc == 0
+      failed_when: helm_install.rc != 0
+
+    # Wait for deployment to be ready
+    - name: Wait for JupyterHub deployment to be ready
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n {{ jupyterhub_namespace }} wait --for=condition=Available deployment/hub --timeout=300s
+      register: wait_deployment
+      changed_when: false
+      retries: 3
+      delay: 30
+      until: wait_deployment.rc == 0
+      failed_when: false
+
+    # Delete network policies to ensure unrestricted connectivity
+    - name: Check for existing network policies in JupyterHub namespace
+      ansible.builtin.command: "{{ kubectl_bin }} get networkpolicy -n {{ jupyterhub_namespace }}"
+      register: existing_policies
+      changed_when: false
+
+    - name: Delete 'hub' network policy
+      ansible.builtin.command: "{{ kubectl_bin }} delete networkpolicy -n {{ jupyterhub_namespace }} hub"
+      register: delete_hub_policy
+      changed_when: delete_hub_policy.rc == 0
+      failed_when: false
+      when: existing_policies.rc == 0 and 'hub' in existing_policies.stdout
+
+    - name: Delete 'proxy' network policy
+      ansible.builtin.command: "{{ kubectl_bin }} delete networkpolicy -n {{ jupyterhub_namespace }} proxy"
+      register: delete_proxy_policy
+      changed_when: delete_proxy_policy.rc == 0
+      failed_when: false
+      when: existing_policies.rc == 0 and 'proxy' in existing_policies.stdout
+
+    - name: Delete 'singleuser' network policy
+      ansible.builtin.command: "{{ kubectl_bin }} delete networkpolicy -n {{ jupyterhub_namespace }} singleuser"
+      register: delete_singleuser_policy
+      changed_when: delete_singleuser_policy.rc == 0
+      failed_when: false
+      when: existing_policies.rc == 0 and 'singleuser' in existing_policies.stdout
+
+    # Clean up values file
+    - name: Remove values file
+      ansible.builtin.file:
+        path: "{{ jupyterhub_values_file }}"
+        state: absent
+
+    # Display deployment information
+    - name: Get JupyterHub status
+      ansible.builtin.command: "{{ kubectl_bin }} -n {{ jupyterhub_namespace }} get pods"
+      register: pods_status
+      changed_when: false
+      failed_when: false
+
+    # Create warning message if Keycloak integration failed
+    - name: Set Keycloak warning message
+      ansible.builtin.set_fact:
+        keycloak_warning: |
+          WARNING: Keycloak integration was not set up correctly.
+          JupyterHub is deployed with dummy authentication.
+          To enable Keycloak OAuth authentication:
+          1. Run: ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/11_configure_keycloak.yaml
+          2. Then redeploy JupyterHub
+      when: auth_type == "dummy"
+
+    - name: Set Keycloak success message
+      ansible.builtin.set_fact:
+        keycloak_message: |
+          Keycloak OAuth integration is properly configured.
+          JupyterHub will use Keycloak for authentication.
+      when: auth_type == "generic-oauth"
+
+    - name: Display JupyterHub deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "=============================================================="
+          - "JupyterHub deployment complete!"
+          - ""
+          - "Access information:"
+          - "  URL: https://{{ jupyterhub_hostname }}"
+          - "  Authentication: {{ 'Keycloak OAuth' if auth_type == 'generic-oauth' else 'Dummy authentication' }}"
+          - ""
+          - "{{ keycloak_message | default(keycloak_warning) }}"
+          - ""
+          - "JupyterHub chart version: {{ jupyterhub_chart_version }}"
+          - "JupyterLab version: 4.1.5 (latest stable)"
+          - ""
+          - "Custom image:"
+          - "  {{ jupyterhub_custom_image_full }}"
+          - ""
+          - "Network policies:"
+          - "  All network policies have been removed to enable unrestricted connectivity."
+          - "  This allows JupyterHub to connect to external services like Minio."
+          - ""
+          - "Pod status:"
+          - "{{ pods_status.stdout_lines }}"
+          - ""
+          - "Shared notebooks location:"
+          - "  {{ code_source_path }}/notebooks"
+          - ""
+          - "Node affinity:"
+          - "  Running on same node as code-server: {{ k8s_controller_node }}"
+          - "=============================================================="

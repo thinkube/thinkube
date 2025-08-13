@@ -1,0 +1,308 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/monitoring/14_import_grafana_dashboards.yaml
+# Description:
+#   Configure and provision Grafana dashboards for Kubernetes and GPU monitoring
+#
+# Requirements:
+#   - Grafana must be deployed (13_deploy_grafana.yaml)
+#   - Prometheus must be deployed and collecting metrics
+#   - Internet access to download dashboards from grafana.com
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/monitoring/14_import_grafana_dashboards.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Grafana Dashboards
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Dashboard IDs from grafana.com - One per area, all in English
+    dashboards:
+      # Kubernetes Dashboard - uses kube-state-metrics and kubelet metrics
+      - id: 7249
+        name: "Kubernetes Cluster"
+        folder: "Kubernetes"
+        datasource: "Prometheus"
+      # Infrastructure Dashboard - uses node_exporter metrics
+      - id: 1860
+        name: "Node Exporter Full"
+        folder: "Infrastructure"
+        datasource: "Prometheus"
+      # Application Dashboard - NGINX Ingress Controller metrics
+      - id: 9614
+        name: "Nginx Ingress Controller"
+        folder: "Applications"
+        datasource: "Prometheus"
+      # GPU Dashboard - NVIDIA DCGM Exporter metrics
+      - id: 12239
+        name: "NVIDIA DCGM Exporter Dashboard"
+        folder: "GPU"
+        datasource: "Prometheus"
+
+  tasks:
+    ###################################################################
+    # 1) Create Service Account and Token
+    ###################################################################
+    - name: Create Grafana Service Account
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/api/serviceaccounts"
+        method: POST
+        user: "{{ admin_username }}"
+        password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: "ansible-provisioning-{{ ansible_date_time.epoch }}"
+          role: "Admin"
+        validate_certs: false
+        status_code: [200, 201, 409]
+      register: grafana_service_account
+
+    - name: Extract service account ID
+      ansible.builtin.set_fact:
+        service_account_id: "{{ grafana_service_account.json.id }}"
+      when: grafana_service_account.status in [200, 201]
+
+    - name: Get service account ID if already exists
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/api/serviceaccounts/search?query=ansible-provisioning"
+        method: GET
+        user: "{{ admin_username }}"
+        password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: existing_accounts
+      when: grafana_service_account.status == 409
+
+    - name: Set service account ID from existing
+      ansible.builtin.set_fact:
+        service_account_id: "{{ existing_accounts.json.serviceAccounts[0].id }}"
+      when: grafana_service_account.status == 409
+
+    - name: Create Service Account Token
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/api/serviceaccounts/{{ service_account_id }}/tokens"
+        method: POST
+        user: "{{ admin_username }}"
+        password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: "token-{{ ansible_date_time.epoch }}"
+        validate_certs: false
+        status_code: [200, 201]
+      register: grafana_api_token
+
+    - name: Set API key fact
+      ansible.builtin.set_fact:
+        grafana_api_key:
+          json:
+            key: "{{ grafana_api_token.json.key }}"
+
+    ###################################################################
+    # 2) Create folders for organization
+    ###################################################################
+    - name: Create dashboard folders
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/api/folders"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ grafana_api_key.json.key }}"
+        body_format: json
+        body:
+          title: "{{ item }}"
+        validate_certs: false
+        status_code: [200, 409]  # 409 if folder already exists
+      loop:
+        - "Kubernetes"
+        - "Infrastructure"
+        - "GPU"
+        - "Applications"
+
+    ###################################################################
+    # 3) Download and import dashboards
+    ###################################################################
+    - name: Download dashboard JSON from grafana.com
+      ansible.builtin.uri:
+        url: "https://grafana.com/api/dashboards/{{ item.id }}/revisions/latest/download"
+        method: GET
+        validate_certs: false
+        return_content: true
+      register: dashboard_json
+      loop: "{{ dashboards }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Get folder UIDs
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/api/folders"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_api_key.json.key }}"
+        validate_certs: false
+      register: folders_list
+
+    - name: Create folder UID mapping
+      ansible.builtin.set_fact:
+        folder_uids: "{{ folder_uids | default({}) | combine({item.title: item.uid}) }}"
+      loop: "{{ folders_list.json }}"
+      when: item.title in ['Kubernetes', 'Infrastructure', 'GPU', 'Applications']
+
+    - name: Get Prometheus datasource UID
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/api/datasources/name/Prometheus"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_api_key.json.key }}"
+        validate_certs: false
+      register: prometheus_datasource
+
+    - name: Process dashboard and replace datasource references
+      ansible.builtin.set_fact:
+        processed_dashboard: >-
+          {{
+            item.1.content | 
+            regex_replace('\$\{DS_PROMETHEUS\}', prometheus_datasource.json.uid) |
+            from_json |
+            combine({'uid': None, 'id': None}, recursive=True) |
+            dict2items |
+            rejectattr('key', 'in', ['__inputs', '__requires']) |
+            items2dict
+          }}
+      loop: "{{ dashboards | zip(dashboard_json.results) | list }}"
+      loop_control:
+        label: "{{ item.0.name }}"
+        index_var: dash_idx
+      when: item.1 is succeeded
+      register: processed_dashboards
+
+    - name: Import processed dashboards to Grafana
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/api/dashboards/db"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ grafana_api_key.json.key }}"
+        body_format: json
+        body:
+          dashboard: "{{ item.ansible_facts.processed_dashboard }}"
+          folderUid: "{{ folder_uids[dashboards[item.dash_idx].folder] }}"
+          overwrite: true
+        validate_certs: false
+        status_code: 200
+      loop: "{{ processed_dashboards.results }}"
+      loop_control:
+        label: "{{ dashboards[item.dash_idx].name if item.dash_idx is defined else 'skipped' }}"
+      when: 
+        - item is not skipped
+        - item.ansible_facts is defined
+
+    ###################################################################
+    # 4) Create ConfigMap for persistent dashboard provisioning
+    ###################################################################
+    - name: Create dashboard provisioning ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ monitoring_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: grafana-dashboard-provisioning
+          data:
+            dashboards.yaml: |
+              apiVersion: 1
+              providers:
+                - name: 'default'
+                  orgId: 1
+                  folder: ''
+                  type: file
+                  disableDeletion: false
+                  updateIntervalSeconds: 10
+                  allowUiUpdates: true
+                  options:
+                    path: /var/lib/grafana/dashboards
+                - name: 'kubernetes'
+                  orgId: 1
+                  folder: 'Kubernetes'
+                  type: file
+                  disableDeletion: false
+                  updateIntervalSeconds: 10
+                  allowUiUpdates: true
+                  options:
+                    path: /var/lib/grafana/dashboards/kubernetes
+                - name: 'infrastructure'
+                  orgId: 1
+                  folder: 'Infrastructure'
+                  type: file
+                  disableDeletion: false
+                  updateIntervalSeconds: 10
+                  allowUiUpdates: true
+                  options:
+                    path: /var/lib/grafana/dashboards/infrastructure
+
+    ###################################################################
+    # 5) Delete the service account token (cleanup)
+    ###################################################################
+    - name: Delete temporary service account token
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/api/serviceaccounts/{{ service_account_id }}/tokens/{{ grafana_api_token.json.id }}"
+        method: DELETE
+        user: "{{ admin_username }}"
+        password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200, 204, 404]  # 404 if already deleted
+      when: grafana_api_token.json.id is defined
+
+    ###################################################################
+    # 6) Summary
+    ###################################################################
+    - name: Dashboard deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Grafana Dashboards Configured
+          ════════════════════════════════════════════════════════
+          
+          The following dashboards have been imported:
+          
+          📊 KUBERNETES DASHBOARD:
+          ─────────────────────────
+          • Kubernetes Cluster (7249)
+            - Shows cluster overview with node status
+            - Pod and container metrics
+            - Resource usage (CPU/Memory)
+          
+          🖥️ INFRASTRUCTURE DASHBOARD:
+          ─────────────────────────
+          • Node Exporter Full (1860)
+            - System metrics (CPU, Memory, Disk, Network)
+            - Load average and uptime
+            - Filesystem usage
+          
+          🌐 APPLICATION DASHBOARD:
+          ─────────────────────────
+          • Nginx Ingress Controller (9614)
+            - Request rates and latencies
+            - Response codes and errors
+            - Certificate expiry monitoring
+          
+          🎮 GPU DASHBOARD:
+          ─────────────────────────
+          • NVIDIA DCGM Exporter Dashboard (12239)
+            - GPU utilization and temperature
+            - Memory usage and power consumption
+            - GPU process information
+          
+          Access dashboards at: https://{{ grafana_hostname }}/dashboards
+          
+          Note: GPU dashboards require NVIDIA GPU Operator or DCGM Exporter
+          ════════════════════════════════════════════════════════

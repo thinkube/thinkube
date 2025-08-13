@@ -1,0 +1,86 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Starship Prompt Setup - Install and configure Starship prompt
+- name: Check if Starship is installed
+  shell: which starship || echo "not found"
+  register: starship_exists
+  changed_when: false
+  tags: [starship]
+
+- name: Create config directory for Starship
+  file:
+    path: "{{ starship_config_dir }}"
+    state: directory
+    mode: '0755'
+  tags: [starship]
+
+- name: Install Starship (system-wide with become)
+  shell: curl --connect-timeout 10 --max-time 60 -sS https://starship.rs/install.sh | sh -s -- -y
+  args:
+    executable: /bin/bash
+  when: starship_exists.stdout == "not found"
+  register: starship_install_result
+  async: 120
+  poll: 5
+  become: true
+  tags: [starship]
+
+- name: Install Starship (fallback method - user install)
+  block:
+    - name: Create personal bin directory
+      file:
+        path: "{{ user_home }}/.local/bin"
+        state: directory
+        mode: '0755'
+        
+    - name: Download Starship binary directly
+      get_url:
+        url: https://github.com/starship/starship/releases/latest/download/starship-x86_64-unknown-linux-gnu.tar.gz
+        dest: /tmp/starship.tar.gz
+        timeout: 30
+      
+    - name: Create extraction directory
+      file:
+        path: /tmp/starship_extract
+        state: directory
+        mode: '0755'
+
+    - name: Extract Starship binary
+      unarchive:
+        src: /tmp/starship.tar.gz
+        dest: /tmp/starship_extract
+        remote_src: yes
+        
+    - name: Install Starship binary to user directory
+      copy:
+        src: /tmp/starship_extract/starship
+        dest: "{{ user_home }}/.local/bin/starship"
+        mode: '0755'
+        remote_src: yes
+  when: 
+    - starship_exists.stdout == "not found"
+    - starship_install_result is defined
+    - starship_install_result.failed is defined
+    - starship_install_result.failed
+  tags: [starship, fallback]
+
+- name: Verify Starship installation
+  shell: which starship || echo "not found"
+  register: starship_final_check
+  changed_when: false
+  tags: [starship]
+
+- name: Set fact for Starship availability
+  set_fact:
+    starship_available: "{{ starship_final_check.stdout != 'not found' }}"
+  tags: [starship]
+
+- name: Configure Starship with Tokyo Night theme
+  template:
+    src: templates/starship.toml.j2
+    dest: "{{ starship_config_dir }}/starship.toml"
+    mode: '0644'
+  when: starship_available
+  tags: [starship]

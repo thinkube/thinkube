@@ -1,0 +1,374 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/cert-manager/letsencrypt/21_configure_renewal.yaml
+# Description:
+#   Configure enhanced certificate renewal and propagation
+#   This ensures certificates are automatically synced when renewed
+#
+# Requirements:
+#   - cert-manager must be deployed
+#   - Certificate sync CronJob must exist (created by 20_request_production.yaml)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/cert-manager/letsencrypt/21_configure_renewal.yaml
+#
+# Variables from inventory:
+#   - domain_name: The domain for certificates
+#   - harbor_hostname: Harbor registry hostname
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Enhanced Certificate Renewal and Propagation
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    cert_manager_namespace: cert-manager
+    # Option to enable pod restarts on certificate renewal
+    restart_pods_on_renewal: "{{ restart_on_cert_renewal | default(false) }}"
+    
+  tasks:
+    - name: Create advanced certificate sync script with restart capability
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cert-sync-advanced
+            namespace: "{{ cert_manager_namespace }}"
+          data:
+            sync-certs.sh: |
+              #!/bin/bash
+              set -e
+              
+              DOMAIN_NAME="{{ domain_name }}"
+              CERT_NAME="${DOMAIN_NAME//./-}-tls"
+              RESTART_ON_RENEWAL="{{ restart_pods_on_renewal }}"
+              CERT_RENEWED="false"
+              
+              echo "════════════════════════════════════════════════════════"
+              echo "Certificate Sync Job - $(date)"
+              echo "════════════════════════════════════════════════════════"
+              
+              # Get the certificate from default namespace
+              echo "Fetching certificate from default namespace..."
+              kubectl get secret "$CERT_NAME" -n default -o json > /tmp/cert.json
+              
+              if [ ! -s /tmp/cert.json ]; then
+                echo "ERROR: Could not fetch certificate from default namespace"
+                exit 1
+              fi
+              
+              # Get the certificate data
+              TLS_CRT=$(jq -r '.data["tls.crt"]' /tmp/cert.json)
+              TLS_KEY=$(jq -r '.data["tls.key"]' /tmp/cert.json)
+              
+              # Check if certificate was recently renewed (within last hour)
+              CERT_ISSUE_TIME=$(echo "$TLS_CRT" | base64 -d | openssl x509 -startdate -noout | cut -d= -f2)
+              CERT_ISSUE_EPOCH=$(date -d "$CERT_ISSUE_TIME" +%s)
+              CURRENT_EPOCH=$(date +%s)
+              HOUR_AGO=$((CURRENT_EPOCH - 3600))
+              
+              if [ $CERT_ISSUE_EPOCH -gt $HOUR_AGO ]; then
+                echo "✨ Certificate was renewed recently!"
+                CERT_RENEWED="true"
+              fi
+              
+              # Get all namespaces that have TLS secrets
+              echo "Finding namespaces with TLS secrets..."
+              NAMESPACES=$(kubectl get secrets --all-namespaces -o json | \
+                jq -r '.items[] | select(.type == "kubernetes.io/tls") | .metadata.namespace' | \
+                sort -u | grep -v "^default$" || true)
+              
+              UPDATED_COUNT=0
+              
+              # Update certificates in each namespace
+              for NS in $NAMESPACES; do
+                # Check if this namespace has our certificate
+                if kubectl get secret -n "$NS" -o name | grep -E "(${CERT_NAME}|tls-secret)" >/dev/null 2>&1; then
+                  echo "Updating certificates in namespace: $NS"
+                  
+                  # Get all TLS secret names in this namespace
+                  SECRETS=$(kubectl get secrets -n "$NS" -o json | \
+                    jq -r '.items[] | select(.type == "kubernetes.io/tls") | .metadata.name')
+                  
+                  for SECRET in $SECRETS; do
+                    # Check if this secret needs updating
+                    CURRENT_CRT=$(kubectl get secret "$SECRET" -n "$NS" -o jsonpath='{.data.tls\.crt}' 2>/dev/null || echo "")
+                    
+                    if [ "$CURRENT_CRT" != "$TLS_CRT" ]; then
+                      echo "  📝 Updating secret: $SECRET"
+                      kubectl create secret tls "$SECRET" \
+                        --cert=<(echo "$TLS_CRT" | base64 -d) \
+                        --key=<(echo "$TLS_KEY" | base64 -d) \
+                        --namespace="$NS" \
+                        --dry-run=client -o yaml | kubectl apply -f -
+                      UPDATED_COUNT=$((UPDATED_COUNT + 1))
+                    else
+                      echo "  ✓ Secret $SECRET is already up to date"
+                    fi
+                  done
+                fi
+              done
+              
+              echo ""
+              echo "Summary:"
+              echo "- Certificates updated: $UPDATED_COUNT"
+              echo "- Certificate renewed: $CERT_RENEWED"
+              
+              # Restart pods if certificate was renewed and option is enabled
+              if [ "$CERT_RENEWED" == "true" ] && [ "$RESTART_ON_RENEWAL" == "true" ]; then
+                echo ""
+                echo "🔄 Restarting pods that mount TLS certificates..."
+                
+                for NS in $NAMESPACES; do
+                  # Find pods that mount TLS secrets
+                  PODS=$(kubectl get pods -n "$NS" -o json | \
+                    jq -r '.items[] | 
+                      select(.spec.volumes[]? | 
+                        select(.secret?.secretName | 
+                          test("tls|cert"))) | 
+                      .metadata.name' 2>/dev/null || true)
+                  
+                  for POD in $PODS; do
+                    echo "  Restarting pod: $POD in namespace: $NS"
+                    kubectl delete pod "$POD" -n "$NS" --grace-period=30 || true
+                  done
+                done
+              fi
+              
+              # Log renewal event
+              if [ "$CERT_RENEWED" == "true" ]; then
+                kubectl create configmap cert-renewal-log-$(date +%s) \
+                  -n cert-manager \
+                  --from-literal=renewed_at="$(date)" \
+                  --from-literal=domain="$DOMAIN_NAME" || true
+                
+                # Clean up old renewal logs (keep last 10)
+                kubectl get configmap -n cert-manager -o name | \
+                  grep "cert-renewal-log-" | \
+                  sort -r | \
+                  tail -n +11 | \
+                  xargs -r kubectl delete -n cert-manager || true
+              fi
+              
+              echo ""
+              echo "Certificate sync completed at $(date)"
+              echo "════════════════════════════════════════════════════════"
+
+    - name: Update certificate sync CronJob to use advanced script
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: cert-sync
+            namespace: "{{ cert_manager_namespace }}"
+          spec:
+            schedule: "0 * * * *"  # Run every hour
+            successfulJobsHistoryLimit: 3
+            failedJobsHistoryLimit: 3
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    serviceAccountName: cert-sync
+                    containers:
+                    - name: cert-sync
+                      image: "{{ harbor_registry }}/thinkube/kubectl:latest"
+                      command:
+                      - /bin/bash
+                      - /scripts/sync-certs.sh
+                      volumeMounts:
+                      - name: script
+                        mountPath: /scripts
+                    volumes:
+                    - name: script
+                      configMap:
+                        name: cert-sync-advanced
+                        defaultMode: 0755
+                    restartPolicy: OnFailure
+
+    - name: Create certificate renewal monitor DaemonSet
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: cert-renewal-monitor
+            namespace: "{{ cert_manager_namespace }}"
+            labels:
+              app: cert-renewal-monitor
+          spec:
+            selector:
+              matchLabels:
+                app: cert-renewal-monitor
+            template:
+              metadata:
+                labels:
+                  app: cert-renewal-monitor
+              spec:
+                serviceAccountName: cert-sync
+                containers:
+                - name: monitor
+                  image: "{{ harbor_registry }}/thinkube/kubectl:latest"
+                  command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    echo "Starting certificate renewal monitor..."
+                    
+                    # Monitor cert-manager events for certificate renewals
+                    kubectl get events -n default --field-selector reason=Issuing -w | while read line; do
+                      if echo "$line" | grep -q "certificate"; then
+                        echo "$(date): Certificate renewal detected - $line"
+                        
+                        # Wait a bit for the certificate to be issued
+                        sleep 30
+                        
+                        # Trigger immediate sync
+                        JOB_NAME="cert-sync-renewal-$(date +%s)"
+                        echo "Creating sync job: $JOB_NAME"
+                        
+                        kubectl create job \
+                          --from=cronjob/cert-sync \
+                          "$JOB_NAME" \
+                          -n cert-manager || echo "Failed to create job"
+                      fi
+                    done
+                  resources:
+                    limits:
+                      cpu: 100m
+                      memory: 128Mi
+                    requests:
+                      cpu: 10m
+                      memory: 64Mi
+                nodeSelector:
+                  node-role.kubernetes.io/control-plane: "true"
+                tolerations:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                  effect: NoSchedule
+
+    - name: Create certificate expiry alert ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cert-expiry-check
+            namespace: "{{ cert_manager_namespace }}"
+          data:
+            check-expiry.sh: |
+              #!/bin/bash
+              # Check certificate expiry and alert if needed
+              
+              DOMAIN_NAME="{{ domain_name }}"
+              CERT_NAME="${DOMAIN_NAME//./-}-tls"
+              WARN_DAYS=14  # Warn if cert expires in less than 14 days
+              
+              # Get certificate expiry
+              CERT_DATA=$(kubectl get secret $CERT_NAME -n default -o jsonpath='{.data.tls\.crt}' | base64 -d)
+              EXPIRY_DATE=$(echo "$CERT_DATA" | openssl x509 -enddate -noout | cut -d= -f2)
+              EXPIRY_EPOCH=$(date -d "$EXPIRY_DATE" +%s)
+              CURRENT_EPOCH=$(date +%s)
+              
+              DAYS_UNTIL_EXPIRY=$(( (EXPIRY_EPOCH - CURRENT_EPOCH) / 86400 ))
+              
+              echo "Certificate expiry check:"
+              echo "- Domain: $DOMAIN_NAME"
+              echo "- Expires: $EXPIRY_DATE"
+              echo "- Days until expiry: $DAYS_UNTIL_EXPIRY"
+              
+              if [ $DAYS_UNTIL_EXPIRY -lt $WARN_DAYS ]; then
+                echo "⚠️  WARNING: Certificate expires in $DAYS_UNTIL_EXPIRY days!"
+                
+                # Create alert ConfigMap
+                kubectl create configmap cert-expiry-alert \
+                  -n cert-manager \
+                  --from-literal=domain="$DOMAIN_NAME" \
+                  --from-literal=days_remaining="$DAYS_UNTIL_EXPIRY" \
+                  --from-literal=expiry_date="$EXPIRY_DATE" \
+                  --dry-run=client -o yaml | kubectl apply -f -
+              else
+                echo "✅ Certificate is valid for $DAYS_UNTIL_EXPIRY more days"
+              fi
+
+    - name: Create certificate expiry check CronJob
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: cert-expiry-check
+            namespace: "{{ cert_manager_namespace }}"
+          spec:
+            schedule: "0 8 * * *"  # Run daily at 8 AM
+            successfulJobsHistoryLimit: 1
+            failedJobsHistoryLimit: 3
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    serviceAccountName: cert-sync
+                    containers:
+                    - name: check-expiry
+                      image: "{{ harbor_registry }}/thinkube/kubectl:latest"
+                      command:
+                      - /bin/bash
+                      - /scripts/check-expiry.sh
+                      volumeMounts:
+                      - name: script
+                        mountPath: /scripts
+                    volumes:
+                    - name: script
+                      configMap:
+                        name: cert-expiry-check
+                        defaultMode: 0755
+                    restartPolicy: OnFailure
+
+    - name: Display renewal configuration summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Certificate Renewal Configuration Complete
+          ════════════════════════════════════════════════════════
+          
+          Automatic Renewal:
+          - cert-manager will renew certificates 30 days before expiry
+          - Renewals happen automatically without intervention
+          
+          Certificate Propagation:
+          - Hourly sync job propagates certificates to all namespaces
+          - Renewal monitor triggers immediate sync on renewal events
+          - Optional: Pod restart on renewal (currently {{ 'enabled' if restart_pods_on_renewal else 'disabled' }})
+          
+          Monitoring:
+          - Daily expiry check at 8 AM
+          - Alerts created 14 days before expiry
+          - Renewal events logged in cert-manager namespace
+          
+          Manual Operations:
+          - Force sync: Run 22_sync_certificates.yaml
+          - Check renewal logs: kubectl get cm -n cert-manager | grep cert-renewal-log
+          - Check expiry alerts: kubectl get cm cert-expiry-alert -n cert-manager
+          
+          🤖 Advanced Features:
+          - Smart sync only updates changed certificates
+          - Renewal detection triggers immediate propagation
+          - Pod restart capability for zero-downtime updates
+          ════════════════════════════════════════════════════════

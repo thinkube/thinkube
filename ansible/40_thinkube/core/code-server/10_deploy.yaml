@@ -1,0 +1,1130 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/code-server/10_deploy.yaml
+# Description:
+#   Deploy Code Server on Kubernetes with Keycloak authentication via OAuth2 Proxy
+#
+# Requirements:
+#   - MicroK8s must be installed
+#   - Keycloak instance running and accessible
+#   - ADMIN_PASSWORD environment variable set
+#   - Wildcard TLS certificate in default namespace
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/code-server/10_deploy.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubectl configuration
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+#   - domain_name: Base domain for all services
+#   - harbor_registry: Harbor registry URL
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username
+#   - primary_ingress_ip: Primary ingress IP address
+#
+# Dependencies:
+#   - CORE-002: Keycloak must be deployed
+#   - CORE-003: cert-manager and TLS certificates must be configured
+#   - CORE-004: Harbor registry must be configured
+#
+# 🤖 [AI-generated]
+
+- name: Deploy Code Server secured with OAuth2 Proxy
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Namespace settings
+    code_server_namespace: "code-server"
+    
+    # Code Server settings
+    code_server_hostname: "code.{{ domain_name }}"
+    code_server_tls_secret_name: "code-server-tls-secret"
+    
+    # Kubernetes configuration
+    kubectl_bin: "microk8s.kubectl"
+    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
+    
+    # Keycloak connection info
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+    # Code Server client details (Keycloak)
+    code_server_client_id: "code-server"
+    code_server_redirect_uri: "https://{{ code_server_hostname }}/oauth2/callback"
+    code_server_web_origins: "https://{{ code_server_hostname }}"
+    code_server_lifespan: "3600"
+    
+    # OAuth2 Proxy settings
+    oauth2_proxy_cookie_domain: ".{{ domain_name }}"
+    
+    # Control hub configuration - following thinkube-control pattern
+    control_host: "control.{{ domain_name }}"
+    control_hub_url: "https://{{ control_host }}"
+    
+    # Shared code directory (accessible from code-server and jupyterhub)
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    code_source_path: "{{ shared_code_path }}"
+
+  pre_tasks:
+    - name: Get Kubernetes node name for current host
+      ansible.builtin.shell: |
+        # Get all node names and find the one that matches our hostname
+        HOSTNAME=$(hostname)
+        for node in $({{ kubectl_bin }} get nodes -o jsonpath='{.items[*].metadata.name}'); do
+          if echo "$node" | grep -q "$HOSTNAME"; then
+            echo "$node"
+            exit 0
+          fi
+        done
+        # This should not happen - fail loudly
+        echo "ERROR: Could not find node matching hostname $HOSTNAME" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: k8s_node_result
+      changed_when: false
+      failed_when: k8s_node_result.rc != 0
+      
+    - name: Set k8s_controller_node fact
+      ansible.builtin.set_fact:
+        k8s_controller_node: "{{ k8s_node_result.stdout }}"
+        
+    - name: Debug node name
+      ansible.builtin.debug:
+        msg: "Kubernetes node name: {{ k8s_controller_node }}"
+
+  tasks:
+    ###################################################################
+    # 0) Ensure shared code directory exists
+    ###################################################################
+    - name: Show source path and user info
+      ansible.builtin.debug:
+        msg: 
+          - "Using shared code path: {{ code_source_path }}"
+          - "Running as UID: 1000, GID: 1000"
+        
+    - name: Ensure source code directory exists with proper permissions
+      ansible.builtin.file:
+        path: "{{ code_source_path }}"
+        state: directory
+        mode: '0775'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      become: true
+
+    - name: Fix permissions on any existing ansible directories created by thinkube-control
+      ansible.builtin.shell: |
+        # Fix any root-owned directories that may have been created by thinkube-control
+        if [ -d "{{ code_source_path }}/ansible" ]; then
+          echo "Fixing permissions on ansible directory..."
+          chown -R {{ system_username }}:{{ system_username }} "{{ code_source_path }}/ansible"
+          chmod -R 755 "{{ code_source_path }}/ansible"
+        fi
+        # Also check for .ansible directory
+        if [ -d "{{ code_source_path }}/.ansible" ]; then
+          echo "Fixing permissions on .ansible directory..."
+          chown -R {{ system_username }}:{{ system_username }} "{{ code_source_path }}/.ansible"
+          chmod -R 755 "{{ code_source_path }}/.ansible"
+        fi
+      become: true
+      register: permission_fix
+
+    - name: Show permission fix results
+      ansible.builtin.debug:
+        msg: "{{ permission_fix.stdout_lines }}"
+      when: permission_fix.stdout_lines | length > 0
+
+    ###################################################################
+    # 1) Keycloak client setup for code‑server
+    ###################################################################
+    - name: Debug Keycloak URL
+      ansible.builtin.debug:
+        msg: "Attempting to connect to Keycloak at: {{ keycloak_url }}"
+
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+      no_log: false
+
+    - name: Debug admin token length
+      ansible.builtin.debug:
+        msg: "Admin token length={{ keycloak_token.json.access_token | length }}"
+      when: keycloak_token is succeeded
+
+    - name: GET existing code-server client from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ code_server_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: existing_code_server_client
+      failed_when: false
+
+    - name: Create "code-server" client if missing
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          clientId: "{{ code_server_client_id }}"
+          enabled: true
+          protocol: "openid-connect"
+          standardFlowEnabled: true
+          implicitFlowEnabled: false
+          directAccessGrantsEnabled: true
+          publicClient: false
+          redirectUris:
+            - "{{ code_server_redirect_uri }}"
+            - "https://{{ code_server_hostname }}/*"
+          webOrigins:
+            - "{{ code_server_web_origins }}"
+            - "+"
+          attributes:
+            "access.token.lifespan": "{{ code_server_lifespan }}"
+            "post.logout.redirect.uris": "+"
+          defaultClientScopes:
+            - "email"
+            - "offline_access"
+            - "profile"
+            - "roles"
+          optionalClientScopes:
+            - "address"
+            - "phone"
+        status_code: [200, 201]
+        validate_certs: false
+      register: create_code_server_client_result
+      when: existing_code_server_client.json | length == 0
+      failed_when: false
+
+    - name: GET final code-server client from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ code_server_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: final_code_server_client
+      failed_when: false
+
+    - name: Fail if code-server client not found in Keycloak
+      ansible.builtin.fail:
+        msg: "Client '{{ code_server_client_id }}' not found in realm '{{ keycloak_realm }}'!"
+      when: final_code_server_client.json | length == 0
+      failed_when: false
+
+    - name: Set fact for code-server client UUID
+      ansible.builtin.set_fact:
+        code_server_client_uuid: "{{ final_code_server_client.json[0].id }}"
+      when: final_code_server_client.json | length > 0
+
+    - name: Debug code-server client UUID
+      ansible.builtin.debug:
+        msg: "code-server client UUID => {{ code_server_client_uuid }}"
+      when: code_server_client_uuid is defined
+
+    - name: Get client secret for code-server from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ code_server_client_uuid }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: client_secret_response
+      when: code_server_client_uuid is defined
+      failed_when: false
+
+    - name: Set fact for code-server client secret
+      ansible.builtin.set_fact:
+        code_server_client_secret: "{{ client_secret_response.json.value }}"
+      when: client_secret_response is defined and client_secret_response.json is defined
+
+    - name: Create audience mapper for code-server client
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ code_server_client_uuid }}/protocol-mappers/models"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "audience-mapper-code-server"
+          protocol: "openid-connect"
+          protocolMapper: "oidc-audience-mapper"
+          config:
+            "included.client.audience": "{{ code_server_client_id }}"
+            "id.token.claim": "true"
+            "access.token.claim": "true"
+        status_code: [201, 409]
+        validate_certs: false
+      register: audience_mapper_result
+      when: code_server_client_uuid is defined
+      failed_when: false
+
+    ###################################################################
+    # 2) Create realm roles and assign admin role
+    ###################################################################
+    - name: Check if realm role "code-server-admin" exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles/code-server-admin"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+      register: code_server_admin_role_check
+      failed_when: false
+
+    - name: Create realm role "code-server-admin" if missing
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "code-server-admin"
+          description: "code-server admin realm role"
+        validate_certs: false
+        status_code: 201
+      when: code_server_admin_role_check.status == 404
+      failed_when: false
+
+    - name: Check if realm role "code-server-user" exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles/code-server-user"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+      register: code_server_user_role_check
+      failed_when: false
+
+    - name: Create realm role "code-server-user" if missing
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "code-server-user"
+          description: "code-server regular user realm role"
+        validate_certs: false
+        status_code: 201
+      when: code_server_user_role_check.status == 404
+      failed_when: false
+
+    - name: GET user "{{ admin_username }}" from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users?username={{ admin_username }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: user_search
+      failed_when: false
+
+    - name: Fail if user "{{ admin_username }}" not found
+      ansible.builtin.fail:
+        msg: "User {{ admin_username }} not found in realm '{{ keycloak_realm }}'"
+      when: user_search.json | length == 0
+      failed_when: false
+
+    - name: Get realm role "code-server-admin" details from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles/code-server-admin"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: code_server_admin_realm_role
+      failed_when: false
+
+    - name: Assign realm role "code-server-admin" to user
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/{{ user_search.json[0].id }}/role-mappings/realm"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: "[{{ code_server_admin_realm_role.json }}]"
+        validate_certs: false
+        status_code: [204, 409]
+      when: code_server_admin_realm_role.json is defined and user_search.json is defined and user_search.json | length > 0
+      failed_when: false
+
+    ###################################################################
+    # 3) Create Namespace, TLS Secret and code-server OAuth secret
+    ###################################################################
+    - name: Create namespace for code-server
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ code_server_namespace }}"
+
+    - name: Create code-server OAuth client secret in Kubernetes
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: code-server-oauth-secret
+          type: Opaque
+          stringData:
+            client_id: "{{ code_server_client_id }}"
+            client_secret: "{{ code_server_client_secret }}"
+      when: code_server_client_secret is defined
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to code-server namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ code_server_tls_secret_name }}"
+            namespace: "{{ code_server_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###################################################################
+    # 4) Setup SSH keys and config on the host (will be available in container via mount)
+    ###################################################################
+    - name: Ensure SSH directory exists in shared code path
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/.ssh"
+        state: directory
+        mode: '0700'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Generate SSH key for Thinkube nodes if it doesn't exist
+      community.crypto.openssh_keypair:
+        path: "{{ code_source_path }}/.ssh/id_ed25519"
+        type: ed25519
+        comment: "coder@code-server"
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        mode: '0600'
+      register: thinkube_key
+
+    - name: Generate GitHub SSH key if it doesn't exist
+      community.crypto.openssh_keypair:
+        path: "{{ code_source_path }}/.ssh/github_ed25519"
+        type: ed25519
+        comment: "coder@code-server-github"
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        mode: '0600'
+      register: github_key
+
+    - name: Ensure SSH config file exists
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/.ssh/config"
+        state: touch
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Add Thinkube nodes to SSH config
+      ansible.builtin.blockinfile:
+        path: "{{ code_source_path }}/.ssh/config"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - THINKUBE NODES"
+        block: |
+          # SSH Configuration for Code-Server
+          # This configuration enables SSH access to control plane nodes
+          
+          # Ansible controller (management node)
+          {% for host in groups['management'] %}
+          Host ansible-controller {{ host }} {{ host }}.{{ domain_name }}
+              HostName {{ hostvars[host]['zerotier_ip'] }}
+              User {{ system_username }}
+              StrictHostKeyChecking no
+              UserKnownHostsFile /dev/null
+              LogLevel ERROR
+              IdentityFile ~/.ssh/thinkube_ed25519
+          {% endfor %}
+          
+          # Kubernetes Control Plane
+          {% for host in groups['microk8s_control_plane'] %}
+          Host {{ host }} {{ host }}.{{ domain_name }}
+              HostName {{ hostvars[host]['zerotier_ip'] }}
+              User {{ system_username }}
+              StrictHostKeyChecking no
+              UserKnownHostsFile /dev/null
+              LogLevel ERROR
+              IdentityFile ~/.ssh/thinkube_ed25519
+          {% endfor %}
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Add GitHub configuration to SSH config
+      ansible.builtin.blockinfile:
+        path: "{{ code_source_path }}/.ssh/config"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - GITHUB"
+        block: |
+          # GitHub SSH Configuration
+          Host github.com
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/github_ed25519
+              StrictHostKeyChecking no
+              AddKeysToAgent yes
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Add default SSH options
+      ansible.builtin.blockinfile:
+        path: "{{ code_source_path }}/.ssh/config"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - DEFAULTS"
+        block: |
+          # Default for all hosts
+          Host *
+              ForwardAgent yes
+              ServerAliveInterval 60
+              ServerAliveCountMax 3
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Check if SSH key exists on ansible controller
+      ansible.builtin.stat:
+        path: "/home/{{ system_username }}/.ssh/thinkube_cluster_key"
+      delegate_to: "{{ groups['management'][0] }}"
+      register: ansible_controller_key
+
+    - name: Verify ansible controller has SSH key
+      ansible.builtin.assert:
+        that:
+          - ansible_controller_key.stat.exists
+        fail_msg: |
+          ERROR: SSH key not found on ansible controller
+          
+          DETAILS:
+          - Expected SSH key at: {{ groups['management'][0] }}:/home/{{ system_username }}/.ssh/thinkube_cluster_key
+          - The ansible controller should have SSH keys for accessing cluster nodes
+          
+          REQUIRED ACTION:
+          - Run the initial setup playbooks to generate SSH keys
+          - Or manually create SSH keys on the ansible controller
+
+    - name: Fetch thinkube SSH private key from ansible controller
+      ansible.builtin.slurp:
+        src: "/home/{{ system_username }}/.ssh/thinkube_cluster_key"
+      delegate_to: "{{ groups['management'][0] }}"
+      register: ssh_key_content
+
+    - name: Copy thinkube SSH private key to shared directory
+      ansible.builtin.copy:
+        content: "{{ ssh_key_content.content | b64decode }}"
+        dest: "{{ code_source_path }}/.ssh/thinkube_ed25519"
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Check if GitHub token is available
+      ansible.builtin.set_fact:
+        github_token: "{{ github_token | default(lookup('env', 'GITHUB_TOKEN'), true) }}"
+
+    - name: Verify GitHub token is set
+      ansible.builtin.assert:
+        that:
+          - github_token is defined
+          - github_token | length > 0
+        fail_msg: |
+          ERROR: GitHub Token Not Found
+          
+          DETAILS:
+          - GITHUB_TOKEN environment variable is required for code-server
+          - This token is needed to automatically configure GitHub SSH access
+          
+          REQUIRED ACTION:
+          1. Add GITHUB_TOKEN to your ~/.env file:
+             echo "GITHUB_TOKEN=your_github_token" >> ~/.env
+          2. Source the environment file:
+             source ~/.env
+          3. Re-run this playbook
+          
+          To create a GitHub token:
+          1. Go to https://github.com/settings/tokens
+          2. Click "Generate new token (classic)"
+          3. Select scopes: repo, write:public_key
+          4. Copy the token and add it to your .env file
+
+    - name: Verify GitHub CLI is installed on ansible controller
+      ansible.builtin.command: which gh
+      delegate_to: "{{ groups['management'][0] }}"
+      register: gh_check
+      failed_when: gh_check.rc != 0
+      changed_when: false
+
+    - name: Read GitHub SSH public key
+      ansible.builtin.slurp:
+        src: "{{ code_source_path }}/.ssh/github_ed25519.pub"
+      register: github_pubkey_file
+
+    - name: Check GitHub CLI authentication status
+      ansible.builtin.command: gh auth status
+      delegate_to: "{{ groups['management'][0] }}"
+      register: gh_auth_status
+      failed_when: false
+      changed_when: false
+
+    - name: Authenticate GitHub CLI on ansible controller if needed
+      ansible.builtin.shell: |
+        echo "{{ github_token }}" | gh auth login --with-token
+      delegate_to: "{{ groups['management'][0] }}"
+      when: gh_auth_status.rc != 0
+      no_log: true
+
+    - name: Add GitHub SSH key from ansible controller
+      ansible.builtin.shell: |
+        echo "{{ github_pubkey_file.content | b64decode }}" | \
+        GH_TOKEN="{{ github_token }}" gh ssh-key add - \
+          --title "code-server@{{ domain_name }}-{{ ansible_date_time.date }}"
+      delegate_to: "{{ groups['management'][0] }}"
+      register: gh_key_result
+      failed_when: 
+        - gh_key_result.rc != 0
+        - "'already exists' not in gh_key_result.stderr"
+        - "'key is already in use' not in gh_key_result.stderr"
+      changed_when: 
+        - gh_key_result.rc == 0
+        - "'added to your account' in gh_key_result.stdout"
+
+    ###################################################################
+    # 5) Create ConfigMap for code‑server (we'll use hostPath instead of PVC)
+    ###################################################################
+    - name: Create ConfigMap for code-server configuration
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: code-server-config
+          data:
+            config.yaml: |
+              auth: none
+              bind-addr: 0.0.0.0:8080
+              disable-telemetry: true
+              cert: false
+
+
+    ###################################################################
+    # 5a) Create ServiceAccount and RBAC for CI/CD monitoring
+    ###################################################################
+    - name: Create ServiceAccount for code-server
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: code-server
+            namespace: "{{ code_server_namespace }}"
+
+    - name: Create ClusterRole for CI/CD monitoring
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: thinkube-cicd-monitor
+          rules:
+            # Read ConfigMaps in any namespace for pipeline events
+            - apiGroups: [""]
+              resources: ["configmaps"]
+              verbs: ["get", "list", "watch"]
+            # Read pods and deployments for monitoring
+            - apiGroups: [""]
+              resources: ["pods", "services"]
+              verbs: ["get", "list"]
+            - apiGroups: ["apps"]
+              resources: ["deployments", "replicasets"]
+              verbs: ["get", "list"]
+
+    - name: Create ClusterRoleBinding for code-server
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: code-server-cicd-monitor
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: thinkube-cicd-monitor
+          subjects:
+            - kind: ServiceAccount
+              name: code-server
+              namespace: "{{ code_server_namespace }}"
+
+
+    ###################################################################
+    # 5a.5) CI/CD token will be configured later by thinkube-control
+    ###################################################################
+    # NOTE: Removed thinkube-control dependency as it's deployed after code-server
+    # The CI/CD monitoring token will be injected by thinkube-control post-deployment
+
+
+    ###################################################################
+    # 5b) Deploy code-server with hostPath volume and node affinity
+    ###################################################################
+    - name: Deploy code-server Deployment with hostPath and node affinity
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: code-server
+            labels:
+              app: code-server
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: code-server
+            template:
+              metadata:
+                labels:
+                  app: code-server
+              spec:
+                serviceAccountName: code-server
+                # Schedule pod on the control node
+                nodeSelector:
+                  kubernetes.io/hostname: "{{ k8s_controller_node }}"
+                # Ensure the pod is scheduled on the control node (required)
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - key: kubernetes.io/hostname
+                          operator: In
+                          values:
+                          - "{{ k8s_controller_node }}"
+                securityContext:
+                  fsGroup: 1000
+                  runAsUser: 1000
+                  runAsGroup: 1000
+                containers:
+                  - name: code-server
+                    image: "{{ harbor_registry }}/library/code-server:latest"
+                    imagePullPolicy: IfNotPresent
+                    ports:
+                      - name: http
+                        containerPort: 8080
+                        protocol: TCP
+                    env:
+                      - name: TZ
+                        value: UTC
+                      - name: CS_DISABLE_GETTING_STARTED_OVERRIDE
+                        value: "true"
+                    args:
+                      - "--auth=none"
+                      - "--config=/config/config.yaml"
+                      - "--proxy-domain={{ code_server_hostname }}"
+                    resources:
+                      requests:
+                        cpu: 1
+                        memory: 4Gi
+                      limits:
+                        cpu: 4
+                        memory: 8Gi
+                    readinessProbe:
+                      httpGet:
+                        path: /
+                        port: http
+                      initialDelaySeconds: 30
+                      periodSeconds: 5
+                    volumeMounts:
+                      - name: host-data
+                        mountPath: /home/coder
+                      - name: config
+                        mountPath: /config
+                      - name: thinkube-ssh
+                        mountPath: /host-ssh
+                        readOnly: true
+                volumes:
+                  - name: host-data
+                    hostPath:
+                      path: "{{ code_source_path }}"
+                      type: Directory
+                  - name: config
+                    configMap:
+                      name: code-server-config
+                      defaultMode: 0755
+                  - name: thinkube-ssh
+                    hostPath:
+                      path: "{{ ansible_env.HOME }}/.ssh"
+                      type: Directory
+
+    ###################################################################
+    # 6) Create code‑server Service and Ingress (secured via oauth2‑proxy)
+    ###################################################################
+    - name: Create code-server Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: code-server
+            labels:
+              app: code-server
+          spec:
+            type: ClusterIP
+            ports:
+              - port: 8080
+                targetPort: http
+                protocol: TCP
+                name: http
+            selector:
+              app: code-server
+
+    - name: Create code-server Ingress (secured with oauth2-proxy)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: code-server
+            annotations:
+              kubernetes.io/ingress.class: nginx
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+              nginx.ingress.kubernetes.io/proxy-body-size: "0"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+              nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
+              nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$escaped_request_uri"
+          spec:
+            tls:
+              - hosts:
+                  - "{{ code_server_hostname }}"
+                secretName: "{{ code_server_tls_secret_name }}"
+            rules:
+              - host: "{{ code_server_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: code-server
+                          port:
+                            number: 8080
+
+    ###################################################################
+    # 7) Deploy ephemeral Valkey for oauth2-proxy session storage
+    ###################################################################
+    - name: Deploy ephemeral Valkey (Deployment) in "{{ code_server_namespace }}"
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ephemeral-valkey
+            labels:
+              app: ephemeral-valkey
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ephemeral-valkey
+            template:
+              metadata:
+                labels:
+                  app: ephemeral-valkey
+              spec:
+                containers:
+                  - name: valkey
+                    image: "{{ harbor_registry }}/library/valkey:7.2-alpine"
+                    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+                    ports:
+                      - containerPort: 6379
+                        name: valkey
+                    resources:
+                      requests:
+                        cpu: 50m
+                        memory: 64Mi
+                      limits:
+                        cpu: 200m
+                        memory: 256Mi
+
+    - name: Deploy ephemeral Valkey (Service) in "{{ code_server_namespace }}"
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ephemeral-valkey
+            labels:
+              app: ephemeral-valkey
+          spec:
+            type: ClusterIP
+            selector:
+              app: ephemeral-valkey
+            ports:
+              - name: valkey
+                port: 6379
+                targetPort: 6379
+
+    ###################################################################
+    # 8) Deploy oauth2-proxy via Helm (using Valkey for session storage)
+    ###################################################################
+    - name: Add oauth2-proxy Helm repository
+      kubernetes.core.helm_repository:
+        binary_path: "{{ helm_bin }}"
+        name: oauth2-proxy
+        repo_url: "https://oauth2-proxy.github.io/manifests"
+        state: present
+
+    - name: Update Helm repo for oauth2-proxy
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy oauth2-proxy (no PKCE, using Valkey session store)
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        name: "oauth2-proxy"
+        chart_ref: "oauth2-proxy/oauth2-proxy"
+        release_namespace: "{{ code_server_namespace }}"
+        create_namespace: false
+        reset_values: true
+        force: true
+        update_repo_cache: true
+        values:
+          ingress:
+            enabled: false
+          service:
+            type: ClusterIP
+            portNumber: 80
+          extraArgs:
+            - --provider=keycloak-oidc
+            - --client-id={{ code_server_client_id }}
+            - --client-secret={{ code_server_client_secret }}
+            - --redirect-url=https://{{ code_server_hostname }}/oauth2/callback
+            - --oidc-issuer-url={{ keycloak_url }}/realms/{{ keycloak_realm }}
+            - --cookie-domain={{ oauth2_proxy_cookie_domain }}
+            - --cookie-secure=true
+            - --cookie-samesite=none
+            - --cookie-refresh=1h
+            - --reverse-proxy
+            - --set-xauthrequest=true
+            - --session-store-type=redis
+            - --redis-connection-url=redis://ephemeral-valkey.{{ code_server_namespace }}.svc.cluster.local:6379
+
+    ###################################################################
+    # 9) Create oauth2-proxy Ingress for /oauth2 routing
+    ###################################################################
+    - name: Create oauth2-proxy Ingress for /oauth2
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: oauth2-proxy
+            annotations:
+              kubernetes.io/ingress.class: "nginx"
+              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+          spec:
+            tls:
+              - hosts:
+                  - "{{ code_server_hostname }}"
+                secretName: "{{ code_server_tls_secret_name }}"
+            rules:
+              - host: "{{ code_server_hostname }}"
+                http:
+                  paths:
+                    - path: /oauth2
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: oauth2-proxy
+                          port:
+                            number: 80
+
+    ###################################################################
+    # 10) Force restart: Verify ConfigMap and delete code-server pods
+    ###################################################################
+    - name: Verify code-server ConfigMap (ensure auth is set to "none")
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: ConfigMap
+        namespace: "{{ code_server_namespace }}"
+        name: code-server-config
+      register: configmap_info
+      failed_when: false
+
+    - name: Debug ConfigMap content
+      ansible.builtin.debug:
+        msg: "{{ configmap_info.resources[0].data['config.yaml'] }}"
+      when: configmap_info.resources is defined and configmap_info.resources | length > 0
+
+    - name: Get code-server pods to force restart
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        label_selectors:
+          - "app=code-server"
+      register: code_server_pods
+      failed_when: false
+
+    - name: Delete code-server pods to force restart with updated configuration
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        name: "{{ item.metadata.name }}"
+        state: absent
+      loop: "{{ code_server_pods.resources | default([]) }}"
+      when: code_server_pods.resources is defined and code_server_pods.resources | length > 0
+
+    ###################################################################
+    # 11) Configure VS Code tasks for Claude Code
+    ###################################################################
+    # Create VS Code tasks configuration for Claude Code
+    - name: Ensure .vscode directory exists in shared code directory
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/.vscode"
+        state: directory
+        mode: '0755'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+    
+    - name: Create VS Code tasks.json for Claude Code integration
+      ansible.builtin.template:
+        src: templates/vscode-tasks.json.j2
+        dest: "{{ code_source_path }}/.vscode/tasks.json"
+        mode: '0644'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+    
+    - name: Create VS Code settings.json to disable auto port forwarding
+      ansible.builtin.copy:
+        content: |
+          {
+            "remote.autoForwardPorts": false,
+            "remote.autoForwardPortsSource": "output"
+          }
+        dest: "{{ code_source_path }}/.vscode/settings.json"
+        mode: '0644'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Display extension status
+      ansible.builtin.debug:
+        msg:
+          - "code-server Extensions Status:"
+          - "- thinkube-ai-integration: Provides Claude Code integration"
+          - "- thinkube-cicd-monitor: Provides CI/CD pipeline monitoring"
+          - ""
+          - "Extensions are automatically installed from:"
+          - "- GitHub repositories (if available)"
+          - "- Local development copies (if present)"
+          - ""
+          - "To reload extensions: Press Ctrl+R in code-server"
+
+    ###################################################################
+    # 12) Final information
+    ###################################################################
+    - name: Final info for code-server setup
+      ansible.builtin.debug:
+        msg:
+          - "code-server deployed in namespace '{{ code_server_namespace }}'."
+          - "Access it at: https://{{ code_server_hostname }}/"
+          - "Client: '{{ code_server_client_id }}' (ID: {{ code_server_client_uuid | default('not set') }})"
+          - "Keycloak Realm: {{ keycloak_realm }}"
+          - "User '{{ admin_username }}' assigned role code-server-admin"
+          - "Using hostPath volume from: {{ code_source_path }}"
+          - "Running as UID:GID 1000:1000"
+          - "TLS status: Using wildcard certificate from default namespace"
+          - ""
+          - "Platform Repositories:"
+          - "  - Location: ~/thinkube-platform/"
+          - "  - Workspace: ~/thinkube-platform/thinkube-platform.code-workspace"
+          - ""
+          - "code-server Extensions:"
+          - "  - Claude Code: Right-click folders → Claude Code submenu"
+          - "  - CI/CD Monitor: View pipelines in sidebar activity bar"
+          - "    (API token auto-configured)"
+          - ""
+          - "Keyboard Shortcuts:"
+          - "  - Ctrl+Shift+C: Open Claude in current directory"
+          - "  - Ctrl+Shift+Alt+C: Continue Claude session"

@@ -1,0 +1,309 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install Go and Rust Development Environments
+  hosts: baremetal:lxd_containers
+  become: false  # Only become root when needed
+  vars:
+    # Go configuration
+    go_version: "1.22.1"  # Update to the latest stable version
+    go_download_location: "https://go.dev/dl/go{{ go_version }}.linux-amd64.tar.gz"
+    go_tarball: "/tmp/go{{ go_version }}.linux-amd64.tar.gz"
+    go_install_dir: "/usr/local"
+    go_path: "{{ ansible_env.HOME }}/go"
+    
+    # Rust configuration
+    rustup_sh: "/tmp/rustup.sh"
+    cargo_bin: "{{ ansible_env.HOME }}/.cargo/bin"
+    
+    # Shell configuration paths
+    shell_config_files:
+      - "{{ ansible_env.HOME }}/.bashrc"
+      - "{{ ansible_env.HOME }}/.zshrc"
+    fish_config: "{{ ansible_env.HOME }}/.config/fish/config.fish"
+    
+  tasks:
+    # Common utilities
+    - name: Ensure build essentials and required packages are installed
+      become: true
+      apt:
+        name:
+          - build-essential
+          - curl
+          - wget
+          - git
+          - pkg-config
+          - libssl-dev
+          - xclip  # X11 clipboard tool (widely used and well-maintained)
+          - wl-clipboard  # Wayland clipboard utilities (for modern displays)
+        state: present
+        update_cache: yes
+    
+    # Go installation
+    - name: Check if Go is installed
+      command: which go
+      register: go_installed
+      ignore_errors: yes
+      changed_when: false
+    
+    - name: Download Go
+      get_url:
+        url: "{{ go_download_location }}"
+        dest: "{{ go_tarball }}"
+        mode: '0644'
+      when: go_installed.rc != 0
+    
+    - name: Remove old Go installation
+      become: true
+      file:
+        path: "{{ go_install_dir }}/go"
+        state: absent
+      when: go_installed.rc != 0
+    
+    - name: Install Go
+      become: true
+      unarchive:
+        src: "{{ go_tarball }}"
+        dest: "{{ go_install_dir }}"
+        remote_src: yes
+        mode: '0755'
+      when: go_installed.rc != 0
+    
+    - name: Create GOPATH directory
+      file:
+        path: "{{ go_path }}"
+        state: directory
+        mode: '0755'
+    
+    - name: Create Go bin directory
+      file:
+        path: "{{ go_path }}/bin"
+        state: directory
+        mode: '0755'
+    
+    # Rust installation
+    - name: Check if Rust is installed
+      command: which rustc
+      register: rust_installed
+      ignore_errors: yes
+      changed_when: false
+    
+    - name: Download Rustup installer
+      get_url:
+        url: https://sh.rustup.rs
+        dest: "{{ rustup_sh }}"
+        mode: '0755'
+      when: rust_installed.rc != 0
+    
+    - name: Install Rust
+      command: "{{ rustup_sh }} -y"
+      args:
+        creates: "{{ ansible_env.HOME }}/.cargo/bin/rustc"
+      when: rust_installed.rc != 0
+    
+    # Shell configurations for Bash and Zsh
+    - name: Configure shell environments for Go and Rust (Bash/Zsh)
+      blockinfile:
+        path: "{{ item }}"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - Go and Rust configuration"
+        block: |
+          # Go configuration
+          export GOPATH={{ go_path }}
+          export GOROOT={{ go_install_dir }}/go
+          export PATH=$PATH:$GOROOT/bin:$GOPATH/bin
+          
+          # Rust configuration
+          [ -f $HOME/.cargo/env ] && source $HOME/.cargo/env
+          export PATH=$PATH:$HOME/.cargo/bin
+          
+          # Clipboard utility aliases - focused on most common use cases
+          alias cb="xclip -selection clipboard"     # copy to clipboard: echo "text" | cb
+          alias cbp="xclip -selection clipboard -o" # paste from clipboard: cbp
+        create: true
+        mode: '0644'
+      with_items: "{{ shell_config_files }}"
+    
+    # Fish shell configuration
+    - name: Create fish config directory
+      file:
+        path: "{{ ansible_env.HOME }}/.config/fish"
+        state: directory
+        mode: '0755'
+    
+    - name: Configure fish shell for Go and Rust
+      blockinfile:
+        path: "{{ fish_config }}"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - Go and Rust configuration"
+        block: |
+          # Go configuration
+          set -x GOPATH {{ go_path }}
+          set -x GOROOT {{ go_install_dir }}/go
+          fish_add_path $GOROOT/bin
+          fish_add_path $GOPATH/bin
+          
+          # Rust configuration
+          if test -f $HOME/.cargo/env
+              # Try to use bass if available, otherwise just add cargo/bin to PATH
+              if functions -q bass
+                  bass source $HOME/.cargo/env
+              else
+                  # Basic PATH setup without bass
+                  if test -d $HOME/.cargo/bin
+                      set -gx PATH $HOME/.cargo/bin $PATH
+                  end
+              end
+          end
+          fish_add_path $HOME/.cargo/bin
+          
+          # Clipboard utility aliases - focused on most common use cases
+          alias cb="xclip -selection clipboard"     # copy to clipboard
+          alias cbp="xclip -selection clipboard -o" # paste from clipboard
+        create: true
+        mode: '0644'
+    
+    # Install common tools
+    - name: Install curated Go tools
+      shell: |
+        export PATH=$PATH:{{ go_install_dir }}/go/bin:{{ go_path }}/bin
+        export GOPATH={{ go_path }}
+        go install github.com/charmbracelet/glow@latest  # Best markdown viewer
+        go install golang.org/x/tools/gopls@latest       # Go language server (for development)
+      args:
+        executable: /bin/bash
+      when: go_installed.rc != 0
+    
+    - name: Install curated Rust tools
+      shell: |
+        source $HOME/.cargo/env
+        cargo install bat                  # Modern replacement for cat with syntax highlighting
+        cargo install exa                  # Modern replacement for ls
+      args:
+        executable: /bin/bash
+      when: rust_installed.rc != 0
+    
+    # Create cheatsheets
+    - name: Create developer utilities cheatsheet
+      copy:
+        dest: "{{ ansible_env.HOME }}/.dev-tools-cheatsheet.md"
+        content: |
+          # DEVELOPER TOOLS CHEATSHEET
+          
+          ## Clipboard Utilities
+          
+          | Command | Description | Example |
+          |---------|-------------|---------|
+          | `cb` | Copy to clipboard | `echo "Hello" \| cb` |
+          | `cbp` | Paste from clipboard | `cbp > file.txt` |
+          | `xclip` | Low-level X clipboard tool | `xclip -selection clipboard file.txt` |
+          | `wl-copy` | Wayland copy (if needed) | `wl-copy < file.txt` |
+          | `wl-paste` | Wayland paste (if needed) | `wl-paste > file.txt` |
+          
+          ## Common Clipboard Patterns
+          
+          ```bash
+          # Copy command output to clipboard
+          ls -la | cb
+          
+          # Copy file contents
+          cat ~/.tmux-cheatsheet.md | cb
+          
+          # Save clipboard to file
+          cbp > clipboard-contents.txt
+          
+          # Filter clipboard contents
+          cbp | grep "search term" | cb
+          
+          # Copy and paste between remote sessions
+          # (useful with SSH when X11 forwarding is not enabled)
+          cat file.txt | cb   # On local machine
+          ssh user@remote "cat file.txt" | cb   # From remote to local
+          cbp | ssh user@remote "cat > file.txt"   # From local to remote
+          ```
+          
+          ## Modern Terminal Tools
+          
+          | Command | Description | Example |
+          |---------|-------------|---------|
+          | `glow` | Markdown viewer | `glow README.md` |
+          | `bat` | Cat with syntax highlighting | `bat script.sh` |
+          | `exa` | Modern replacement for ls | `exa -la` |
+          
+          ## Go Development
+          
+          | Command | Description |
+          |---------|-------------|
+          | `go run` | Run Go program | `go run main.go` |
+          | `go build` | Compile packages and dependencies | `go build` |
+          | `go get` | Add dependencies | `go get github.com/user/pkg` |
+          | `go mod tidy` | Add missing and remove unused modules | `go mod tidy` |
+          | `go test` | Test packages | `go test ./...` |
+          | `gopls` | Go language server | Used by editors/IDEs |
+          
+          ## Rust Development
+          
+          | Command | Description |
+          |---------|-------------|
+          | `cargo new` | Create a new Rust project | `cargo new myproject` |
+          | `cargo build` | Compile the current package | `cargo build` |
+          | `cargo run` | Run the current package | `cargo run` |
+          | `cargo test` | Run the tests | `cargo test` |
+        mode: '0644'
+    
+    # Verification
+    - name: Verify Go installation
+      shell: "{{ go_install_dir }}/go/bin/go version"
+      register: go_version_output
+      changed_when: false
+    
+    - name: Verify Rust installation
+      shell: "{{ ansible_env.HOME }}/.cargo/bin/rustc --version"
+      register: rust_version_output
+      changed_when: false
+    
+    # Cleanup
+    - name: Remove temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "{{ go_tarball }}"
+        - "{{ rustup_sh }}"
+    
+    # Output
+    - name: Installation summary
+      debug:
+        msg:
+          - "Go and Rust have been successfully installed!"
+          - "Go version: {{ go_version_output.stdout }}"
+          - "Rust version: {{ rust_version_output.stdout }}"
+          - ""
+          - "To use Go and Rust, either restart your terminal or run one of the following:"
+          - "Bash/Zsh: source ~/.bashrc or source ~/.zshrc"
+          - "Fish: source ~/.config/fish/config.fish"
+          - ""
+          - "Installed tools:"
+          - "- glow: Markdown viewer for terminal"
+          - "- bat: Modern cat with syntax highlighting"
+          - "- exa: Modern replacement for ls"
+          - ""
+          - "Clipboard utilities installed:"
+          - "- xclip for X11 systems"
+          - "- wl-clipboard for Wayland systems"
+          - "- Aliases added:"
+          - "  * cb: Copy to clipboard (echo 'text' | cb)"
+          - "  * cbp: Paste from clipboard"
+          - ""
+          - "Examples:"
+          - "  cat ~/.tmux-cheatsheet.md | cb  # Copy content to clipboard"
+          - "  go version | cb                 # Copy output to clipboard"
+          - "  cbp > saved-data.txt            # Save clipboard content to file"
+          - ""
+          - "Try viewing your tmux cheatsheet with:"
+          - "  glow ~/.tmux-cheatsheet.md"
+          - ""
+          - "A concise developer tools cheatsheet has been created at:"
+          - "  ~/.dev-tools-cheatsheet.md"
+          - ""
+          - "View it with:"
+          - "  glow ~/.dev-tools-cheatsheet.md"

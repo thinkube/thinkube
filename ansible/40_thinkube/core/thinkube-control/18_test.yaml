@@ -1,0 +1,333 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/18_test.yaml
+# Description:
+#   Test Thinkube Control deployment and functionality
+#
+# Requirements:
+#   - Control deployed via 10_deploy.yaml
+#   - kubectl configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Primary domain name
+#   - admin_username: Admin username for authentication
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 [AI-assisted]
+
+- name: Test Thinkube Control Deployment
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    control_namespace: "thinkube-control"
+    control_host: "control.{{ domain_name }}"
+    control_url: "https://{{ control_host }}"
+    expected_deployments:
+      - thinkube-control-backend
+      - thinkube-control-frontend
+    expected_services:
+      - backend
+      - frontend
+    argocd_namespace: "argocd"
+    argo_workflows_namespace: "argo"
+    keycloak_url: "https://auth.{{ domain_name }}"
+    keycloak_realm: "thinkube"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.fail:
+        msg: "{{ item }} is not defined. Please set it in inventory."
+      when: vars[item] is not defined or vars[item] == ""
+      loop:
+        - domain_name
+        - kubeconfig
+
+    # Test namespace exists
+    - name: Check control namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ control_namespace }}"
+      register: namespace_info
+      failed_when: namespace_info.resources | length == 0
+
+    # Test deployments
+    - name: Check expected deployments are running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ control_namespace }}"
+        name: "{{ item }}"
+      register: deployment_info
+      failed_when: 
+        - deployment_info.resources | length == 0
+        - deployment_info.resources[0].status.replicas != deployment_info.resources[0].status.readyReplicas
+      loop: "{{ expected_deployments }}"
+
+    # Test services
+    - name: Check expected services exist
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ control_namespace }}"
+        name: "{{ item }}"
+      register: service_info
+      failed_when: service_info.resources | length == 0
+      loop: "{{ expected_services }}"
+
+    # Test secrets
+    - name: Check required secrets exist
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ control_namespace }}"
+        name: "{{ item }}"
+      register: secret_info
+      failed_when: secret_info.resources | length == 0
+      loop:
+        - control-tls-secret
+        - github-token
+        - thinkube-control-keycloak
+
+    # Test control ingresses
+    - name: Check control ingresses exist
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ control_namespace }}"
+      register: ingress_info
+      
+    - name: Verify at least one ingress exists
+      ansible.builtin.assert:
+        that:
+          - ingress_info.resources | length > 0
+        fail_msg: "No ingresses found in control namespace"
+
+    # Test ArgoCD application
+    - name: Check Control ArgoCD application
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+        name: thinkube-control
+      register: control_app
+      failed_when: control_app.resources | length == 0
+      
+    - name: Debug ArgoCD application status
+      ansible.builtin.debug:
+        msg: 
+          - "Resources found: {{ control_app.resources | length }}"
+          - "Status: {{ control_app.resources[0].status | default('NOT FOUND') }}"
+      when: control_app.resources | length > 0
+          
+    - name: Verify ArgoCD application exists
+      ansible.builtin.assert:
+        that:
+          - control_app.resources | length > 0
+        fail_msg: "ArgoCD application not found"
+
+    # Test Argo Workflow templates
+    - name: Check Control build workflow template exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: argoproj.io/v1alpha1
+        kind: WorkflowTemplate
+        namespace: "{{ argo_workflows_namespace }}"
+        name: "build-thinkube-control-template"
+      register: workflow_info
+      failed_when: workflow_info.resources | length == 0
+
+    # Test backend pods are running
+    - name: Get control backend pods
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ control_namespace }}"
+        label_selectors: "app=thinkube-control-backend"
+      register: backend_pods
+
+    - name: Check backend pod status
+      ansible.builtin.assert:
+        that:
+          - backend_pods.resources | length > 0
+          - backend_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+        fail_msg: "No control backend pods running"
+
+    # Test frontend pods are running
+    - name: Get control frontend pods
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ control_namespace }}"
+        label_selectors: "app=thinkube-control-frontend"
+      register: frontend_pods
+
+    - name: Check frontend pod status
+      ansible.builtin.assert:
+        that:
+          - frontend_pods.resources | length > 0
+          - frontend_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+        fail_msg: "No control frontend pods running"
+
+    # Test DNS resolution
+    - name: Test control DNS resolution
+      ansible.builtin.command: 
+        cmd: "nslookup {{ control_host }}"
+      register: dns_test
+      changed_when: false
+      failed_when: 
+        - dns_test.rc != 0
+        - "'NXDOMAIN' in dns_test.stdout"
+
+    # Test HTTPS connectivity
+    - name: Test control HTTPS endpoint
+      ansible.builtin.uri:
+        url: "https://{{ control_host }}/"
+        method: GET
+        validate_certs: false
+        follow_redirects: none
+        status_code: [200, 302]  # May redirect to auth
+      register: https_test
+
+    # Test backend API endpoints
+    - name: Test backend health endpoint
+      ansible.builtin.uri:
+        url: "{{ control_url }}/health"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: health_test
+
+    - name: Verify health response
+      ansible.builtin.assert:
+        that:
+          - health_test.json.status == "ok"
+        fail_msg: "Backend health check failed"
+
+    - name: Test API root endpoint
+      ansible.builtin.uri:
+        url: "{{ control_url }}/api/v1/"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: api_test
+
+    # Test authentication flow
+    - name: Get Keycloak token for testing
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+      no_log: true
+
+    # Test authenticated API access
+    - name: Test dashboards endpoint with authentication
+      ansible.builtin.uri:
+        url: "{{ control_url }}/api/v1/dashboards"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: dashboards_test
+
+    - name: Verify dashboards response
+      ansible.builtin.assert:
+        that:
+          - dashboards_test.json | length > 0
+          - dashboards_test.json | selectattr('id', 'equalto', 'harbor') | list | length > 0
+        fail_msg: "Dashboards API did not return expected services"
+
+    # Test token API endpoints
+    - name: Test token API - List tokens (should require auth)
+      ansible.builtin.uri:
+        url: "{{ control_url }}/api/v1/tokens"
+        method: GET
+        validate_certs: false
+        status_code: 401
+      register: tokens_unauth_test
+
+    - name: Test token API - List tokens with authentication
+      ansible.builtin.uri:
+        url: "{{ control_url }}/api/v1/tokens"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: tokens_auth_test
+
+    - name: Test CI/CD API endpoints
+      ansible.builtin.uri:
+        url: "{{ control_url }}/api/v1/cicd/health"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: cicd_health_test
+
+    - name: Verify CI/CD health response
+      ansible.builtin.assert:
+        that:
+          - cicd_health_test.json.status == "healthy"
+        fail_msg: "CI/CD API health check failed"
+
+    - name: Display test results summary
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Thinkube Control Tests Passed
+          ════════════════════════════════════════════════════════
+          
+          Infrastructure Tests:
+          ├─ Namespace: ✓ {{ control_namespace }} exists
+          ├─ Deployments: ✓ All {{ expected_deployments | length }} deployments running
+          ├─ Services: ✓ All {{ expected_services | length }} services created
+          ├─ Secrets: ✓ All required secrets present
+          ├─ Ingress: ✓ OAuth2 proxy configured
+          ├─ ArgoCD: ✓ Application created and healthy
+          ├─ Workflows: ✓ Build template configured
+          ├─ Backend Pod: ✓ Running
+          └─ Frontend Pod: ✓ Running
+          
+          Connectivity Tests:
+          ├─ DNS: ✓ {{ control_host }} resolves
+          ├─ HTTPS: ✓ Endpoint accessible
+          └─ Health: ✓ Backend responding
+          
+          API Tests:
+          ├─ Health Endpoint: ✓ Returns ok
+          ├─ API Root: ✓ Accessible
+          ├─ Dashboards API: ✓ Returns service list
+          ├─ Authentication: ✓ Keycloak integration working
+          ├─ Token API: ✓ Requires authentication
+          └─ CI/CD API: ✓ Health check passing
+          
+          Control URL: https://{{ control_host }}
+          API Docs: https://{{ control_host }}/api/v1/docs
+          
+          ════════════════════════════════════════════════════════

@@ -1,0 +1,135 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/11_install_podman.yaml
+# Description:
+#   Installs and configures podman for registry testing
+#   Enables rootless podman for the current user
+#
+# Requirements:
+#   - Ubuntu/Debian-based system
+#   - Sudo privileges for package installation
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/11_install_podman.yaml
+#
+# Variables from inventory:
+#   - admin_username: User to configure podman for
+#
+# 🤖 [AI-assisted]
+
+- name: Install and Configure Podman
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  tasks:
+    ##########################################################################
+    # Install Podman
+    ##########################################################################
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+      become: true
+      when: ansible_os_family == "Debian"
+
+    - name: Install podman packages
+      ansible.builtin.apt:
+        name:
+          - podman
+          - podman-compose
+          - podman-toolbox
+          - buildah
+          - skopeo
+        state: present
+      become: true
+      when: ansible_os_family == "Debian"
+
+    - name: Ensure user can use podman rootless
+      ansible.builtin.user:
+        name: "{{ admin_username }}"
+        groups: 
+          - systemd-journal
+        append: yes
+      become: true
+
+    - name: Enable and start user systemd service
+      ansible.builtin.shell: |
+        loginctl enable-linger {{ admin_username }}
+      become: true
+      changed_when: false
+
+    - name: Create podman directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+        mode: '0700'
+      with_items:
+        - "/home/{{ admin_username }}/.config/containers"
+        - "/home/{{ admin_username }}/.local/share/containers"
+      become: true
+
+    - name: Configure podman registries
+      ansible.builtin.copy:
+        content: |
+          [[registry]]
+          location = "{{ harbor_registry }}"
+          insecure = false
+          
+          [[registry]]
+          location = "docker.io"
+          
+          [[registry]]
+          location = "quay.io"
+          
+          [[registry]]
+          location = "ghcr.io"
+        dest: "/home/{{ admin_username }}/.config/containers/registries.conf"
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+        mode: '0644'
+      become: true
+
+    - name: Set subuid and subgid mappings
+      ansible.builtin.lineinfile:
+        path: "{{ item.path }}"
+        regexp: "^{{ admin_username }}:"
+        line: "{{ admin_username }}:100000:65536"
+        create: yes
+      with_items:
+        - { path: /etc/subuid }
+        - { path: /etc/subgid }
+      become: true
+
+    - name: Initialize podman system
+      ansible.builtin.shell: |
+        podman system migrate
+      become: false
+      changed_when: false
+
+    - name: Verify podman installation
+      ansible.builtin.command: podman version
+      register: podman_version
+      changed_when: false
+
+    - name: Display podman version
+      ansible.builtin.debug:
+        var: podman_version.stdout_lines
+
+    - name: Test podman with hello-world
+      ansible.builtin.shell: |
+        podman run --rm hello-world
+      register: podman_test
+      changed_when: false
+      failed_when: false
+
+    - name: Display podman test result
+      ansible.builtin.debug:
+        msg:
+          - "Podman installed successfully"
+          - "Version: {{ podman_version.stdout_lines[0] | default('Unknown') }}"
+          - "Test result: {{ 'PASSED' if podman_test.rc == 0 else 'FAILED' }}"

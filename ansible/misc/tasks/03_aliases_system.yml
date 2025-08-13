@@ -1,0 +1,273 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Aliases System Setup - Shared aliases with shell-appropriate generators
+
+# Export common aliases to a JSON file
+- name: Export common aliases to JSON format
+  copy:
+    dest: "{{ thinkube_system_aliases_dir }}/common_aliases.json"
+    content: "{{ common_aliases | to_nice_json }}"
+    mode: '0644'
+  tags: [thinkube, aliases]
+  
+# Create alias generator script for Bash/Zsh
+- name: Create shared aliases generator for Bash/Zsh
+  copy:
+    dest: "{{ thinkube_system_aliases_dir }}/generate_aliases.sh"
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      # Generate aliases from shared JSON definition for Bash/Zsh shells
+      
+      ALIASES_JSON="{{ thinkube_system_aliases_dir }}/common_aliases.json"
+      GENERATED_ALIASES_FILE="{{ thinkube_system_aliases_dir }}/generated_aliases.sh"
+      USER_ALIASES_DIR="{{ thinkube_user_aliases_dir }}"
+      
+      # Check if jq is installed
+      if ! command -v jq &> /dev/null; then
+          echo "Error: jq is required but not installed. Please install jq." >&2
+          exit 1
+      fi
+      
+      # Start with a fresh file
+      echo "#!/bin/bash" > "$GENERATED_ALIASES_FILE"
+      echo "# Auto-generated aliases - DO NOT EDIT" >> "$GENERATED_ALIASES_FILE"
+      echo "# Generated on $(date)" >> "$GENERATED_ALIASES_FILE"
+      echo "" >> "$GENERATED_ALIASES_FILE"
+      
+      # Generate aliases from JSON
+      jq -r '.[] | "# " + .description + "\nalias " + .name + "=\"" + .command + "\""' "$ALIASES_JSON" >> "$GENERATED_ALIASES_FILE"
+      
+      # Add any user-defined alias files
+      if [ -d "$USER_ALIASES_DIR" ]; then
+          for user_alias_file in "$USER_ALIASES_DIR"/*.sh; do
+              if [ -f "$user_alias_file" ]; then
+                  echo "" >> "$GENERATED_ALIASES_FILE"
+                  echo "# Including user alias file: $(basename "$user_alias_file")" >> "$GENERATED_ALIASES_FILE"
+                  cat "$user_alias_file" >> "$GENERATED_ALIASES_FILE"
+              fi
+          done
+      fi
+      
+      echo "" >> "$GENERATED_ALIASES_FILE"
+      echo "# Define a function to list all available aliases" >> "$GENERATED_ALIASES_FILE"
+      echo "aliases() {" >> "$GENERATED_ALIASES_FILE"
+      echo "    echo \"Loaded shared aliases. Use 'aliases' command to list them.\"" >> "$GENERATED_ALIASES_FILE"
+      echo "    alias | sort" >> "$GENERATED_ALIASES_FILE"
+      echo "}" >> "$GENERATED_ALIASES_FILE"
+      
+      chmod 644 "$GENERATED_ALIASES_FILE"
+      echo "Generated aliases for Bash/Zsh"
+  tags: [thinkube, aliases]
+  
+# Create abbreviation generator script for Fish
+- name: Create shared abbreviation generator for Fish
+  copy:
+    dest: "{{ thinkube_system_aliases_dir }}/generate_abbreviations.fish"
+    mode: '0755'
+    content: |
+      #!/usr/bin/env fish
+      # Generate abbreviations from shared JSON definition for Fish shell
+      
+      # Prevent recursive execution
+      if set -q __THINKUBE_GENERATING_ABBREVIATIONS
+          echo "Already generating abbreviations. Preventing recursive execution."
+          exit 0
+      end
+      set -g __THINKUBE_GENERATING_ABBREVIATIONS 1
+      
+      set ALIASES_JSON "{{ thinkube_system_aliases_dir }}/common_aliases.json"
+      set GENERATED_ABBR_FILE "{{ thinkube_system_aliases_dir }}/generated_abbreviations.fish"
+      set USER_ALIASES_DIR "{{ thinkube_user_aliases_dir }}"
+      
+      # Check if jq is installed
+      if not type -q jq
+          echo "Error: jq is required but not installed. Please install jq." >&2
+          exit 1
+      end
+      
+      # Start with a fresh file
+      echo "# Auto-generated abbreviations - DO NOT EDIT" > $GENERATED_ABBR_FILE
+      echo "# Generated on "(date) >> $GENERATED_ABBR_FILE
+      echo "" >> $GENERATED_ABBR_FILE
+      
+      # First, erase any existing abbreviations with the same names to avoid conflicts
+      for line in (jq -r '.[] | .name' $ALIASES_JSON)
+          echo "abbr -e $line 2>/dev/null; or true  # Erase if exists" >> $GENERATED_ABBR_FILE
+      end
+      
+      echo "" >> $GENERATED_ABBR_FILE
+      
+      # Generate abbreviations from JSON
+      for line in (jq -r '.[] | "# " + .description + "\nabbr -a " + .name + " \"" + .command + "\""' $ALIASES_JSON)
+          echo $line >> $GENERATED_ABBR_FILE
+      end
+      
+      # Add any user-defined abbreviation files
+      if test -d "$USER_ALIASES_DIR"
+          for user_abbr_file in $USER_ALIASES_DIR/*.fish
+              if test -f $user_abbr_file
+                  echo "" >> $GENERATED_ABBR_FILE
+                  echo "# Including user abbreviation file: "(basename $user_abbr_file) >> $GENERATED_ABBR_FILE
+                  cat $user_abbr_file >> $GENERATED_ABBR_FILE
+              end
+          end
+      end
+      
+      echo "" >> $GENERATED_ABBR_FILE
+      echo "# Define a function to list all available abbreviations" >> $GENERATED_ABBR_FILE
+      echo "function aliases" >> $GENERATED_ABBR_FILE
+      echo "    abbr | sort" >> $GENERATED_ABBR_FILE
+      echo "end" >> $GENERATED_ABBR_FILE
+      
+      chmod 644 $GENERATED_ABBR_FILE
+      echo "Generated abbreviations for Fish"
+  tags: [thinkube, aliases]
+
+# Create shell loader functions for aliases
+- name: Create alias loader function for Bash/Zsh
+  copy:
+    dest: "{{ thinkube_system_functions_dir }}/load_aliases.sh"
+    mode: '0644'
+    content: |
+      #!/bin/bash
+      # Function to load and maintain shared aliases
+      
+      # Prevent recursive loading
+      if [ -n "$__THINKUBE_ALIASES_LOADED" ]; then
+        return 0
+      fi
+      __THINKUBE_ALIASES_LOADED=1
+      
+      load_aliases() {
+        local generate_script="{{ thinkube_system_aliases_dir }}/generate_aliases.sh"
+        local aliases_file="{{ thinkube_system_aliases_dir }}/generated_aliases.sh"
+        local force_regenerate=false
+        
+        # Process command line options
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --regenerate|-r)
+              force_regenerate=true
+              shift
+              ;;
+            *)
+              shift
+              ;;
+          esac
+        done
+        
+        # Regenerate if needed
+        if [ "$force_regenerate" = true ] || [ ! -f "$aliases_file" ]; then
+          echo "Regenerating shared aliases..."
+          "$generate_script"
+        fi
+        
+        # Source the aliases file
+        if [ -f "$aliases_file" ]; then
+          source "$aliases_file"
+          echo "Loaded shared aliases. Use 'aliases' command to list them."
+        else
+          echo "Error: Aliases file not found: $aliases_file"
+          return 1
+        fi
+      }
+      
+      # Auto-load aliases when this file is sourced
+      load_aliases
+  tags: [thinkube, aliases]
+
+- name: Create alias loader function for Fish
+  copy:
+    dest: "{{ thinkube_system_functions_dir }}/load_aliases.fish"
+    mode: '0644'
+    content: |
+      #!/usr/bin/env fish
+      # Function to load and maintain shared aliases (as fish abbreviations)
+      
+      # Prevent recursive loading
+      if set -q __THINKUBE_ALIASES_LOADED
+        return 0
+      end
+      set -g __THINKUBE_ALIASES_LOADED 1
+      
+      function load_aliases
+        set generate_script "{{ thinkube_system_aliases_dir }}/generate_abbreviations.fish"
+        set abbr_file "{{ thinkube_system_aliases_dir }}/generated_abbreviations.fish"
+        set force_regenerate false
+        
+        # Process command line options
+        argparse 'r/regenerate' -- $argv
+        
+        if test -n "$_flag_r"; or test -n "$_flag_regenerate"
+          set force_regenerate true
+        end
+        
+        # Regenerate if needed
+        if test "$force_regenerate" = true; or test ! -f "$abbr_file"
+          echo "Regenerating shared abbreviations..."
+          "$generate_script"
+        end
+        
+        # Source the abbreviations file
+        if test -f "$abbr_file"
+          source "$abbr_file"
+          echo "Loaded shared abbreviations. Use 'aliases' command to list them."
+        else
+          echo "Error: Abbreviations file not found: $abbr_file"
+          return 1
+        end
+      end
+      
+      # Auto-load abbreviations when this file is sourced
+      # Only load if not already loaded in this session
+      if not set -q __THINKUBE_ABBREVIATIONS_LOADED
+        set -g __THINKUBE_ABBREVIATIONS_LOADED 1
+        load_aliases
+      end
+  tags: [thinkube, aliases]
+  
+# Run the generators during playbook execution
+- name: Generate aliases for Bash/Zsh
+  command: "{{ thinkube_system_aliases_dir }}/generate_aliases.sh"
+  tags: [thinkube, aliases]
+  
+- name: Generate abbreviations for Fish
+  shell: |  
+    if command -v fish >/dev/null 2>&1; then
+      # Run fish with no config to avoid recursion
+      fish --no-config {{ thinkube_system_aliases_dir }}/generate_abbreviations.fish
+    else
+      echo "Fish not installed, skipping abbreviation generation"
+      exit 0
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: false
+  tags: [thinkube, aliases]
+  
+# Create example user alias files
+- name: Create example user aliases for Bash/Zsh
+  copy:
+    dest: "{{ thinkube_user_aliases_dir }}/example.sh"
+    content: |
+      #!/bin/bash
+      # Example user alias file - Edit this or create new .sh files in this directory
+      
+      # alias my_custom_alias='command --flag'
+    mode: '0644'
+    force: no  # Don't overwrite if exists
+  tags: [thinkube, aliases]
+  
+- name: Create example user abbreviations for Fish
+  copy:
+    dest: "{{ thinkube_user_aliases_dir }}/example.fish"
+    content: |
+      # Example user abbreviation file - Edit this or create new .fish files in this directory
+      
+      # abbr -a my_custom_abbr 'command --flag'
+    mode: '0644'
+    force: no  # Don't overwrite if exists
+  tags: [thinkube, aliases]

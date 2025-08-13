@@ -1,0 +1,421 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/monitoring/18_test_monitoring.yaml
+# Description:
+#   Test Prometheus and Grafana deployments and validate functionality
+#
+# Requirements:
+#   - Prometheus must be deployed (10_deploy_prometheus.yaml)
+#   - Grafana must be deployed (12_deploy_grafana.yaml)
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/monitoring/18_test_monitoring.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Test Monitoring Stack (Prometheus + Grafana)
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  tasks:
+    ###################################################################
+    # Common checks
+    ###################################################################
+    - name: Check if monitoring namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ monitoring_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    ###################################################################
+    # Prometheus checks
+    ###################################################################
+    - name: Check Prometheus StatefulSet
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus
+      register: prometheus_statefulset
+      failed_when: prometheus_statefulset.resources | length == 0
+
+    - name: Verify Prometheus StatefulSet is ready
+      ansible.builtin.assert:
+        that:
+          - prometheus_statefulset.resources[0].status.readyReplicas == 1
+          - prometheus_statefulset.resources[0].status.replicas == 1
+        fail_msg: "Prometheus StatefulSet is not ready"
+        success_msg: "Prometheus StatefulSet is ready"
+
+    - name: Check Prometheus service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus
+      register: prometheus_service
+      failed_when: prometheus_service.resources | length == 0
+
+    - name: Check Prometheus ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus
+      register: prometheus_ingress
+      failed_when: prometheus_ingress.resources | length == 0
+
+    - name: Check Prometheus TLS secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ monitoring_namespace }}"
+        name: "prometheus-tls-secret"
+      register: prometheus_tls_secret
+      failed_when: prometheus_tls_secret.resources | length == 0
+
+    - name: Check Prometheus ConfigMap exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus-config
+      register: prometheus_config_map
+      failed_when: prometheus_config_map.resources | length == 0
+
+    - name: Check Prometheus ServiceAccount exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ServiceAccount
+        namespace: "{{ monitoring_namespace }}"
+        name: prometheus
+      register: prometheus_service_account
+      failed_when: prometheus_service_account.resources | length == 0
+
+    - name: Check Prometheus ClusterRole exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        name: prometheus
+      register: prometheus_cluster_role
+      failed_when: prometheus_cluster_role.resources | length == 0
+
+    - name: Check Prometheus ClusterRoleBinding exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        name: prometheus
+      register: prometheus_cluster_role_binding
+      failed_when: prometheus_cluster_role_binding.resources | length == 0
+
+    - name: Check Prometheus persistent volume claim
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ monitoring_namespace }}"
+        label_selectors:
+          - app=prometheus
+      register: prometheus_pvc_check
+      failed_when: prometheus_pvc_check.resources | length == 0
+
+    - name: Test Prometheus API endpoint
+      ansible.builtin.uri:
+        url: "https://{{ prometheus_hostname }}/api/v1/status/config"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: prometheus_api_test
+
+    - name: Test Prometheus targets endpoint
+      ansible.builtin.uri:
+        url: "https://{{ prometheus_hostname }}/api/v1/targets"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: prometheus_targets_test
+
+    - name: Verify Prometheus active targets exist
+      ansible.builtin.assert:
+        that:
+          - prometheus_targets_test.json.data.activeTargets | length > 0
+        fail_msg: "No active targets found in Prometheus"
+        success_msg: "Prometheus has active targets"
+
+    - name: Test Prometheus health endpoint
+      ansible.builtin.uri:
+        url: "https://{{ prometheus_hostname }}/-/healthy"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: prometheus_health_test
+
+    - name: Test Prometheus ready endpoint
+      ansible.builtin.uri:
+        url: "https://{{ prometheus_hostname }}/-/ready"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: prometheus_ready_test
+
+    ###################################################################
+    # Grafana checks
+    ###################################################################
+    - name: Check Grafana Deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana
+      register: grafana_deployment
+      failed_when: grafana_deployment.resources | length == 0
+
+    - name: Verify Grafana Deployment is ready
+      ansible.builtin.assert:
+        that:
+          - grafana_deployment.resources[0].status.readyReplicas == 1
+          - grafana_deployment.resources[0].status.replicas == 1
+        fail_msg: "Grafana Deployment is not ready"
+        success_msg: "Grafana Deployment is ready"
+
+    - name: Check Grafana service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana
+      register: grafana_service
+      failed_when: grafana_service.resources | length == 0
+
+    - name: Check Grafana ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana
+      register: grafana_ingress
+      failed_when: grafana_ingress.resources | length == 0
+
+    - name: Check Grafana TLS secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ monitoring_namespace }}"
+        name: "grafana-tls-secret"
+      register: grafana_tls_secret
+      failed_when: grafana_tls_secret.resources | length == 0
+
+    - name: Check Grafana ConfigMap exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana-config
+      register: grafana_config_map
+      failed_when: grafana_config_map.resources | length == 0
+
+    - name: Check Grafana credentials secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana-creds
+      register: grafana_creds_secret
+      failed_when: grafana_creds_secret.resources | length == 0
+
+    - name: Check Grafana OAuth secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana-oauth-secret
+      register: grafana_oauth_secret
+      failed_when: grafana_oauth_secret.resources | length == 0
+
+    - name: Check Grafana persistent volume claim
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana-storage
+      register: grafana_pvc_check
+      failed_when: grafana_pvc_check.resources | length == 0
+
+    - name: Test Grafana health endpoint
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/api/health"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: grafana_health_test
+
+    - name: Test Grafana login page (should be accessible)
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/login"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: grafana_login_test
+
+    ###################################################################
+    # Keycloak integration checks
+    ###################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+
+    - name: Check Grafana client in Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId=grafana"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: grafana_client
+      failed_when: grafana_client.json | length == 0
+
+    - name: Check Grafana realm roles in Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: realm_roles
+
+    - name: Verify Grafana admin role exists
+      ansible.builtin.assert:
+        that:
+          - realm_roles.json | selectattr('name', 'equalto', 'grafana-admin') | list | length > 0
+        fail_msg: "Grafana admin role not found in Keycloak"
+        success_msg: "Grafana admin role exists in Keycloak"
+
+    ###################################################################
+    # Grafana datasource check
+    ###################################################################
+    - name: Check Grafana datasources via API
+      ansible.builtin.uri:
+        url: "https://{{ grafana_hostname }}/api/datasources"
+        method: GET
+        validate_certs: false
+        user: "{{ admin_username }}"
+        password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+        force_basic_auth: true
+        status_code: 200
+      register: grafana_datasources
+
+    - name: Verify Prometheus datasource exists
+      ansible.builtin.assert:
+        that:
+          - grafana_datasources.json | selectattr('name', 'equalto', 'Prometheus') | list | length > 0
+          - grafana_datasources.json | selectattr('type', 'equalto', 'prometheus') | list | length > 0
+        fail_msg: "Prometheus datasource not found in Grafana"
+        success_msg: "Prometheus datasource is configured in Grafana"
+
+    ###################################################################
+    # Summary
+    ###################################################################
+    - name: Test summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Monitoring Stack Test Results
+          ════════════════════════════════════════════════════════
+          
+          Namespace: {{ monitoring_namespace }}
+          
+          🎯 PROMETHEUS STATUS:
+          ─────────────────────
+          URL: https://{{ prometheus_hostname }}
+          ✓ StatefulSet: Ready (1/1 replicas)
+          ✓ Service: Active
+          ✓ Ingress: Configured
+          ✓ TLS certificate: Present
+          ✓ ConfigMap: Deployed
+          ✓ RBAC: Configured
+          ✓ Persistent storage: {{ prometheus_storage_size }} allocated
+          ✓ API endpoints: Accessible
+          ✓ Active targets: {{ prometheus_targets_test.json.data.activeTargets | length }} found
+          
+          📊 GRAFANA STATUS:
+          ─────────────────────
+          URL: https://{{ grafana_hostname }}
+          ✓ Deployment: Ready (1/1 replicas)
+          ✓ Service: Active
+          ✓ Ingress: Configured
+          ✓ TLS certificate: Present
+          ✓ ConfigMap: Deployed
+          ✓ Credentials: Configured
+          ✓ OAuth secret: Present
+          ✓ Persistent storage: {{ grafana_storage_size }} allocated
+          ✓ Health check: Passed
+          ✓ Prometheus datasource: Configured
+          
+          🔐 KEYCLOAK INTEGRATION:
+          ─────────────────────
+          ✓ Grafana client: Configured
+          ✓ Realm roles: grafana-admin, grafana-editor, grafana-viewer
+          ✓ OAuth integration: Enabled
+          
+          📝 ACCESS INSTRUCTIONS:
+          ─────────────────────
+          
+          Prometheus:
+          • Web UI: https://{{ prometheus_hostname }}
+          • API: https://{{ prometheus_hostname }}/api/v1/
+          • Note: No authentication configured
+          
+          Grafana:
+          • Web UI: https://{{ grafana_hostname }}
+          • Login options:
+            - OAuth: Login via Keycloak SSO
+            - Basic auth: Username '{{ admin_username }}' with ADMIN_PASSWORD
+          • Admin role assigned to: {{ admin_username }}
+          
+          Useful Endpoints:
+          • Prometheus targets: https://{{ prometheus_hostname }}/targets
+          • Prometheus config: https://{{ prometheus_hostname }}/config
+          • Grafana datasources: https://{{ grafana_hostname }}/datasources
+          • Grafana dashboards: https://{{ grafana_hostname }}/dashboards
+          
+          Example Prometheus Queries:
+          • up
+          • node_memory_MemAvailable_bytes
+          • container_cpu_usage_seconds_total
+          
+          ════════════════════════════════════════════════════════

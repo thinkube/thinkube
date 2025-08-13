@@ -1,0 +1,409 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 10_setup_ssh_keys.yaml - Establishes bidirectional SSH access between all baremetal servers
+# 
+# Purpose:
+#   Sets up SSH key-based authentication between all Thinkube baremetal servers
+#   to enable password-less automation.
+#
+# Requirements:
+#   - SSH server installed on all hosts
+#   - Password authentication enabled for initial setup
+#   - All hosts reachable by IP address
+#
+# Variables:
+#   Required (from inventory):
+#     - ansible_host: IP address of each server
+#   Optional:
+#     - ssh_key_name: Name of SSH key file (default: thinkube_cluster_key)
+#     - ssh_key_type: Type of SSH key (default: ed25519)
+#
+# Run with: 
+#   ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/10_setup_ssh_keys.yaml --ask-pass --ask-become-pass
+#   Or with helper script:
+#   ./scripts/run_ansible.sh ansible/00_initial_setup/10_setup_ssh_keys.yaml --ask-pass
+
+- name: Setup Controller SSH Key
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ssh_key_name: "thinkube_cluster_key"
+    ssh_key_type: "ed25519"
+  tasks:
+    - name: Ensure .ssh directory exists on controller
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/.ssh"
+        state: directory
+        mode: '0700'
+
+    - name: Remove old controller SSH key if exists
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "{{ lookup('env', 'HOME') }}/.ssh/{{ ssh_key_name }}"
+        - "{{ lookup('env', 'HOME') }}/.ssh/{{ ssh_key_name }}.pub"
+
+    - name: Generate fresh SSH key on controller
+      ansible.builtin.command:
+        cmd: ssh-keygen -t {{ ssh_key_type }} -f {{ lookup('env', 'HOME') }}/.ssh/{{ ssh_key_name }} -C "thinkube_cluster_controller" -N ""
+      changed_when: true
+
+    - name: Ensure correct permissions on controller SSH keys
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: file
+        mode: "{{ '0600' if item.endswith('/thinkube_cluster_key') else '0644' }}"
+      with_items:
+        - "{{ lookup('env', 'HOME') }}/.ssh/{{ ssh_key_name }}"
+        - "{{ lookup('env', 'HOME') }}/.ssh/{{ ssh_key_name }}.pub"
+
+    - name: Clear all keys from SSH agent
+      ansible.builtin.shell: |
+        # Clear all keys to ensure clean state
+        ssh-add -D
+      failed_when: false
+      changed_when: false
+
+    - name: Load controller key into SSH agent
+      ansible.builtin.shell: |
+        ssh-add {{ lookup('env', 'HOME') }}/.ssh/{{ ssh_key_name }}
+      failed_when: false
+      changed_when: false
+
+- name: Setup SSH Keys for Baremetal Servers
+  hosts: baremetal
+  gather_facts: false  # Disable initial facts gathering until Python is installed
+  become: false
+  vars:
+    ssh_key_name: "thinkube_cluster_key"
+    ssh_key_type: "ed25519"
+    ansible_become_pass: "{{ lookup('env', 'ANSIBLE_BECOME_PASSWORD') }}"
+    ansible_ssh_pass: "{{ lookup('env', 'ANSIBLE_SSH_PASSWORD') }}"
+  
+  handlers:
+    - name: Restart SSH service
+      become: true
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+  tasks:
+    # Install Python first - required for all subsequent tasks
+    - name: Ensure Python3 and dependencies are installed
+      become: true
+      ansible.builtin.raw: |
+        # Always ensure Python3 is installed
+        apt-get update
+        apt-get install -y python3 python3-pip python3-venv python3-full
+      register: python_install
+      changed_when: false
+
+    - name: Gather facts now that Python is available
+      ansible.builtin.setup:
+      
+    - name: Remove existing venv if it exists (to ensure clean state)
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.venv"
+        state: absent
+      become: false
+      when: false  # Set to true if you want to force recreation
+
+    - name: Create Python virtual environment
+      ansible.builtin.command: python3 -m venv "/home/{{ ansible_user }}/.venv"
+      args:
+        creates: "/home/{{ ansible_user }}/.venv/bin/python"
+      become: false
+
+    - name: Ensure pip is installed in venv (using ensurepip)
+      ansible.builtin.command: "/home/{{ ansible_user }}/.venv/bin/python -m ensurepip --default-pip"
+      become: false
+      register: ensurepip_result
+      failed_when: false
+      changed_when: "'Successfully installed' in ensurepip_result.stdout"
+
+    - name: Upgrade pip and install essential packages in virtual environment
+      ansible.builtin.command: "/home/{{ ansible_user }}/.venv/bin/python -m pip install --upgrade pip packaging setuptools wheel"
+      become: false
+      register: pip_upgrade
+      changed_when: "'Successfully installed' in pip_upgrade.stdout or 'Requirement already satisfied' in pip_upgrade.stdout"
+      failed_when: pip_upgrade.rc != 0
+      
+    - name: Verify packaging module is installed
+      ansible.builtin.command: "/home/{{ ansible_user }}/.venv/bin/python -c 'import packaging; print(packaging.__version__)'"
+      become: false
+      register: packaging_check
+      failed_when: packaging_check.rc != 0
+      changed_when: false
+      
+    - name: Set Python interpreter to use virtual environment
+      ansible.builtin.set_fact:
+        ansible_python_interpreter: "/home/{{ ansible_user }}/.venv/bin/python3"
+      
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - ansible_host is defined
+        fail_msg: |
+          ERROR: Missing Required Variables
+          
+          DETAILS:
+          - The following variables must be defined in inventory:
+            - ansible_host: {% if ansible_host is defined %}✓{% else %}✗ missing{% endif %}
+          
+          REQUIRED ACTION:
+          - Add missing variables to your inventory file at inventory/inventory.yaml
+          - Or define them in inventory/group_vars/all.yml
+          
+          REFERENCE: See docs/architecture/VARIABLE_HANDLING.md
+    - name: Ensure openssh-server is installed
+      become: true
+      ansible.builtin.apt:
+        name: openssh-server
+        state: present
+        update_cache: yes
+      
+    - name: Ensure SSH service is running
+      become: true
+      ansible.builtin.service:
+        name: ssh
+        state: started
+        enabled: true
+        
+    - name: Configure SSH to allow password authentication
+      become: true
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication yes'
+        state: present
+      notify: Restart SSH service
+
+    - name: Check for cloud-init SSH config
+      become: true
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+      register: cloud_init_conf
+      
+    - name: Configure SSH cloud-init to allow password authentication
+      become: true
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication yes'
+        state: present
+      when: cloud_init_conf.stat.exists
+      notify: Restart SSH service
+        
+    - name: Force SSH configuration to take effect
+      become: true 
+      ansible.builtin.meta: flush_handlers
+        
+    - name: Ensure .ssh directory exists
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir }}/.ssh"
+        state: directory
+        mode: '0700'
+
+    - name: Remove old SSH keys if they exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}"
+        - "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}.pub"
+
+    - name: Generate fresh SSH key for each host
+      ansible.builtin.command:
+        cmd: ssh-keygen -t {{ ssh_key_type }} -f {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }} -C "thinkube_cluster_{{ ansible_hostname }}" -N ""
+      changed_when: true
+
+    - name: Ensure correct permissions on SSH keys
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: file
+        mode: "{{ '0600' if item.endswith('/thinkube_cluster_key') else '0644' }}"
+      with_items:
+        - "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}"
+        - "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}.pub"
+
+    - name: Get public key content
+      ansible.builtin.command: cat {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}.pub
+      register: pubkey_content
+      changed_when: false
+
+    # Clean up old thinkube cluster keys from authorized_keys
+    - name: Remove old thinkube cluster keys from authorized_keys
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_user_dir }}/.ssh/authorized_keys"
+        regexp: ".*thinkube_cluster.*"
+        state: absent
+        backup: yes
+
+    # Simple approach - add all public keys to all hosts directly
+    - name: Add public keys to authorized_keys from all hosts
+      ansible.builtin.authorized_key:
+        user: "{{ ansible_user_id }}"
+        key: "{{ hostvars[item]['pubkey_content']['stdout'] }}"
+        state: present
+      loop: "{{ groups['baremetal'] }}"
+      when: hostvars[item]['pubkey_content'] is defined
+
+    # CRITICAL: Add controller's SSH key to all baremetal hosts
+    # This is needed when running from an external controller
+    - name: Check if controller has SSH key
+      delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ lookup('env', 'HOME') }}/.ssh/{{ ssh_key_name }}.pub"
+      register: controller_key_stat
+      run_once: true
+
+    - name: Get controller's public key
+      delegate_to: localhost
+      ansible.builtin.command: cat {{ lookup('env', 'HOME') }}/.ssh/{{ ssh_key_name }}.pub
+      register: controller_pubkey
+      when: controller_key_stat.stat.exists
+      run_once: true
+      changed_when: false
+
+    - name: Add controller's key to all baremetal hosts
+      ansible.builtin.authorized_key:
+        user: "{{ ansible_user_id }}"
+        key: "{{ controller_pubkey.stdout }}"
+        state: present
+      when: 
+        - controller_key_stat.stat.exists
+        - controller_pubkey.stdout is defined
+
+    # Optimize SSH server configuration for faster connections
+    - name: Optimize SSH server configuration
+      become: true
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+        backup: yes
+      loop:
+        - { regexp: '^#?UseDNS', line: 'UseDNS no' }
+        - { regexp: '^#?GSSAPIAuthentication', line: 'GSSAPIAuthentication no' }
+      notify: Restart SSH service
+      tags: [ssh-optimize]
+
+    - name: Check for existing SSH config file
+      ansible.builtin.stat:
+        path: "{{ ansible_user_dir }}/.ssh/config"
+      register: ssh_config_stat
+
+    - name: Backup existing SSH config if it exists
+      ansible.builtin.copy:
+        src: "{{ ansible_user_dir }}/.ssh/config"
+        dest: "{{ ansible_user_dir }}/.ssh/config.backup.{{ ansible_date_time.epoch }}"
+        remote_src: yes
+        mode: '0600'
+      when: ssh_config_stat.stat.exists
+      
+    # Simple approach: Check for section markers and either create a new file or update existing
+    - name: Check if SSH config already has Thinkube Baremetal section
+      ansible.builtin.shell: |
+        if [ -f "{{ ansible_user_dir }}/.ssh/config" ]; then
+          grep -q "BEGIN-THINKUBE-BAREMETAL" "{{ ansible_user_dir }}/.ssh/config" && echo "found" || echo "not found"
+        else
+          echo "not found"
+        fi
+      register: has_baremetal_section
+      changed_when: false
+
+    # Create new SSH config if it doesn't exist
+    - name: Create new SSH config file if it doesn't exist
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/ssh_config.j2"
+        dest: "{{ ansible_user_dir }}/.ssh/config"
+        mode: '0600'
+      when: not ssh_config_stat.stat.exists
+
+    # Generate Thinkube SSH config snippet for baremetal hosts
+    - name: Generate Thinkube baremetal SSH config snippet
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/ssh_config.j2"
+        dest: "{{ ansible_user_dir }}/.ssh/baremetal_snippet"
+        mode: '0600'
+      when: ssh_config_stat.stat.exists
+
+    # If section exists, update it
+    - name: Update existing Thinkube baremetal section
+      ansible.builtin.shell: |
+        # Create new config file
+        touch "{{ ansible_user_dir }}/.ssh/config.new"
+        
+        # Add everything before the BEGIN marker
+        sed -n '1,/# BEGIN-THINKUBE-BAREMETAL/p' "{{ ansible_user_dir }}/.ssh/config" | \
+        grep -v "# BEGIN-THINKUBE-BAREMETAL" > "{{ ansible_user_dir }}/.ssh/config.new"
+        
+        # Add the new baremetal snippet
+        cat "{{ ansible_user_dir }}/.ssh/baremetal_snippet" >> "{{ ansible_user_dir }}/.ssh/config.new"
+        
+        # Add everything after the END marker
+        sed -n '/# END-THINKUBE-BAREMETAL/,$p' "{{ ansible_user_dir }}/.ssh/config" | \
+        grep -v "# END-THINKUBE-BAREMETAL" >> "{{ ansible_user_dir }}/.ssh/config.new"
+        
+        # Replace the original file
+        mv "{{ ansible_user_dir }}/.ssh/config.new" "{{ ansible_user_dir }}/.ssh/config"
+        chmod 600 "{{ ansible_user_dir }}/.ssh/config"
+      when: ssh_config_stat.stat.exists and has_baremetal_section.stdout == "found"
+
+    # If no section exists yet, append it
+    - name: Append baremetal section to existing SSH config
+      ansible.builtin.shell: |
+        # Add an empty line for separation
+        echo "" >> "{{ ansible_user_dir }}/.ssh/config"
+        
+        # Add the baremetal snippet
+        cat "{{ ansible_user_dir }}/.ssh/baremetal_snippet" >> "{{ ansible_user_dir }}/.ssh/config"
+      when: ssh_config_stat.stat.exists and has_baremetal_section.stdout == "not found"
+
+    # Clean up temporary files
+    - name: Clean up temporary files
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir }}/.ssh/baremetal_snippet"
+        state: absent
+      when: ssh_config_stat.stat.exists
+
+    - name: Test SSH connection to other hosts
+      ansible.builtin.shell: |
+        if [ "{{ item }}" != "{{ inventory_hostname }}" ]; then
+          echo "Testing SSH connection to {{ item }} at IP {{ hostvars[item]['ansible_host'] }}..."
+          ssh -i {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }} -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ hostvars[item]['ansible_host'] }} "echo Successfully connected from {{ inventory_hostname }} to {{ item }}"
+          exit $?
+        else
+          echo "Skipping test to self ({{ inventory_hostname }})"
+          exit 0
+        fi
+      register: ssh_test
+      changed_when: false
+      failed_when: "ssh_test.rc != 0"
+      loop: "{{ groups['baremetal'] }}"
+
+    - name: Display successful setup message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          ✓ SSH Keys Setup Complete ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          SSH key authentication has been successfully configured.
+          
+          DETAILS:
+            ✓ Generated SSH keys
+            ✓ Distributed public keys to all hosts
+            ✓ Created SSH config file
+            ✓ Verified connectivity to all hosts
+          
+          RESULT:
+            Passwordless SSH is now enabled between all servers.
+            You can connect using: ssh <hostname>
+          
+          ═════════════════════════════════════════════════════════

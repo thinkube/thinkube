@@ -1,0 +1,438 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/monitoring/13_deploy_grafana.yaml
+# Description:
+#   Deploy Grafana with Keycloak OAuth integration and Prometheus datasource
+#   Migrated from thinkube-core/playbooks/services/92_setup_grafana.yaml
+#
+# Requirements:
+#   - MicroK8s cluster with control plane
+#   - Keycloak instance running and accessible
+#   - Keycloak client for Grafana configured (run 12_configure_grafana_keycloak.yaml first)
+#   - Prometheus deployed (run 10_deploy_prometheus.yaml first)
+#   - ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/monitoring/13_deploy_grafana.yaml
+#
+# Variables from inventory:
+#   - monitoring_namespace: Namespace for monitoring components
+#   - grafana_hostname: Hostname for Grafana access
+#   - grafana_storage_size: Storage size for Grafana data (5Gi)
+#   - grafana_storage_class: Storage class to use (microk8s-hostpath)
+#   - harbor_registry: Harbor registry URL
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_hostname: Keycloak hostname
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username for all applications
+#   - kubeconfig: Path to kubectl configuration
+#
+# Dependencies:
+#   - CORE-002: TLS Certificates (wildcard cert in default namespace)
+#   - CORE-003: Ingress Controllers
+#   - CORE-004: Keycloak must be deployed
+#   - CORE-005: Harbor Container Registry (for image)
+#   - OPT-001: Prometheus must be deployed
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy Grafana + Ingress
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    # Grafana container image
+    grafana_image: "{{ harbor_registry }}/library/grafana:latest"
+
+    # Grafana credentials
+    grafana_admin_user: "{{ admin_username }}"
+    grafana_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+
+    # keycloak credentials
+    keycloak_admin_user: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+
+    # TLS secret name
+    grafana_tls_secret_name: "grafana-tls-secret"
+
+  tasks:
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ keycloak_admin_user }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+      no_log: true
+
+    - name: GET "grafana" client
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId=grafana"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: grafana_client_info
+
+    - name: Fail if client not found
+      ansible.builtin.fail:
+        msg: "Grafana client not found in Keycloak. Please run the Keycloak client setup playbook first."
+      when: grafana_client_info.json | length == 0
+
+    - name: Set client UUID
+      ansible.builtin.set_fact:
+        grafana_client_uuid: "{{ grafana_client_info.json[0].id }}"
+
+    - name: Get client secret
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ grafana_client_uuid }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: client_secret_response
+
+    - name: Set client secret fact
+      ansible.builtin.set_fact:
+        grafana_client_secret: "{{ client_secret_response.json.value }}"
+
+    ###################################################################
+    # 1) Get and copy wildcard certificate
+    ###################################################################
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to monitoring namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ grafana_tls_secret_name }}"
+            namespace: "{{ monitoring_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###################################################################
+    # 2) Create the Grafana ConfigMap
+    ###################################################################
+    - name: Create Grafana ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ monitoring_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: grafana-config
+          data:
+            grafana.ini: |
+              [server]
+              domain = {{ grafana_hostname }}
+              root_url = https://{{ grafana_hostname }}
+
+              [auth]
+              disable_login_form = false
+              oauth_auto_login = false
+
+              [log]
+              level = debug
+              mode = console
+
+              [auth.generic_oauth]
+              enabled = true
+              name = Keycloak-OAuth
+              allow_sign_up = true
+              client_id = grafana
+              client_secret = {{ grafana_client_secret }}
+              scopes = openid email profile
+              email_attribute_path = email
+              login_attribute_path = preferred_username
+              name_attribute_path = name
+              auth_url = {{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/auth
+              token_url = {{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token
+              api_url = {{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/userinfo
+              role_attribute_path = contains(realm_access.roles[*], 'grafana-admin') && 'GrafanaAdmin' || contains(resource_access.grafana.roles[*], 'grafana-admin') && 'GrafanaAdmin' || contains(realm_access.roles[*], 'grafana-editor') && 'Editor' || contains(resource_access.grafana.roles[*], 'grafana-editor') && 'Editor' || 'Viewer'
+              allow_assign_grafana_admin = true
+              jwt_debug = true
+              verbose_logging = true
+
+              [auth.basic]
+              enabled = true
+
+              [database]
+              type = sqlite3
+
+              [analytics]
+              reporting_enabled = false
+              check_for_updates = false
+
+              [dashboards]
+              versions_to_keep = 20
+
+              [users]
+              allow_sign_up = false
+              auto_assign_org = true
+              auto_assign_org_role = Viewer
+
+              [security]
+              cookie_secure = true
+              cookie_samesite = lax
+
+              [paths]
+              data = /var/lib/grafana
+              logs = /var/log/grafana
+              plugins = /var/lib/grafana/plugins
+              provisioning = /etc/grafana/provisioning
+            datasources.yaml: |
+              apiVersion: 1
+              datasources:
+                - name: Prometheus
+                  type: prometheus
+                  access: proxy
+                  url: http://prometheus:9090
+                  isDefault: true
+                  editable: true
+                  jsonData:
+                    timeInterval: "15s"
+
+    ###################################################################
+    # 3) Create Grafana admin credentials secret
+    ###################################################################
+    - name: Create Grafana credentials secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ monitoring_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: grafana-creds
+          type: Opaque
+          stringData:
+            admin-user: "{{ grafana_admin_user }}"
+            admin-password: "{{ grafana_admin_password }}"
+
+    ###################################################################
+    # 4) Update OAuth client secret with real value
+    ###################################################################
+    - name: Update OAuth client secret with real value
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ monitoring_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: grafana-oauth-secret
+          type: Opaque
+          stringData:
+            client_id: "grafana"
+            client_secret: "{{ grafana_client_secret }}"
+
+    ###################################################################
+    # 5) Create Persistent Volume Claim for Grafana
+    ###################################################################
+    - name: Create Grafana Persistent Volume Claim
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ monitoring_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: grafana-storage
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            storageClassName: "{{ grafana_storage_class }}"
+            resources:
+              requests:
+                storage: "{{ grafana_storage_size }}"
+
+    ###################################################################
+    # 6) Create Grafana Deployment
+    ###################################################################
+    - name: Create Grafana Deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ monitoring_namespace }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: grafana
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: grafana
+            template:
+              metadata:
+                labels:
+                  app: grafana
+              spec:
+                containers:
+                  - name: grafana
+                    image: "{{ grafana_image }}"
+                    env:
+                      - name: GF_SECURITY_ADMIN_USER
+                        valueFrom:
+                          secretKeyRef:
+                            name: grafana-creds
+                            key: admin-user
+                      - name: GF_SECURITY_ADMIN_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: grafana-creds
+                            key: admin-password
+                    ports:
+                      - containerPort: 3000
+                        name: grafana
+                    volumeMounts:
+                      - name: grafana-config
+                        mountPath: /etc/grafana/grafana.ini
+                        subPath: grafana.ini
+                      - name: grafana-config
+                        mountPath: /etc/grafana/provisioning/datasources/datasources.yaml
+                        subPath: datasources.yaml
+                      - name: grafana-storage
+                        mountPath: /var/lib/grafana
+                    livenessProbe:
+                      httpGet:
+                        path: /api/health
+                        port: 3000
+                      initialDelaySeconds: 60
+                      timeoutSeconds: 30
+                    readinessProbe:
+                      httpGet:
+                        path: /api/health
+                        port: 3000
+                      initialDelaySeconds: 60
+                      timeoutSeconds: 30
+                volumes:
+                  - name: grafana-config
+                    configMap:
+                      name: grafana-config
+                  - name: grafana-storage
+                    persistentVolumeClaim:
+                      claimName: grafana-storage
+
+    ###################################################################
+    # 7) Create Grafana Service
+    ###################################################################
+    - name: Create Grafana Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ monitoring_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: grafana
+            labels:
+              app: grafana
+          spec:
+            ports:
+              - port: 3000
+                targetPort: 3000
+                protocol: TCP
+                name: http
+            selector:
+              app: grafana
+
+    ###################################################################
+    # 8) Create Grafana Ingress
+    ###################################################################
+    - name: Create Grafana Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ monitoring_namespace }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: grafana
+            annotations:
+              nginx.ingress.kubernetes.io/proxy-body-size: "0"
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - "{{ grafana_hostname }}"
+                secretName: "{{ grafana_tls_secret_name }}"
+            rules:
+              - host: "{{ grafana_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: grafana
+                          port:
+                            number: 3000
+
+    ###################################################################
+    # 9) Wait for Grafana to be ready
+    ###################################################################
+    - name: Wait for Grafana to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ monitoring_namespace }}"
+        name: grafana
+      register: grafana_deployment
+      until: 
+        - grafana_deployment.resources[0].status.readyReplicas is defined
+        - grafana_deployment.resources[0].status.readyReplicas == 1
+      retries: 60
+      delay: 5
+
+    ###################################################################
+    # 10) Final info
+    ###################################################################
+    - name: Final Grafana info
+      ansible.builtin.debug:
+        msg:
+          - "Grafana deployed successfully!"
+          - "Namespace: {{ monitoring_namespace }}"
+          - "URL: https://{{ grafana_hostname }}"
+          - "Service: grafana port 3000"
+          - ""
+          - "Login options:"
+          - "1. OAuth: Login via Keycloak SSO"
+          - "2. Basic auth: Username '{{ admin_username }}' with ADMIN_PASSWORD"
+          - ""
+          - "Prometheus datasource is pre-configured and ready to use"
+          - "Note: Ensure you've run the Keycloak client setup (12_configure_grafana_keycloak.yaml) for OAuth to work."

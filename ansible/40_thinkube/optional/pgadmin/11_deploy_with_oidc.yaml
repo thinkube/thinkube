@@ -1,0 +1,425 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/pgadmin/11_deploy_with_oidc.yaml
+# Description:
+#   Deploy pgAdmin with OIDC authentication via Keycloak
+#   This playbook deploys pgAdmin with full OIDC integration
+#
+# Requirements:
+#   - Kubernetes cluster with MicroK8s
+#   - Keycloak instance running and accessible
+#   - Keycloak client configured (run 10_configure_keycloak.yaml first)
+#   - ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/pgadmin/11_deploy_with_oidc.yaml
+#
+# Variables from inventory:
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name  
+#   - admin_username: Admin username for Keycloak
+#   - pgadmin_hostname: Hostname for pgAdmin access
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 [AI-assisted]
+
+- name: Configure OIDC in pgAdmin deployment with Keycloak using proper env quoting and updated metadata parameter
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    ###################################################################
+    # Get admin password from environment
+    ###################################################################
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    
+    ###################################################################
+    # Basic configuration
+    ###################################################################
+    pgadmin_namespace: "pgadmin"
+    postgres_namespace: "postgres"
+    pgadmin_domain: "pgadmin.{{ domain_name }}"
+    pgadmin_image: "{{ harbor_registry }}/{{ library_project }}/pgadmin4:latest"
+    library_project: "library"  # Harbor's default library project
+
+    ###################################################################
+    # Keycloak OIDC configuration
+    ###################################################################
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ admin_password }}"
+    pgadmin_oidc_client_id: "pgadmin"
+
+    # Derived Keycloak endpoints
+    keycloak_token_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
+    keycloak_auth_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/auth"
+    keycloak_api_base_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+    keycloak_userinfo_endpoint: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/userinfo"
+
+  tasks:
+    ###################################################################
+    # 1) Ensure pgAdmin namespace exists
+    ###################################################################
+    - name: Ensure pgAdmin namespace exists
+      ansible.builtin.shell: |
+        if ! {{ kubectl_bin }} get namespace {{ pgadmin_namespace }}; then
+          {{ kubectl_bin }} create namespace {{ pgadmin_namespace }}
+        fi
+      register: ensure_ns
+      changed_when: ensure_ns.stdout != ""
+
+    ###################################################################
+    # 2) Create TLS secret from wildcard certificate
+    ###################################################################
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to pgAdmin namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: pgadmin-tls-secret
+            namespace: "{{ pgadmin_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###################################################################
+    # 3) Check if PostgreSQL is deployed and create servers config
+    ###################################################################
+    - name: Check if PostgreSQL is deployed
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ postgres_namespace }}"
+        name: "postgresql-official"
+      register: postgres_check
+      failed_when: false
+
+    - name: Extract PostgreSQL password if deployed
+      ansible.builtin.set_fact:
+        postgres_password: "{{ postgres_check.resources[0].spec.template.spec.containers[0].env | selectattr('name', 'equalto', 'POSTGRES_PASSWORD') | map(attribute='value') | first }}"
+      when: postgres_check.resources | length > 0
+
+    - name: Create servers configuration if PostgreSQL exists
+      ansible.builtin.set_fact:
+        servers_config:
+          Servers:
+            "1":
+              Name: "Thinkube PostgreSQL"
+              Group: "Servers"
+              Host: "postgresql-official.{{ postgres_namespace }}.svc.cluster.local"
+              Port: 5432
+              MaintenanceDB: "mydatabase"
+              Username: "{{ admin_username }}"
+              SharedUsername: "{{ admin_username }}"
+              Password: "{{ postgres_password }}"
+              SSLMode: "prefer"
+              Comment: "Default Thinkube PostgreSQL instance"
+              SavePassword: true
+              Shared: true
+      when: postgres_check.resources | length > 0
+
+    - name: Create servers.json ConfigMap if PostgreSQL exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: pgadmin-servers
+            namespace: "{{ pgadmin_namespace }}"
+          data:
+            servers.json: "{{ servers_config | to_nice_json }}"
+      when: postgres_check.resources | length > 0
+
+    ###################################################################
+    # 4) Obtain Keycloak admin token
+    ###################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ keycloak_admin_username }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+      no_log: true
+
+    ###################################################################
+    # 5) Retrieve the "pgadmin" client from Keycloak and its secret
+    ###################################################################
+    - name: Retrieve "pgadmin" client from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ pgadmin_oidc_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+      register: client_info
+
+    - name: Fail if "pgadmin" client is not found
+      ansible.builtin.fail:
+        msg: "Client '{{ pgadmin_oidc_client_id }}' not found in realm '{{ keycloak_realm }}'"
+      when: client_info.json | length == 0
+
+    - name: Retrieve pgAdmin client secret from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ client_info.json[0].id }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        validate_certs: false
+        status_code: 200
+      register: secret_info
+
+    - name: Set fact for pgadmin_oidc_client_secret
+      ansible.builtin.set_fact:
+        pgadmin_oidc_client_secret: "{{ secret_info.json.value | default('') }}"
+
+    ###################################################################
+    # 6) Apply the OAuth2 ConfigMap (updated to use OAUTH2_SERVER_METADATA_URL)
+    ###################################################################
+    - name: Apply OAuth2 ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        template: templates/oauth2-config.yaml.j2
+
+    ###################################################################
+    # 7) Apply the Init Script ConfigMap
+    ###################################################################
+    - name: Apply Init Script ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        template: templates/init-script.yaml.j2
+
+    ###################################################################
+    # 8) Create Proxy Headers ConfigMap to override X-Forwarded-Proto
+    ###################################################################
+    - name: Create Proxy Headers ConfigMap for pgAdmin
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: pgadmin-proxy-headers
+            namespace: "{{ pgadmin_namespace }}"
+          data:
+            X-Forwarded-Proto: "http"
+
+    ###################################################################
+    # 9) Deploy pgAdmin with OIDC configuration
+    ###################################################################
+    - name: Update pgAdmin Deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: pgadmin
+            namespace: "{{ pgadmin_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: pgadmin
+            template:
+              metadata:
+                labels:
+                  app: pgadmin
+              spec:
+                volumes:
+                  - name: servers-config
+                    configMap:
+                      name: pgadmin-servers
+                      optional: true
+                  - name: oauth-config
+                    configMap:
+                      name: pgadmin-oauth-config
+                  - name: init-script
+                    configMap:
+                      name: pgadmin-init-script
+                  - name: pgadmin-config
+                    emptyDir: {}
+                  - name: pgadmin-data
+                    emptyDir: {}
+                initContainers:
+                  - name: init-config
+                    image: "python:3.9-slim"
+                    command: ["python", "/scripts/init.py"]
+                    volumeMounts:
+                      - name: oauth-config
+                        mountPath: /config
+                      - name: init-script
+                        mountPath: /scripts
+                      - name: pgadmin-config
+                        mountPath: /pgadmin4
+                containers:
+                  - name: pgadmin
+                    image: "{{ pgadmin_image }}"
+                    env:
+                      - name: PGADMIN_DEFAULT_EMAIL
+                        value: "{{ auth_realm_username }}@{{ domain_name }}"
+                      - name: PGADMIN_DEFAULT_PASSWORD
+                        value: "{{ admin_password }}"
+                      - name: GUNICORN_TIMEOUT
+                        value: "120"
+                      # Override configuration via environment variables.
+                      # Note the extra quotes for string values.
+                      - name: PGADMIN_CONFIG_SERVER_MODE
+                        value: "True"
+                      - name: PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED
+                        value: "False"
+                      - name: PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION
+                        value: "False"
+                      - name: PGADMIN_CONFIG_COOKIE_SAMESITE
+                        value: "'Lax'"
+                      - name: PGADMIN_CONFIG_PREFERRED_URL_SCHEME
+                        value: "'http'"
+                      - name: PGADMIN_CONFIG_SECURITY_HTTPS_ONLY
+                        value: "False"
+                      - name: PGADMIN_CONFIG_SECURITY_REDIRECT_HTTPS
+                        value: "False"
+                      - name: PGADMIN_SERVER_JSON_FILE
+                        value: "/pgadmin4/servers.json"
+                      - name: PGADMIN_REPLACE_SERVERS_ON_STARTUP
+                        value: "True"
+                    volumeMounts:
+                      - name: servers-config
+                        mountPath: /pgadmin4/servers.json
+                        subPath: servers.json
+                        readOnly: true
+                      - name: pgadmin-config
+                        mountPath: /pgadmin4/config_local.py
+                        subPath: config_local.py
+                      - name: pgadmin-data
+                        mountPath: /var/lib/pgadmin
+                    ports:
+                      - containerPort: 80
+
+    ###################################################################
+    # 10) Create pgAdmin Service
+    ###################################################################
+    - name: Create pgAdmin Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: pgadmin
+            namespace: "{{ pgadmin_namespace }}"
+          spec:
+            selector:
+              app: pgadmin
+            ports:
+              - port: 80
+                targetPort: 80
+            type: ClusterIP
+
+    ###################################################################
+    # 11) Create pgAdmin Ingress with proxy headers
+    ###################################################################
+    - name: Create pgAdmin Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: pgadmin-ingress
+            namespace: "{{ pgadmin_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/ssl-redirect: "false"
+              nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+              nginx.ingress.kubernetes.io/proxy-body-size: "128m"
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+              nginx.ingress.kubernetes.io/proxy-set-headers: "pgadmin-proxy-headers"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ pgadmin_domain }}"
+                secretName: "pgadmin-tls-secret"
+            rules:
+              - host: "{{ pgadmin_domain }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: pgadmin
+                          port:
+                            number: 80
+
+    ###################################################################
+    # 12) Wait for the pgAdmin pod to be running and display its status
+    ###################################################################
+    - name: Wait for pgAdmin pod
+      ansible.builtin.shell: |
+        attempt=1
+        max_attempts=30
+        until {{ kubectl_bin }} get pods -n {{ pgadmin_namespace }} -l app=pgadmin | grep Running || [ $attempt -eq $max_attempts ]; do
+          sleep 2
+          attempt=$((attempt + 1))
+        done
+      register: wait_pg
+      failed_when: wait_pg.rc != 0
+
+    - name: Show pgAdmin pod status
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n {{ pgadmin_namespace }} -l app=pgadmin"
+      register: pod_status
+
+    - name: Display pod status
+      ansible.builtin.debug:
+        var: pod_status.stdout_lines
+
+    - name: Display OIDC configuration summary
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          PGADMIN OIDC CONFIGURATION COMPLETE
+          ==========================================
+          
+          PgAdmin has been configured with Keycloak OIDC authentication!
+          
+          Access URL: https://{{ pgadmin_hostname }}
+          
+          Authentication: Users will now login via Keycloak
+          - Click "Keycloak Login" button on the pgAdmin login page
+          - Authenticate with Keycloak credentials
+          - Users will be auto-created in pgAdmin on first login
+          
+          Note: The dummy email/password in the deployment are no longer used.
+          All authentication is now handled through Keycloak.

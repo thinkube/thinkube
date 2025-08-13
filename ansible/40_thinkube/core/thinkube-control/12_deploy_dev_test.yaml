@@ -1,0 +1,146 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/12_deploy_dev_test.yaml
+# Description:
+#   Test version - Only runs Copier update to see what happens
+#
+# Requirements:
+#   - Initial deployment (10_deploy.yaml) must have been run at least once
+#   - Environment variable: ADMIN_PASSWORD
+#   - Copier installed in virtualenv
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/12_deploy_dev_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain for Kubernetes services
+#   - admin_username: Admin username for service access
+#   - kubeconfig: Path to kubeconfig file
+#   - system_username: System user on remote host
+#   - github_user: GitHub username
+#   - github_token: GitHub token
+#
+# 🤖 [AI-assisted]
+
+- name: Test Copier Update Only
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    # Namespace configuration
+    k8s_namespace: "thinkube-control"
+    
+    # GitOps configuration
+    gitea_org: "thinkube-deployments"
+    
+    # Template processing
+    template_url: "git@github.com:{{ github_user | default(github_org) }}/thinkube-control.git"
+    template_path: "{{ playbook_dir }}/../../../thinkube-control-temp"
+    
+    # Paths
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    local_repo_path: "{{ shared_code_path }}/thinkube-control"
+    app_name: "thinkube-control"
+    gitea_repo_name: "{{ app_name }}"
+    
+    # Get master node name for template processing
+    master_node_name: "{{ inventory_hostname }}"
+    master_node_ip: "{{ hostvars[inventory_hostname]['lan_ip'] | default('') }}"
+    
+    # Container registry
+    container_registry: "registry.{{ domain_name }}"
+
+  pre_tasks:
+    - name: Set GitHub variables from environment if not in inventory
+      ansible.builtin.set_fact:
+        github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+      when: github_token is not defined or github_token == ""
+      
+    - name: Set github_user from environment if not in inventory
+      ansible.builtin.set_fact:
+        github_user: "{{ lookup('env', 'GITHUB_USER') }}"
+      when: github_user is not defined or github_user == ""
+
+    - name: Verify required variables
+      ansible.builtin.fail:
+        msg: "{{ item }} is not defined. Please set it in inventory."
+      when: vars[item] is not defined or vars[item] == ""
+      loop:
+        - domain_name
+        - kubeconfig
+        - system_username
+        - admin_username
+        - github_token
+        - github_user
+
+    - name: Set admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    - name: Show current copier answers
+      ansible.builtin.shell: |
+        cd {{ local_repo_path }}
+        echo "Current copier answers:"
+        cat .copier-answers.yml | head -5
+        echo "..."
+        echo "Current commit in answers:"
+        grep "_commit:" .copier-answers.yml
+      register: current_answers
+      
+    - name: Display current state
+      ansible.builtin.debug:
+        var: current_answers.stdout_lines
+
+    - name: Run Copier update with verbose output
+      ansible.builtin.shell: |
+        cd {{ local_repo_path }}
+        
+        # Configure SSH for private repositories
+        export GIT_SSH_COMMAND="ssh -i {{ shared_code_path }}/.ssh/{{ app_name }}/id_ed25519 -o StrictHostKeyChecking=no"
+        
+        echo "=== Running copier update ==="
+        echo "Current directory: $(pwd)"
+        echo "Template URL from answers: $(grep _src_path .copier-answers.yml)"
+        
+        # Try different approaches
+        echo ""
+        echo "=== Approach 1: Basic update ==="
+        ~/.venv/bin/copier update --trust --defaults 2>&1 || echo "Exit code: $?"
+        
+        echo ""
+        echo "=== Checking if anything changed ==="
+        git status --short
+        
+        echo ""
+        echo "=== New copier answers ==="
+        grep "_commit:" .copier-answers.yml
+      register: copier_test
+      
+    - name: Show Copier test results
+      ansible.builtin.debug:
+        var: copier_test.stdout_lines
+        
+    - name: Check git diff
+      ansible.builtin.shell: |
+        cd {{ local_repo_path }}
+        echo "=== Files changed ==="
+        git diff --name-only
+        echo ""
+        echo "=== Detailed changes ==="
+        git diff --stat
+      register: git_changes
+      
+    - name: Show what changed
+      ansible.builtin.debug:
+        var: git_changes.stdout_lines
+        
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          Test complete. This playbook only runs copier update.
+          Check the output above to see if it worked.
+          NO commits or pushes were made.

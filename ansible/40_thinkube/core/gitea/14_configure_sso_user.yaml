@@ -1,0 +1,139 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/gitea/14_configure_sso_user.yaml
+# Description:
+#   Configure the SSO thinkube user with admin privileges and organization access
+#   This playbook should be run after the user has logged in via SSO at least once
+#
+# Requirements:
+#   - Gitea must be deployed and running
+#   - The thinkube user must have logged in via SSO at least once
+#   - Gitea admin token must exist
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/gitea/14_configure_sso_user.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for services
+#   - admin_username: Admin username (tkadmin)
+#   - auth_realm_username: SSO username (thinkube)
+
+- name: Configure SSO thinkube user with admin privileges
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    gitea_host: "git.{{ domain_name }}"
+    gitea_namespace: "gitea"
+    kubeconfig: /var/snap/microk8s/current/credentials/client.config
+    
+  tasks:
+    - name: Get Gitea admin token from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: gitea-admin-token
+        namespace: "{{ gitea_namespace }}"
+      register: token_check
+      
+    - name: Decode admin token
+      ansible.builtin.set_fact:
+        gitea_admin_token: "{{ token_check.resources[0].data.token | b64decode }}"
+      when: token_check.resources | length > 0
+      
+    - name: Check if thinkube user exists
+      ansible.builtin.uri:
+        url: "https://{{ gitea_host }}/api/v1/users/{{ auth_realm_username }}"
+        headers:
+          Authorization: "token {{ gitea_admin_token }}"
+        validate_certs: false
+        status_code: [200, 404]
+      register: user_check
+      
+    - name: User status
+      ansible.builtin.debug:
+        msg: "SSO user '{{ auth_realm_username }}' {{ 'exists' if user_check.status == 200 else 'does not exist yet - user must log in via SSO first' }}"
+      
+    - name: Grant admin privileges to thinkube user
+      ansible.builtin.uri:
+        url: "https://{{ gitea_host }}/api/v1/admin/users/{{ auth_realm_username }}"
+        method: PATCH
+        headers:
+          Authorization: "token {{ gitea_admin_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          admin: true
+          allow_create_organization: true
+          allow_git_hook: true
+          allow_import_local: true
+          max_repo_creation: -1
+        validate_certs: false
+        status_code: 200
+      when: user_check.status == 200
+      register: admin_grant
+      
+    - name: Add thinkube user to thinkube-deployments organization
+      ansible.builtin.uri:
+        url: "https://{{ gitea_host }}/api/v1/orgs/thinkube-deployments/members/{{ auth_realm_username }}"
+        method: PUT
+        headers:
+          Authorization: "token {{ gitea_admin_token }}"
+        validate_certs: false
+        status_code: [204, 205]
+      when: user_check.status == 200
+      register: org_membership
+      
+    - name: Make thinkube user an owner of the organization
+      ansible.builtin.uri:
+        url: "https://{{ gitea_host }}/api/v1/orgs/thinkube-deployments/teams"
+        headers:
+          Authorization: "token {{ gitea_admin_token }}"
+        validate_certs: false
+        status_code: 200
+      register: teams_list
+      when: user_check.status == 200
+      
+    - name: Find owners team ID
+      ansible.builtin.set_fact:
+        owners_team_id: "{{ item.id }}"
+      loop: "{{ teams_list.json | default([]) }}"
+      when: 
+        - user_check.status == 200
+        - item.name == 'Owners'
+      
+    - name: Add thinkube user to owners team
+      ansible.builtin.uri:
+        url: "https://{{ gitea_host }}/api/v1/teams/{{ owners_team_id }}/members/{{ auth_realm_username }}"
+        method: PUT
+        headers:
+          Authorization: "token {{ gitea_admin_token }}"
+        validate_certs: false
+        status_code: [204, 205]
+      when: 
+        - user_check.status == 200
+        - owners_team_id is defined
+      
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+          {% if user_check.status == 200 %}
+          ✅ SSO user '{{ auth_realm_username }}' configured successfully:
+          - Admin privileges granted
+          - Added to thinkube-deployments organization
+          - Made owner of the organization
+          
+          The user now has full access to all repositories.
+          {% else %}
+          ⚠️  SSO user '{{ auth_realm_username }}' does not exist yet.
+          
+          Please ensure the user logs in via SSO at least once:
+          1. Navigate to https://{{ gitea_host }}
+          2. Click "Sign in with Keycloak"
+          3. Log in with username: {{ auth_realm_username }}
+          4. After successful login, run this playbook again
+          {% endif %}

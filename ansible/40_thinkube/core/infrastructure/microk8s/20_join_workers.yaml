@@ -1,0 +1,210 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Join MicroK8s Worker Nodes to Cluster
+#
+# This playbook installs MicroK8s on worker nodes and joins them to an existing cluster.
+# It must be run after the control node has been set up (CORE-001).
+#
+# Source Reference: playbooks/core/30_install_microk8s_worker.yaml
+#
+# Prerequisites:
+#   - Control node must be installed and running (CORE-001)
+#   - Worker nodes must be accessible via SSH
+#   - Snapd must be available on worker nodes
+#
+# Dependencies:
+#   - Requires working MicroK8s control node
+#   - Must run after 10_install_microk8s.yaml
+#
+# Worker Nodes:
+#   - tkw1: VM on bcn1 (RTX 3090 passthrough)
+#   - bcn1: Baremetal server with direct GPU access
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/microk8s/20_join_workers.yaml
+
+- name: Join MicroK8s Worker Nodes to Cluster
+  hosts: microk8s_workers
+  gather_facts: true
+
+  vars:
+    node_ip: "{{ lan_ip | default(ansible_default_ipv4.address) }}"
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+
+    # MicroK8s addons configuration (minimal for workers)
+    microk8s_addons:
+      required:
+        - dns
+        - storage
+
+  tasks:
+    - name: Ensure snapd is running
+      ansible.builtin.systemd:
+        name: snapd
+        state: started
+        enabled: true
+      become: true
+      tags:
+        - setup
+
+    - name: Wait for snapd initialization
+      ansible.builtin.wait_for:
+        path: /run/snapd.socket
+        state: present
+        timeout: 60
+      tags:
+        - setup
+
+    - name: Install MicroK8s
+      ansible.builtin.command: snap install microk8s --classic
+      register: snap_install
+      changed_when: "'already installed' not in snap_install.stderr"
+      become: true
+      tags:
+        - setup
+        - microk8s
+
+    - name: Add user to microk8s group
+      ansible.builtin.user:
+        name: "{{ user }}"
+        groups: microk8s
+        append: true
+      become: true
+      tags:
+        - setup
+        - config
+
+    - name: Stop MicroK8s for configuration
+      ansible.builtin.command: microk8s stop
+      become: true
+      changed_when: true
+      tags:
+        - config
+
+    - name: Configure node IP
+      ansible.builtin.lineinfile:
+        path: /var/snap/microk8s/current/args/kubelet
+        line: "--node-ip={{ node_ip }}"
+        create: true
+        mode: '0644'
+      become: true
+      when: node_ip is defined
+      tags:
+        - config
+
+    - name: Start MicroK8s
+      ansible.builtin.command: microk8s start
+      become: true
+      changed_when: true
+      tags:
+        - config
+
+    - name: Wait for MicroK8s to be ready
+      ansible.builtin.command: microk8s status --wait-ready
+      retries: 6
+      delay: 10
+      register: microk8s_ready
+      until: microk8s_ready.rc == 0
+      changed_when: false
+      become: true
+      tags:
+        - config
+
+    # Check if node is already in cluster
+    - name: Check if node is already joined
+      ansible.builtin.shell: |
+        microk8s kubectl get nodes -o name | grep -E "({{ inventory_hostname }}|{{ ansible_hostname }})"
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+      register: existing_node
+      changed_when: false
+      failed_when: false
+      become: true
+      tags:
+        - join
+
+    # Get join token from control node (only if not already joined)
+    - name: Get join token from control node
+      ansible.builtin.command: microk8s add-node --token-ttl 300
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+      register: join_command
+      become: true
+      changed_when: true
+      when: existing_node.rc != 0
+      tags:
+        - join
+
+    - name: Extract join command with correct IP
+      ansible.builtin.set_fact:
+        worker_join_cmd: "{{ join_command.stdout_lines | select('match', '.*microk8s join.*' + hostvars[groups['microk8s_control_plane'][0]]['lan_ip'] + '.*') | first }}"
+      when: existing_node.rc != 0
+      tags:
+        - join
+
+    - name: Join worker to cluster
+      ansible.builtin.command: "{{ worker_join_cmd }} --worker"
+      register: join_result
+      retries: 3
+      delay: 10
+      until: join_result.rc == 0
+      become: true
+      changed_when: join_result.rc == 0
+      when: existing_node.rc != 0
+      tags:
+        - join
+
+    - name: Wait for node to be ready
+      ansible.builtin.shell: |
+        # Try to find node by either hostname
+        NODE_INFO=$(microk8s kubectl get nodes | grep -E "({{ inventory_hostname }}|{{ ansible_hostname }})" || true)
+        
+        if [ -z "$NODE_INFO" ]; then
+          echo "Node not found"
+          exit 1
+        fi
+        
+        echo "$NODE_INFO"
+        if echo "$NODE_INFO" | grep -q "Ready"; then
+          exit 0
+        else
+          exit 1
+        fi
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+      register: node_status
+      retries: 10
+      delay: 10
+      until: node_status.rc == 0
+      changed_when: false
+      become: true
+      tags:
+        - verify
+        
+    - name: Verify node is in cluster
+      ansible.builtin.shell: |
+        microk8s kubectl get nodes -o name | grep -E "({{ inventory_hostname }}|{{ ansible_hostname }})"
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+      register: node_check
+      changed_when: false
+      become: true
+      retries: 10
+      delay: 10
+      until: node_check.rc == 0
+      tags:
+        - verify
+
+    # Note: Addons should only be enabled on the control node, not on workers
+
+    - name: Display join status
+      ansible.builtin.debug:
+        msg:
+          - "Worker node {{ inventory_hostname }} joined successfully"
+          - "Node IP: {{ node_ip | default('default') }}"
+          - ""
+          - "NOTE: User may need to log out and back in for group membership to take effect"
+
+  handlers:
+    - name: Refresh user groups
+      ansible.builtin.debug:
+        msg: "User added to microk8s group - logout/login required"

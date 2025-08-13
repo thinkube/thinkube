@@ -1,0 +1,204 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# ============================================================================
+# OAUTH2 PROXY ROLE - KEYCLOAK SETUP
+# ============================================================================
+# File: roles/oauth2_proxy/tasks/keycloak_setup.yaml
+# Description: Sets up a Keycloak client for OAuth2 Proxy authentication
+#   This file handles the creation and configuration of a Keycloak client
+#   that will be used by OAuth2 Proxy for authentication. It performs the
+#   following operations:
+#   - Obtains an admin token from Keycloak
+#   - Creates or updates an OIDC client in the specified realm
+#   - Retrieves the client secret
+#   - Optionally creates an audience mapper for token validation
+#
+# Author: Infrastructure Team
+# Last Updated: 2025-03-06
+# ============================================================================
+
+---
+
+# ============================================================================
+# DEBUG INFORMATION
+# ============================================================================
+# Displays Keycloak connection information for debugging purposes
+# This task is conditional and only runs when keycloak debugging is enabled
+- name: Debug Keycloak connection info
+  ansible.builtin.debug:
+    msg:
+      - "Keycloak URL: {{ keycloak_url }}"
+      - "Keycloak realm: {{ keycloak_realm }}"
+      - "Client ID: {{ oauth2_proxy_client_id }}"
+      - "Dashboard host: {{ oauth2_proxy_dashboard_host }}"
+  when: oauth2_proxy_keycloak_debug | bool
+
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
+# Obtains an admin token from Keycloak for subsequent API calls
+# This task authenticates with Keycloak using the admin credentials and
+# stores the resulting access token for use in subsequent API calls.
+# The no_log parameter is set based on the debug flag to prevent logging
+# sensitive information in production environments.
+- name: Get Keycloak admin token
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      username: "{{ keycloak_admin_username }}"
+      password: "{{ keycloak_admin_password }}"
+      grant_type: "password"
+      client_id: "admin-cli"
+    validate_certs: "{{ keycloak_validate_certs | default(true) }}"
+    status_code: [200, 201]
+  register: keycloak_token
+  check_mode: no
+
+# Displays the length of the obtained token for verification
+# This task is conditional and only runs when keycloak debugging is enabled
+- name: Debug token (masked)
+  ansible.builtin.debug:
+    msg: "Obtained admin token length: {{ keycloak_token.json.access_token | length }}"
+  when: oauth2_proxy_keycloak_debug | bool
+
+# ============================================================================
+# CLIENT CREATION
+# ============================================================================
+# Creates or updates an OIDC client in Keycloak
+# This task creates a new client in Keycloak with the specified client ID
+# and configures it for OIDC authentication. The client is configured with:
+# - A redirect URI for the OAuth2 callback
+# - A base URL for the application
+# - Post-logout redirect URIs
+# The status codes 201 (created) and 409 (conflict) are both accepted,
+# as 409 indicates the client already exists (which is fine).
+- name: Create or reuse OIDC client
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ keycloak_token.json.access_token | default('check-mode-token') }}"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      clientId: "{{ oauth2_proxy_client_id }}"
+      enabled: true
+      protocol: "openid-connect"
+      publicClient: false
+      redirectUris:
+        - "https://{{ oauth2_proxy_dashboard_host }}/oauth2/callback"
+      baseUrl: "https://{{ oauth2_proxy_dashboard_host }}"
+      attributes:
+        post.logout.redirect.uris: "+"
+    validate_certs: "{{ keycloak_validate_certs | default(true) }}"
+    status_code: [201, 409]
+  register: client_creation
+  check_mode: no
+  when: not ansible_check_mode
+
+# ============================================================================
+# CLIENT RETRIEVAL
+# ============================================================================
+# Retrieves the details of the created/existing client
+# This task queries Keycloak for the client details, which are needed
+# to retrieve the client UUID for subsequent operations.
+- name: Get client details
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ oauth2_proxy_client_id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ keycloak_token.json.access_token | default('check-mode-token') }}"
+      Content-Type: "application/json"
+    validate_certs: "{{ keycloak_validate_certs | default(true) }}"
+    status_code: 200
+    return_content: true
+    body_format: json
+  register: client_list
+  check_mode: no
+  when: not ansible_check_mode
+
+# Extracts the client UUID from the client details
+# This UUID is needed for subsequent API calls
+- name: Set fact for client ID
+  ansible.builtin.set_fact:
+    client_uuid: "{{ client_list.json[0].id | default('check-mode-uuid') }}"
+  when: not ansible_check_mode
+
+# ============================================================================
+# CLIENT SECRET RETRIEVAL
+# ============================================================================
+# Retrieves the client secret from Keycloak
+# This task queries Keycloak for the client secret, which is needed
+# for OAuth2 Proxy to authenticate with Keycloak.
+- name: Retrieve Keycloak-generated client secret
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ client_uuid }}/client-secret"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ keycloak_token.json.access_token | default('check-mode-token') }}"
+      Content-Type: "application/json"
+    validate_certs: "{{ keycloak_validate_certs | default(true) }}"
+    status_code: 200
+    return_content: true
+    body_format: json
+  register: client_secret_data
+  check_mode: no
+  when: not ansible_check_mode
+
+# Stores the client secret as a fact for use in subsequent tasks
+- name: Set client secret fact
+  ansible.builtin.set_fact:
+    oauth2_proxy_client_secret: "{{ client_secret_data.json.value | default('check-mode-secret') }}"
+  when: not ansible_check_mode
+
+# For check mode, set a dummy client secret
+- name: Set dummy client secret for check mode
+  ansible.builtin.set_fact:
+    oauth2_proxy_client_secret: "check-mode-client-secret"
+  when: ansible_check_mode
+
+# ============================================================================
+# AUDIENCE MAPPER CREATION
+# ============================================================================
+# Creates an audience mapper for the client
+# This task is conditional and only runs when audience mapper creation is enabled.
+# The audience mapper adds the client ID to the audience claim in the token,
+# which is useful for token validation.
+- name: Create audience mapper if enabled
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ client_uuid }}/protocol-mappers/models"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ keycloak_token.json.access_token | default('check-mode-token') }}"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      name: "{{ oauth2_proxy_audience_mapper_name }}"
+      protocol: "openid-connect"
+      protocolMapper: "oidc-audience-mapper"
+      consentRequired: false
+      config:
+        "included.client.audience": "{{ oauth2_proxy_client_id }}"
+        "id.token.claim": "true"
+        "access.token.claim": "true"
+    validate_certs: "{{ keycloak_validate_certs | default(true) }}"
+    status_code: [201, 409]
+  when: oauth2_proxy_create_audience_mapper | bool and not ansible_check_mode
+  check_mode: no
+
+# ============================================================================
+# DEBUG RESULTS
+# ============================================================================
+# Displays the results of the client setup for debugging purposes
+# This task is conditional and only runs when keycloak debugging is enabled
+- name: Debug client setup results
+  ansible.builtin.debug:
+    msg:
+      - "Client '{{ oauth2_proxy_client_id }}' setup completed"
+      - "Client UUID: {{ client_uuid }}"
+      - "Client secret length: {{ oauth2_proxy_client_secret | length }} characters"
+      - "Audience mapper added: {{ oauth2_proxy_create_audience_mapper }}"
+  when: oauth2_proxy_keycloak_debug | bool

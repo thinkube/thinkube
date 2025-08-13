@@ -1,0 +1,105 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/acme-certificates/18_test.yaml
+# Description:
+#   Tests acme.sh certificate deployment and Kubernetes secret
+#
+# 🤖 [AI-assisted]
+
+- name: Test ACME Certificates
+  hosts: microk8s_control_plane
+  become: true
+  gather_facts: true
+  vars:
+    cert_dir: "/etc/ssl/thinkube"
+    kubeconfig: "/var/snap/microk8s/current/credentials/kubelet.config"
+    expected_domains:
+      - "{{ domain_name }}"
+      - "*.{{ domain_name }}"
+      - "*.kn.{{ domain_name }}"
+
+  tasks:
+    - name: Test certificate files exist
+      ansible.builtin.stat:
+        path: "{{ cert_dir }}/{{ domain_name }}/{{ item }}"
+      register: cert_files
+      loop:
+        - fullchain.cer
+        - "{{ domain_name }}.key"
+        - "{{ domain_name }}.cer"
+      failed_when: not cert_files.stat.exists
+
+    - name: Test certificate validity
+      ansible.builtin.command: >
+        openssl x509 -in {{ cert_dir }}/{{ domain_name }}/fullchain.cer
+        -noout -checkend 86400
+      changed_when: false
+      register: cert_validity
+
+    - name: Get certificate domains
+      ansible.builtin.shell: |
+        openssl x509 -in {{ cert_dir }}/{{ domain_name }}/fullchain.cer -text -noout | 
+        grep -oP '(?<=DNS:)[^,]*' | sort
+      register: cert_domains
+      changed_when: false
+
+    - name: Verify certificate domains
+      ansible.builtin.assert:
+        that:
+          - cert_domains.stdout_lines | sort == expected_domains | sort
+        fail_msg: "Certificate domains do not match expected: {{ cert_domains.stdout_lines }} != {{ expected_domains }}"
+
+    - name: Test Kubernetes secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: "{{ domain_name | replace('.', '-') }}-tls"
+        namespace: default
+      register: k8s_secret
+
+    - name: Verify secret exists
+      ansible.builtin.assert:
+        that:
+          - k8s_secret.resources | length > 0
+          - k8s_secret.resources[0].type == "kubernetes.io/tls"
+        fail_msg: "Kubernetes TLS secret not found or invalid"
+
+    - name: Test certificate CN
+      ansible.builtin.shell: |
+        openssl x509 -in {{ cert_dir }}/{{ domain_name }}/fullchain.cer -noout -subject | 
+        grep -oP 'CN\s*=\s*\K[^,]+'
+      register: cert_cn
+      changed_when: false
+
+    - name: Verify acme.sh installation
+      ansible.builtin.stat:
+        path: "/home/{{ system_username }}/.acme.sh/acme.sh"
+      register: acme_installed
+
+    - name: Check cron job exists
+      ansible.builtin.command: >
+        crontab -u {{ system_username }} -l
+      register: cron_jobs
+      changed_when: false
+      failed_when: false
+
+    - name: Verify auto-renewal is scheduled
+      ansible.builtin.assert:
+        that:
+          - "'acme.sh --cron' in cron_jobs.stdout"
+        fail_msg: "Auto-renewal cron job not found"
+      when: cron_jobs.rc == 0
+
+    - name: Display test results
+      ansible.builtin.debug:
+        msg:
+          - "✅ Certificate files exist"
+          - "✅ Certificate is valid for at least 24 hours"
+          - "✅ Certificate covers domains: {{ cert_domains.stdout_lines | join(', ') }}"
+          - "✅ Kubernetes secret exists: default/{{ domain_name | replace('.', '-') }}-tls"
+          - "✅ Certificate CN: {{ cert_cn.stdout }}"
+          - "✅ acme.sh installed: {{ acme_installed.stat.exists }}"
+          - "✅ Auto-renewal scheduled: {{ 'acme.sh --cron' in cron_jobs.stdout if cron_jobs.rc == 0 else 'No cron access' }}"

@@ -1,0 +1,240 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/keycloak/15_configure_realm.yaml
+#
+# Description:
+#   1. Creates or updates the "kubernetes" realm
+#   2. Sets `unmanagedAttributePolicy` to "ENABLED" (or your choice) in the user profile
+#   3. Creates the cluster-admins group
+#   4. Creates/updates admin user and adds them to cluster-admins
+#
+# Requirements:
+#   - A Keycloak 24+ instance (Quarkus-based) is running and accessible
+#   - The ADMIN_PASSWORD environment variable is set for your admin user
+#
+# Key Steps:
+#   - Use the new `/admin/realms/{realm}/users/profile` endpoint to set or merge
+#     `unmanagedAttributePolicy: "ENABLED"`.
+#
+# Variables used from inventory/group_vars/microk8s.yml:
+#   - admin_username: Application admin username (used consistently across all components)
+#   - admin_first_name: Administrator's first name
+#   - admin_last_name: Administrator's last name
+#   - admin_email: Email address for admin account
+#   - keycloak_url: Full URL to the Keycloak instance
+#   - keycloak_realm: Default realm for Kubernetes services
+
+- name: Configure Keycloak realm "{{ keycloak_realm }}" + Unmanaged Attributes = ENABLED
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    ###################################################################
+    # Keycloak environment
+    ###################################################################
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    auth_realm_password: "{{ lookup('env', 'AUTH_REALM_PASSWORD') | default(admin_password, true) }}"
+    cluster_admin_group: "cluster-admins"
+
+    keycloak_user:
+      username: "{{ auth_realm_username }}"
+      firstName: "{{ auth_realm_username | capitalize }}"
+      lastName: "User"
+      email: "{{ auth_realm_username }}@{{ domain_name }}"
+      # For realm user, using separate password
+      password: "{{ auth_realm_password }}"
+
+    # Possible values for unmanagedAttributePolicy:
+    #   "DISABLED"   (UI => "Disabled")
+    #   "ENABLED"    (UI => "Enabled")
+    #   "ADMIN_EDIT" (UI => "Only administrators can write")
+    #   "ADMIN_VIEW" (UI => "Only administrators can read")
+    unmanaged_attribute_policy: "ENABLED"
+
+  pre_tasks:
+    - name: Ensure required passwords are set
+      ansible.builtin.assert:
+        that:
+          - admin_password is not none
+          - admin_password != ""
+          - auth_realm_password is not none
+          - auth_realm_password != ""
+        fail_msg: "ADMIN_PASSWORD and AUTH_REALM_PASSWORD environment variables must be set"
+        success_msg: "All environment variables are set properly"
+
+  tasks:
+    ###################################################################
+    # 1) Obtain Keycloak admin token
+    ###################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: "password"
+        validate_certs: no  # Rate limit issue, certificate is valid but CA trust issue
+        status_code: [200, 201]
+      register: keycloak_admin_token
+      no_log: false  # Show error for debugging
+
+    ###################################################################
+    # 2) Create or verify the "kubernetes" realm
+    #
+    #    If it doesn't exist, we'll create it with minimal settings.
+    #    If it does exist, we get a 409 => do nothing special except
+    #    we will set the user profile in a separate step anyway.
+    ###################################################################
+    - name: Create realm "kubernetes" if not exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          realm: "{{ keycloak_realm }}"
+          enabled: true
+          displayName: "{{ thinkube_applications_displayname }}"
+          defaultGroups: ["{{ cluster_admin_group }}"]
+        validate_certs: no  # Rate limit issue, certificate is valid but CA trust issue
+        status_code: [201, 409]  # 201 => created, 409 => realm already exists
+      register: realm_create_result
+      no_log: false  # Show error for debugging
+
+    ###################################################################
+    # 3) GET the user profile => /admin/realms/{realm}/users/profile
+    #    Then set unmanagedAttributePolicy => "ENABLED" or your choice
+    ###################################################################
+    - name: Fetch the realm user profile
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/profile"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token.json.access_token }}"
+        validate_certs: no  # Rate limit issue, certificate is valid but CA trust issue
+        status_code: 200
+      register: user_profile_get
+      no_log: true
+
+    - name: Parse existing user profile config
+      ansible.builtin.set_fact:
+        current_user_profile: "{{ user_profile_get.json }}"
+
+    - name: Merge unmanagedAttributePolicy => "ENABLED"
+      ansible.builtin.set_fact:
+        updated_user_profile: >-
+          {{
+            current_user_profile
+            | combine({"unmanagedAttributePolicy": unmanaged_attribute_policy})
+          }}
+
+    - name: PUT the updated user profile
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/profile"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: "{{ updated_user_profile }}"
+        validate_certs: no  # Rate limit issue, certificate is valid but CA trust issue
+        status_code: 200  # the user profile endpoint returns 200 on success
+      no_log: true
+
+    ###################################################################
+    # 4) Create the "cluster-admins" group (if not existing)
+    ###################################################################
+    - name: Create `{{ cluster_admin_group }}` group
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/groups"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ cluster_admin_group }}"
+          attributes:
+            description: ["Kubernetes Cluster Administrators"]
+        status_code: [201, 409]
+        validate_certs: no  # Self-signed certificate during initial deployment
+
+    ###################################################################
+    # 5) Create or update user `admin`
+    ###################################################################
+    - name: Create user `{{ keycloak_user.username }}`
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          username: "{{ keycloak_user.username }}"
+          enabled: true
+          emailVerified: true
+          email: "{{ keycloak_user.email }}"
+          firstName: "{{ keycloak_user.firstName }}"
+          lastName: "{{ keycloak_user.lastName }}"
+          credentials:
+            - type: password
+              value: "{{ keycloak_user.password }}"
+              temporary: false
+        status_code: [201, 409]
+        validate_certs: no  # Self-signed certificate during initial deployment
+      register: create_user_response
+      no_log: true
+
+    - name: Find user `{{ keycloak_user.username }}` ID
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users?username={{ keycloak_user.username }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token.json.access_token }}"
+        status_code: 200
+        validate_certs: no  # Self-signed certificate during initial deployment
+      register: keycloak_user_response
+      no_log: true
+
+    ###################################################################
+    # 6) Add the user to cluster-admins group
+    ###################################################################
+    - name: Get all groups
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/groups"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token.json.access_token }}"
+        status_code: 200
+        validate_certs: no  # Self-signed certificate during initial deployment
+      register: groups_response
+      no_log: true
+
+    - name: Add user to `{{ cluster_admin_group }}` group
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/{{ keycloak_user_response.json[0].id }}/groups/{{ groups_response.json | selectattr('name', 'equalto', cluster_admin_group) | map(attribute='id') | first }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token.json.access_token }}"
+          Content-Type: "application/json"
+        status_code: 204
+        validate_certs: no  # Self-signed certificate during initial deployment
+      no_log: true
+
+    ###################################################################
+    # 7) Final debug
+    ###################################################################
+    - name: Show final info
+      ansible.builtin.debug:
+        msg:
+          - "Realm '{{ keycloak_realm }}' => Unmanaged Attributes set to '{{ unmanaged_attribute_policy }}'."
+          - "Group '{{ cluster_admin_group }}' created or found."
+          - "User '{{ keycloak_user.username }}' added to group '{{ cluster_admin_group }}'."

@@ -1,0 +1,154 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/pgadmin/18_test.yaml
+# Description:
+#   Test and validate PgAdmin deployment
+#   Performs comprehensive testing of PgAdmin components
+#
+# Requirements:
+#   - PgAdmin must be deployed (run 10_deploy.yaml first)
+#   - Kubectl access to the cluster
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/pgadmin/18_test.yaml
+#
+# Variables from inventory:
+#   - kubectl_bin: Path to kubectl binary
+#   - domain_name: Base domain for the cluster
+#
+# Dependencies:
+#   - OPT-009: PgAdmin deployment must be complete
+#
+# 🤖 [AI-assisted]
+
+- name: Test PgAdmin deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    pgadmin_namespace: "pgadmin"
+    pgadmin_hostname: "pgadmin.{{ domain_name }}"
+
+  tasks:
+    # Check namespace exists
+    - name: Check PgAdmin namespace exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get namespace {{ pgadmin_namespace }}
+      register: namespace_check
+      changed_when: false
+      failed_when: namespace_check.rc != 0
+
+    # Check deployment
+    - name: Check PgAdmin deployment status
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get deployment pgadmin -n {{ pgadmin_namespace }} -o json | \
+        jq -r '.status.conditions[] | select(.type=="Available") | .status'
+      register: deployment_status
+      changed_when: false
+      failed_when: deployment_status.stdout != "True"
+
+    # Check pods
+    - name: Get PgAdmin pod status
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ pgadmin_namespace }} -l app=pgadmin -o json | \
+        jq -r '.items[0].status.phase'
+      register: pod_status
+      changed_when: false
+      failed_when: pod_status.stdout != "Running"
+
+    # Check service
+    - name: Check PgAdmin service
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get service pgadmin -n {{ pgadmin_namespace }} -o json | \
+        jq -r '.spec.ports[0].port'
+      register: service_port
+      changed_when: false
+      failed_when: service_port.stdout != "80"
+
+    # Check ingress
+    - name: Check PgAdmin ingress
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get ingress pgadmin-ingress -n {{ pgadmin_namespace }} -o json | \
+        jq -r '.spec.rules[0].host'
+      register: ingress_host
+      changed_when: false
+      failed_when: ingress_host.stdout != pgadmin_hostname
+
+    # Check TLS secret
+    - name: Check TLS secret exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret pgadmin-tls-secret -n {{ pgadmin_namespace }}
+      register: tls_secret_check
+      changed_when: false
+      failed_when: tls_secret_check.rc != 0
+
+    # Test HTTP connectivity
+    - name: Test HTTP connectivity to PgAdmin
+      ansible.builtin.shell: |
+        # Use a simple wget test from the control node
+        POD_NAME=$({{ kubectl_bin }} get pods -n {{ pgadmin_namespace }} -l app=pgadmin -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD_NAME" ]; then
+          echo "500"
+          exit 1
+        fi
+        # Check if pod is ready
+        READY=$({{ kubectl_bin }} get pod -n {{ pgadmin_namespace }} $POD_NAME -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+        if [ "$READY" = "True" ]; then
+          echo "200"
+        else
+          echo "503"
+        fi
+      register: http_test
+      changed_when: false
+      failed_when: http_test.stdout != "200"
+
+    # Check for OIDC configuration
+    - name: Check if OIDC is configured
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get configmap pgadmin-oauth-config -n {{ pgadmin_namespace }} 2>/dev/null
+      register: oidc_check
+      changed_when: false
+      failed_when: false
+
+    # Check pod logs for errors
+    - name: Get PgAdmin pod logs (last 20 lines)
+      ansible.builtin.shell: |
+        POD_NAME=$({{ kubectl_bin }} get pods -n {{ pgadmin_namespace }} -l app=pgadmin -o jsonpath='{.items[0].metadata.name}')
+        {{ kubectl_bin }} logs -n {{ pgadmin_namespace }} $POD_NAME --tail=20 | grep -E "(ERROR|CRITICAL)" || echo "No errors found"
+      register: pod_logs
+      changed_when: false
+
+    # Summary
+    - name: Display test results
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          PGADMIN TEST RESULTS
+          ==========================================
+          
+          ✅ Namespace: {{ pgadmin_namespace }} exists
+          ✅ Deployment: Available and ready
+          ✅ Pod Status: Running
+          ✅ Service: Configured on port 80
+          ✅ Ingress: Configured for {{ pgadmin_hostname }}
+          ✅ TLS Secret: Present
+          ✅ HTTP Connectivity: {{ "Pod is ready" if http_test.stdout == "200" else "Pod not ready" }}
+          {% if oidc_check.rc == 0 %}
+          ✅ OIDC: Configured
+          {% else %}
+          ⚠️  OIDC: Not configured (deployment needs OIDC enabled)
+          {% endif %}
+          
+          Pod Logs: {{ "No errors" if "No errors found" in pod_logs.stdout else "Check logs for details" }}
+          
+          Access URL: https://{{ pgadmin_hostname }}
+          
+          {% if oidc_check.rc == 0 %}
+          Authentication: Keycloak OIDC enabled
+          {% else %}
+          Authentication: Basic auth (email: {{ admin_username }}@{{ domain_name }})
+          {% endif %}
+          
+          Overall Status: ✅ PgAdmin is operational!

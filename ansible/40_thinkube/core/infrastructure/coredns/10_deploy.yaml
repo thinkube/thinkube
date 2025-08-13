@@ -1,0 +1,281 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/coredns/10_deploy.yaml
+# Description:
+#   Configures CoreDNS as the primary DNS server for the cluster
+#   Provides both internal Kubernetes DNS and external domain resolution
+#   Exposes DNS service externally via LoadBalancer for network-wide DNS
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - Will enable MetalLB for LoadBalancer services
+#   - Ingress controllers should be deployed with proper IPs after this
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/coredns/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for all services
+#   - zerotier_subnet_prefix: Prefix for ZeroTier network
+#   - primary_ingress_ip_octet: Last octet for primary ingress IP
+#   - secondary_ingress_ip_octet: Last octet for secondary ingress IP
+#   - microk8s_workers: Group containing worker nodes
+#
+# Dependencies:
+#   - Core infrastructure components should be deployed
+#   - This playbook enables MetalLB before deploying CoreDNS
+#
+# 🤖 [AI-assisted]
+
+- name: Configure CoreDNS for Ingress Hairpin Routing and Service Resolution
+  hosts: microk8s_control_plane
+  gather_facts: true
+  become: true
+  vars:
+    system_ca_path: /etc/ssl/certs/ca-certificates.crt
+    cert_namespace: kube-system
+    cert_dir: /var/snap/microk8s/current/certs
+    ca_cert: "{{ cert_dir }}/ca.crt"
+    ca_key: "{{ cert_dir }}/ca.key"
+    kubeconfig: /var/snap/microk8s/current/credentials/client.config
+    kubectl_bin: microk8s kubectl
+    knative_enabled: false  # Explicitly set to false for CoreDNS setup
+    kn_subdomain: "kn"  # Knative subdomain
+    # Determine subnet prefix based on network mode
+    subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    primary_ingress_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
+    secondary_ingress_ip: "{{ subnet_prefix }}{{ secondary_ingress_ip_octet }}"
+    coredns_external_ip: "{{ subnet_prefix }}{{ dns_external_ip_octet }}"  # From inventory configuration
+
+  pre_tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - network_mode is defined
+          - primary_ingress_ip_octet is defined
+          - secondary_ingress_ip_octet is defined
+          - dns_external_ip_octet is defined
+          - metallb_ip_start_octet is defined
+          - metallb_ip_end_octet is defined
+          - groups['microk8s_workers'] is defined
+          - network_mode == 'local' or zerotier_subnet_prefix is defined
+          - network_mode == 'overlay' or network_cidr is defined
+        fail_msg: "Required inventory variables are not defined"
+
+  tasks:
+    # CoreDNS is enabled by default in MicroK8s, just verify it's running
+    - name: Verify CoreDNS deployment exists and is ready
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system rollout status deployment/coredns --timeout=120s
+      register: coredns_status
+      changed_when: false
+      failed_when: coredns_status.rc != 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # MetalLB is now enabled in the MicroK8s installation playbook
+    # CoreDNS configuration starts here
+    
+    # Detect current Kourier service IPs if installed
+    - name: Check if Kourier services exist
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc -n kourier-system kourier --no-headers
+      register: kourier_exists
+      changed_when: false
+      failed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Get current Kourier service IP
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc kourier -n kourier-system -o jsonpath='{.spec.clusterIP}'
+      register: kourier_svc_ip
+      changed_when: false
+      when: kourier_exists.rc == 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Get current Kourier internal service IP
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc kourier-internal -n kourier-system -o jsonpath='{.spec.clusterIP}'
+      register: kourier_internal_svc_ip
+      changed_when: false
+      when: kourier_exists.rc == 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Set dynamic Kourier IPs
+      ansible.builtin.set_fact:
+        kourier_ip: "{{ kourier_svc_ip.stdout | default('') }}"
+        kourier_internal_ip: "{{ kourier_internal_svc_ip.stdout | default('') }}"
+      when: kourier_exists.rc == 0
+
+    # Get primary ingress controller service IP
+    - name: Check if primary ingress controller exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get svc -n ingress primary-ingress-ingress-nginx-controller --no-headers 2>/dev/null || echo "not-found"
+      register: primary_ingress_check
+      changed_when: false
+      failed_when: false
+
+    - name: Get primary ingress controller ClusterIP
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get svc -n ingress primary-ingress-ingress-nginx-controller -o jsonpath='{.spec.clusterIP}'
+      register: primary_ingress_cluster_ip
+      when: primary_ingress_check.stdout != "not-found" and "not-found" not in primary_ingress_check.stdout
+      changed_when: false
+
+    - name: Set primary ingress internal IP
+      ansible.builtin.set_fact:
+        primary_ingress_internal_ip: "{{ primary_ingress_cluster_ip.stdout | default('') }}"
+      when: primary_ingress_cluster_ip is defined and primary_ingress_cluster_ip.stdout is defined
+
+    # Get secondary ingress controller service IP
+    - name: Check if secondary ingress controller exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get svc -n ingress-kn secondary-ingress-ingress-nginx-controller --no-headers 2>/dev/null || echo "not-found"
+      register: secondary_ingress_check
+      changed_when: false
+      failed_when: false
+
+    - name: Get secondary ingress controller ClusterIP
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get svc -n ingress-kn secondary-ingress-ingress-nginx-controller -o jsonpath='{.spec.clusterIP}'
+      register: secondary_ingress_cluster_ip
+      when: secondary_ingress_check.stdout != "not-found" and "not-found" not in secondary_ingress_check.stdout
+      changed_when: false
+
+    - name: Set secondary ingress internal IP
+      ansible.builtin.set_fact:
+        secondary_ingress_internal_ip: "{{ secondary_ingress_cluster_ip.stdout | default('') }}"
+      when: secondary_ingress_cluster_ip is defined and secondary_ingress_cluster_ip.stdout is defined
+
+    # Create CoreDNS configuration
+    - name: Create temporary CoreDNS Corefile content
+      ansible.builtin.template:
+        src: "templates/Corefile.j2"
+        dest: "{{ ansible_user_dir }}/coredns-corefile-content.txt"
+        mode: '0644'
+      register: coredns_content_file
+
+    - name: Create CoreDNS ConfigMap YAML
+      ansible.builtin.shell: |
+        cat > {{ ansible_user_dir }}/coredns-config.yaml <<EOF
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: coredns
+          namespace: kube-system
+        data:
+          Corefile: |
+        $(cat {{ ansible_user_dir }}/coredns-corefile-content.txt | sed 's/^/        /')
+        EOF
+      register: create_configmap_yaml
+      changed_when: true
+
+    - name: Update CoreDNS ConfigMap using kubectl
+      ansible.builtin.command: >
+        {{ kubectl_bin }} apply --validate=false -f {{ ansible_user_dir }}/coredns-config.yaml
+      register: coredns_update
+      changed_when: '"configmap/coredns configured" in coredns_update.stdout or "configmap/coredns created" in coredns_update.stdout'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Restart CoreDNS pods
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system delete pods -l k8s-app=kube-dns
+      when: coredns_update.changed
+      register: restart_dns
+      changed_when: restart_dns.rc == 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Wait for CoreDNS pods to be ready
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-dns --timeout=300s
+      when: coredns_update.changed
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # Note: External DNS is now handled by a separate BIND9 deployment
+    # CoreDNS only handles Kubernetes internal DNS (cluster.local)
+
+    # Configure system certificates
+    - name: Ensure ca-certificates package is installed
+      ansible.builtin.apt:
+        name: ca-certificates
+        state: present
+
+    - name: Update system CA certificates
+      ansible.builtin.command: update-ca-certificates
+      register: ca_update
+      changed_when: ca_update.rc == 0
+
+    - name: Create ConfigMap with system certificates
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} create configmap system-certificates \
+        --from-file=ca-certificates.crt={{ system_ca_path }} \
+        -n {{ cert_namespace }} --dry-run=client -o yaml | \
+        {{ kubectl_bin }} apply -f -
+      register: cert_config
+      changed_when: cert_config.rc == 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # Configure worker nodes to use CoreDNS external service
+    - name: Configure worker nodes to use CoreDNS for domain resolution
+      block:
+        - name: Create systemd-resolved conf directory
+          ansible.builtin.file:
+            path: /etc/systemd/resolved.conf.d
+            state: directory
+            mode: '0755'
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['microk8s_workers'] }}"
+
+        - name: Configure systemd-resolved to forward domain to CoreDNS
+          ansible.builtin.copy:
+            dest: /etc/systemd/resolved.conf.d/coredns-external.conf
+            content: |
+              [Resolve]
+              DNS={{ coredns_external_ip }}
+              Domains=~{{ domain_name }}
+            mode: '0644'
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['microk8s_workers'] }}"
+          register: resolved_config
+
+        - name: Restart systemd-resolved service
+          ansible.builtin.systemd:
+            name: systemd-resolved
+            state: restarted
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['microk8s_workers'] }}"
+          when: resolved_config.changed
+
+    - name: Restart CoreDNS to apply final configuration
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pods -n kube-system -l k8s-app=kube-dns
+        {{ kubectl_bin }} wait --for=condition=Ready pods -l k8s-app=kube-dns -n kube-system --timeout=60s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Display summary message
+      ansible.builtin.debug:
+        msg: |
+          CoreDNS is now configured for Kubernetes internal DNS:
+          
+          1. Internal Kubernetes DNS (cluster.local) on ClusterIP
+          2. Service discovery for pods and services
+          3. Configured with upstream DNS servers: 8.8.8.8, 8.8.4.4
+
+          Note: External DNS for {{ domain_name }} is handled by a separate
+          BIND9 deployment. Run the dns-server playbook to deploy it.
+
+          CoreDNS ClusterIP: 10.152.183.10
+          This handles only Kubernetes-internal DNS resolution.

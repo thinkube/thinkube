@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Update thinkube-control from template using Copier
+# This script is generated from a template to avoid complex inline shell in playbooks
+
+set -e  # Exit on error
+
+cd {{ local_repo_path }}
+
+# Configure SSH for private repositories
+export GIT_SSH_COMMAND="ssh -i {{ shared_code_path }}/.ssh/{{ app_name }}/id_ed25519 -o StrictHostKeyChecking=no"
+
+# Pull latest changes from remote
+echo "Pulling latest changes from remote..."
+git pull origin main || true
+
+# Ensure we have a clean state for Copier
+# First, commit any local changes to avoid losing them
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "Committing local changes before template update..."
+  git add -A
+  git commit -m "Local changes before template update - $(date +%Y%m%d-%H%M%S)"
+fi
+
+# Update from latest template
+# Clear copier cache to force fresh fetch
+rm -rf ~/.cache/copier
+
+# Fix: Ensure .copier-answers.yml uses HEAD before running copier
+# This prevents the recurring issue of copier pinning to old commits
+if [ -f .copier-answers.yml ]; then
+  sed -i 's/_commit: .*/_commit: HEAD/' .copier-answers.yml
+  
+  # Commit the copier answers change to ensure clean repository
+  if ! git diff --quiet .copier-answers.yml; then
+    git add .copier-answers.yml
+    git commit -m "Fix copier answers to use HEAD"
+  fi
+  
+  # Use recopy to regenerate all files (including k8s manifests with new image tags)
+  # Provide the missing variables that don't have defaults
+  # Use --overwrite to handle any conflicts non-interactively
+  ~/.venv/bin/copier recopy --trust --answers-file .copier-answers.yml --vcs-ref=HEAD --defaults --overwrite \
+    --data "system_username={{ system_username }}" \
+    --data "master_node_name={{ master_node_name }}" \
+    --data "master_node_ip={{ master_node_ip }}" \
+    --data "admin_username={{ admin_username }}" \
+    --data "admin_password={{ admin_password }}"
+else
+  echo "ERROR: .copier-answers.yml not found - cannot update without losing configuration"
+  exit 1
+fi
+
+# Always create a commit to ensure webhook triggers
+git add -A
+git commit --allow-empty -m "Update from template - $(date +%Y%m%d-%H%M%S)"
+
+echo "✅ Template update completed successfully"

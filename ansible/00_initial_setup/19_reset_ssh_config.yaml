@@ -1,0 +1,125 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 19_reset_ssh_config.yaml - Resets SSH configuration if needed
+#
+# Purpose:
+#   Removes the SSH keys and configuration created by the setup_ssh_keys playbook,
+#   allowing for a clean reinstallation if needed.
+#
+# Run with: 
+#   ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/19_reset_ssh_config.yaml -e "ansible_become_pass=$ANSIBLE_BECOME_PASSWORD"
+#   Or with helper script:
+#   ./scripts/run_ansible.sh ansible/00_initial_setup/19_reset_ssh_config.yaml
+
+- name: Reset SSH Configuration
+  hosts: baremetal
+  gather_facts: true
+  become: false
+  vars:
+    ssh_key_name: "thinkube_cluster_key"
+    ansible_become_pass: "{{ lookup('env', 'ANSIBLE_BECOME_PASSWORD') }}"
+    
+  tasks:
+    - name: Display warning message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          ⚠️  WARNING: Resetting SSH Configuration ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          This playbook will REMOVE the following SSH components:
+          
+          1. SSH keys generated for Thinkube cluster ({{ ssh_key_name }})
+          2. SSH config entries for Thinkube hosts
+          3. Authorized key entries from other Thinkube hosts
+          
+          SSH PASSWORD AUTHENTICATION will be REQUIRED after this operation.
+          
+          ═════════════════════════════════════════════════════════
+    
+    - name: Add pause for confirmation
+      ansible.builtin.pause:
+        prompt: "Press ENTER to continue with SSH configuration reset or Ctrl+C to abort"
+    
+    - name: Backup SSH config file if it exists
+      ansible.builtin.copy:
+        src: "{{ ansible_user_dir }}/.ssh/config"
+        dest: "{{ ansible_user_dir }}/.ssh/config.bak.{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: yes
+        mode: '0600'
+      when: ansible_user_dir is defined and ansible_user_dir != ""
+      ignore_errors: yes
+    
+    - name: Remove SSH keys for Thinkube
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}"
+        - "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}.pub"
+      when: ansible_user_dir is defined and ansible_user_dir != ""
+    
+    - name: Get public key fingerprints to remove from authorized_keys
+      ansible.builtin.shell: |
+        if [ -f {{ ansible_user_dir }}/.ssh/authorized_keys ]; then
+          grep -n "thinkube_cluster_" {{ ansible_user_dir }}/.ssh/authorized_keys | cut -d: -f1
+        else
+          echo ""
+        fi
+      register: key_lines
+      changed_when: false
+      when: ansible_user_dir is defined and ansible_user_dir != ""
+    
+    - name: Remove Thinkube keys from authorized_keys
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_user_dir }}/.ssh/authorized_keys"
+        regexp: "thinkube_cluster_"
+        state: absent
+      when: ansible_user_dir is defined and ansible_user_dir != "" and key_lines.stdout != ""
+    
+    - name: Remove SSH config for Thinkube hosts
+      ansible.builtin.shell: |
+        if [ -f "{{ ansible_user_dir }}/.ssh/config" ]; then
+          sed -i '/# BEGIN-THINKUBE-CLUSTER/,/# END-THINKUBE-CLUSTER/d' "{{ ansible_user_dir }}/.ssh/config"
+          exit_code=$?
+          if [ $exit_code -eq 0 ]; then
+            echo "Thinkube SSH configuration removed"
+          else
+            echo "Error removing Thinkube SSH configuration"
+            exit $exit_code
+          fi
+        else
+          echo "SSH config file does not exist"
+        fi
+      register: ssh_config_removal
+      changed_when: "'Thinkube SSH configuration removed' in ssh_config_removal.stdout"
+      when: ansible_user_dir is defined and ansible_user_dir != ""
+      ignore_errors: yes
+      
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          ✓ SSH Configuration Reset Complete ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          SSH configuration has been reset successfully.
+          
+          DETAILS:
+            ✓ Removed SSH keys: {{ ssh_key_name }} and {{ ssh_key_name }}.pub
+            ✓ Removed Thinkube entries from authorized_keys
+            ✓ Removed Thinkube configuration from SSH config
+          {% if ansible_user_dir is defined and ansible_user_dir != "" %}
+            ✓ Original SSH config backed up to: {{ ansible_user_dir }}/.ssh/config.bak.{{ ansible_date_time.iso8601_basic_short }}
+          {% endif %}
+          
+          IMPORTANT:
+            Password authentication is now required for SSH connections.
+            To reconfigure SSH keys, run:
+            ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/10_setup_ssh_keys.yaml --ask-pass
+          
+          ═════════════════════════════════════════════════════════

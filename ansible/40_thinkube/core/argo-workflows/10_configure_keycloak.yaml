@@ -1,0 +1,101 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/argo-workflows/10_configure_keycloak.yaml
+# Description:
+#   Configure Keycloak client for Argo Workflows authentication
+#
+# Requirements:
+#   - MicroK8s Kubernetes cluster 
+#   - Keycloak instance running and accessible (CORE-004)
+#   - ADMIN_PASSWORD environment variable set for Keycloak admin access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/argo-workflows/10_configure_keycloak.yaml
+#
+# Variables from inventory:
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Keycloak admin username (standard admin user for all applications)
+#   - domain_name: Domain name for all services
+#
+# Dependencies:
+#   - CORE-004: Keycloak must be deployed and operational
+
+- name: Configure Keycloak client "argo" for realm "{{ keycloak_realm }}" and ensure audience mapper exists
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    ###################################################################
+    # Keycloak connection info
+    ###################################################################
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    keycloak_validate_certs: false
+    
+    ###################################################################
+    # Setup configuration for the keycloak_setup role
+    ###################################################################
+    keycloak_setup_client_id: "{{ argo_oidc_client_id }}"
+    
+    keycloak_setup_client_body:
+      clientId: "{{ argo_oidc_client_id }}"
+      enabled: true
+      protocol: "openid-connect"
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      publicClient: false
+      redirectUris: 
+        - "https://{{ argo_domain }}/oauth2/callback"
+        - "https://{{ argo_domain }}/*"
+      webOrigins:
+        - "https://{{ argo_domain }}"
+    
+    keycloak_setup_client_mappers:
+      - name: "audience"
+        protocol: "openid-connect"
+        protocolMapper: "oidc-audience-mapper"
+        consentRequired: false
+        config:
+          included.client.audience: "argo"
+          id.token.claim: "true"
+          access.token.claim: "true"
+          userinfo.token.claim: "false"
+
+  tasks:
+    ###################################################################
+    # Setup Argo client in Keycloak
+    ###################################################################
+    - name: Create Argo client in Keycloak
+      include_role:
+        name: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ keycloak_setup_client_id }}"
+        keycloak_client_body: "{{ keycloak_setup_client_body }}"
+
+    ###################################################################
+    # Add audience mapper to client
+    ###################################################################
+    - name: Create audience mapper for Argo client
+      include_role:
+        name: keycloak/keycloak_mapper
+      vars:
+        keycloak_mapper_target_type: "client"
+        keycloak_mapper_target_uuid: "{{ keycloak_client_uuid }}"
+        keycloak_mapper_body: "{{ keycloak_setup_client_mappers[0] }}"
+
+    ###################################################################
+    # Final output
+    ###################################################################
+    - name: Final info
+      ansible.builtin.debug:
+        msg:
+          - "Realm => {{ keycloak_realm }}"
+          - "Client => '{{ keycloak_setup_client_id }}' => id={{ keycloak_client_uuid }}"
+          - "Redirect URIs => {{ keycloak_setup_client_body.redirectUris }}"
+          - "Audience Mapper => Added"
+          - "Client secret => {{ keycloak_client_secret }}"
+      when: keycloak_client_uuid is defined and keycloak_client_secret is defined

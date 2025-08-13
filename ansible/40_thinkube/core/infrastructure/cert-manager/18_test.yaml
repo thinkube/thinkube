@@ -1,0 +1,195 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Test cert-manager installation and certificate issuance
+#
+# This playbook verifies that cert-manager is properly installed and configured,
+# and that certificates are being issued correctly.
+#
+# Prerequisites:
+#   - Cert-manager deployed (10_deploy.yaml)
+#   - ClusterIssuers configured
+#   - Certificates created
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/cert-manager/18_test.yaml
+
+- name: Test cert-manager installation
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    cert_manager_namespace: "cert-manager"
+
+  tasks:
+    - name: Check cert-manager addon status
+      ansible.builtin.command: microk8s status --addon cert-manager
+      register: addon_status
+      changed_when: false
+      become: true
+      failed_when: "'enabled' not in addon_status.stdout"
+
+    - name: Check cert-manager namespace exists
+      ansible.builtin.command: microk8s kubectl get namespace cert-manager
+      register: namespace_check
+      changed_when: false
+      become: true
+      failed_when: namespace_check.rc != 0
+
+    - name: Check cert-manager pods are running
+      ansible.builtin.shell: |
+        microk8s kubectl get pods -n cert-manager -l app.kubernetes.io/instance=cert-manager --no-headers | wc -l
+      register: pods_count
+      changed_when: false
+      become: true
+      failed_when: pods_count.stdout | int == 0
+
+    - name: Get cert-manager pod status
+      ansible.builtin.command: microk8s kubectl get pods -n cert-manager -l app.kubernetes.io/instance=cert-manager
+      register: pods_status
+      changed_when: false
+      become: true
+
+    - name: Check ClusterIssuers exist
+      ansible.builtin.command: microk8s kubectl get clusterissuer
+      register: issuers_check
+      changed_when: false
+      become: true
+      failed_when: issuers_check.rc != 0
+
+    - name: Verify ClusterIssuers are ready
+      ansible.builtin.shell: |
+        microk8s kubectl get clusterissuer letsencrypt-prod -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: issuer_ready
+      changed_when: false
+      become: true
+      failed_when: issuer_ready.stdout != "True"
+
+    - name: Check Cloudflare API token secret exists
+      ansible.builtin.command: |
+        microk8s kubectl get secret cloudflare-api-token -n cert-manager
+      register: token_secret
+      changed_when: false
+      become: true
+      failed_when: token_secret.rc != 0
+
+    # Check base domain certificate in default namespace
+    - name: Check combined certificate exists
+      ansible.builtin.command: |
+        microk8s kubectl get certificate {{ domain_name.replace('.', '-') }}-tls -n default
+      register: combined_cert_check
+      changed_when: false
+      become: true
+      failed_when: combined_cert_check.rc != 0
+
+    - name: Verify combined certificate secret exists
+      ansible.builtin.command: |
+        microk8s kubectl get secret {{ domain_name.replace('.', '-') }}-tls -n default
+      register: combined_cert_secret_status
+      changed_when: false
+      become: true
+      failed_when: combined_cert_secret_status.rc != 0
+      
+    - name: Check certificate domains in default namespace
+      ansible.builtin.shell: |
+        #!/bin/bash
+        # Check combined certificate domains
+        CERT_DOMAINS=$(microk8s kubectl get secret {{ domain_name.replace('.', '-') }}-tls -n default -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout | grep -A1 'Subject Alternative Name' | grep DNS)
+        echo "Certificate domains: $CERT_DOMAINS"
+        
+        # Verify the certificate has all expected domains
+        MISSING_DOMAINS=0
+        
+        # Check domains
+        if ! echo "$CERT_DOMAINS" | grep -q "{{ domain_name }}"; then
+          echo "Certificate missing domain: {{ domain_name }}"
+          MISSING_DOMAINS=1
+        else
+          echo "Certificate contains domain: {{ domain_name }}"
+        fi
+        
+        if ! echo "$CERT_DOMAINS" | grep -q "\*.{{ domain_name }}"; then
+          echo "Certificate missing domain: *.{{ domain_name }}"
+          MISSING_DOMAINS=1
+        else
+          echo "Certificate contains domain: *.{{ domain_name }}"
+        fi
+        
+        if ! echo "$CERT_DOMAINS" | grep -q "\*.kn.{{ domain_name }}"; then
+          echo "Certificate missing domain: *.kn.{{ domain_name }}"
+          MISSING_DOMAINS=1
+        else
+          echo "Certificate contains domain: *.kn.{{ domain_name }}"
+        fi
+        
+        if [ $MISSING_DOMAINS -eq 1 ]; then
+          echo "Certificate is missing required domains"
+          exit 1
+        fi
+        
+        echo "Certificate contains all required domains"
+        exit 0
+      register: default_cert_domains_check
+      changed_when: false
+      become: true
+      failed_when: default_cert_domains_check.rc != 0
+
+    # Already covered by the previous step
+
+    # NOTE: Ingress-related certificates will be tested after ingress controller installation
+    - name: Set default values for ingress namespaces (for display only)
+      ansible.builtin.set_fact:
+        ingress_cert_check: {'rc': 0}
+        ingress_cert_secret_status: {'rc': 0}
+        ingress_kn_cert_check: {'rc': 0}
+        ingress_kn_cert_secret_status: {'rc': 0}
+      changed_when: false
+
+    # Already covered by the previous step
+
+    # Check certificate contents
+    - name: Verify certificate secret contains required keys in default namespace
+      ansible.builtin.shell: |
+        microk8s kubectl get secret {{ domain_name.replace('.', '-') }}-tls -n default -o jsonpath='{.data}' | grep -q 'tls\.crt' && \
+        microk8s kubectl get secret {{ domain_name.replace('.', '-') }}-tls -n default -o jsonpath='{.data}' | grep -q 'tls\.key'
+      register: default_cert_keys
+      changed_when: false
+      become: true
+      failed_when: default_cert_keys.rc != 0
+
+    - name: Check certificate domains in default namespace
+      ansible.builtin.shell: |
+        microk8s kubectl get certificate {{ domain_name.replace('.', '-') }}-wildcard -n default -o jsonpath='{.spec.dnsNames}' | tr -d '[]"' | tr ',' '\n'
+      register: default_cert_domains
+      changed_when: false
+      become: true
+
+    - name: Display certificate details
+      ansible.builtin.command: |
+        microk8s kubectl describe certificate {{ domain_name.replace('.', '-') }}-wildcard -n default
+      register: cert_details
+      changed_when: false
+      become: true
+
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "Cert-manager Status: PASS"
+          - "Namespace exists: PASS"
+          - "Pods running: PASS ({{ pods_count.stdout }} pods)"
+          - "ClusterIssuers ready: PASS"
+          - "---------------------------------------------------"
+          - "Base domain certificate: {{ 'PASS' if base_cert_check.rc == 0 and base_cert_secret_status.rc == 0 else 'FAIL' }}"
+          - "Wildcard certificate: {{ 'PASS' if wildcard_cert_check.rc == 0 and wildcard_cert_secret_status.rc == 0 else 'FAIL' }}"
+          - "Certificate domains check: {{ 'PASS' if default_cert_domains_check.rc == 0 else 'FAIL' }}"
+          - "Note: Ingress-related certificates will be tested after ingress controller installation"
+          - "---------------------------------------------------"          
+          - "Certificate domains:"
+          - "{{ default_cert_domains.stdout_lines }}"
+          - ""
+          - "Certificate Details:"
+          - "{{ cert_details.stdout_lines[-10:] }}"
+          - ""
+          - "NOTE: Certificates may show as 'Ready: False' while waiting for final Let's Encrypt certificates."
+          - "This is normal - temporary certificates are being used in the meantime."

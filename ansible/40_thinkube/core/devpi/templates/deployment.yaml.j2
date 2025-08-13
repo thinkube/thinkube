@@ -1,0 +1,62 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devpi
+  namespace: {{ devpi_namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: devpi
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: devpi
+    spec:
+      imagePullSecrets:
+      - name: harbor-pull-secret
+      initContainers:
+      - name: fix-permissions
+        image: busybox
+        command: ['sh', '-c', 'chown -R 1000:1000 /devpi']
+        volumeMounts:
+        - name: devpi-data
+          mountPath: /devpi
+      containers:
+      - name: devpi
+        image: {{ devpi_image }}
+        ports:
+        - containerPort: 3141
+        env:
+        - name: DEVPI_SERVERDIR
+          value: /devpi/server
+        - name: DEVPI_PORT
+          value: "3141"
+        - name: DEVPI_OUTSIDE_URL
+          value: "https://{{ devpi_dashboard_hostname }}"
+        - name: DEVPI_TRUSTED_PROXY
+          value: "10.0.0.0/8"
+        volumeMounts:
+        - name: devpi-data
+          mountPath: /devpi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 3141
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 3141
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: devpi-data
+        persistentVolumeClaim:
+          claimName: devpi-data-pvc

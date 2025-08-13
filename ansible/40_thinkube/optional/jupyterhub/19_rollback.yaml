@@ -1,0 +1,128 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/jupyterhub/19_rollback.yaml
+# Description:
+#   Rollback JupyterHub deployment including Helm release, namespace, and persistent volumes
+#
+# Requirements:
+#   - MicroK8s cluster with kubectl and helm configured
+#   - kubectl_bin and helm_bin variables set in inventory
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+#
+# 🤖 [AI-assisted]
+
+- name: Rollback JupyterHub Deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    jupyterhub_namespace: "jupyterhub"
+    jupyterhub_release_name: "jupyterhub"
+    package_management_path: "{{ ansible_env.HOME }}/jupyterhub-packages"
+    pip_cache_path: "{{ ansible_env.HOME }}/pip-cache"
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    code_source_path: "{{ shared_code_path }}"
+
+  tasks:
+    - name: Check if JupyterHub namespace exists
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get namespace {{ jupyterhub_namespace }}
+      register: namespace_check
+      changed_when: false
+      failed_when: false
+
+    - name: Uninstall JupyterHub Helm release
+      ansible.builtin.command: >
+        {{ helm_bin }} uninstall {{ jupyterhub_release_name }} --namespace {{ jupyterhub_namespace }}
+      when: namespace_check.rc == 0
+      register: helm_uninstall
+      changed_when: helm_uninstall.rc == 0
+      failed_when: false
+
+    - name: Delete persistent volume claims
+      ansible.builtin.command: >
+        {{ kubectl_bin }} delete pvc -n {{ jupyterhub_namespace }} --all --timeout=60s
+      when: namespace_check.rc == 0
+      register: delete_pvcs
+      changed_when: delete_pvcs.rc == 0
+      failed_when: false
+
+    - name: Delete JupyterHub namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ jupyterhub_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: absent
+        wait: true
+        wait_timeout: 180
+      when: namespace_check.rc == 0
+
+    - name: Delete persistent volumes
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ item }}"
+        api_version: v1
+        kind: PersistentVolume
+        state: absent
+      loop:
+        - pip-cache-pv
+        - jupyterhub-shared-notebooks
+      failed_when: false
+
+    - name: Remove package management directory
+      ansible.builtin.file:
+        path: "{{ package_management_path }}"
+        state: absent
+      failed_when: false
+
+    - name: Clean up pip cache directory permissions
+      ansible.builtin.file:
+        path: "{{ pip_cache_path }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      become: true
+      failed_when: false
+
+    - name: Clean up notebooks directory permissions
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/notebooks"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      become: true
+      failed_when: false
+
+    - name: Check for any remaining JupyterHub resources
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get all -n {{ jupyterhub_namespace }}
+      register: remaining_resources
+      changed_when: false
+      failed_when: false
+
+    - name: Display cleanup status
+      ansible.builtin.debug:
+        msg:
+          - "=============================================================="
+          - "JupyterHub rollback completed successfully"
+          - ""
+          - "Cleanup performed:"
+          - "- Namespace: {{ 'Not found' if namespace_check.rc != 0 else 'Removed' }}"
+          - "- Helm release: {{ 'Not found' if namespace_check.rc != 0 else 'Uninstalled' }}"
+          - "- Package management directory: Removed"
+          - "- Persistent volumes: Cleaned"
+          - ""
+          - "Note: User data directories may still exist and require manual cleanup"
+          - "=============================================================="

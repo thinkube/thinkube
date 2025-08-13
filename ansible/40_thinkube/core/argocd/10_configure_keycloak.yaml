@@ -1,0 +1,249 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/argocd/10_configure_keycloak.yaml
+# Description:
+#   Configure Keycloak client for ArgoCD authentication and authorization
+#
+# Requirements:
+#   - MicroK8s Kubernetes cluster
+#   - Keycloak instance running and accessible (CORE-004)
+#   - ADMIN_PASSWORD environment variable set for Keycloak admin access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/argocd/10_configure_keycloak.yaml
+#
+# Variables from inventory:
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Keycloak admin username (standard admin user for all applications)
+#   - domain_name: Domain name for all services
+#
+# Dependencies:
+#   - CORE-004: Keycloak must be deployed and operational
+
+- name: Configure Keycloak client "argocd" for realm "{{ keycloak_realm }}"
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    ###################################################################
+    # Keycloak connection info
+    ###################################################################
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    keycloak_validate_certs: false
+
+    ###################################################################
+    # Setup configuration for Argo CD client
+    ###################################################################
+    keycloak_setup_client_id: "{{ argocd_client_id }}"
+    
+    keycloak_setup_client_body:
+      clientId: "{{ argocd_client_id }}"
+      enabled: true
+      protocol: "openid-connect"
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      publicClient: false
+      redirectUris: 
+        - "https://{{ argocd_hostname }}/api/dex/callback"
+        - "https://{{ argocd_hostname }}/*"
+      webOrigins:
+        - "https://{{ argocd_hostname }}"
+
+  tasks:
+    ###################################################################
+    # Setup Argo CD client in Keycloak
+    ###################################################################
+    - name: Create Argo CD client in Keycloak
+      include_role:
+        name: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ keycloak_setup_client_id }}"
+        keycloak_client_body: "{{ keycloak_setup_client_body }}"
+
+    ###################################################################
+    # Ensure redirect URIs are up to date (in case client already existed)
+    ###################################################################
+    - name: Include common Keycloak tasks to get admin token
+      include_role:
+        name: keycloak/keycloak_common
+      when: keycloak_client_uuid is defined
+
+    - name: Update Keycloak client redirect URIs
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ keycloak_client_uuid }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          id: "{{ keycloak_client_uuid }}"
+          clientId: "{{ keycloak_setup_client_id }}"
+          redirectUris: "{{ keycloak_setup_client_body.redirectUris }}"
+          webOrigins: "{{ keycloak_setup_client_body.webOrigins }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 204
+      when: keycloak_client_uuid is defined
+      failed_when: false
+
+    ###################################################################
+    # Add group membership mapper directly to the client
+    ###################################################################
+    - name: Check existing protocol mappers
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ keycloak_client_uuid }}/protocol-mappers/models"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: existing_mappers
+      when: keycloak_client_uuid is defined
+      failed_when: false
+
+    - name: Set fact for existing group mapper
+      ansible.builtin.set_fact:
+        group_mapper_exists: "{{ existing_mappers.json | selectattr('name', 'equalto', 'group-membership-mapper') | list | length > 0 }}"
+      when: existing_mappers is defined
+
+    - name: Add group membership mapper to argocd client
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ keycloak_client_uuid }}/protocol-mappers/models"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "group-membership-mapper"
+          protocol: "openid-connect"
+          protocolMapper: "oidc-group-membership-mapper"
+          config:
+            full.path: "false"
+            id.token.claim: "true"
+            access.token.claim: "true"
+            claim.name: "groups"
+            userinfo.token.claim: "true"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 201
+      when: keycloak_client_uuid is defined and (not group_mapper_exists | default(false))
+      failed_when: false
+      register: mapper_creation
+
+    ###################################################################
+    # Check for auth_realm_username
+    ###################################################################
+    - name: Check if auth_realm_username user exists in Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users?username={{ auth_realm_username }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: auth_user_check
+      when: keycloak_token is defined
+      failed_when: false
+
+    - name: Display auth user status
+      ansible.builtin.debug:
+        msg: "User {{ auth_realm_username }} {{ 'exists' if auth_user_check.json | default([]) | length > 0 else 'does not exist' }} in Keycloak"
+      when: auth_user_check is defined
+
+    - name: Set auth_user_exists fact
+      ansible.builtin.set_fact:
+        auth_user_exists: "{{ auth_user_check.json | default([]) | length > 0 }}"
+      when: auth_user_check is defined
+
+    ###################################################################
+    # Create an admin group in Keycloak if it doesn't exist
+    ###################################################################
+    - name: Check if 'argocd-admins' group exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/groups?search=argocd-admins"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: group_check
+      when: keycloak_token is defined
+      failed_when: false
+
+    - name: Display group check result
+      ansible.builtin.debug:
+        var: group_check.json
+      when: group_check is defined
+
+    - name: Set group_exists fact
+      ansible.builtin.set_fact:
+        group_exists: "{{ group_check.json | default([]) | length > 0 }}"
+      when: group_check is defined
+
+    - name: Extract group ID if exists
+      ansible.builtin.set_fact:
+        admin_group_id: "{{ group_check.json[0].id }}"
+      when: group_check is defined and group_exists
+
+    - name: Create 'argocd-admins' group if it doesn't exist
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/groups"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "argocd-admins"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 201
+      when: group_check is defined and not group_exists
+      register: group_creation
+      failed_when: false
+
+    - name: Check for created group ID in Location header
+      ansible.builtin.set_fact:
+        admin_group_id: "{{ group_creation.location.split('/')[-1] }}"
+      when: group_creation is defined and group_creation.location is defined
+
+    ###################################################################
+    # Add auth user to 'argocd-admins' group if both exist
+    ###################################################################
+    - name: Get auth user ID
+      ansible.builtin.set_fact:
+        auth_user_id: "{{ auth_user_check.json[0].id }}"
+      when: auth_user_check is defined and auth_user_exists
+
+    - name: Add auth user to 'argocd-admins' group
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/{{ auth_user_id }}/groups/{{ admin_group_id }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: {}
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 204
+      when: auth_user_exists is defined and auth_user_exists and admin_group_id is defined
+      failed_when: false
+
+    ###################################################################
+    # Final output
+    ###################################################################
+    - name: Final info
+      ansible.builtin.debug:
+        msg:
+          - "Realm => {{ keycloak_realm }}"
+          - "Client => '{{ keycloak_setup_client_id }}' => id={{ keycloak_client_uuid }}"
+          - "Redirect URIs => {{ keycloak_setup_client_body.redirectUris }}"
+          - "Client secret => {{ keycloak_client_secret }}"
+          - "Group mapper => {{ 'already existed' if group_mapper_exists | default(false) else 'created' }}"
+          - "User {{ auth_realm_username }} {{ 'added to' if auth_user_exists else 'not found in' }} Keycloak"
+          - "Admin group => {{ 'created' if group_creation is defined else 'already existed' }}"
+      when: keycloak_client_uuid is defined and keycloak_client_secret is defined
