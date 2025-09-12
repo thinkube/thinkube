@@ -24,6 +24,26 @@
   gather_facts: true
   
   tasks:
+    - name: Create monitoring service discovery ConfigMap (for Optional Components)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: monitoring
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/component: "monitoring-stack"
+          data:
+            # This is used by Optional Components to detect installation
+            installed: "true"
+            installed_at: "{{ ansible_date_time.iso8601 }}"
+            components: "prometheus,grafana"
+    
     - name: Create Prometheus service discovery ConfigMap
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -119,6 +139,15 @@
                   min_replicas: 1
                   can_disable: true
                   
+    - name: Verify monitoring ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: monitoring
+      register: monitoring_configmap
+      
     - name: Verify Prometheus ConfigMap creation
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
@@ -136,38 +165,10 @@
         name: thinkube-service-config-grafana
         namespace: monitoring
       register: grafana_configmap
-      
-    - name: Create generic monitoring ConfigMap for Optional Components tracking
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: thinkube-service-config
-            namespace: "{{ monitoring_namespace }}"
-            labels:
-              app.kubernetes.io/name: monitoring-stack
-              app.kubernetes.io/part-of: thinkube
-              app.kubernetes.io/managed-by: ansible
-          data:
-            components: |
-              prometheus:
-                name: Prometheus
-                url: https://prometheus.{{ domain_name }}
-                icon: /icons/prometheus.svg
-              grafana:
-                name: Grafana
-                url: https://grafana.{{ domain_name }}
-                icon: /icons/grafana.svg
-            installed_at: "{{ ansible_date_time.iso8601 }}"
-            installed_by: "ansible"
-      register: generic_configmap
 
     - name: Display ConfigMap status
       ansible.builtin.debug:
         msg: 
-          - "Prometheus ConfigMap: {{ 'Created' if prometheus_configmap.resources | length > 0 else 'Failed' }}"
-          - "Grafana ConfigMap: {{ 'Created' if grafana_configmap.resources | length > 0 else 'Failed' }}"
-          - "Generic ConfigMap: {{ 'Created' if generic_configmap is changed else 'Already exists' }}"
+          - "Monitoring ConfigMap (for Optional Components): {{ 'Created' if monitoring_configmap.resources | length > 0 else 'Failed' }}"
+          - "Prometheus ConfigMap (for Dashboard): {{ 'Created' if prometheus_configmap.resources | length > 0 else 'Failed' }}"
+          - "Grafana ConfigMap (for Dashboard): {{ 'Created' if grafana_configmap.resources | length > 0 else 'Failed' }}"
