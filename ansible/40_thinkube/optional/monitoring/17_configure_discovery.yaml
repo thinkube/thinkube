@@ -24,7 +24,8 @@
   gather_facts: true
   
   tasks:
-    - name: Create monitoring service discovery ConfigMap (for Optional Components)
+    # Create separate ConfigMaps for Prometheus and Grafana
+    - name: Create Prometheus service ConfigMap
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -32,31 +33,12 @@
           apiVersion: v1
           kind: ConfigMap
           metadata:
-            name: thinkube-service-config
+            name: prometheus-service-config
             namespace: monitoring
             labels:
               thinkube.io/managed: "true"
               thinkube.io/service-type: "optional"
-              thinkube.io/component: "monitoring-stack"
-          data:
-            # This is used by Optional Components to detect installation
-            installed: "true"
-            installed_at: "{{ ansible_date_time.iso8601 }}"
-            components: "prometheus,grafana"
-    
-    - name: Create Prometheus service discovery ConfigMap
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: thinkube-service-config-prometheus
-            namespace: monitoring
-            labels:
-              thinkube.io/managed: "true"
-              thinkube.io/service-type: "optional"
+              thinkube.io/component: "monitoring"  # This label marks monitoring as installed
               thinkube.io/service-name: "prometheus"
           data:
             service.yaml: |
@@ -91,7 +73,7 @@
                   min_replicas: 1
                   can_disable: true
                   
-    - name: Create Grafana service discovery ConfigMap
+    - name: Create Grafana service ConfigMap
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -99,11 +81,12 @@
           apiVersion: v1
           kind: ConfigMap
           metadata:
-            name: thinkube-service-config-grafana
+            name: grafana-service-config
             namespace: monitoring
             labels:
               thinkube.io/managed: "true"
               thinkube.io/service-type: "optional"
+              thinkube.io/component: "monitoring"  # This label marks monitoring as installed
               thinkube.io/service-name: "grafana"
           data:
             service.yaml: |
@@ -118,8 +101,8 @@
                 endpoints:
                   - name: web
                     type: http
-                    url: "https://grafana.{{ domain_name }}"
-                    health_path: "/api/health"
+                    url: "https://grafana.{{ domain_name }}/login/generic_oauth"
+                    health_url: "https://grafana.{{ domain_name }}/api/health"
                     description: "Dashboard UI"
                     primary: true
                     
@@ -138,37 +121,19 @@
                   namespace: monitoring
                   min_replicas: 1
                   can_disable: true
-                  
-    - name: Verify monitoring ConfigMap creation
+    
+    - name: Verify monitoring ConfigMaps creation
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
         api_version: v1
         kind: ConfigMap
-        name: thinkube-service-config
         namespace: monitoring
-      register: monitoring_configmap
-      
-    - name: Verify Prometheus ConfigMap creation
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: ConfigMap
-        name: thinkube-service-config-prometheus
-        namespace: monitoring
-      register: prometheus_configmap
-      
-    - name: Verify Grafana ConfigMap creation
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: ConfigMap
-        name: thinkube-service-config-grafana
-        namespace: monitoring
-      register: grafana_configmap
+        label_selector: "thinkube.io/component=monitoring"
+      register: monitoring_configmaps
 
     - name: Display ConfigMap status
       ansible.builtin.debug:
         msg: 
-          - "Monitoring ConfigMap (for Optional Components): {{ 'Created' if monitoring_configmap.resources | length > 0 else 'Failed' }}"
-          - "Prometheus ConfigMap (for Dashboard): {{ 'Created' if prometheus_configmap.resources | length > 0 else 'Failed' }}"
-          - "Grafana ConfigMap (for Dashboard): {{ 'Created' if grafana_configmap.resources | length > 0 else 'Failed' }}"
+          - "Monitoring ConfigMaps created: {{ monitoring_configmaps.resources | length }}"
+          - "ConfigMaps: {{ monitoring_configmaps.resources | map(attribute='metadata.name') | list | join(', ') }}"
+          - "Optional Components will detect monitoring as installed via the component label"
