@@ -38,7 +38,32 @@
     sync_secret_name: "sync-webhook-secret"
     
   tasks:
-    - name: Create sync webhook secret
+    - name: Check if sync webhook secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ sync_namespace }}"
+        name: "{{ sync_secret_name }}"
+      register: existing_secret
+
+    - name: Check for force regenerate flag
+      ansible.builtin.set_fact:
+        force_regenerate: "{{ force_webhook_secret_regenerate | default(false) | bool }}"
+
+    - name: Generate webhook secret if not exists or force regenerate
+      ansible.builtin.set_fact:
+        webhook_secret_value: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+      when: (existing_secret.resources | length == 0) or force_regenerate
+
+    - name: Use existing webhook secret if it exists and not forcing regenerate
+      ansible.builtin.set_fact:
+        webhook_secret_value: "{{ existing_secret.resources[0].data.webhook_secret | b64decode }}"
+      when: 
+        - existing_secret.resources | length > 0
+        - not force_regenerate
+
+    - name: Create or update sync webhook secret
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -50,8 +75,8 @@
             namespace: "{{ sync_namespace }}"
           type: Opaque
           stringData:
-            # Generate a random webhook secret for authentication
-            webhook_secret: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+            # Use existing secret or newly generated one
+            webhook_secret: "{{ webhook_secret_value }}"
             # Store ArgoCD server URL (internal service)
             argocd_server: "argocd-server.{{ sync_namespace }}.svc.cluster.local"
 
@@ -401,6 +426,36 @@
           status: "True"
         wait_timeout: 300
 
+    - name: Restart sync webhook pods to pick up latest secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ sync_service_name }}"
+            namespace: "{{ sync_namespace }}"
+          spec:
+            template:
+              metadata:
+                annotations:
+                  restartedAt: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Wait for pods to be ready after restart
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ sync_namespace }}"
+        label_selectors:
+          - app={{ sync_service_name }}
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 120
+
     - name: Get webhook secret for configuration
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
@@ -425,7 +480,8 @@
           - HMAC signature verification for security
           - Clear audit trail of sync operations
           
-          Webhook Secret: {{ webhook_secret_data.resources[0].data.webhook_secret | b64decode }}
+          Webhook Secret: {{ webhook_secret_value }}
+          Secret was: {{ 'force regenerated' if force_regenerate else ('reused from existing' if existing_secret.resources | length > 0 else 'newly generated') }}
           
           To trigger a sync, POST to /sync with:
           {
@@ -434,3 +490,7 @@
           
           Include header: X-Webhook-Signature: <HMAC-SHA256>
           ════════════════════════════════════════════════════════
+
+    - name: Verify webhook secret consistency
+      ansible.builtin.debug:
+        msg: "Webhook secret is consistent: {{ webhook_secret_value | length }} characters"
