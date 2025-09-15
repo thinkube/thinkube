@@ -1,0 +1,119 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/15_mirror_single_image.yaml
+# Description:
+#   Mirror a single container image to Harbor registry
+#   This playbook is called by thinkube-control API for on-demand mirroring
+#
+# Requirements:
+#   - Harbor registry must be installed and accessible
+#   - Podman or Docker must be installed on the control node
+#   - HARBOR_ROBOT_TOKEN environment variable must be set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/15_mirror_single_image.yaml \
+#     -e source_image=docker.io/library/nginx:latest \
+#     -e destination_image=registry.thinkube.com/library/nginx:latest \
+#     -e image_description="Nginx web server"
+#
+# Variables from inventory:
+#   - harbor_registry: Registry domain
+#   - kubeconfig: Path to Kubernetes configuration file
+#
+# Variables passed by API:
+#   - source_image: Source image URL (required)
+#   - destination_image: Destination image URL (required)
+#   - image_description: Description of the image (optional)
+#   - image_category: Category (user/custom) (optional, default: user)
+#
+
+- name: Mirror Single Container Image to Harbor
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    image_category: "{{ image_category | default('user') }}"
+    image_description: "{{ image_description | default('User-added image') }}"
+
+  pre_tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - source_image is defined
+          - destination_image is defined
+          - harbor_registry is defined
+        fail_msg: "Required variables are not defined"
+
+    - name: Get robot token from env file
+      ansible.builtin.shell: |
+        grep HARBOR_ROBOT_TOKEN {{ ansible_env.HOME }}/.env | cut -d= -f2
+      register: robot_token_cmd
+      changed_when: false
+      failed_when: robot_token_cmd.rc != 0
+
+    - name: Set robot token fact
+      ansible.builtin.set_fact:
+        harbor_robot_token: "{{ robot_token_cmd.stdout | trim }}"
+        harbor_robot_user: "robot$thinkube"
+
+    - name: Get admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+        harbor_admin_user: "admin"
+
+  tasks:
+    - name: Check container runtime
+      ansible.builtin.shell: which podman || which docker
+      register: container_runtime_check
+      changed_when: false
+
+    - name: Set container runtime
+      ansible.builtin.set_fact:
+        container_runtime: "{{ 'podman' if 'podman' in container_runtime_check.stdout else 'docker' }}"
+
+    - name: Login to Harbor registry
+      ansible.builtin.command: >
+        {{ container_runtime }} login {{ harbor_registry }}
+        --username {{ harbor_robot_user }}
+        --password {{ harbor_robot_token }}
+        --tls-verify=true
+      register: harbor_login
+      changed_when: "'Login Succeeded' in harbor_login.stdout"
+      no_log: true
+
+    - name: Mirror the image
+      include_role:
+        name: container_deployment/image_mirror
+      vars:
+        source_image: "{{ source_image }}"
+        destination_image: "{{ destination_image }}"
+        harbor_api_user: "{{ harbor_admin_user }}"
+        harbor_api_password: "{{ admin_password }}"
+
+    - name: Update image manifest (for user images)
+      include_role:
+        name: container_deployment/image_manifest
+      vars:
+        manifest_images:
+          - source: "{{ source_image }}"
+            destination: "{{ destination_image }}"
+            description: "{{ image_description }}"
+        manifest_category: "{{ image_category }}"
+        manifest_namespace: "registry"
+      when: image_category == "user"
+
+    - name: Logout from Harbor registry
+      ansible.builtin.command: >-
+        {{ container_runtime }} logout {{ harbor_registry }}
+      changed_when: false
+      failed_when: false
+
+    - name: Display success message
+      ansible.builtin.debug:
+        msg:
+          - "Image mirrored successfully:"
+          - "  Source: {{ source_image }}"
+          - "  Destination: {{ destination_image }}"
+          - "  Category: {{ image_category }}"
