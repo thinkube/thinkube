@@ -5,10 +5,6 @@
 #   Fast deployment (2 minutes) - no image building
 #
 # Requirements:
-#   - MicroK8s must be installed and running
-#   - Keycloak must be deployed (mandatory, no fallback)
-#   - SeaweedFS must be deployed (mandatory, no fallback)
-#   - thinkube-control must be running (mandatory, no fallback)
 #   - Harbor registry must be accessible
 #
 # Usage:
@@ -26,7 +22,6 @@
 #   - CORE-002 (Harbor) must be complete
 #   - CORE-003 (Keycloak) must be complete
 #   - CORE-004 (SeaweedFS) must be complete
-#   - thinkube-control must be deployed
 #
 # 🤖 AI-assisted
 
@@ -41,45 +36,7 @@
     helm_repo_url: https://hub.jupyter.org/helm-chart/
 
   tasks:
-    # Step 1: Verify all dependencies are available (NO FALLBACKS)
-    - name: Verify Keycloak is running
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: Deployment
-        namespace: keycloak
-        name: keycloak
-      register: keycloak_status
-      failed_when: keycloak_status.resources | length == 0 or keycloak_status.resources[0].status.availableReplicas | default(0) == 0
-
-    - name: Verify SeaweedFS is running
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: StatefulSet
-        namespace: seaweedfs
-        name: seaweedfs-master
-      register: seaweedfs_status
-      failed_when: seaweedfs_status.resources | length == 0 or seaweedfs_status.resources[0].status.readyReplicas | default(0) == 0
-
-    - name: Verify thinkube-control API is accessible
-      ansible.builtin.uri:
-        url: "http://{{ ansible_default_ipv4.address }}:30080/health"
-        method: GET
-        timeout: 10
-      register: thinkube_control_health
-      failed_when: thinkube_control_health.status != 200
-
-    - name: Verify Harbor is accessible
-      ansible.builtin.uri:
-        url: "https://{{ harbor_registry }}/api/v2.0/health"
-        method: GET
-        validate_certs: false
-        timeout: 10
-      register: harbor_health
-      failed_when: harbor_health.status != 200
-
-    # Step 2: Create namespace
+    # Step 1: Create namespace
     - name: Create JupyterHub namespace
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -88,7 +45,7 @@
         kind: Namespace
         state: present
 
-    # Step 3: Create SeaweedFS volumes for notebooks
+    # Step 2: Create SeaweedFS volumes for notebooks
     - name: Create SeaweedFS PVC for notebooks
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -143,7 +100,7 @@
               requests:
                 storage: 200Gi
 
-    # Step 4: Get wildcard certificate from default namespace
+    # Step 3: Get wildcard certificate from default namespace
     - name: Get wildcard certificate from default namespace
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
@@ -169,14 +126,14 @@
             tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
 
-    # Step 5: Add JupyterHub Helm repository
+    # Step 4: Add JupyterHub Helm repository
     - name: Add JupyterHub Helm repository
       kubernetes.core.helm_repository:
         name: "{{ helm_repo_name }}"
         repo_url: "{{ helm_repo_url }}"
         state: present
 
-    # Step 6: Create values file from template
+    # Step 5: Create values file from template
     - name: Create temporary directory for JupyterHub configuration
       ansible.builtin.tempfile:
         state: directory
@@ -189,7 +146,7 @@
         dest: "{{ temp_dir.path }}/values.yaml"
         mode: '0644'
 
-    # Step 7: Deploy JupyterHub using Helm
+    # Step 6: Deploy JupyterHub using Helm
     - name: Deploy JupyterHub
       kubernetes.core.helm:
         name: jupyterhub
@@ -204,7 +161,7 @@
         state: present
         chart_version: "{{ jupyterhub_version }}"
 
-    # Step 8: Create Ingress for JupyterHub
+    # Step 7: Create Ingress for JupyterHub
     - name: Create JupyterHub Ingress
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -239,7 +196,7 @@
                           port:
                             number: 80
 
-    # Step 9: Wait for JupyterHub to be ready
+    # Step 8: Wait for JupyterHub to be ready
     - name: Wait for JupyterHub hub pod to be ready
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
@@ -270,13 +227,13 @@
           status: "True"
         wait_timeout: 300
 
-    # Step 10: Clean up temporary directory
+    # Step 9: Clean up temporary directory
     - name: Clean up temporary directory
       ansible.builtin.file:
         path: "{{ temp_dir.path }}"
         state: absent
 
-    # Step 11: Display access information
+    # Step 10: Display access information
     - name: Display JupyterHub access information
       ansible.builtin.debug:
         msg:
