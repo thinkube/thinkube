@@ -117,69 +117,26 @@
       register: harbor_login
       changed_when: "'Login Succeeded' in harbor_login.stdout"
 
-    - name: Build images without dependencies
+    - name: Build all images sequentially
       ansible.builtin.shell: |
         cd {{ build_dir }}/{{ item.context }}
         podman build \
-          --quiet \
           --no-cache \
           -f {{ item.name }}.Dockerfile \
           -t {{ harbor_registry }}/library/{{ item.name }}:latest \
-          . 2>&1 | tail -20
-      loop: "{{ images_to_build | selectattr('depends_on', 'undefined') | list }}"
-      register: build_results_base
-      async: 1800  # 30 minutes timeout
-      poll: 0
-
-    - name: Wait for base images to complete
-      ansible.builtin.async_status:
-        jid: "{{ item.ansible_job_id }}"
-      loop: "{{ build_results_base.results }}"
-      register: build_jobs
-      until: build_jobs.finished
-      retries: 60
-      delay: 30
-      failed_when: build_jobs.rc is defined and build_jobs.rc != 0
-
-    - name: Build images with dependencies
-      ansible.builtin.shell: |
-        cd {{ build_dir }}/{{ item.context }}
-        podman build \
-          --quiet \
-          --no-cache \
-          -f {{ item.name }}.Dockerfile \
-          -t {{ harbor_registry }}/library/{{ item.name }}:latest \
-          . 2>&1 | tail -20
-      loop: "{{ images_to_build | selectattr('depends_on', 'defined') | list }}"
-      register: build_results_dependent
-      async: 1800  # 30 minutes timeout
-      poll: 0
-
-    - name: Wait for dependent images to complete
-      ansible.builtin.async_status:
-        jid: "{{ item.ansible_job_id }}"
-      loop: "{{ build_results_dependent.results }}"
-      register: build_jobs_dependent
-      until: build_jobs_dependent.finished
-      retries: 60
-      delay: 30
-      failed_when: build_jobs_dependent.rc is defined and build_jobs_dependent.rc != 0
-
-    - name: Check which images exist locally
-      ansible.builtin.shell: |
-        podman images --format "table {{.Repository}}:{{.Tag}}" | grep "{{ harbor_registry }}/library/{{ item.name }}:latest" || true
+          .
       loop: "{{ images_to_build }}"
-      register: image_exists
-      changed_when: false
+      register: build_results
+      loop_control:
+        label: "{{ item.name }}"
 
-    - name: Push successfully built images to Harbor
+    - name: Push all images to Harbor
       ansible.builtin.shell: |
-        podman push {{ harbor_registry }}/library/{{ item.item.name }}:latest
-      loop: "{{ image_exists.results }}"
-      when: item.stdout | length > 0
+        podman push {{ harbor_registry }}/library/{{ item.name }}:latest
+      loop: "{{ images_to_build }}"
       register: push_results
       loop_control:
-        label: "{{ item.item.name }}"
+        label: "{{ item.name }}"
 
     - name: Tag images with metadata in Harbor
       ansible.builtin.uri:
@@ -195,6 +152,8 @@
         status_code: [200, 201, 409]  # 409 if label already exists
       loop: "{{ images_to_build }}"
       failed_when: false  # Don't fail on tagging errors
+      loop_control:
+        label: "{{ item.name }}"
 
     - name: Display build summary
       ansible.builtin.debug:
