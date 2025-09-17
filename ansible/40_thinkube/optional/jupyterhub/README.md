@@ -1,16 +1,16 @@
-# JupyterHub with GPU Flexibility
+# JupyterHub with Dynamic Image Discovery
 
-Multi-user Jupyter notebook environment with GPU flexibility, persistent storage via SeaweedFS, and specialized ML/AI images.
+Fast-deploying Jupyter notebook environment with GPU flexibility, SeaweedFS storage, and dynamic image discovery from thinkube-control.
 
 ## Overview
 
-JupyterHub provides a complete AI/ML development platform with:
-- **GPU Flexibility**: Notebooks can run on ANY node (control plane or GPU nodes)
-- **Persistent Storage**: SeaweedFS-backed storage accessible from all nodes
-- **Hybrid Storage Strategy**: Combines SeaweedFS persistence with local scratch for performance
-- **Custom ML/AI Images**: Four specialized environments for different workloads
-- **Dynamic Profiles**: Auto-detection of GPU nodes and resources
-- **Authentication**: Keycloak SSO (mandatory)
+JupyterHub deployment features:
+- **Fast Deployment**: 2 minutes (images built separately)
+- **GPU Flexibility**: Notebooks run on any GPU node
+- **Mandatory Dependencies**: Keycloak, SeaweedFS, thinkube-control (no fallbacks)
+- **Dynamic Discovery**: Images queried from thinkube-control at runtime
+- **Hybrid Storage**: SeaweedFS persistence + local scratch performance
+- **No Conditionals**: Fails fast if dependencies unavailable
 
 ## Architecture
 

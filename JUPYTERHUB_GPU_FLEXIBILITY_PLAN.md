@@ -2,30 +2,58 @@
 
 ## Executive Summary
 
-This plan enables JupyterHub to run on any GPU node in the Thinkube cluster while maintaining notebook persistence and avoiding complex shared-code migrations. Designed for single-user deployment to avoid multi-tenancy complexity.
+This plan enables JupyterHub to run on any GPU node in the Thinkube cluster while maintaining notebook persistence. Uses dynamic runtime image discovery from thinkube-control and separates image building from deployment for rapid iteration.
 
 ## Key Decisions
 
 1. **GPU flexibility is priority** - JupyterHub must run on any GPU node
-2. **No shared-code migration** - Keep shared-code as hostPath for CI/CD integrity
-3. **SeaweedFS for notebooks** - Enables true portability between nodes
-4. **Single-user focus** - Simplifies configuration and security
-5. **License compliance** - Only Apache 2.0 compatible components
+2. **SeaweedFS is mandatory** - Core component, always installed, no fallbacks
+3. **Hybrid storage approach** - SeaweedFS for persistence, local for performance
+4. **Keycloak authentication only** - No fallbacks, fails if unavailable
+5. **Dynamic image discovery** - Runtime queries to thinkube-control API
+6. **Separated concerns** - Image building in custom-images module, not JupyterHub
+7. **Fast deployment** - 2 minutes, not 20+ minutes
 
 ## Architecture
 
-```
-Control Plane (node1)                    GPU Nodes (node2, node3, etc)
-├── shared-code (hostPath)               ├── JupyterHub pods can run here
-│   ├── code-server ✓                    ├── Full GPU access
-│   ├── thinkube-control ✓               └── Mount notebooks via SeaweedFS
-│   └── CI/CD pipeline ✓
-└── [Stays unchanged]
+### Component Separation
 
-SeaweedFS (existing)
-├── /notebooks        # Persistent notebook storage (small files, portable)
-├── /datasets         # Large datasets
-└── /models          # Trained models
+```
+┌─────────────────────────────────────────────────────┐
+│                 custom-images module                  │
+│  - Builds Docker images (20+ minutes)                │
+│  - Pushes to Harbor registry                         │
+│  - Updates thinkube-control database                 │
+│  - Independent of JupyterHub deployment              │
+└─────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────┐
+│               thinkube-control API                   │
+│  - Provides /api/v1/images/jupyter endpoint          │
+│  - Returns available images with metadata            │
+│  - Dynamic runtime queries (not deployment-time)     │
+└─────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────┐
+│              JupyterHub Deployment                   │
+│  - Queries thinkube-control at runtime               │
+│  - Generates profiles dynamically                    │
+│  - Deploys in 2 minutes (no image building)         │
+│  - Fails if dependencies unavailable (no fallbacks)  │
+└─────────────────────────────────────────────────────┘
+```
+
+### Storage Architecture
+
+```
+GPU Nodes (node2, node3, etc)
+├── JupyterHub pods (can run on any GPU node)
+├── SeaweedFS CSI Mounts (mandatory)
+│   ├── /home/jovyan/notebooks   # Persistent, shared
+│   ├── /home/jovyan/datasets    # Large data, shared
+│   └── /home/jovyan/models      # Trained models, shared
+└── Local Storage
+    └── /home/jovyan/scratch     # emptyDir, fast temp storage
 ```
 
 ## Implementation Phases
@@ -70,7 +98,7 @@ spec:
 # Uses emptyDir for fast local temporary storage
 ```
 
-### Phase 2: JupyterHub Configuration Update (Day 3-4)
+### Phase 2: JupyterHub Configuration Update
 
 #### 2.1 Update jupyterhub-values.yaml.j2
 ```yaml
@@ -78,55 +106,73 @@ spec:
 hub:
   config:
     JupyterHub:
-      # Single-user configuration
-      authenticator_class: nullauthenticator.NullAuthenticator
-      # Or keep Keycloak with single admin user:
-      # authenticator_class: generic-oauth
+      # MANDATORY: Keycloak authentication only
+      authenticator_class: generic-oauth
 
-    # Dynamic profile generation
+    GenericOAuthenticator:
+      client_id: jupyterhub
+      client_secret: {{ jupyterhub_client_secret }}
+      authorize_url: https://keycloak.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/auth
+      token_url: https://keycloak.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token
+      userdata_url: https://keycloak.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/userinfo
+      scope: ['openid', 'profile', 'email']
+      username_key: preferred_username
+      admin_users: ['{{ admin_username }}']
+
+    # Dynamic profile generation from thinkube-control
     KubeSpawner:
       profile_list: |
+        import requests
+        import sys
+
         def get_profile_list(spawner):
-            # This function dynamically generates profiles based on available nodes
-            profiles = []
+            """Dynamically query thinkube-control for available images"""
+            try:
+                # Query thinkube-control API - NO FALLBACKS
+                response = requests.get(
+                    'http://thinkube-control-api.thinkube-control:8000/api/v1/images/jupyter',
+                    headers={'Accept': 'application/json'},
+                    timeout=10
+                )
 
-            # CPU-only profile (can run anywhere)
-            profiles.append({
-                'display_name': 'Development (CPU only)',
-                'description': 'General development and exploration',
-                'default': True,
-                'kubespawner_override': {
-                    'image': '{{ harbor_registry }}/library/jupyter-ml-cpu:latest',
-                    'cpu_limit': 4,
-                    'mem_limit': '8G'
-                }
-            })
+                if response.status_code != 200:
+                    print(f"FATAL: thinkube-control API returned {response.status_code}")
+                    sys.exit(1)  # Fail immediately - no fallbacks
 
-            # GPU profile (auto-selects available GPU node)
-            profiles.append({
-                'display_name': 'GPU Training - Auto-select',
-                'description': 'Automatically selects available GPU node',
-                'kubespawner_override': {
-                    'image': '{{ harbor_registry }}/library/jupyter-ml-gpu:latest',
-                    'node_selector': {'nvidia.com/gpu': 'true'},
-                    'extra_resource_limits': {'nvidia.com/gpu': '1'}
-                }
-            })
+                images = response.json()
+                profiles = []
 
-            # Fine-tuning profile
-            profiles.append({
-                'display_name': 'Fine-tuning (Unsloth)',
-                'description': 'Unsloth environment for model fine-tuning',
-                'kubespawner_override': {
-                    'image': '{{ harbor_registry }}/library/jupyter-unsloth:latest',
-                    'node_selector': {'nvidia.com/gpu': 'true'},
-                    'extra_resource_limits': {'nvidia.com/gpu': '1'},
-                    'cpu_limit': 8,
-                    'mem_limit': '32G'
-                }
-            })
+                for img in images:
+                    profile = {
+                        'display_name': img.get('display_name', img['name']),
+                        'description': img.get('description', ''),
+                        'kubespawner_override': {
+                            'image': f"{{ harbor_registry }}/library/{img['name']}:latest"
+                        }
+                    }
 
-            return profiles
+                    # Add GPU requirements if specified
+                    if img.get('metadata', {}).get('gpu_required'):
+                        profile['kubespawner_override']['node_selector'] = {'nvidia.com/gpu': 'true'}
+                        profile['kubespawner_override']['extra_resource_limits'] = {'nvidia.com/gpu': '1'}
+
+                    # Add resource recommendations
+                    if 'cpu_limit' in img.get('metadata', {}):
+                        profile['kubespawner_override']['cpu_limit'] = img['metadata']['cpu_limit']
+                    if 'mem_limit' in img.get('metadata', {}):
+                        profile['kubespawner_override']['mem_limit'] = img['metadata']['mem_limit']
+
+                    profiles.append(profile)
+
+                if not profiles:
+                    print("FATAL: No Jupyter images available from thinkube-control")
+                    sys.exit(1)  # Fail immediately - no images available
+
+                return profiles
+
+            except Exception as e:
+                print(f"FATAL: Failed to query thinkube-control: {e}")
+                sys.exit(1)  # Fail immediately on any error
 
         c.KubeSpawner.profile_list = get_profile_list
 
@@ -173,136 +219,152 @@ singleuser:
   extraNodeAffinity: {}
 ```
 
-### Phase 3: Custom Image Building (Day 5-6)
+### Phase 3: Custom Image Module (Separate from JupyterHub)
 
-#### 3.1 Base CPU Image
-```dockerfile
-# File: ansible/40_thinkube/core/harbor/base-images/jupyter-ml-cpu.Dockerfile.j2
-FROM {{ harbor_registry }}/library/jupyter-datascience-notebook:latest
+The custom-images module is completely independent and handles all Docker image building:
 
-RUN pip install --no-cache-dir \
-    pandas==2.1.4 \
-    scikit-learn==1.3.2 \
-    matplotlib==3.8.2 \
-    seaborn==0.13.0 \
-    jupyterlab-git==0.50.0 \
-    black==23.12.0 \
-    pytest==7.4.3 \
-    mlflow==2.9.2 \
-    boto3==1.34.0  # For SeaweedFS S3 API
+```yaml
+# File: ansible/40_thinkube/core/custom-images/10_build_jupyter_images.yaml
+---
+# This playbook is in the custom-images module, NOT in jupyterhub
+# Runs independently to build and push images to Harbor
+# Updates thinkube-control database after successful builds
 
-WORKDIR /home/jovyan
+- name: Build Jupyter Docker images
+  hosts: microk8s_control_plane
+  gather_facts: true
+  tasks:
+    - name: Build and push images to Harbor
+      include_tasks: build_single_image.yaml
+      loop:
+        - jupyter-ml-cpu
+        - jupyter-ml-gpu
+        - jupyter-agent-dev
+        - jupyter-fine-tuning
+
+    - name: Update thinkube-control database
+      uri:
+        url: "http://thinkube-control-api.thinkube-control:8000/api/v1/images"
+        method: POST
+        body_format: json
+        body:
+          name: "{{ item }}"
+          category: "jupyter"
+          tags: ["jupyter-compatible"]
+          metadata:
+            gpu_required: "{{ 'gpu' in item }}"
 ```
 
-#### 3.2 GPU-Enabled Image
-```dockerfile
-# File: ansible/40_thinkube/core/harbor/base-images/jupyter-ml-gpu.Dockerfile.j2
-FROM {{ harbor_registry }}/library/cuda:12.6.0-base-ubuntu24.04
+Images are built with pinned versions in requirements files:
 
-# Install Python and Jupyter
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip python3-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install JupyterLab and ML packages
-RUN pip install --no-cache-dir --break-system-packages \
-    jupyterlab==4.0.9 \
-    torch==2.1.2 --index-url https://download.pytorch.org/whl/cu121 \
-    transformers==4.36.2 \
-    accelerate==0.25.0 \
-    datasets==2.16.1 \
-    tensorboard==2.15.1 \
-    mlflow==2.9.2 \
-    boto3==1.34.0
-
-# Create jovyan user (JupyterHub convention)
-RUN useradd -m -s /bin/bash jovyan
-USER jovyan
-WORKDIR /home/jovyan
-```
-
-#### 3.3 Fine-tuning Image (Unsloth)
-```dockerfile
-# File: ansible/40_thinkube/core/harbor/base-images/jupyter-unsloth.Dockerfile.j2
-FROM {{ harbor_registry }}/library/jupyter-ml-gpu:latest
-
-USER root
-# Install Unsloth and fine-tuning tools
-RUN pip install --no-cache-dir --break-system-packages \
-    "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git" \
-    trl==0.7.7 \
-    peft==0.7.1 \
-    bitsandbytes==0.41.3 \
-    mlflow==2.9.2 \
-    aim==3.17.5  # Apache 2.0 alternative to wandb
-
-USER jovyan
-```
-
-### Phase 4: Integration with Thinkube-Control (Day 7-8)
-
-#### 4.1 Add Image Metadata
 ```python
-# File: thinkube-control/backend/app/db/seed_jupyter_images.py
-jupyter_images = [
-    {
-        "name": "jupyter-ml-cpu",
-        "category": "custom",
-        "tags": ["jupyter-compatible", "cpu-only"],
-        "description": "JupyterLab for CPU-based ML development",
-        "metadata": {
-            "jupyter_compatible": True,
-            "gpu_required": False,
-            "packages": ["scikit-learn", "pandas", "matplotlib"]
-        }
-    },
-    {
-        "name": "jupyter-ml-gpu",
-        "category": "custom",
-        "tags": ["jupyter-compatible", "gpu-required"],
-        "description": "JupyterLab with GPU support for deep learning",
-        "metadata": {
-            "jupyter_compatible": True,
-            "gpu_required": True,
-            "packages": ["torch", "transformers", "accelerate"]
-        }
-    },
-    {
-        "name": "jupyter-unsloth",
-        "category": "custom",
-        "tags": ["jupyter-compatible", "gpu-required", "fine-tuning"],
-        "description": "JupyterLab with Unsloth for model fine-tuning",
-        "metadata": {
-            "jupyter_compatible": True,
-            "gpu_required": True,
-            "memory_recommended": "32G",
-            "packages": ["unsloth", "trl", "peft", "bitsandbytes"]
-        }
-    }
-]
+# File: ansible/40_thinkube/core/custom-images/images/jupyter-ml-gpu/requirements.txt
+jupyterlab==4.2.5
+torch==2.4.1
+torchvision==0.19.1
+transformers==4.44.2
+accelerate==0.33.0
+datasets==2.21.0
+tensorboard==2.17.1
+mlflow==2.16.0
+nvitop==1.3.2
+jupyterlab-nvdashboard==0.11.0
 ```
 
-#### 4.2 Add JupyterHub Launch Button
+### Phase 4: Integration with Thinkube-Control
+
+#### 4.1 API Endpoint for Image Discovery
+```python
+# File: thinkube-control/backend/app/api/v1/images.py
+from fastapi import APIRouter, HTTPException
+from typing import List
+
+router = APIRouter()
+
+@router.get("/jupyter", response_model=List[ImageResponse])
+async def get_jupyter_images(db: AsyncSession = Depends(get_db)):
+    """Get all Jupyter-compatible images for dynamic profile generation"""
+    try:
+        result = await db.execute(
+            select(Image).where(
+                Image.tags.contains(["jupyter-compatible"]),
+                Image.is_active == True
+            )
+        )
+        images = result.scalars().all()
+
+        if not images:
+            # No fallback - fail if no images available
+            raise HTTPException(
+                status_code=503,
+                detail="No Jupyter images available"
+            )
+
+        return images
+    except Exception as e:
+        # No graceful degradation - fail immediately
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve images: {str(e)}"
+        )
+```
+
+#### 4.2 Image Management Interface
 ```vue
-<!-- File: thinkube-control/frontend/src/components/ImageActions.vue -->
+<!-- File: thinkube-control/frontend/src/views/CustomImages.vue -->
 <template>
-  <div class="image-actions">
-    <button
-      v-if="image.metadata?.jupyter_compatible"
-      @click="launchInJupyter"
-      class="btn btn-primary"
-    >
-      <Icon icon="mdi:jupyter" />
-      Launch in JupyterHub
-    </button>
+  <div class="custom-images">
+    <div class="tabs">
+      <button
+        @click="activeTab = 'jupyter'"
+        :class="{ active: activeTab === 'jupyter' }"
+      >
+        Jupyter Images
+      </button>
+      <button
+        @click="activeTab = 'other'"
+        :class="{ active: activeTab === 'other' }"
+      >
+        Other Images
+      </button>
+    </div>
+
+    <div v-if="activeTab === 'jupyter'" class="jupyter-images">
+      <div v-for="image in jupyterImages" :key="image.id" class="image-card">
+        <h3>{{ image.display_name }}</h3>
+        <p>{{ image.description }}</p>
+        <div class="metadata">
+          <span v-if="image.metadata.gpu_required" class="gpu-badge">
+            GPU Required
+          </span>
+          <span class="last-built">
+            Built: {{ formatDate(image.last_built) }}
+          </span>
+        </div>
+        <button
+          @click="rebuildImage(image.name)"
+          class="btn btn-secondary"
+        >
+          Rebuild
+        </button>
+      </div>
+    </div>
+
+    <div class="build-status" v-if="buildStatus">
+      <h4>Build Status: {{ buildStatus.status }}</h4>
+      <pre>{{ buildStatus.logs }}</pre>
+    </div>
   </div>
 </template>
 
 <script setup>
-const launchInJupyter = () => {
-  // Redirect to JupyterHub with image parameter
-  const jupyterUrl = `https://jupyter.${domain}/hub/spawn?image=${image.name}`
-  window.open(jupyterUrl, '_blank')
+const rebuildImage = async (imageName) => {
+  // Trigger rebuild via custom-images module
+  const response = await api.post('/api/v1/images/rebuild', {
+    image: imageName
+  })
+  // WebSocket will stream build logs
+  connectToBuildLogs(response.data.build_id)
 }
 </script>
 ```
@@ -394,72 +456,97 @@ echo "Repository $REPO_NAME synced successfully"
 
 ## Testing Plan
 
-### Week 3: Testing & Validation
+### Component Testing
 
-1. **Storage Testing**
-   - Verify notebook persistence across node restarts
-   - Test SeaweedFS performance for notebook operations
-   - Validate scratch space cleanup
+1. **Deployment Speed Testing**
+   - JupyterHub deployment must complete in < 2 minutes
+   - No image building during deployment
+   - Verify all dependencies available (fail if not)
 
-2. **GPU Scheduling Testing**
+2. **Dynamic Discovery Testing**
+   - Verify thinkube-control API returns images
+   - Test profile generation from API response
+   - Confirm no hardcoded image lists
+
+3. **Storage Testing**
+   - SeaweedFS must be available (no fallback to hostPath)
+   - Verify notebook persistence across pod restarts
+   - Test hybrid storage (SeaweedFS + local scratch)
+
+4. **Authentication Testing**
+   - Keycloak must authenticate users (no NullAuthenticator)
+   - Test failure when Keycloak unavailable
+   - Verify no fallback mechanisms
+
+5. **GPU Scheduling Testing**
    - Launch notebooks on different GPU nodes
-   - Verify GPU allocation and limits
-   - Test node selector functionality
+   - Verify no node affinity constraints
+   - Test GPU resource allocation
 
-3. **Image Testing**
-   - Test each custom image (CPU, GPU, Unsloth)
-   - Verify package installations
-   - Run sample ML workloads
+## Implementation Checklist
 
-4. **Integration Testing**
-   - Test launch from thinkube-control
-   - Verify Git synchronization workflow
-   - Test SeaweedFS data access
+### Custom Images Module (Separate Task)
+- [ ] Create ansible/40_thinkube/core/custom-images/ structure
+- [ ] Move Docker image definitions from JupyterHub
+- [ ] Create requirements.txt files with pinned versions
+- [ ] Implement build playbooks (20+ minute execution)
+- [ ] Add thinkube-control database update after builds
 
-## Migration Checklist
+### JupyterHub Deployment Module
+- [ ] Remove all image building tasks
+- [ ] Update values template with dynamic discovery
+- [ ] Implement Keycloak authentication (no fallbacks)
+- [ ] Configure SeaweedFS volumes (mandatory)
+- [ ] Test 2-minute deployment time
 
-- [ ] Backup existing JupyterHub notebooks (if any)
-- [ ] Create SeaweedFS volumes
-- [ ] Build and push custom images to Harbor
-- [ ] Update JupyterHub Helm values
-- [ ] Deploy updated JupyterHub
-- [ ] Test GPU node scheduling
-- [ ] Test notebook persistence
-- [ ] Update documentation
-- [ ] Create example notebooks
+### Thinkube-Control Integration
+- [ ] Create /api/v1/images/jupyter endpoint
+- [ ] Add image management UI
+- [ ] Implement rebuild triggers
+- [ ] Add WebSocket support for build logs
 
-## Risk Mitigation
+## Critical Requirements
 
-### Risk 1: SeaweedFS Performance
-**Mitigation**: Monitor notebook save/load times. If too slow, consider NFS as alternative.
-
-### Risk 2: Node Scheduling Issues
-**Mitigation**: Start with manual node selection, add auto-scheduling after testing.
-
-### Risk 3: Storage Compatibility
-**Mitigation**: Test SeaweedFS CSI driver thoroughly before migration.
+1. **No Fallbacks**: System must fail if dependencies unavailable
+2. **Fast Iteration**: 2-minute deployment, not 20+ minutes
+3. **Dynamic Configuration**: Runtime queries, not deployment-time
+4. **Separation of Concerns**: Images separate from deployment
+5. **Pinned Versions**: Requirements files for reproducibility
 
 ## Success Criteria
 
-1. ✅ JupyterHub pods can run on any GPU node
-2. ✅ Notebooks persist across node changes
-3. ✅ GPU resources properly allocated
-4. ✅ Custom images with ML frameworks working
-5. ✅ Integration with thinkube-control functional
-6. ✅ Data sync workflows documented and tested
+1. ✅ JupyterHub deployment completes in 2 minutes
+2. ✅ Images discovered dynamically from thinkube-control
+3. ✅ No fallback mechanisms - fails when dependencies unavailable
+4. ✅ Notebooks persist via SeaweedFS (mandatory)
+5. ✅ Hybrid storage working (SeaweedFS + local scratch)
+6. ✅ GPU pods schedulable on any GPU node
+7. ✅ Keycloak authentication mandatory
 
-## Notes
+## Architecture Benefits
 
-- All components are Apache 2.0 compatible
-- Single-user focus simplifies configuration
-- SeaweedFS provides the best balance of persistence and flexibility
-- Git remains the primary code synchronization method
-- Shared-code remains unchanged for CI/CD stability
+### Separation of Concerns
+- **custom-images**: Handles all Docker builds (slow, 20+ min)
+- **jupyterhub**: Only deploys, no building (fast, 2 min)
+- **thinkube-control**: Central image registry and management
 
-## Next Steps
+### Dynamic Runtime Configuration
+- No static image lists in deployment
+- Profiles generated from API at runtime
+- Images can be added/removed without redeployment
 
-After this plan is implemented, consider:
-1. Adding more specialized images (JAX, specific model architectures)
-2. Implementing notebook templates for common workflows
-3. Adding resource monitoring for GPU utilization
-4. Creating automated backup of notebooks to Git
+### Fast Development Cycle
+- Deploy JupyterHub in 2 minutes
+- Build images separately when needed
+- Update images without touching JupyterHub
+
+## Summary
+
+This architecture achieves all goals:
+- **Fast iteration**: 2-minute deployments
+- **No overengineering**: Simple, direct solutions
+- **No fallbacks**: Fails fast when dependencies unavailable
+- **Dynamic configuration**: Runtime discovery from thinkube-control
+- **Pinned versions**: Reproducible builds with requirements.txt
+- **GPU flexibility**: Runs on any GPU node
+- **Persistent storage**: SeaweedFS mandatory, no conditionals

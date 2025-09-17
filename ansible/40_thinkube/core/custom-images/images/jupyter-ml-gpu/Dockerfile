@@ -1,7 +1,8 @@
 # Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
 # SPDX-License-Identifier: Apache-2.0
 
-FROM {{ harbor_registry }}/library/cuda:12.6.0-runtime-ubuntu24.04
+ARG HARBOR_REGISTRY
+FROM ${HARBOR_REGISTRY}/library/cuda:12.6.0-runtime-ubuntu24.04
 
 # Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -23,49 +24,21 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
 
-# Install JupyterLab
-RUN pip install --no-cache-dir --break-system-packages \
-    jupyterlab \
-    ipywidgets \
-    jupyterlab-nvdashboard \
-    jupyter-server-terminals
+# Copy requirements file
+COPY requirements.txt /tmp/requirements.txt
 
-# Install PyTorch with CUDA support
+# Install PyTorch with CUDA support first
 RUN pip install --no-cache-dir --break-system-packages \
-    torch \
-    torchvision \
-    torchaudio \
+    torch==2.4.1 \
+    torchvision==0.19.1 \
+    torchaudio==2.4.1 \
     --index-url https://download.pytorch.org/whl/cu121
 
-# Install ML packages
-RUN pip install --no-cache-dir --break-system-packages \
-    transformers \
-    accelerate \
-    datasets \
-    bitsandbytes \
-    scipy \
-    sentencepiece \
-    safetensors
+# Install remaining packages from requirements
+RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
-# Install monitoring and utils
-RUN pip install --no-cache-dir --break-system-packages \
-    mlflow \
-    tensorboard \
-    wandb \
-    nvitop \
-    litellm \
-    gpustat
-
-# Install data science packages
-RUN pip install --no-cache-dir --break-system-packages \
-    numpy \
-    pandas \
-    matplotlib \
-    seaborn \
-    scikit-learn
-
-# Create jovyan user
-RUN useradd -m -s /bin/bash -u 1000 jovyan && \
+# Create jovyan user (check if user with UID 1000 exists first)
+RUN id -u 1000 &>/dev/null || useradd -m -s /bin/bash -u 1000 jovyan; \
     echo "jovyan ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 USER jovyan

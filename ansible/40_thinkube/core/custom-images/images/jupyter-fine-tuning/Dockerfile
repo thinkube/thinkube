@@ -1,7 +1,8 @@
 # Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
 # SPDX-License-Identifier: Apache-2.0
 
-FROM {{ harbor_registry }}/library/jupyter-ml-gpu:latest
+ARG HARBOR_REGISTRY
+FROM ${HARBOR_REGISTRY}/library/jupyter-ml-gpu:latest
 
 USER root
 
@@ -10,30 +11,15 @@ RUN apt-get update && apt-get install -y \
     ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Unsloth and dependencies
-# Note: Using pip install from git for latest version
-RUN pip install --no-cache-dir --break-system-packages \
-    "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git" \
-    trl \
-    peft \
-    loralib \
-    einops \
-    xformers \
-    ninja
+# Copy requirements file
+COPY requirements.txt /tmp/finetuning-requirements.txt
 
-# Install additional fine-tuning tools
-RUN pip install --no-cache-dir --break-system-packages \
-    deepspeed \
-    triton \
-    aim \
-    evaluate \
-    rouge-score \
-    bert-score
+# Install fine-tuning packages from requirements
+RUN pip install --no-cache-dir --break-system-packages -r /tmp/finetuning-requirements.txt
 
-# Install quantization tools
+# Install Unsloth from git (not in requirements due to git dependency)
 RUN pip install --no-cache-dir --break-system-packages \
-    auto-gptq \
-    optimum
+    "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 
 # Copy example notebooks (will be added during build)
 COPY --chown=jovyan:jovyan notebooks/fine-tuning /home/jovyan/examples/fine-tuning || true

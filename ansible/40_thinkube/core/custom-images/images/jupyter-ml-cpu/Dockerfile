@@ -12,42 +12,11 @@ RUN apt-get update && apt-get install -y \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install JupyterLab and extensions
-RUN pip install --no-cache-dir --break-system-packages \
-    jupyterlab \
-    ipywidgets \
-    jupyterlab-git \
-    jupyterlab-lsp \
-    python-lsp-server[all] \
-    jupyter-server-terminals
+# Copy requirements file
+COPY requirements.txt /tmp/requirements.txt
 
-# Install data science packages
-RUN pip install --no-cache-dir --break-system-packages \
-    numpy \
-    pandas \
-    matplotlib \
-    seaborn \
-    scikit-learn \
-    plotly \
-    scipy
-
-# Install ML/AI packages
-RUN pip install --no-cache-dir --break-system-packages \
-    transformers \
-    datasets \
-    tokenizers \
-    sentence-transformers \
-    huggingface-hub
-
-# Install utility packages
-RUN pip install --no-cache-dir --break-system-packages \
-    python-dotenv \
-    requests \
-    boto3 \
-    mlflow \
-    litellm \
-    pyyaml \
-    rich
+# Install all packages from requirements
+RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
 # Create jovyan user (JupyterHub convention)
 RUN useradd -m -s /bin/bash -u 1000 jovyan && \

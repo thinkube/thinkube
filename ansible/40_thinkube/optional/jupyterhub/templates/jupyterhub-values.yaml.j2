@@ -1,150 +1,116 @@
 # Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# JupyterHub Helm chart values with GPU flexibility and hybrid storage
-# This configuration enables notebooks to run on any node with persistence
+# JupyterHub Helm chart values with dynamic image discovery
+# Images discovered at runtime from thinkube-control API
+# No fallbacks - fails if dependencies unavailable
 
 hub:
   config:
+    JupyterHub:
+      # MANDATORY: Keycloak authentication only - no fallbacks
+      authenticator_class: generic-oauth
+      admin_access: true
+      admin_users:
+        - {{ admin_username }}
+      allow_named_servers: false
+      shutdown_on_logout: true
+
     # Keycloak authentication is mandatory
     GenericOAuthenticator:
-      client_id: "{{ client_id }}"
-      client_secret: "{{ client_secret }}"
-      oauth_callback_url: "{{ oauth_callback_url }}"
-      authorize_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/auth"
-      token_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
-      userdata_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/userinfo"
+      client_id: jupyterhub
+      client_secret: "{{ jupyterhub_client_secret }}"
+      oauth_callback_url: "https://jupyter.{{ domain_name }}/hub/oauth_callback"
+      authorize_url: "https://keycloak.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/auth"
+      token_url: "https://keycloak.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
+      userdata_url: "https://keycloak.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/userinfo"
       login_service: "Keycloak"
       username_claim: "preferred_username"
       scope:
         - "openid"
         - "profile"
         - "email"
-      allow_all: true
-
-    JupyterHub:
-      authenticator_class: generic-oauth
-      admin_access: true
-      admin_users:
+      allow_all: false
+      allowed_users:
         - {{ admin_username }}
-      allow_named_servers: true
-      shutdown_on_logout: true
 
   extraConfig:
-    00-dns-settings: |
-      # Set DNS settings for spawned pods
-      c.KubeSpawner.extra_pod_config = {
-          'dnsPolicy': 'ClusterFirst',
-          'dnsConfig': {
-              'searches': [
-                  'svc.cluster.local',
-                  'cluster.local'
-              ]
-          }
-      }
-
-    01-default-url: |
+    00-default-url: |
       # Set default URL to JupyterLab
       c.Spawner.default_url = '/lab'
 
-    02-gpu-profile-generator: |
-      import subprocess
-      import json
-      import os
+    01-dynamic-profile-generator: |
+      # Dynamic profile generation from thinkube-control API
+      # NO FALLBACKS - fails if API unavailable
+      import requests
+      import sys
+      import logging
 
-      def get_gpu_nodes():
-          """Get list of nodes with GPUs"""
+      def get_profile_list(spawner):
+          """Dynamically query thinkube-control for available Jupyter images"""
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+
           try:
-              result = subprocess.run(
-                  ['kubectl', 'get', 'nodes', '-l', 'nvidia.com/gpu=true', '-o', 'json'],
-                  capture_output=True, text=True, timeout=5
+              # Query thinkube-control API - NO FALLBACKS
+              logger.info("Querying thinkube-control for available images...")
+              response = requests.get(
+                  'http://thinkube-control-api.thinkube-control:8000/api/v1/images/jupyter',
+                  headers={'Accept': 'application/json'},
+                  timeout=10
               )
-              if result.returncode == 0:
-                  nodes_data = json.loads(result.stdout)
-                  gpu_nodes = []
-                  for node in nodes_data.get('items', []):
-                      name = node['metadata']['name']
-                      gpu_count = node['status'].get('capacity', {}).get('nvidia.com/gpu', '0')
-                      gpu_nodes.append({'name': name, 'gpus': gpu_count})
-                  return gpu_nodes
+
+              if response.status_code != 200:
+                  logger.error(f"FATAL: thinkube-control API returned {response.status_code}")
+                  sys.exit(1)  # Fail immediately - no fallbacks
+
+              images = response.json()
+              profiles = []
+
+              for img in images:
+                  logger.info(f"Adding profile for image: {img.get('name')}")
+                  profile = {
+                      'display_name': img.get('display_name', img['name']),
+                      'description': img.get('description', ''),
+                      'default': img.get('default', False),
+                      'kubespawner_override': {
+                          'image': f"{{ harbor_registry }}/library/{img['name']}:latest",
+                          'image_pull_policy': 'Always'
+                      }
+                  }
+
+                  # Add GPU requirements if specified
+                  if img.get('metadata', {}).get('gpu_required'):
+                      profile['kubespawner_override']['node_selector'] = {'nvidia.com/gpu': 'true'}
+                      profile['kubespawner_override']['extra_resource_limits'] = {'nvidia.com/gpu': '1'}
+                      profile['kubespawner_override']['extra_resource_guarantees'] = {'nvidia.com/gpu': '1'}
+
+                  # Add resource recommendations
+                  if 'cpu_limit' in img.get('metadata', {}):
+                      profile['kubespawner_override']['cpu_limit'] = img['metadata']['cpu_limit']
+                  if 'mem_limit' in img.get('metadata', {}):
+                      profile['kubespawner_override']['mem_limit'] = img['metadata']['mem_limit']
+
+                  profiles.append(profile)
+
+              if not profiles:
+                  logger.error("FATAL: No Jupyter images available from thinkube-control")
+                  sys.exit(1)  # Fail immediately - no images available
+
+              logger.info(f"Successfully loaded {len(profiles)} profiles")
+              return profiles
+
+          except requests.exceptions.RequestException as e:
+              logger.error(f"FATAL: Failed to connect to thinkube-control: {e}")
+              sys.exit(1)  # Fail immediately on connection error
           except Exception as e:
-              print(f"Error getting GPU nodes: {e}")
-          return []
+              logger.error(f"FATAL: Unexpected error querying thinkube-control: {e}")
+              sys.exit(1)  # Fail immediately on any error
 
-      # Generate profiles dynamically
-      c.KubeSpawner.profile_list = []
-
-      # CPU profiles (can run anywhere)
-      c.KubeSpawner.profile_list.append({
-          'display_name': '📚 Standard Environment (CPU)',
-          'description': 'JupyterLab with standard data science packages',
-          'default': True,
-          'kubespawner_override': {
-              'image': '{{ harbor_registry }}/library/jupyter-ml-cpu:latest',
-              'cpu_limit': 4,
-              'cpu_guarantee': 1,
-              'mem_limit': '8G',
-              'mem_guarantee': '2G'
-          }
-      })
-
-      # GPU auto-select profile
-      c.KubeSpawner.profile_list.append({
-          'display_name': '🚀 GPU Environment (Auto-select)',
-          'description': 'Automatically finds available GPU',
-          'kubespawner_override': {
-              'image': '{{ harbor_registry }}/library/jupyter-ml-gpu:latest',
-              'node_selector': {'nvidia.com/gpu': 'true'},
-              'extra_resource_limits': {'nvidia.com/gpu': '1'},
-              'extra_resource_guarantees': {'nvidia.com/gpu': '1'},
-              'cpu_limit': 8,
-              'mem_limit': '16G'
-          }
-      })
-
-      # Fine-tuning profile
-      c.KubeSpawner.profile_list.append({
-          'display_name': '🔧 Fine-tuning (Unsloth + QLoRA)',
-          'description': 'Optimized for LLM fine-tuning with 4-bit quantization',
-          'kubespawner_override': {
-              'image': '{{ harbor_registry }}/library/jupyter-fine-tuning:latest',
-              'node_selector': {'nvidia.com/gpu': 'true'},
-              'extra_resource_limits': {'nvidia.com/gpu': '1'},
-              'extra_resource_guarantees': {'nvidia.com/gpu': '1'},
-              'cpu_limit': 8,
-              'mem_limit': '32G',
-              'mem_guarantee': '8G'
-          }
-      })
-
-      # Agent development profile
-      c.KubeSpawner.profile_list.append({
-          'display_name': '🤖 Agent Development (LangChain)',
-          'description': 'LangChain, CrewAI, and agent tools',
-          'kubespawner_override': {
-              'image': '{{ harbor_registry }}/library/jupyter-agent-dev:latest',
-              'cpu_limit': 4,
-              'mem_limit': '8G'
-          }
-      })
-
-      # Add specific GPU node profiles
-      gpu_nodes = get_gpu_nodes()
-      for node in gpu_nodes:
-          c.KubeSpawner.profile_list.append({
-              'display_name': f"💻 GPU on {node['name']} ({node['gpus']} GPUs)",
-              'description': f"Run specifically on {node['name']}",
-              'kubespawner_override': {
-                  'image': '{{ harbor_registry }}/library/jupyter-ml-gpu:latest',
-                  'node_selector': {'kubernetes.io/hostname': node['name']},
-                  'extra_resource_limits': {'nvidia.com/gpu': '1'},
-                  'cpu_limit': 8,
-                  'mem_limit': '16G'
-              }
-          })
+      c.KubeSpawner.profile_list = get_profile_list
 
 proxy:
-  secretToken: "{{ proxy_secretToken }}"
+  secretToken: "{{ jupyterhub_proxy_token | default(lookup('password', '/dev/null chars=hex_digits length=64')) }}"
   service:
     type: ClusterIP
   https:
@@ -152,71 +118,62 @@ proxy:
   chp:
     pdb:
       enabled: false
-    extraCommandLineFlags: []
+    extraCommandLineFlags:
+      - "--websocket-max-frame-size=104857600"
+      - "--websocket-ping-interval=30000"
+      - "--websocket-ping-timeout=60000"
 
 singleuser:
   defaultUrl: "/lab"
 
-  # Remove old hostPath storage configuration
+  # MANDATORY: SeaweedFS storage - no fallbacks
   storage:
-    type: none  # We'll define volumes manually
+    type: none  # We define volumes manually
 
-  # Extra volumes for hybrid storage approach
+  # Hybrid storage approach: SeaweedFS (persistent) + local scratch (performance)
   extraVolumes:
-    # SeaweedFS for persistent notebooks
-    - name: notebooks-persistent
+    # SeaweedFS for persistent notebooks (MANDATORY)
+    - name: notebooks
       persistentVolumeClaim:
         claimName: jupyter-notebooks-pvc
 
-    # SeaweedFS for datasets
-    - name: datasets-persistent
+    # SeaweedFS for datasets (MANDATORY)
+    - name: datasets
       persistentVolumeClaim:
         claimName: jupyter-datasets-pvc
 
-    # SeaweedFS for models
-    - name: models-persistent
+    # SeaweedFS for models (MANDATORY)
+    - name: models
       persistentVolumeClaim:
         claimName: jupyter-models-pvc
 
     # Local scratch for fast I/O (per-pod temporary)
     - name: scratch
       emptyDir:
-        sizeLimit: 50Gi
-
-    # Optional: Read-only reference to shared-code (only works on control plane)
-    - name: shared-code-ref
-      hostPath:
-        path: {{ code_source_path | default('/home/' + system_username + '/shared-code') }}
-        type: DirectoryOrCreate
+        sizeLimit: 100Gi
 
   extraVolumeMounts:
-    # Primary notebook storage (SeaweedFS)
-    - name: notebooks-persistent
+    # Primary notebook storage (SeaweedFS - persistent across nodes)
+    - name: notebooks
       mountPath: /home/jovyan/notebooks
 
-    # Datasets directory (SeaweedFS)
-    - name: datasets-persistent
+    # Datasets directory (SeaweedFS - persistent across nodes)
+    - name: datasets
       mountPath: /home/jovyan/datasets
 
-    # Models directory (SeaweedFS)
-    - name: models-persistent
+    # Models directory (SeaweedFS - persistent across nodes)
+    - name: models
       mountPath: /home/jovyan/models
 
-    # Fast local scratch space
+    # Fast local scratch space (emptyDir - temporary)
     - name: scratch
       mountPath: /home/jovyan/scratch
 
-    # Reference mount (will fail gracefully on non-control nodes)
-    - name: shared-code-ref
-      mountPath: /home/jovyan/shared-code-reference
-      readOnly: true
-      mountPropagation: HostToContainer
-
-  # Remove all node restrictions to allow scheduling on any node
+  # Remove all node restrictions to allow scheduling on any GPU node
   nodeSelector: {}
   extraNodeAffinity: {}
 
-  # Enable GPU support by default
+  # Enable GPU support
   extraEnv:
     - name: NVIDIA_VISIBLE_DEVICES
       value: "all"
@@ -224,14 +181,29 @@ singleuser:
       value: "compute,utility"
     - name: JUPYTER_ENABLE_LAB
       value: "yes"
+    - name: GRANT_SUDO
+      value: "yes"
 
-  # Resource limits (can be overridden by profiles)
+  # Default resource limits (overridden by dynamic profiles)
   cpu:
     limit: 4
-    guarantee: 0.5
+    guarantee: 1
   memory:
     limit: 8G
-    guarantee: 1G
+    guarantee: 2G
+
+  # Allow privilege escalation for sudo
+  allowPrivilegeEscalation: true
+
+  # Network policy
+  networkPolicy:
+    enabled: false
+
+  # Image pull policy
+  imagePullPolicy: Always
+
+  # Start timeout (5 minutes for image pull)
+  startTimeout: 300
 
   # Lifecycle hooks for directory setup
   lifecycleHooks:
@@ -245,30 +217,13 @@ singleuser:
             mkdir -p /home/jovyan/notebooks/{projects,experiments,agents,fine-tuning}
             mkdir -p /home/jovyan/datasets/{raw,processed,embeddings}
             mkdir -p /home/jovyan/models/{checkpoints,production,fine-tuned}
-            # Install user packages if defined
-            if [ -f /home/jovyan/.user-packages ]; then
-              pip install --user -r /home/jovyan/.user-packages;
-            fi
+            mkdir -p /home/jovyan/scratch/tmp
 
-# Ingress configuration
+# Ingress is handled separately in the deployment playbook
 ingress:
-  enabled: true
-  ingressClassName: {{ primary_ingress_class }}
-  hosts:
-    - "{{ hostname }}"
-  annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "1024m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
-    nginx.ingress.kubernetes.io/proxy-buffer-size: "8k"
-    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
-    nginx.ingress.kubernetes.io/proxy-set-headers: "{{ ingress_namespace }}/websocket-headers"
-  tls:
-    - hosts:
-        - "{{ hostname }}"
-      secretName: "{{ tls_secret }}"
+  enabled: false
 
-# Scheduling configuration
+# Scheduling configuration (disabled for simplicity)
 scheduling:
   userScheduler:
     enabled: false
@@ -276,3 +231,25 @@ scheduling:
     enabled: false
   userPlaceholder:
     enabled: false
+
+# Pre-puller configuration (disabled - images pulled on demand)
+prePuller:
+  hook:
+    enabled: false
+  continuous:
+    enabled: false
+
+# Culling configuration
+cull:
+  enabled: true
+  timeout: 3600  # 1 hour idle timeout
+  every: 600  # Check every 10 minutes
+  maxAge: 0  # Don't cull based on age
+
+# Debug mode (disable in production)
+debug:
+  enabled: false
+
+# Global configuration
+global:
+  safeToShowValues: false

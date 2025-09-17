@@ -1,16 +1,34 @@
-# JupyterHub Implementation Plan - GPU Flexibility & Custom Images
+# JupyterHub Implementation Plan - GPU Flexibility & Dynamic Images
 
 ## Overview
 
-This plan focuses exclusively on implementing JupyterHub enhancements to enable GPU flexibility and custom AI/ML images. This is the most complex component with the least available examples.
+This plan implements JupyterHub with GPU flexibility and dynamic image discovery from thinkube-control. Image building is completely separated into a dedicated Custom Images module.
 
-## Core Challenge
+## Architecture Changes
 
-Current JupyterHub is locked to control plane node due to shared-code mounting. We need to:
+### Separation of Concerns
+1. **JupyterHub Module** (`/ansible/40_thinkube/optional/jupyterhub/`)
+   - Focus: Deployment and configuration only
+   - Time: 2-minute deployments (down from 20+ minutes)
+   - No image building
+
+2. **Custom Images Module** (`/ansible/40_thinkube/optional/custom-images/`)
+   - Focus: Generic image build framework
+   - Includes: Jupyter, CI/CD runners, development environments
+   - Independent execution
+
+### Dynamic Image Discovery
+JupyterHub queries thinkube-control API at runtime for available images:
+- No redeployment needed when images change
+- Profiles generated dynamically per user session
+- thinkube-control is single source of truth
+
+## Core Requirements
+
 1. Enable notebooks to run on ANY GPU node
-2. Create custom images for different AI workloads (fine-tuning, agents, etc.)
-3. Allow dynamic image selection
-4. Maintain notebook persistence across nodes
+2. Dynamic image selection from thinkube-control
+3. Maintain notebook persistence across nodes via SeaweedFS
+4. **No fallbacks** - fail if dependencies unavailable
 
 ## Phase 1: Storage Architecture Change (Days 1-2)
 
@@ -176,118 +194,105 @@ singleuser:
       value: "compute,utility"
 ```
 
-### 2.2 Dynamic Profile Generation
+### 2.2 Dynamic Profile Generation from thinkube-control
 
 ```yaml
 # Continuation of jupyterhub-values.yaml.j2
 hub:
   extraConfig:
     01-profile-generator: |
-      import subprocess
+      import requests
       import json
       import os
+      import sys
+
+      def get_available_images():
+          """Query thinkube-control for available Jupyter images"""
+          try:
+              # Call thinkube-control API
+              response = requests.get(
+                  'http://thinkube-control-api.thinkube-control:8000/api/v1/images/jupyter',
+                  headers={'Accept': 'application/json'},
+                  timeout=10
+              )
+
+              if response.status_code != 200:
+                  print(f"ERROR: thinkube-control API returned {response.status_code}")
+                  sys.exit(1)  # Fail fast - no fallbacks
+
+              return response.json()
+          except requests.exceptions.RequestException as e:
+              print(f"FATAL: Cannot connect to thinkube-control API: {e}")
+              sys.exit(1)  # Fail fast - no fallbacks
 
       def get_gpu_nodes():
-          """Get list of nodes with GPUs"""
+          """Get list of nodes with GPUs from thinkube-control"""
           try:
-              result = subprocess.run(
-                  ['kubectl', 'get', 'nodes', '-l', 'nvidia.com/gpu=true', '-o', 'json'],
-                  capture_output=True, text=True, timeout=5
+              response = requests.get(
+                  'http://thinkube-control-api.thinkube-control:8000/api/v1/nodes/gpu',
+                  timeout=5
               )
-              if result.returncode == 0:
-                  nodes_data = json.loads(result.stdout)
-                  gpu_nodes = []
-                  for node in nodes_data.get('items', []):
-                      name = node['metadata']['name']
-                      gpu_count = node['status'].get('capacity', {}).get('nvidia.com/gpu', '0')
-                      gpu_nodes.append({'name': name, 'gpus': gpu_count})
-                  return gpu_nodes
-          except Exception as e:
-              print(f"Error getting GPU nodes: {e}")
+              if response.status_code == 200:
+                  return response.json()
+          except:
+              pass
           return []
 
-      def get_custom_images():
-          """Get available custom images from Harbor"""
-          # This would query Harbor API or thinkube-control
-          # For now, return static list
-          return [
-              {'name': 'jupyter-ml-cpu', 'tag': 'latest', 'gpu': False},
-              {'name': 'jupyter-ml-gpu', 'tag': 'latest', 'gpu': True},
-              {'name': 'jupyter-fine-tuning', 'tag': 'latest', 'gpu': True},
-              {'name': 'jupyter-agent-dev', 'tag': 'latest', 'gpu': False}
-          ]
+      # Get available images from thinkube-control (REQUIRED)
+      images = get_available_images()
 
-      # Generate profiles dynamically
+      if not images:
+          print("FATAL: No Jupyter images available from thinkube-control")
+          sys.exit(1)  # Fail fast - no fallbacks
+
+      # Generate profiles dynamically based on available images
       c.KubeSpawner.profile_list = []
 
-      # CPU profiles (can run anywhere)
-      c.KubeSpawner.profile_list.append({
-          'display_name': '📚 Standard Environment (CPU)',
-          'description': 'JupyterLab with standard data science packages',
-          'default': True,
-          'kubespawner_override': {
-              'image': '{{ harbor_registry }}/library/jupyter-ml-cpu:latest',
-              'cpu_limit': 4,
-              'cpu_guarantee': 1,
-              'mem_limit': '8G',
-              'mem_guarantee': '2G'
+      for image in images:
+          profile = {
+              'display_name': image.get('display_name', image['name']),
+              'description': image.get('description', ''),
+              'kubespawner_override': {
+                  'image': image['full_path'],
+                  'cpu_limit': image.get('cpu_limit', 4),
+                  'cpu_guarantee': image.get('cpu_guarantee', 1),
+                  'mem_limit': image.get('mem_limit', '8G'),
+                  'mem_guarantee': image.get('mem_guarantee', '2G')
+              }
           }
-      })
 
-      # GPU auto-select profile
-      c.KubeSpawner.profile_list.append({
-          'display_name': '🚀 GPU Environment (Auto-select)',
-          'description': 'Automatically finds available GPU',
-          'kubespawner_override': {
-              'image': '{{ harbor_registry }}/library/jupyter-ml-gpu:latest',
-              'node_selector': {'nvidia.com/gpu': 'true'},
-              'extra_resource_limits': {'nvidia.com/gpu': '1'},
-              'extra_resource_guarantees': {'nvidia.com/gpu': '1'},
-              'cpu_limit': 8,
-              'mem_limit': '16G'
-          }
-      })
+          # Add GPU resources if needed
+          if image.get('gpu_required'):
+              profile['kubespawner_override'].update({
+                  'node_selector': {'nvidia.com/gpu': 'true'},
+                  'extra_resource_limits': {'nvidia.com/gpu': '1'},
+                  'extra_resource_guarantees': {'nvidia.com/gpu': '1'}
+              })
 
-      # Fine-tuning profile
-      c.KubeSpawner.profile_list.append({
-          'display_name': '🔧 Fine-tuning (Unsloth + QLoRA)',
-          'description': 'Optimized for LLM fine-tuning with 4-bit quantization',
-          'kubespawner_override': {
-              'image': '{{ harbor_registry }}/library/jupyter-fine-tuning:latest',
-              'node_selector': {'nvidia.com/gpu': 'true'},
-              'extra_resource_limits': {'nvidia.com/gpu': '1'},
-              'extra_resource_guarantees': {'nvidia.com/gpu': '1'},
-              'cpu_limit': 8,
-              'mem_limit': '32G',
-              'mem_guarantee': '8G'
-          }
-      })
+          # Set default profile
+          if image.get('default'):
+              profile['default'] = True
 
-      # Agent development profile
-      c.KubeSpawner.profile_list.append({
-          'display_name': '🤖 Agent Development (LangChain)',
-          'description': 'LangChain, CrewAI, and agent tools',
-          'kubespawner_override': {
-              'image': '{{ harbor_registry }}/library/jupyter-agent-dev:latest',
-              'cpu_limit': 4,
-              'mem_limit': '8G'
-          }
-      })
+          c.KubeSpawner.profile_list.append(profile)
 
-      # Add specific GPU node profiles
+      # Add specific GPU node profiles if available
       gpu_nodes = get_gpu_nodes()
       for node in gpu_nodes:
-          c.KubeSpawner.profile_list.append({
-              'display_name': f"💻 GPU on {node['name']} ({node['gpus']} GPUs)",
-              'description': f"Run specifically on {node['name']}",
-              'kubespawner_override': {
-                  'image': '{{ harbor_registry }}/library/jupyter-ml-gpu:latest',
-                  'node_selector': {'kubernetes.io/hostname': node['name']},
-                  'extra_resource_limits': {'nvidia.com/gpu': '1'},
-                  'cpu_limit': 8,
-                  'mem_limit': '16G'
-              }
-          })
+          # Only add if we have GPU images
+          gpu_images = [img for img in images if img.get('gpu_required')]
+          if gpu_images:
+              default_gpu_image = gpu_images[0]
+              c.KubeSpawner.profile_list.append({
+                  'display_name': f"💻 GPU on {node['name']} ({node['gpu_count']} GPUs)",
+                  'description': f"Run specifically on {node['name']}",
+                  'kubespawner_override': {
+                      'image': default_gpu_image['full_path'],
+                      'node_selector': {'kubernetes.io/hostname': node['name']},
+                      'extra_resource_limits': {'nvidia.com/gpu': '1'},
+                      'cpu_limit': 8,
+                      'mem_limit': '16G'
+                  }
+              })
 ```
 
 ## Phase 3: Custom Image Creation (Days 5-7)
