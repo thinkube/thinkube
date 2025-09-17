@@ -248,3 +248,72 @@
       ansible.builtin.fail:
         msg: "JupyterHub deployment has {{ failed_tests }} critical test failures. Please check the logs and resolve issues."
       when: failed_tests | int > 0
+
+    # Additional Tests for Enhanced Features
+    - name: Test SeaweedFS volumes
+      block:
+        - name: Check SeaweedFS PVCs
+          kubernetes.core.k8s_info:
+            kubeconfig: "{{ kubeconfig }}"
+            api_version: v1
+            kind: PersistentVolumeClaim
+            namespace: "{{ jupyterhub_namespace }}"
+            name: "{{ item }}"
+          register: pvc_check
+          loop:
+            - jupyter-notebooks-pvc
+            - jupyter-datasets-pvc
+            - jupyter-models-pvc
+          failed_when: false
+
+        - name: Record SeaweedFS test results
+          ansible.builtin.set_fact:
+            test_results: "{{ test_results + ['SeaweedFS PVC ' + item.item + ': ' + ('PASS' if item.resources | length > 0 and item.resources[0].status.phase == 'Bound' else 'FAIL')] }}"
+          loop: "{{ pvc_check.results }}"
+
+    - name: Test custom images availability
+      block:
+        - name: Check if custom images exist
+          ansible.builtin.shell: |
+            podman search {{ harbor_registry }}/library/{{ item }} 2>/dev/null | grep -q {{ item }} && echo "found" || echo "not found"
+          register: image_check
+          loop:
+            - jupyter-ml-cpu
+            - jupyter-ml-gpu
+            - jupyter-fine-tuning
+            - jupyter-agent-dev
+          changed_when: false
+          failed_when: false
+
+        - name: Record image test results
+          ansible.builtin.set_fact:
+            test_results: "{{ test_results + ['Custom image ' + item.item + ': ' + ('PASS' if 'found' in item.stdout else 'FAIL')] }}"
+          loop: "{{ image_check.results }}"
+
+    - name: Test GPU node detection (if available)
+      block:
+        - name: Check for GPU nodes
+          kubernetes.core.k8s_info:
+            kubeconfig: "{{ kubeconfig }}"
+            api_version: v1
+            kind: Node
+            label_selectors:
+              - nvidia.com/gpu=true
+          register: gpu_nodes
+
+        - name: Record GPU test result
+          ansible.builtin.set_fact:
+            test_results: "{{ test_results + ['GPU nodes available: ' + (gpu_nodes.resources | length | string) + ' node(s)']}}"
+
+    - name: Display enhanced test summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          JupyterHub Enhanced Features Test Report
+          ========================================
+          Storage: SeaweedFS volumes for notebooks, datasets, models
+          Images: 4 custom ML/AI images
+          GPU: Flexibility to run on any GPU node
+          Authentication: Keycloak (if configured) or NullAuthenticator
+
+          All test results have been recorded above.

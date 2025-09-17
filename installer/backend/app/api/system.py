@@ -163,7 +163,6 @@ async def check_installation_state():
         "ansible_installed": False,
         "thinkube_repo_cloned": False,
         "ssh_keys_configured": False,
-        "lxd_installed": False,
         "microk8s_installed": False,
         "kubernetes_running": False,
         "services_deployed": [],
@@ -204,23 +203,6 @@ async def check_installation_state():
         if env_file.exists() and inventory_file.exists():
             state["environment_setup"] = True
         
-        # Check if LXD is installed and configured
-        result = await asyncio.create_subprocess_exec(
-            'which', 'lxc',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await result.communicate()
-        if result.returncode == 0:
-            # Check if LXD is actually configured
-            result = await asyncio.create_subprocess_exec(
-                'lxc', 'list',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            await result.communicate()
-            if result.returncode == 0:
-                state["lxd_installed"] = True
         
         # Check if MicroK8s is installed
         result = await asyncio.create_subprocess_exec(
@@ -266,7 +248,6 @@ async def check_installation_state():
             state["ansible_installed"] and
             state["thinkube_repo_cloned"] and
             state["ssh_keys_configured"] and
-            state["lxd_installed"] and
             state["kubernetes_running"] and
             len(state["services_deployed"]) >= 3  # At least 3 core services
         )
@@ -809,22 +790,6 @@ async def check_thinkube_installation():
         "details": []
     }
     
-    # Check for LXD VMs (tkc, tkw1, etc)
-    try:
-        result = await asyncio.create_subprocess_exec(
-            'lxc', 'list', '--format=json',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await result.communicate()
-        if stdout:
-            vms = json.loads(stdout.decode())
-            thinkube_vms = [vm['name'] for vm in vms if vm['name'] in ['tkc', 'tkw1', 'dns1']]
-            if thinkube_vms:
-                markers["installed"] = True
-                markers["details"].append(f"Found LXD VMs: {', '.join(thinkube_vms)}")
-    except:
-        pass
     
     # Check for MicroK8s
     try:

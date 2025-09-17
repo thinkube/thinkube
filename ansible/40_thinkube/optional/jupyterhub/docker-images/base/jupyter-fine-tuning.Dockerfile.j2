@@ -1,0 +1,55 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+FROM {{ harbor_registry }}/library/jupyter-ml-gpu:latest
+
+USER root
+
+# Install additional system dependencies for Unsloth
+RUN apt-get update && apt-get install -y \
+    ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Unsloth and dependencies
+# Note: Using pip install from git for latest version
+RUN pip install --no-cache-dir \
+    "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git" \
+    trl==0.7.7 \
+    peft==0.7.1 \
+    loralib==0.1.2 \
+    einops==0.7.0 \
+    xformers==0.0.23.post1 \
+    ninja==1.11.1.1
+
+# Install additional fine-tuning tools
+RUN pip install --no-cache-dir \
+    deepspeed==0.12.6 \
+    triton==2.1.0 \
+    aim==3.17.5 \
+    evaluate==0.4.1 \
+    rouge-score==0.1.2 \
+    bert-score==0.3.13
+
+# Install quantization tools
+RUN pip install --no-cache-dir \
+    auto-gptq==0.6.0 \
+    optimum==1.16.1
+
+# Copy example notebooks (will be added during build)
+COPY --chown=jovyan:jovyan notebooks/fine-tuning /home/jovyan/examples/fine-tuning || true
+
+USER jovyan
+
+# Create fine-tuning specific directories
+RUN mkdir -p /home/jovyan/notebooks/fine-tuning \
+    && mkdir -p /home/jovyan/notebooks/models \
+    && mkdir -p /home/jovyan/notebooks/datasets \
+    && mkdir -p /home/jovyan/notebooks/checkpoints
+
+# Add environment variables for fine-tuning
+ENV TRANSFORMERS_CACHE=/home/jovyan/models/cache
+ENV HF_HOME=/home/jovyan/models/huggingface
+ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
+
+EXPOSE 8888
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--no-browser", "--allow-root"]

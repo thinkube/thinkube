@@ -1,0 +1,219 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/jupyterhub/10_build_custom_images.yaml
+# Description:
+#   Build and push JupyterHub custom images with ML/AI capabilities
+#
+# Requirements:
+#   - Podman installed on control plane
+#   - Harbor registry accessible
+#   - HARBOR_ROBOT_TOKEN environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/10_build_custom_images.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Registry domain
+#   - harbor_robot_user: Robot account name
+#   - system_username: System user
+#
+# Dependencies:
+#   - CORE-004 (Harbor) must be complete
+#
+# 🤖 [AI-assisted]
+
+- name: Build and Push JupyterHub Custom Images
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    build_dir: "/tmp/jupyter-builds"
+    docker_images_dir: "{{ playbook_dir }}/docker-images"
+    images_to_build:
+      - name: jupyter-ml-cpu
+        dockerfile: jupyter-ml-cpu.Dockerfile.j2
+        context: base
+        gpu_required: false
+        description: "CPU-based ML development environment"
+      - name: jupyter-ml-gpu
+        dockerfile: jupyter-ml-gpu.Dockerfile.j2
+        context: base
+        gpu_required: true
+        description: "GPU-enabled deep learning environment"
+      - name: jupyter-fine-tuning
+        dockerfile: jupyter-fine-tuning.Dockerfile.j2
+        context: base
+        gpu_required: true
+        description: "Fine-tuning environment with Unsloth and QLoRA"
+        depends_on: jupyter-ml-gpu
+      - name: jupyter-agent-dev
+        dockerfile: jupyter-agent-dev.Dockerfile.j2
+        context: base
+        gpu_required: false
+        description: "Agent development with LangChain and CrewAI"
+        depends_on: jupyter-ml-cpu
+
+  pre_tasks:
+    - name: Set environment file path
+      ansible.builtin.set_fact:
+        env_file_path: "{{ ansible_env.HOME }}/.env"
+
+    - name: Load Harbor robot token from .env file
+      ansible.builtin.shell: |
+        if [ -f "{{ env_file_path }}" ]; then
+          grep HARBOR_ROBOT_TOKEN {{ env_file_path }} | sed -E 's/HARBOR_ROBOT_TOKEN="?([^"]*)"?/\1/' || echo ""
+        else
+          echo ""
+        fi
+      register: harbor_token_result
+      changed_when: false
+      no_log: true
+
+    - name: Set harbor_robot_token fact
+      ansible.builtin.set_fact:
+        harbor_robot_token: "{{ harbor_token_result.stdout }}"
+
+    - name: Verify Harbor token is available
+      ansible.builtin.fail:
+        msg: "HARBOR_ROBOT_TOKEN not found in .env file"
+      when: harbor_robot_token == ""
+
+  tasks:
+    - name: Create build directory
+      ansible.builtin.file:
+        path: "{{ build_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create subdirectories in build directory
+      ansible.builtin.file:
+        path: "{{ build_dir }}/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - base
+        - notebooks
+        - notebooks/fine-tuning
+        - notebooks/agents
+
+    - name: Template Dockerfiles
+      ansible.builtin.template:
+        src: "{{ docker_images_dir }}/{{ item.context }}/{{ item.dockerfile }}"
+        dest: "{{ build_dir }}/{{ item.context }}/{{ item.name }}.Dockerfile"
+        mode: '0644'
+      loop: "{{ images_to_build }}"
+      vars:
+        harbor_registry: "{{ harbor_registry }}"
+
+    - name: Copy example notebooks if they exist
+      ansible.builtin.copy:
+        src: "{{ docker_images_dir }}/notebooks/"
+        dest: "{{ build_dir }}/notebooks/"
+        mode: '0644'
+      failed_when: false  # Don't fail if notebooks don't exist yet
+
+    - name: Login to Harbor registry
+      ansible.builtin.shell: |
+        echo "{{ harbor_robot_token }}" | podman login \
+          --username {{ harbor_robot_user }} \
+          --password-stdin \
+          {{ harbor_registry }}
+      no_log: true
+      changed_when: false
+
+    - name: Build images without dependencies
+      ansible.builtin.shell: |
+        cd {{ build_dir }}/{{ item.context }}
+        podman build \
+          --no-cache \
+          -f {{ item.name }}.Dockerfile \
+          -t {{ harbor_registry }}/library/{{ item.name }}:latest \
+          .
+      loop: "{{ images_to_build | selectattr('depends_on', 'undefined') | list }}"
+      register: build_results_base
+      async: 1800  # 30 minutes timeout
+      poll: 0
+
+    - name: Wait for base images to complete
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ build_results_base.results }}"
+      register: build_jobs
+      until: build_jobs.finished
+      retries: 60
+      delay: 30
+
+    - name: Build images with dependencies
+      ansible.builtin.shell: |
+        cd {{ build_dir }}/{{ item.context }}
+        podman build \
+          --no-cache \
+          -f {{ item.name }}.Dockerfile \
+          -t {{ harbor_registry }}/library/{{ item.name }}:latest \
+          .
+      loop: "{{ images_to_build | selectattr('depends_on', 'defined') | list }}"
+      register: build_results_dependent
+
+    - name: Push all images to Harbor
+      ansible.builtin.shell: |
+        podman push {{ harbor_registry }}/library/{{ item.name }}:latest
+      loop: "{{ images_to_build }}"
+      register: push_results
+
+    - name: Tag images with metadata in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects/library/repositories/{{ item.name }}/artifacts/latest/labels"
+        method: POST
+        headers:
+          Authorization: "Basic {{ (harbor_robot_user + ':' + harbor_robot_token) | b64encode }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          id: 1  # Using default label ID
+        validate_certs: false
+        status_code: [200, 201, 409]  # 409 if label already exists
+      loop: "{{ images_to_build }}"
+      failed_when: false  # Don't fail on tagging errors
+
+    - name: Display build summary
+      ansible.builtin.debug:
+        msg: |
+          JupyterHub Custom Images Build Summary:
+          =====================================
+          {% for image in images_to_build %}
+          {{ image.name }}:
+            - Description: {{ image.description }}
+            - GPU Required: {{ image.gpu_required }}
+            - Image: {{ harbor_registry }}/library/{{ image.name }}:latest
+          {% endfor %}
+
+    - name: Clean up build directory
+      ansible.builtin.file:
+        path: "{{ build_dir }}"
+        state: absent
+      when: push_results is succeeded
+
+    - name: Create image list for thinkube-control
+      ansible.builtin.template:
+        src: jupyter-images-metadata.json.j2
+        dest: "{{ ansible_env.HOME }}/jupyter-images.json"
+        mode: '0644'
+      vars:
+        images: "{{ images_to_build }}"
+
+  handlers:
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+          ✅ JupyterHub custom images built and pushed successfully!
+
+          Images available:
+          - jupyter-ml-cpu: Standard ML/AI development
+          - jupyter-ml-gpu: GPU-accelerated deep learning
+          - jupyter-fine-tuning: LLM fine-tuning with Unsloth
+          - jupyter-agent-dev: Agent development with LangChain
+
+          These images are now available for selection in JupyterHub profiles.

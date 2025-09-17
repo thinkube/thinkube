@@ -71,8 +71,7 @@
     # Values file for Helm chart
     jupyterhub_values_file: "/tmp/jupyterhub-values.yaml"
     
-    # Default client secret (will be used if Keycloak client creation fails)
-    default_client_secret: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=32') }}"
+    # Keycloak authentication is mandatory - no fallback
     
     # Custom image settings
     jupyterhub_custom_image: "jupyterhub-custom"
@@ -145,7 +144,32 @@
             name: "{{ jupyterhub_namespace }}"
 
   tasks:
-    # Ensure shared code directory exists
+    # Apply SeaweedFS volumes for JupyterHub
+    - name: Apply SeaweedFS volumes for JupyterHub
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        src: "{{ playbook_dir }}/manifests/01-seaweedfs-volumes.yaml"
+      register: seaweedfs_volumes
+
+    - name: Wait for PVCs to be bound
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ jupyterhub_namespace }}"
+        name: "{{ item }}"
+      register: pvc_status
+      until: pvc_status.resources[0].status.phase == "Bound"
+      retries: 30
+      delay: 10
+      loop:
+        - jupyter-notebooks-pvc
+        - jupyter-datasets-pvc
+        - jupyter-models-pvc
+      when: seaweedfs_volumes is changed
+
+    # Ensure shared code directory exists (for optional reference)
     - name: Show source path
       ansible.builtin.debug:
         msg: 
@@ -198,22 +222,8 @@
       changed_when: create_secret_result.rc == 0
       failed_when: create_secret_result.rc != 0
 
-    # Create StorageClass for JupyterHub
-    - name: Create StorageClass for JupyterHub
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: storage.k8s.io/v1
-          kind: StorageClass
-          metadata:
-            name: jupyterhub-user-storage
-            annotations:
-              storageclass.kubernetes.io/is-default-class: "false"
-          provisioner: microk8s.io/hostpath
-          reclaimPolicy: Delete
-          volumeBindingMode: Immediate
-          allowVolumeExpansion: true
+    # Note: SeaweedFS PVCs are now used instead of hostPath for persistence
+    # The StorageClass is no longer needed as we use SeaweedFS
     
     # Create persistent volumes and claims
     - name: Create persistent volume for pip cache
@@ -269,59 +279,8 @@
                 type: hostPath
                 app: jupyterhub-pip-cache
     
-    # Create persistent volume for shared notebooks
-    - name: Create persistent volume for shared notebooks
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: PersistentVolume
-          metadata:
-            name: jupyterhub-shared-notebooks
-            labels:
-              type: hostPath
-              app: jupyterhub-shared-notebooks
-          spec:
-            capacity:
-              storage: 10Gi
-            accessModes:
-              - ReadWriteMany
-            persistentVolumeReclaimPolicy: Retain
-            storageClassName: manual
-            hostPath:
-              path: "{{ code_source_path }}/notebooks"
-              type: DirectoryOrCreate
-            nodeAffinity:
-              required:
-                nodeSelectorTerms:
-                - matchExpressions:
-                  - key: kubernetes.io/hostname
-                    operator: In
-                    values:
-                    - "{{ k8s_controller_node }}"
-
-    - name: Create persistent volume claim for shared notebooks
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ jupyterhub_namespace }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: jupyterhub-shared-notebooks
-          spec:
-            accessModes:
-              - ReadWriteMany
-            storageClassName: manual
-            resources:
-              requests:
-                storage: 10Gi
-            selector:
-              matchLabels:
-                type: hostPath
-                app: jupyterhub-shared-notebooks
+    # Note: Shared notebooks are now in SeaweedFS for true multi-node access
+    # The shared-code directory is available as read-only reference on control plane
     
     # Ensure directories exist with proper permissions
     - name: Ensure pip cache directory exists
@@ -361,11 +320,12 @@
         name: jupyterhub-oidc-secret
         namespace: "{{ jupyterhub_namespace }}"
       register: keycloak_secret
+      failed_when: keycloak_secret.resources | length == 0
+      fail_msg: "Keycloak OIDC secret not found. Please run 11_configure_keycloak.yaml first to configure Keycloak authentication."
 
-    - name: Set auth type based on Keycloak secret existence
+    - name: Extract Keycloak client secret
       ansible.builtin.set_fact:
-        auth_type: "{{ 'generic-oauth' if keycloak_secret.resources | length > 0 else 'dummy' }}"
-        jupyterhub_client_secret: "{{ keycloak_secret.resources[0].data.client_secret | b64decode if keycloak_secret.resources | length > 0 else default_client_secret }}"
+        jupyterhub_client_secret: "{{ keycloak_secret.resources[0].data.client_secret | b64decode }}"
 
     # Get wildcard certificate from default namespace
     - name: Get wildcard certificate from default namespace
@@ -433,14 +393,26 @@
         src: templates/jupyterhub-values.yaml.j2
         dest: "{{ jupyterhub_values_file }}"
       vars:
-        auth_type: "{{ auth_type }}"
+        auth_type: "generic-oauth"  # Always use Keycloak authentication
         client_id: "{{ jupyterhub_client_id }}"
         client_secret: "{{ jupyterhub_client_secret }}"
         oauth_callback_url: "https://{{ jupyterhub_hostname }}/hub/oauth_callback"
         hostname: "{{ jupyterhub_hostname }}"
+        jupyterhub_hostname: "{{ jupyterhub_hostname }}"
+        jupyterhub_namespace: "{{ jupyterhub_namespace }}"
+        jupyterhub_tls_secret_name: "{{ jupyterhub_tls_secret_name }}"
         proxy_secretToken: "{{ proxy_token }}"
         tls_secret: "{{ jupyterhub_tls_secret_name }}"
-        control_plane_hostname: "{{ k8s_controller_node }}"
+        k8s_controller_node: "{{ k8s_controller_node }}"
+        admin_username: "{{ admin_username }}"
+        harbor_registry: "{{ harbor_registry }}"
+        jupyterhub_custom_image: "{{ jupyterhub_custom_image }}"
+        jupyterhub_custom_image_tag: "{{ jupyterhub_custom_image_tag }}"
+        jupyterhub_custom_image_full: "{{ jupyterhub_custom_image_full }}"
+        code_source_path: "{{ code_source_path }}"
+        ingress_namespace: "{{ ingress_namespace }}"
+        primary_ingress_class: "{{ primary_ingress_class }}"
+        system_username: "{{ ansible_env.USER }}"
 
     # Create ConfigMap for WebSocket headers in the ingress namespace
     - name: Create WebSocket headers ConfigMap for ingress controller

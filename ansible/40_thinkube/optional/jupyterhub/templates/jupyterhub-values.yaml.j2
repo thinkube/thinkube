@@ -1,12 +1,12 @@
 # Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# JupyterHub Helm chart values configured for primary ingress controller
-# This file will be used as a template for the Ansible playbook
+# JupyterHub Helm chart values with GPU flexibility and hybrid storage
+# This configuration enables notebooks to run on any node with persistence
 
 hub:
   config:
-{% if auth_type == 'generic-oauth' %}
+    # Keycloak authentication is mandatory
     GenericOAuthenticator:
       client_id: "{{ client_id }}"
       client_secret: "{{ client_secret }}"
@@ -21,19 +21,18 @@ hub:
         - "profile"
         - "email"
       allow_all: true
-{% endif %}
-    
+
     JupyterHub:
-      authenticator_class: {{ auth_type }}
+      authenticator_class: generic-oauth
       admin_access: true
+      admin_users:
+        - {{ admin_username }}
       allow_named_servers: true
       shutdown_on_logout: true
-      template_paths:
-        - /etc/jupyterhub/templates
 
   extraConfig:
     00-dns-settings: |
-      # Set DNS settings for spawned pods to access ZeroTier services
+      # Set DNS settings for spawned pods
       c.KubeSpawner.extra_pod_config = {
           'dnsPolicy': 'ClusterFirst',
           'dnsConfig': {
@@ -43,180 +42,226 @@ hub:
               ]
           }
       }
-    
+
     01-default-url: |
       # Set default URL to JupyterLab
       c.Spawner.default_url = '/lab'
-    
-    02-shared-volume: |
-      # Mount shared volume for notebooks and code
-      c.KubeSpawner.volumes = [
-        {
-          'name': 'shared-source',
-          'hostPath': {
-            'path': '{{ code_source_path }}',
-            'type': 'Directory'
-          }
-        }
-      ]
-      c.KubeSpawner.volume_mounts = [
-        {
-          'name': 'shared-source',
-          'mountPath': '/home/jovyan/shared-source'
-        }
-      ]
-    
-    03-websocket-config: |
-      c.Spawner.args = ['--NotebookApp.allow_origin=*']
-      
-    04-allow-config: |
-      # Explicitly set allow configuration to avoid warnings
-      c.Authenticator.allow_all = True
-    
-    05-profile-list: |
-      # Define available environments
-      c.KubeSpawner.profile_list = [
-        {
-          'display_name': 'Default Environment',
-          'description': 'Default JupyterLab with pre-installed packages',
+
+    02-gpu-profile-generator: |
+      import subprocess
+      import json
+      import os
+
+      def get_gpu_nodes():
+          """Get list of nodes with GPUs"""
+          try:
+              result = subprocess.run(
+                  ['kubectl', 'get', 'nodes', '-l', 'nvidia.com/gpu=true', '-o', 'json'],
+                  capture_output=True, text=True, timeout=5
+              )
+              if result.returncode == 0:
+                  nodes_data = json.loads(result.stdout)
+                  gpu_nodes = []
+                  for node in nodes_data.get('items', []):
+                      name = node['metadata']['name']
+                      gpu_count = node['status'].get('capacity', {}).get('nvidia.com/gpu', '0')
+                      gpu_nodes.append({'name': name, 'gpus': gpu_count})
+                  return gpu_nodes
+          except Exception as e:
+              print(f"Error getting GPU nodes: {e}")
+          return []
+
+      # Generate profiles dynamically
+      c.KubeSpawner.profile_list = []
+
+      # CPU profiles (can run anywhere)
+      c.KubeSpawner.profile_list.append({
+          'display_name': '📚 Standard Environment (CPU)',
+          'description': 'JupyterLab with standard data science packages',
           'default': True,
           'kubespawner_override': {
-            'image': '{{ jupyterhub_custom_image_full }}'
+              'image': '{{ harbor_registry }}/library/jupyter-ml-cpu:latest',
+              'cpu_limit': 4,
+              'cpu_guarantee': 1,
+              'mem_limit': '8G',
+              'mem_guarantee': '2G'
           }
-        },
-        {
-          'display_name': 'TensorFlow Environment',
-          'description': 'JupyterLab optimized for TensorFlow with GPU support',
+      })
+
+      # GPU auto-select profile
+      c.KubeSpawner.profile_list.append({
+          'display_name': '🚀 GPU Environment (Auto-select)',
+          'description': 'Automatically finds available GPU',
           'kubespawner_override': {
-            'image': '{{ harbor_registry }}/library/jupyter-tensorflow-notebook:latest',
-            'cpu_limit': 4,
-            'mem_limit': '8G'
+              'image': '{{ harbor_registry }}/library/jupyter-ml-gpu:latest',
+              'node_selector': {'nvidia.com/gpu': 'true'},
+              'extra_resource_limits': {'nvidia.com/gpu': '1'},
+              'extra_resource_guarantees': {'nvidia.com/gpu': '1'},
+              'cpu_limit': 8,
+              'mem_limit': '16G'
           }
-        },
-        {
-          'display_name': 'Minimal Environment',
-          'description': 'Minimal JupyterLab for lightweight tasks',
+      })
+
+      # Fine-tuning profile
+      c.KubeSpawner.profile_list.append({
+          'display_name': '🔧 Fine-tuning (Unsloth + QLoRA)',
+          'description': 'Optimized for LLM fine-tuning with 4-bit quantization',
           'kubespawner_override': {
-            'image': '{{ harbor_registry }}/library/jupyter-minimal-notebook:latest',
-            'cpu_limit': 1,
-            'mem_limit': '2G'
+              'image': '{{ harbor_registry }}/library/jupyter-fine-tuning:latest',
+              'node_selector': {'nvidia.com/gpu': 'true'},
+              'extra_resource_limits': {'nvidia.com/gpu': '1'},
+              'extra_resource_guarantees': {'nvidia.com/gpu': '1'},
+              'cpu_limit': 8,
+              'mem_limit': '32G',
+              'mem_guarantee': '8G'
           }
-        }
-      ]
+      })
+
+      # Agent development profile
+      c.KubeSpawner.profile_list.append({
+          'display_name': '🤖 Agent Development (LangChain)',
+          'description': 'LangChain, CrewAI, and agent tools',
+          'kubespawner_override': {
+              'image': '{{ harbor_registry }}/library/jupyter-agent-dev:latest',
+              'cpu_limit': 4,
+              'mem_limit': '8G'
+          }
+      })
+
+      # Add specific GPU node profiles
+      gpu_nodes = get_gpu_nodes()
+      for node in gpu_nodes:
+          c.KubeSpawner.profile_list.append({
+              'display_name': f"💻 GPU on {node['name']} ({node['gpus']} GPUs)",
+              'description': f"Run specifically on {node['name']}",
+              'kubespawner_override': {
+                  'image': '{{ harbor_registry }}/library/jupyter-ml-gpu:latest',
+                  'node_selector': {'kubernetes.io/hostname': node['name']},
+                  'extra_resource_limits': {'nvidia.com/gpu': '1'},
+                  'cpu_limit': 8,
+                  'mem_limit': '16G'
+              }
+          })
 
 proxy:
-  # This token must be a random value
   secretToken: "{{ proxy_secretToken }}"
-  
-  # Use ClusterIP service type instead of LoadBalancer (default)
   service:
     type: ClusterIP
-  
-  # Don't enable HTTPS at proxy level (handled at ingress)
   https:
     enabled: false
-  
-  # Configuration for the ConfigurableHTTPProxy
   chp:
-    # We need to explicitly define pdb (Pod Disruption Budget)
     pdb:
       enabled: false
-    # No command line flags that might not be supported
     extraCommandLineFlags: []
 
 singleuser:
-  # Default to JupyterLab
   defaultUrl: "/lab"
-  
-  # Use your Harbor custom image as default instead of Docker Hub
-  image:
-    name: "{{ harbor_registry }}/library/{{ jupyterhub_custom_image }}"
-    tag: "{{ jupyterhub_custom_image_tag }}"
-    pullPolicy: Always
-  
-  # Profile list - users can choose their environment
-  profileList:
-    - display_name: "Standard Environment (No GPU)"
-      description: "Standard JupyterLab environment without GPU"
-      default: true
-      kubespawner_override:
-        node_selector:
-          kubernetes.io/hostname: {{ control_plane_hostname }}
-    - display_name: "GPU Environment"
-      description: "JupyterLab environment with GPU support"
-      kubespawner_override:
-        node_selector:
-          kubernetes.io/hostname: {{ control_plane_hostname }}
-        extra_resource_limits:
-          nvidia.com/gpu: "1"
-        extra_resource_guarantees:
-          nvidia.com/gpu: "1"
-  
-  # Default node selector (can be overridden by profiles)
-  nodeSelector:
-    kubernetes.io/hostname: {{ control_plane_hostname }}
-    
-  # Explicit node affinity to ensure pod lands on same node as code-server
-  extraNodeAffinity:
-    required:
-      - matchExpressions:
-          - key: kubernetes.io/hostname
-            operator: In
-            values:
-              - {{ control_plane_hostname }}
-            
-  # Resource limits
+
+  # Remove old hostPath storage configuration
+  storage:
+    type: none  # We'll define volumes manually
+
+  # Extra volumes for hybrid storage approach
+  extraVolumes:
+    # SeaweedFS for persistent notebooks
+    - name: notebooks-persistent
+      persistentVolumeClaim:
+        claimName: jupyter-notebooks-pvc
+
+    # SeaweedFS for datasets
+    - name: datasets-persistent
+      persistentVolumeClaim:
+        claimName: jupyter-datasets-pvc
+
+    # SeaweedFS for models
+    - name: models-persistent
+      persistentVolumeClaim:
+        claimName: jupyter-models-pvc
+
+    # Local scratch for fast I/O (per-pod temporary)
+    - name: scratch
+      emptyDir:
+        sizeLimit: 50Gi
+
+    # Optional: Read-only reference to shared-code (only works on control plane)
+    - name: shared-code-ref
+      hostPath:
+        path: {{ code_source_path | default('/home/' + system_username + '/shared-code') }}
+        type: DirectoryOrCreate
+
+  extraVolumeMounts:
+    # Primary notebook storage (SeaweedFS)
+    - name: notebooks-persistent
+      mountPath: /home/jovyan/notebooks
+
+    # Datasets directory (SeaweedFS)
+    - name: datasets-persistent
+      mountPath: /home/jovyan/datasets
+
+    # Models directory (SeaweedFS)
+    - name: models-persistent
+      mountPath: /home/jovyan/models
+
+    # Fast local scratch space
+    - name: scratch
+      mountPath: /home/jovyan/scratch
+
+    # Reference mount (will fail gracefully on non-control nodes)
+    - name: shared-code-ref
+      mountPath: /home/jovyan/shared-code-reference
+      readOnly: true
+      mountPropagation: HostToContainer
+
+  # Remove all node restrictions to allow scheduling on any node
+  nodeSelector: {}
+  extraNodeAffinity: {}
+
+  # Enable GPU support by default
+  extraEnv:
+    - name: NVIDIA_VISIBLE_DEVICES
+      value: "all"
+    - name: NVIDIA_DRIVER_CAPABILITIES
+      value: "compute,utility"
+    - name: JUPYTER_ENABLE_LAB
+      value: "yes"
+
+  # Resource limits (can be overridden by profiles)
   cpu:
-    limit: 2
+    limit: 4
     guarantee: 0.5
   memory:
-    limit: 4G
+    limit: 8G
     guarantee: 1G
-  
-  # Storage configuration
-  storage:
-    type: static
-    extraVolumes:
-      - name: source-code
-        hostPath:
-          path: "{{ code_source_path }}"
-          type: Directory
-      - name: pip-cache
-        persistentVolumeClaim:
-          claimName: pip-cache-pvc
-    extraVolumeMounts:
-      - name: source-code
-        mountPath: /home/jovyan/work
-      - name: pip-cache
-        mountPath: /home/jovyan/.cache/pip
-        
-  # Add lifecycle hooks to enable package persistence
+
+  # Lifecycle hooks for directory setup
   lifecycleHooks:
     postStart:
       exec:
-        command: 
+        command:
           - "sh"
           - "-c"
-          - >
+          - |
+            # Create notebook directories if they don't exist
+            mkdir -p /home/jovyan/notebooks/{projects,experiments,agents,fine-tuning}
+            mkdir -p /home/jovyan/datasets/{raw,processed,embeddings}
+            mkdir -p /home/jovyan/models/{checkpoints,production,fine-tuned}
+            # Install user packages if defined
             if [ -f /home/jovyan/.user-packages ]; then
               pip install --user -r /home/jovyan/.user-packages;
             fi
 
-# Ingress configuration - configured for primary ingress controller
+# Ingress configuration
 ingress:
   enabled: true
-  ingressClassName: {{ primary_ingress_class }}  # Using variable from inventory
+  ingressClassName: {{ primary_ingress_class }}
   hosts:
     - "{{ hostname }}"
   annotations:
-    # Standard annotations for NGINX ingress
     nginx.ingress.kubernetes.io/proxy-body-size: "1024m"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
     nginx.ingress.kubernetes.io/proxy-buffer-size: "8k"
-    # Essential for WebSockets
     nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
-    # WebSocket upgrade headers
     nginx.ingress.kubernetes.io/proxy-set-headers: "{{ ingress_namespace }}/websocket-headers"
   tls:
     - hosts:
