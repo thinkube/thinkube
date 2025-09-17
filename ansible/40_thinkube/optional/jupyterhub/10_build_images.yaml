@@ -139,7 +139,7 @@
       until: build_jobs.finished
       retries: 60
       delay: 30
-      failed_when: build_jobs.rc != 0
+      failed_when: build_jobs.rc is defined and build_jobs.rc != 0
 
     - name: Build images with dependencies
       ansible.builtin.shell: |
@@ -163,13 +163,23 @@
       until: build_jobs_dependent.finished
       retries: 60
       delay: 30
-      failed_when: build_jobs_dependent.rc != 0
+      failed_when: build_jobs_dependent.rc is defined and build_jobs_dependent.rc != 0
 
-    - name: Push all images to Harbor
+    - name: Check which images exist locally
       ansible.builtin.shell: |
-        podman push {{ harbor_registry }}/library/{{ item.name }}:latest
+        podman images --format "table {{.Repository}}:{{.Tag}}" | grep "{{ harbor_registry }}/library/{{ item.name }}:latest" || true
       loop: "{{ images_to_build }}"
+      register: image_exists
+      changed_when: false
+
+    - name: Push successfully built images to Harbor
+      ansible.builtin.shell: |
+        podman push {{ harbor_registry }}/library/{{ item.item.name }}:latest
+      loop: "{{ image_exists.results }}"
+      when: item.stdout | length > 0
       register: push_results
+      loop_control:
+        label: "{{ item.item.name }}"
 
     - name: Tag images with metadata in Harbor
       ansible.builtin.uri:
