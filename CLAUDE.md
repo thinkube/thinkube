@@ -436,3 +436,4 @@ Never confuse these two types!
 - Never use docker
 - Always use Gitea for domain-specific deployments
 - Templates (.jinja) are source of truth, not processed files
+- to access vilanova1 with ssh_run_command you must use the ip 192.168.191.100
