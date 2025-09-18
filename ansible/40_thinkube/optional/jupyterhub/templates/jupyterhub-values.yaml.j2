@@ -38,74 +38,198 @@ hub:
       c.Spawner.default_url = '/lab'
 
     01-dynamic-profile-generator: |
-      # Dynamic profile generation from thinkube-control API
-      # NO FALLBACKS - fails if API unavailable
+      # Dynamic profile generation with flexible resource selection
       import requests
       import sys
       import logging
 
+      def parse_memory_to_gb(memory_str):
+          """Convert memory string to GB for comparison"""
+          if memory_str.endswith('Gi'):
+              return int(memory_str[:-2])
+          elif memory_str.endswith('G'):
+              return int(memory_str[:-1])
+          elif memory_str.endswith('Mi'):
+              return int(memory_str[:-2]) / 1024
+          elif memory_str.endswith('M'):
+              return int(memory_str[:-1]) / 1024
+          return 0
+
       def get_profile_list(spawner):
-          """Dynamically query thinkube-control for available Jupyter images"""
+          """Generate profiles with flexible resource selection forms"""
           logging.basicConfig(level=logging.INFO)
           logger = logging.getLogger(__name__)
 
           try:
-              # Query thinkube-control API - NO FALLBACKS
+              # Query thinkube-control for available resources
+              logger.info("Querying thinkube-control for cluster resources...")
+              resources_response = requests.get(
+                  'http://backend.thinkube-control:8000/api/v1/cluster/resources',
+                  headers={'Accept': 'application/json'},
+                  timeout=10
+              )
+
+              if resources_response.status_code != 200:
+                  logger.error(f"Failed to get cluster resources: {resources_response.status_code}")
+                  sys.exit(1)
+
+              resources = resources_response.json()
+
+              # Query for available images
               logger.info("Querying thinkube-control for available images...")
-              response = requests.get(
+              images_response = requests.get(
                   'http://backend.thinkube-control:8000/api/v1/images/jupyter',
                   headers={'Accept': 'application/json'},
                   timeout=10
               )
 
-              if response.status_code != 200:
-                  logger.error(f"FATAL: thinkube-control API returned {response.status_code}")
-                  sys.exit(1)  # Fail immediately - no fallbacks
+              if images_response.status_code != 200:
+                  logger.error(f"Failed to get images: {images_response.status_code}")
+                  sys.exit(1)
 
-              images = response.json()
+              images = images_response.json()
               profiles = []
 
+              # Find max available resources across all nodes
+              max_cpu = max(node['available']['cpu'] for node in resources)
+              max_memory_gb = max(parse_memory_to_gb(node['available']['memory']) for node in resources)
+              has_gpu = any(node['available']['gpu'] > 0 for node in resources)
+
+              # Build dynamic CPU choices based on availability
+              cpu_choices = {}
+              for cores in [1, 2, 4, 6, 8, 12, 16, 24, 32]:
+                  if cores <= max_cpu:
+                      cpu_choices[str(cores)] = f"{cores} core{'s' if cores > 1 else ''}"
+
+              # Build dynamic memory choices based on availability
+              memory_choices = {}
+              for gb in [2, 4, 8, 16, 32, 48, 64, 96, 128]:
+                  if gb <= max_memory_gb:
+                      memory_choices[f"{gb}Gi"] = f"{gb} GB"
+
               for img in images:
-                  logger.info(f"Adding profile for image: {img.get('name')}")
+                  # Build node choices with resource info
+                  node_choices = {}
+                  for node in resources:
+                      node_label = (f"{node['name']} "
+                                  f"({node['available']['cpu']:.1f}/{node['capacity']['cpu']} CPUs, "
+                                  f"{node['available']['memory']}/{node['capacity']['memory']}")
+
+                      # Add GPU info if available
+                      if node['gpu_details']:
+                          available_gpus = [g for g in node['gpu_details'] if g['available']]
+                          if available_gpus:
+                              gpu = available_gpus[0]
+                              node_label += f", GPU: {gpu['model']} {gpu['memory_total']}"
+                          else:
+                              node_label += ", GPU: In use"
+                      else:
+                          node_label += ", No GPU"
+
+                      node_label += ")"
+                      node_choices[node['name']] = node_label
+
+                  # Build GPU choices based on availability
+                  gpu_choices = {'0': 'No GPU'}
+                  if has_gpu:
+                      gpu_choices['1'] = 'Use GPU (if available on selected node)'
+
+                  # Create profile with options form
                   profile = {
                       'display_name': img.get('display_name', img['name']),
-                      'description': img.get('description', ''),
+                      'description': f"{img.get('description', '')} - Select your resources below",
                       'default': img.get('default', False),
+                      'profile_options': {
+                          'image': {
+                              'display_name': 'Hidden Image',
+                              'choices': {img['name']: img['name']},
+                              'default': img['name']
+                          },
+                          'node': {
+                              'display_name': 'Select Node',
+                              'choices': node_choices,
+                              'default': list(node_choices.keys())[0] if node_choices else 'vilanova1'
+                          },
+                          'cpu': {
+                              'display_name': 'CPU Cores',
+                              'choices': cpu_choices,
+                              'default': '4' if '4' in cpu_choices else list(cpu_choices.keys())[0]
+                          },
+                          'memory': {
+                              'display_name': 'Memory',
+                              'choices': memory_choices,
+                              'default': '8Gi' if '8Gi' in memory_choices else list(memory_choices.keys())[0]
+                          },
+                          'enable_gpu': {
+                              'display_name': 'Enable GPU',
+                              'choices': gpu_choices,
+                              'default': '0'
+                          }
+                      },
                       'kubespawner_override': {
                           'image': f"{{ harbor_registry }}/library/{img['name']}:latest",
                           'image_pull_policy': 'Always'
                       }
                   }
-
-                  # Add GPU requirements if specified
-                  if img.get('metadata', {}).get('gpu_required'):
-                      profile['kubespawner_override']['node_selector'] = {'nvidia.com/gpu': 'true'}
-                      profile['kubespawner_override']['extra_resource_limits'] = {'nvidia.com/gpu': '1'}
-                      profile['kubespawner_override']['extra_resource_guarantees'] = {'nvidia.com/gpu': '1'}
-
-                  # Add resource recommendations
-                  if 'cpu_limit' in img.get('metadata', {}):
-                      profile['kubespawner_override']['cpu_limit'] = img['metadata']['cpu_limit']
-                  if 'mem_limit' in img.get('metadata', {}):
-                      profile['kubespawner_override']['mem_limit'] = img['metadata']['mem_limit']
-
                   profiles.append(profile)
 
               if not profiles:
-                  logger.error("FATAL: No Jupyter images available from thinkube-control")
-                  sys.exit(1)  # Fail immediately - no images available
+                  logger.error("No profiles could be generated")
+                  sys.exit(1)
 
-              logger.info(f"Successfully loaded {len(profiles)} profiles")
+              logger.info(f"Successfully generated {len(profiles)} profiles with resource options")
               return profiles
 
-          except requests.exceptions.RequestException as e:
-              logger.error(f"FATAL: Failed to connect to thinkube-control: {e}")
-              sys.exit(1)  # Fail immediately on connection error
           except Exception as e:
-              logger.error(f"FATAL: Unexpected error querying thinkube-control: {e}")
-              sys.exit(1)  # Fail immediately on any error
+              logger.error(f"Failed to generate profiles: {e}")
+              sys.exit(1)
 
+      def apply_profile_options(spawner, user_options):
+          """Apply the selected options to the spawner"""
+          import logging
+          logger = logging.getLogger(__name__)
+
+          # Get selected options
+          profile = user_options.get('profile', {})
+          image = profile.get('image')
+          node = profile.get('node')
+          cpu = profile.get('cpu', '4')
+          memory = profile.get('memory', '8Gi')
+          enable_gpu = profile.get('enable_gpu', '0')
+
+          logger.info(f"Applying options: node={node}, cpu={cpu}, memory={memory}, gpu={enable_gpu}")
+
+          # Apply to spawner
+          if node:
+              spawner.node_selector = {"kubernetes.io/hostname": node}
+
+          spawner.cpu_limit = float(cpu)
+          spawner.cpu_guarantee = float(cpu) * 0.5  # 50% guarantee
+          spawner.mem_limit = memory
+          spawner.mem_guarantee = memory
+
+          if enable_gpu == '1':
+              spawner.extra_resource_limits = {"nvidia.com/gpu": "1"}
+              spawner.extra_resource_guarantees = {"nvidia.com/gpu": "1"}
+              logger.info("GPU enabled for this session")
+
+          return spawner
+
+      # Set the configurations
       c.KubeSpawner.profile_list = get_profile_list
+      c.JupyterHub.spawner_class = 'kubespawner.KubeSpawner'
+
+      # Enable profile options
+      from kubespawner import KubeSpawner
+
+      class CustomKubeSpawner(KubeSpawner):
+          def load_user_options(self):
+              """Load user options and apply them"""
+              super().load_user_options()
+              if self.user_options:
+                  apply_profile_options(self, self.user_options)
+
+      c.JupyterHub.spawner_class = CustomKubeSpawner
 
 proxy:
   secretToken: "{{ jupyterhub_proxy_token | default(lookup('password', '/dev/null chars=hex_digits length=64')) }}"
