@@ -172,6 +172,7 @@ Key kubectl commands for troubleshooting:
    - Is there a configuration mismatch?
 3. **NEVER spend more than 1 check** verifying deployment status
 4. **Focus on the runtime issue**, not deployment status
+5. **NEVER OFFER FALLBACK SOLUTIONS** - Fix the root cause, don't paper over it
 
 ### Common False Alarms
 - **"API returns 404"** → Usually means database is empty or route not registered, NOT that code isn't deployed
