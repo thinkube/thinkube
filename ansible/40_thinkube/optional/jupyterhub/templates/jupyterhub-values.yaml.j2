@@ -107,67 +107,79 @@ hub:
                   if gb <= max_memory_gb:
                       memory_choices[f"{gb}Gi"] = {'display_name': f"{gb} GB"}
 
-              for img in images:
-                  # Build node choices with resource info
-                  node_choices = {}
-                  for node in resources:
-                      node_label = (f"{node['name']} "
-                                  f"({node['available']['cpu']:.1f}/{node['capacity']['cpu']} CPUs, "
-                                  f"{node['available']['memory']}/{node['capacity']['memory']}")
+              # Build node choices with resource info (shared across all profiles)
+              node_choices = {}
+              for node in resources:
+                  node_label = (f"{node['name']} "
+                              f"({node['available']['cpu']:.1f}/{node['capacity']['cpu']} CPUs, "
+                              f"{node['available']['memory']}/{node['capacity']['memory']}")
 
-                      # Add GPU info if available
-                      if node['gpu_details']:
-                          available_gpus = [g for g in node['gpu_details'] if g['available']]
-                          if available_gpus:
-                              gpu = available_gpus[0]
-                              node_label += f", GPU: {gpu['model']} {gpu['memory_total']}"
-                          else:
-                              node_label += ", GPU: In use"
+                  # Add GPU info if available
+                  if node['gpu_details']:
+                      available_gpus = [g for g in node['gpu_details'] if g['available']]
+                      if available_gpus:
+                          gpu = available_gpus[0]
+                          node_label += f", GPU: {gpu['model']} {gpu['memory_total']}"
                       else:
-                          node_label += ", No GPU"
+                          node_label += ", GPU: In use"
+                  else:
+                      node_label += ", No GPU"
 
-                      node_label += ")"
-                      node_choices[node['name']] = {'display_name': node_label}
+                  node_label += ")"
+                  node_choices[node['name']] = {'display_name': node_label}
 
-                  # Build GPU choices based on max available GPUs across nodes
-                  max_gpus = max(node['available']['gpu'] for node in resources)
-                  gpu_choices = {'0': {'display_name': 'No GPU'}}
-                  for i in range(1, max_gpus + 1):
-                      gpu_choices[str(i)] = {'display_name': f'{i} GPU{"s" if i > 1 else ""}'}
+              # Build GPU choices based on max available GPUs across nodes
+              max_gpus = max(node['available']['gpu'] for node in resources)
+              gpu_choices = {'0': {'display_name': 'No GPU'}}
+              for i in range(1, max_gpus + 1):
+                  gpu_choices[str(i)] = {'display_name': f'{i} GPU{"s" if i > 1 else ""}'}
 
-                  # Create profile with options form
-                  profile = {
+              # Create a single "Resource Selection" profile with image choice
+              image_choices = {}
+              for img in images:
+                  image_choices[img['name']] = {
                       'display_name': img.get('display_name', img['name']),
-                      'description': f"{img.get('description', '')} - Select your resources below",
-                      'default': img.get('default', False),
-                      'profile_options': {
-                          'node': {
-                              'display_name': 'Select Node',
-                              'choices': node_choices,
-                              'default': list(node_choices.keys())[0] if node_choices else 'vilanova1'
-                          },
-                          'cpu': {
-                              'display_name': 'CPU Cores',
-                              'choices': cpu_choices,
-                              'default': '4' if '4' in cpu_choices else list(cpu_choices.keys())[0]
-                          },
-                          'memory': {
-                              'display_name': 'Memory',
-                              'choices': memory_choices,
-                              'default': '8Gi' if '8Gi' in memory_choices else list(memory_choices.keys())[0]
-                          },
-                          'enable_gpu': {
-                              'display_name': 'Number of GPUs',
-                              'choices': gpu_choices,
-                              'default': '0'
-                          }
-                      },
                       'kubespawner_override': {
-                          'image': f"{{ harbor_registry }}/library/{img['name']}:latest",
-                          'image_pull_policy': 'Always'
+                          'image': f"{{ harbor_registry }}/library/{img['name']}:latest"
                       }
                   }
-                  profiles.append(profile)
+
+              profile = {
+                  'display_name': 'Custom Resource Allocation',
+                  'description': 'Select your image and compute resources',
+                  'default': True,
+                  'profile_options': {
+                      'image': {
+                          'display_name': 'Select Image',
+                          'choices': image_choices,
+                          'default': list(image_choices.keys())[0] if image_choices else 'base'
+                      },
+                      'node': {
+                          'display_name': 'Select Node',
+                          'choices': node_choices,
+                          'default': list(node_choices.keys())[0] if node_choices else 'vilanova1'
+                      },
+                      'cpu': {
+                          'display_name': 'CPU Cores',
+                          'choices': cpu_choices,
+                          'default': '4' if '4' in cpu_choices else list(cpu_choices.keys())[0]
+                      },
+                      'memory': {
+                          'display_name': 'Memory',
+                          'choices': memory_choices,
+                          'default': '8Gi' if '8Gi' in memory_choices else list(memory_choices.keys())[0]
+                      },
+                      'enable_gpu': {
+                          'display_name': 'Number of GPUs',
+                          'choices': gpu_choices,
+                          'default': '0'
+                      }
+                  },
+                  'kubespawner_override': {
+                      'image_pull_policy': 'Always'
+                  }
+              }
+              profiles.append(profile)
 
               if not profiles:
                   logger.error("No profiles could be generated")
@@ -180,62 +192,39 @@ hub:
               logger.error(f"Failed to generate profiles: {e}")
               sys.exit(1)
 
-      def apply_profile_options(spawner, user_options):
-          """Apply the selected options to the spawner"""
+      # Apply resource selections using pre_spawn_hook
+      async def resource_selector_hook(spawner):
+          """Apply resource selections from profile_options"""
           import logging
           logger = logging.getLogger(__name__)
 
-          logger.info(f"user_options type: {type(user_options)}, content: {user_options}")
+          user_options = spawner.user_options
+          if user_options and 'profile' in user_options:
+              profile = user_options['profile']
+              logger.info(f"Applying resource selections: {profile}")
 
-          # Get selected options
-          if not isinstance(user_options, dict):
-              logger.warning(f"user_options is not a dict, it's {type(user_options)}: {user_options}")
-              return spawner
+              # Apply node selection
+              node = profile.get('node')
+              if node:
+                  spawner.node_selector = {"kubernetes.io/hostname": node}
 
-          profile = user_options.get('profile', {})
+              # Apply CPU and memory
+              cpu = profile.get('cpu', '4')
+              spawner.cpu_limit = float(cpu)
+              spawner.cpu_guarantee = float(cpu) * 0.5
 
-          if not isinstance(profile, dict):
-              logger.warning(f"profile is not a dict, it's {type(profile)}: {profile}")
-              return spawner
+              memory = profile.get('memory', '8Gi')
+              spawner.mem_limit = memory
+              spawner.mem_guarantee = memory
 
-          node = profile.get('node')
-          cpu = profile.get('cpu', '4')
-          memory = profile.get('memory', '8Gi')
-          gpu_count = profile.get('enable_gpu', '0')
+              # Apply GPU allocation
+              gpu_count = profile.get('enable_gpu', '0')
+              if gpu_count != '0':
+                  spawner.extra_resource_limits = {"nvidia.com/gpu": gpu_count}
+                  spawner.extra_resource_guarantees = {"nvidia.com/gpu": gpu_count}
 
-          logger.info(f"Applying options: node={node}, cpu={cpu}, memory={memory}, gpu={gpu_count}")
-
-          # Apply to spawner
-          if node:
-              spawner.node_selector = {"kubernetes.io/hostname": node}
-
-          spawner.cpu_limit = float(cpu)
-          spawner.cpu_guarantee = float(cpu) * 0.5  # 50% guarantee
-          spawner.mem_limit = memory
-          spawner.mem_guarantee = memory
-
-          if gpu_count != '0':
-              spawner.extra_resource_limits = {"nvidia.com/gpu": gpu_count}
-              spawner.extra_resource_guarantees = {"nvidia.com/gpu": gpu_count}
-              logger.info(f"{gpu_count} GPU(s) allocated for this session")
-
-          return spawner
-
-      # Set the configurations
       c.KubeSpawner.profile_list = get_profile_list
-      c.JupyterHub.spawner_class = 'kubespawner.KubeSpawner'
-
-      # Enable profile options
-      from kubespawner import KubeSpawner
-
-      class CustomKubeSpawner(KubeSpawner):
-          def load_user_options(self):
-              """Load user options and apply them"""
-              super().load_user_options()
-              if self.user_options:
-                  apply_profile_options(self, self.user_options)
-
-      c.JupyterHub.spawner_class = CustomKubeSpawner
+      c.KubeSpawner.pre_spawn_hook = resource_selector_hook
 
 proxy:
   secretToken: "{{ jupyterhub_proxy_token | default(lookup('password', '/dev/null chars=hex_digits length=64')) }}"
