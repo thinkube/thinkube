@@ -269,18 +269,25 @@ singleuser:
         - sh
         - -c
         - |
-          # Fix permissions for SeaweedFS volumes
-          # These are mounted as root by the CSI driver
-          for dir in /home/jovyan/notebooks /home/jovyan/datasets /home/jovyan/models; do
-            if [ -d "$dir" ]; then
-              echo "Fixing permissions for $dir"
-              chown -R 1000:100 "$dir" || echo "Warning: Could not change ownership of $dir"
-              chmod -R 775 "$dir" || echo "Warning: Could not change permissions of $dir"
+          # Fix permissions for the home directory
+          echo "Fixing permissions for /home/jovyan"
+          chown -R 1000:100 /home/jovyan || echo "Warning: Could not change ownership of /home/jovyan"
+          chmod -R 775 /home/jovyan || echo "Warning: Could not change permissions of /home/jovyan"
+
+          # Create subdirectories if they don't exist
+          for dir in notebooks datasets models work scratch; do
+            if [ ! -d "/home/jovyan/$dir" ]; then
+              echo "Creating directory /home/jovyan/$dir"
+              mkdir -p "/home/jovyan/$dir"
+              chown 1000:100 "/home/jovyan/$dir"
+              chmod 775 "/home/jovyan/$dir"
             fi
           done
       securityContext:
         runAsUser: 0  # Run as root to fix permissions
       volumeMounts:
+        - name: home
+          mountPath: /home/jovyan
         - name: notebooks
           mountPath: /home/jovyan/notebooks
         - name: datasets
@@ -293,6 +300,11 @@ singleuser:
     type: none  # We define volumes manually
     # Hybrid storage approach: SeaweedFS (persistent) + local scratch (performance)
     extraVolumes:
+    # Main home directory (MANDATORY - base persistent storage)
+    - name: home
+      persistentVolumeClaim:
+        claimName: jupyterhub-home-pvc
+
     # SeaweedFS for persistent notebooks (MANDATORY)
     - name: notebooks
       persistentVolumeClaim:
@@ -314,6 +326,10 @@ singleuser:
         sizeLimit: 100Gi
 
     extraVolumeMounts:
+    # Base home directory (SeaweedFS - persistent)
+    - name: home
+      mountPath: /home/jovyan
+
     # Primary notebook storage (SeaweedFS - persistent across nodes)
     - name: notebooks
       mountPath: /home/jovyan/notebooks
