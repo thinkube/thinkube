@@ -160,6 +160,39 @@ Key kubectl commands for troubleshooting:
 - Check services: `microk8s.kubectl get svc -n <namespace>`
 - Check ingress: `microk8s.kubectl get ingress -n <namespace>`
 
+## CRITICAL: Debugging Failed Deployments
+
+**STOP assuming code isn't deployed!** When something fails:
+
+1. **ASSUME the code IS deployed** - The CI/CD pipeline works. Stop questioning it.
+2. **Check the ACTUAL problem**:
+   - Is the database empty? (most common)
+   - Is a service not registered in the router?
+   - Are credentials missing?
+   - Is there a configuration mismatch?
+3. **NEVER spend more than 1 check** verifying deployment status
+4. **Focus on the runtime issue**, not deployment status
+
+### Common False Alarms
+- **"API returns 404"** → Usually means database is empty or route not registered, NOT that code isn't deployed
+- **"Service unavailable"** → Usually means pods are crashing due to missing config/data, NOT deployment issues
+- **"Import error"** → Usually means missing dependencies, NOT deployment issues
+
+### The Right Approach
+```bash
+# WRONG: Spending 10 minutes checking if code is deployed
+# RIGHT: One quick check, then move to the actual problem
+
+# Quick deployment verification (MAX 1 command):
+kubectl describe pod <pod> | grep Image:
+
+# Then immediately check the REAL issues:
+- Database content
+- Service registration
+- Configuration values
+- Dependencies
+```
+
 ## Playbook Numbering Convention
 
 - **10-17**: Main component setup and configuration
