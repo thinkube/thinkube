@@ -49,6 +49,14 @@
       when: namespace_check.resources | length > 0
       ignore_errors: true
 
+    - name: Force delete stuck pods if any
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pods --all -n {{ jupyterhub_namespace }} --grace-period=0 --force || true
+      vars:
+        kubectl_bin: /snap/bin/microk8s.kubectl
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
     - name: Delete persistent volume claims
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -58,9 +66,11 @@
         name: "{{ item }}"
         state: absent
       loop:
-        - jupyter-notebooks-pvc
-        - jupyter-datasets-pvc
-        - jupyter-models-pvc
+        - jupyterhub-home-pvc
+        - jupyterhub-notebooks-pvc
+        - jupyterhub-datasets-pvc
+        - jupyterhub-models-pvc
+        - hub-db-dir
       when: namespace_check.resources | length > 0
       ignore_errors: true
 
@@ -83,8 +93,26 @@
         kind: Namespace
         state: absent
         wait: true
-        wait_timeout: 180
+        wait_timeout: 60
       when: namespace_check.resources | length > 0
+      register: namespace_delete
+      ignore_errors: true
+
+    - name: Force remove namespace finalizers if stuck
+      ansible.builtin.shell: |
+        # Check if namespace is stuck in Terminating
+        NS_STATUS=$({{ kubectl_bin }} get namespace {{ jupyterhub_namespace }} -o json 2>/dev/null | jq -r '.status.phase')
+        if [ "$NS_STATUS" = "Terminating" ]; then
+          echo "Namespace stuck in Terminating, removing finalizers..."
+          {{ kubectl_bin }} get namespace {{ jupyterhub_namespace }} -o json | \
+            jq '.spec.finalizers = []' | \
+            {{ kubectl_bin }} replace --raw /api/v1/namespaces/{{ jupyterhub_namespace }}/finalize -f -
+        fi
+      vars:
+        kubectl_bin: /snap/bin/microk8s.kubectl
+      when:
+        - namespace_check.resources | length > 0
+        - namespace_delete is failed or namespace_delete.changed == false
 
     - name: Display cleanup status
       ansible.builtin.debug:
