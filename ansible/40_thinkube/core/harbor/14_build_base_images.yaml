@@ -210,6 +210,28 @@
       register: ai_inference_push
       changed_when: true
       
+    # Build tk-package-version from GitHub repository
+    - name: Clone tk-package-version repository
+      ansible.builtin.git:
+        repo: "https://github.com/thinkube/tk-package-version.git"
+        dest: "{{ base_images_dir }}/tk-package-version"
+        version: main
+        force: yes
+
+    - name: Build tk-package-version image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/tk-package-version:latest \
+                     {{ base_images_dir }}/tk-package-version
+      register: tk_package_version_build
+      changed_when: true
+
+    - name: Push tk-package-version image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/tk-package-version:latest
+      register: tk_package_version_push
+      changed_when: true
+
     - name: Clean up temp dockerfiles directory
       ansible.builtin.file:
         path: "{{ temp_dockerfiles_dir.path }}"
@@ -261,6 +283,12 @@
           - destination: "{{ harbor_registry }}/library/ai-inference-base:latest"
             source: "custom-build"
             description: "AI inference base latest (CUDA 12.4)"
+          - destination: "{{ harbor_registry }}/library/tk-package-version:latest"
+            source: "github.com/thinkube/tk-package-version"
+            description: "MCP server for checking package versions across multiple registries"
+            metadata:
+              language: "rust"
+              type: "mcp-server"
         manifest_category: "custom"
         manifest_namespace: "registry"
 
@@ -278,7 +306,8 @@
           Test runner: {{ harbor_registry }}/library/test-runner:latest
           CI utils: {{ harbor_registry }}/library/ci-utils:latest
           AI inference: {{ harbor_registry }}/library/ai-inference-base:latest
-          
+          tk-package-version: {{ harbor_registry }}/library/tk-package-version:latest
+
           These images contain common dependencies and will speed up:
           - Test execution (dependencies pre-installed)
           - Build times (less to download/install)
