@@ -5,9 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## CRITICAL REMINDERS - READ FIRST!
 
 **WORKING ENVIRONMENT**: You are working REMOTELY, not on the actual servers
-- **microk8s controller**: Located on node1 (NOT vm-2, which no longer exists)
+- **microk8s controller**: Located on vilanova1 (NOT vm-2, which no longer exists)
 - **thinkube-control**: Runs on control.example.com (deployed on Kubernetes)
-- **Deployment logs**: Located on node1 at `/tmp/thinkube-deployments/{app_name}/`
+- **Deployment logs**: Located on vilanova1 at `/tmp/thinkube-deployments/{app_name}/`
 - **NO DIRECT ACCESS**: Cannot SSH or directly access servers - work through APIs and web interfaces
 
 **CURRENT DIRECTORY**: You are likely in `/home/thinkube/thinkube/` or one of its subdirectories
