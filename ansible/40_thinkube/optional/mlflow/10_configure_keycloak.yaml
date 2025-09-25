@@ -1,0 +1,117 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/mlflow/10_configure_keycloak.yaml
+# Description:
+#   Configure Keycloak OIDC client for MLflow with proper role mappings
+#
+# Requirements:
+#   - Keycloak must be deployed and accessible
+#   - ADMIN_PASSWORD environment variable must be set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/mlflow/10_configure_keycloak.yaml
+#
+# Variables from inventory:
+#   - mlflow_hostname: Hostname for MLflow UI access
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username for role assignments
+#   - kubeconfig: Path to kubeconfig file
+#
+# Dependencies:
+#   - Keycloak must be running
+#
+# 🤖 AI-assisted
+
+- name: Configure Keycloak "mlflow" client and setup OAuth
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    keycloak_admin_user: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    mlflow_client_id: "mlflow"
+    keycloak_admin_user_id: "{{ admin_username }}"
+    mlflow_namespace: "mlflow"
+    mlflow_k8s_secret_name: "mlflow-oauth-secret"
+
+  tasks:
+    - name: Setup MLflow Keycloak integration without K8s secret
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_setup
+      vars:
+        keycloak_setup_client_id: "{{ mlflow_client_id }}"
+        keycloak_setup_client_body:
+          clientId: "{{ mlflow_client_id }}"
+          enabled: true
+          protocol: "openid-connect"
+          standardFlowEnabled: true
+          implicitFlowEnabled: false
+          directAccessGrantsEnabled: true
+          publicClient: false
+          redirectUris:
+            - "https://{{ mlflow_hostname }}/*"
+            - "https://{{ mlflow_hostname }}/oauth2/callback"
+            - "https://{{ mlflow_hostname }}/callback"
+          webOrigins:
+            - "https://{{ mlflow_hostname }}"
+            - "+"
+          attributes:
+            "access.token.lifespan": "3600"
+            "post.logout.redirect.uris": "+"
+          defaultClientScopes:
+            - "email"
+            - "profile"
+            - "roles"
+            - "openid"
+            - "offline_access"
+          optionalClientScopes:
+            - "address"
+            - "phone"
+
+        keycloak_setup_client_mappers:
+          - name: "mlflow-realm-role-mapper"
+            protocol: "openid-connect"
+            protocolMapper: "oidc-usermodel-realm-role-mapper"
+            config:
+              "claim.name": "realm_access.roles"
+              "id.token.claim": "true"
+              "access.token.claim": "true"
+              "userinfo.token.claim": "true"
+              "multivalued": "true"
+              "jsonType.label": "String"
+
+          - name: "mlflow-audience-mapper"
+            protocol: "openid-connect"
+            protocolMapper: "oidc-audience-mapper"
+            config:
+              "included.client.audience": "mlflow"
+              "id.token.claim": "false"
+              "access.token.claim": "true"
+              "included.custom.audience": "mlflow"
+
+          - name: "mlflow-client-role-mapper"
+            protocol: "openid-connect"
+            protocolMapper: "oidc-usermodel-client-role-mapper"
+            config:
+              "claim.name": "resource_access.${client_id}.roles"
+              "client.id": "mlflow"
+              "id.token.claim": "true"
+              "access.token.claim": "true"
+              "userinfo.token.claim": "true"
+              "multivalued": "true"
+              "jsonType.label": "String"
+
+        keycloak_setup_bulk_roles:
+          - name: "mlflow-admin"
+            description: "MLflow administrator role"
+          - name: "mlflow-user"
+            description: "MLflow standard user role"
+
+        keycloak_setup_user_roles:
+          - username: "{{ keycloak_admin_user_id }}"
+            role_name: "mlflow-admin"
+            role_description: "MLflow administrator role"

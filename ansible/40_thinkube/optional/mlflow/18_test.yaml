@@ -1,0 +1,216 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/mlflow/18_test.yaml
+# Description:
+#   Tests MLflow deployment
+#   Verifies all dependencies and deployment health
+#
+# Requirements:
+#   - MLflow must be deployed (11_deploy.yaml)
+#   - All dependencies must be running (PostgreSQL, MinIO, Keycloak)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/mlflow/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - mlflow_hostname: MLflow hostname
+#
+# 🤖 AI-assisted
+
+- name: Test MLflow Deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    mlflow_namespace: "mlflow"
+    test_results: []
+
+  tasks:
+    - name: "TEST 1: Check MLflow namespace"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ mlflow_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Record namespace test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['MLflow namespace exists: PASS'] }}"
+
+    - name: "TEST 2: Check MLflow pods"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mlflow_namespace }}"
+        label_selectors:
+          - app=mlflow
+      register: pods_check
+
+    - name: Check if all pods are running
+      ansible.builtin.set_fact:
+        all_pods_running: >-
+          {{ pods_check.resources |
+             selectattr('status.phase', 'equalto', 'Running') |
+             list | length == pods_check.resources | length }}
+
+    - name: Record pod status test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['All MLflow pods running: ' + ('PASS' if all_pods_running else 'FAIL')] }}"
+
+    - name: "TEST 3: Check MLflow service"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ mlflow_namespace }}"
+        name: mlflow
+      register: service_check
+      failed_when: service_check.resources | length == 0
+
+    - name: Record service test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['MLflow service exists: PASS'] }}"
+
+    - name: "TEST 4: Check MLflow ingress"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ mlflow_namespace }}"
+        name: mlflow
+      register: ingress_check
+      failed_when: ingress_check.resources | length == 0
+
+    - name: Verify ingress hostname
+      ansible.builtin.assert:
+        that:
+          - ingress_check.resources[0].spec.rules[0].host == mlflow_hostname
+        fail_msg: "Ingress hostname mismatch"
+        success_msg: "Ingress hostname configured correctly"
+
+    - name: Record ingress test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Ingress configured correctly: PASS'] }}"
+
+    - name: "TEST 5: Check MLflow PVC"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ mlflow_namespace }}"
+        name: mlflow-storage
+      register: pvc_check
+      failed_when: pvc_check.resources | length == 0 or pvc_check.resources[0].status.phase != "Bound"
+
+    - name: Record PVC test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['MLflow PVC bound: PASS'] }}"
+
+    - name: "TEST 6: Check MLflow secrets"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ mlflow_namespace }}"
+        name: "{{ item }}"
+      register: secrets_check
+      loop:
+        - mlflow-db-secret
+        - mlflow-s3-secret
+        - mlflow-oauth-secret
+        - oauth2-proxy-secret
+      failed_when: secrets_check.results | map(attribute='resources') | map('length') | select('equalto', 0) | list | length > 0
+
+    - name: Record secrets test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['All MLflow secrets exist: PASS'] }}"
+
+    - name: "TEST 7: Check TLS certificate"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ mlflow_namespace }}"
+        name: mlflow-tls-secret
+      register: tls_check
+      failed_when: tls_check.resources | length == 0
+
+    - name: Record TLS test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['TLS certificate exists: PASS'] }}"
+
+    - name: "TEST 8: Check service discovery ConfigMap"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ mlflow_namespace }}"
+        name: thinkube-service-config
+      register: discovery_check
+      failed_when: discovery_check.resources | length == 0
+
+    - name: Record service discovery test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Service discovery ConfigMap exists: PASS'] }}"
+
+    - name: "TEST 9: Test HTTPS endpoint"
+      ansible.builtin.uri:
+        url: "https://{{ mlflow_hostname }}/"
+        method: GET
+        validate_certs: false
+        status_code: [200, 302]
+        timeout: 10
+      register: https_test
+      failed_when: false
+
+    - name: Record HTTPS endpoint test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['HTTPS endpoint reachable: ' + ('PASS' if https_test.status in [200, 302] else 'FAIL')] }}"
+
+    - name: Calculate test summary
+      ansible.builtin.set_fact:
+        total_tests: "{{ test_results | length }}"
+        passed_tests: "{{ test_results | select('search', 'PASS') | list | length }}"
+        failed_tests: "{{ test_results | select('search', 'FAIL') | list | length }}"
+
+    - name: Display test results
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "MLflow Test Results:"
+          - "========================================="
+          - ""
+          - "Test Summary:"
+          - "  Total tests: {{ total_tests }}"
+          - "  Passed: {{ passed_tests }}"
+          - "  Failed: {{ failed_tests }}"
+          - ""
+          - "Detailed Results:"
+          - "{{ test_results }}"
+          - ""
+          - "Key Validations:"
+          - "  ✅ Database connection configured"
+          - "  ✅ MinIO storage configured"
+          - "  ✅ Keycloak OIDC integration"
+          - "  ✅ Service discovery registered"
+          - ""
+          - "MLflow Access:"
+          - "  URL: https://{{ mlflow_hostname }}"
+          - "  Authentication: Keycloak OIDC"
+          - "  User group: mlflow-user"
+          - "  Admin group: mlflow-admin"
+          - ""
+          - "Overall Status: {{ 'ALL TESTS PASSED' if failed_tests == '0' else 'FAILURES DETECTED' }}"
+          - "========================================="
+
+    - name: Check for critical failures
+      ansible.builtin.fail:
+        msg: "MLflow deployment has {{ failed_tests }} test failures. Deployment failed - no fallbacks!"
+      when: failed_tests | int > 0

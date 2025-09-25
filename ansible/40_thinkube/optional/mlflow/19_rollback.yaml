@@ -1,0 +1,193 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/mlflow/19_rollback.yaml
+# Description:
+#   Rollback MLflow deployment including namespace, resources, and database
+#
+# Requirements:
+#   - MicroK8s cluster with kubectl configured
+#   - kubectl_bin variable set in inventory
+#   - PostgreSQL admin password set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/mlflow/19_rollback.yaml
+#
+# Variables from inventory:
+#   - Domain and namespace configuration
+#   - Database configuration
+#
+# 🤖 AI-assisted
+
+- name: Rollback MLflow Deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    mlflow_namespace: "mlflow"
+    mlflow_db_name: "mlflow"
+    mlflow_db_user: "mlflow"
+    mlflow_artifacts_bucket: "mlflow"
+    postgres_admin_user: "admin"
+    postgres_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+
+  tasks:
+    - name: Check if MLflow namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ mlflow_namespace }}"
+      register: namespace_check
+
+    - name: Delete MLflow deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ mlflow_namespace }}"
+        name: mlflow
+        state: absent
+        wait: true
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete MLflow service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ mlflow_namespace }}"
+        name: mlflow
+        state: absent
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete MLflow ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ mlflow_namespace }}"
+        name: mlflow
+        state: absent
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete persistent volume claim
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ mlflow_namespace }}"
+        name: mlflow-storage
+        state: absent
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete ConfigMaps
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ mlflow_namespace }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - mlflow-group-plugin
+        - thinkube-service-config
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ mlflow_namespace }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - mlflow-db-secret
+        - mlflow-s3-secret
+        - mlflow-oauth-secret
+        - oauth2-proxy-secret
+        - mlflow-tls-secret
+        - harbor-registry-secret
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Force delete stuck pods if any
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pods --all -n {{ mlflow_namespace }} --grace-period=0 --force || true
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete MLflow namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ mlflow_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: absent
+        wait: true
+        wait_timeout: 60
+      when: namespace_check.resources | length > 0
+      register: namespace_delete
+      ignore_errors: true
+
+    - name: Force remove namespace finalizers if stuck
+      ansible.builtin.shell: |
+        NS_STATUS=$({{ kubectl_bin }} get namespace {{ mlflow_namespace }} -o json 2>/dev/null | jq -r '.status.phase')
+        if [ "$NS_STATUS" = "Terminating" ]; then
+          echo "Namespace stuck in Terminating, removing finalizers..."
+          {{ kubectl_bin }} get namespace {{ mlflow_namespace }} -o json | \
+            jq '.spec.finalizers = []' | \
+            {{ kubectl_bin }} replace --raw /api/v1/namespaces/{{ mlflow_namespace }}/finalize -f -
+        fi
+      when:
+        - namespace_check.resources | length > 0
+        - namespace_delete is failed or namespace_delete.changed == false
+      ignore_errors: true
+
+    - name: Drop MLflow database
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ postgres_admin_password }}" psql -h {{ postgres_hostname }} -p 5432 -U {{ postgres_admin_user }} -d postgres -c "
+        DROP DATABASE IF EXISTS {{ mlflow_db_name }};
+        DROP USER IF EXISTS {{ mlflow_db_user }};
+        "
+      become: true
+      register: db_drop
+      changed_when: db_drop.rc == 0
+      ignore_errors: true
+
+    - name: Remove MLflow MinIO bucket
+      ansible.builtin.shell: |
+        mc alias set mlflow https://{{ minio_api_hostname }} {{ lookup('env', 'MINIO_ROOT_USER') }} {{ lookup('env', 'MINIO_ROOT_PASSWORD') }} --insecure && \
+        mc rb mlflow/{{ mlflow_artifacts_bucket }} --force --insecure || true
+      become: true
+      environment:
+        MC_INSECURE: "1"
+      ignore_errors: true
+
+    - name: Display cleanup status
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "MLflow Rollback Complete"
+          - "========================================="
+          - "Resources removed:"
+          - "  - Deployment: mlflow"
+          - "  - Service: mlflow"
+          - "  - Ingress: mlflow"
+          - "  - Namespace: {{ mlflow_namespace }}"
+          - "  - Database: {{ mlflow_db_name }}"
+          - "  - Database user: {{ mlflow_db_user }}"
+          - "  - MinIO bucket: {{ mlflow_artifacts_bucket }}"
+          - "  - All secrets and ConfigMaps"
+          - ""
+          - "Note: Custom images remain in Harbor"
+          - "Note: Keycloak client configuration preserved"
+          - "========================================="

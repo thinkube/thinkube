@@ -1,0 +1,86 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/mlflow/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for MLflow by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - MLflow must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/mlflow/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#   - mlflow_hostname: Hostname for MLflow UI access
+#
+# 🤖 AI-assisted
+
+- name: Configure MLflow service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  tasks:
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: mlflow
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "mlflow"
+          data:
+            service.yaml: |
+              service:
+                name: mlflow
+                display_name: "MLflow"
+                description: "ML experiment tracking and model registry"
+                type: optional
+                category: ai
+                icon: /icons/tk_ai.svg
+
+                endpoints:
+                  - name: web
+                    type: http
+                    url: "https://{{ mlflow_hostname }}"
+                    health_url: "https://{{ mlflow_hostname }}/"
+                    description: "Web interface"
+                    primary: true
+
+                dependencies:
+                  - postgres
+                  - minio
+                  - keycloak
+
+                scaling:
+                  resource_type: deployment
+                  resource_name: mlflow
+                  namespace: mlflow
+                  min_replicas: 1
+                  can_disable: true
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: mlflow
+      register: configmap_info
+
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for MLflow"
+      when: configmap_info.resources | length > 0
