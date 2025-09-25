@@ -141,23 +141,6 @@
             tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
 
-    - name: Create Docker registry auth config
-      ansible.builtin.copy:
-        dest: "/tmp/mlflow-registry-auth.json"
-        content: |
-          {
-            "auths": {
-              "{{ harbor_registry }}": {
-                "username": "{{ harbor_robot_user }}",
-                "password": "{{ harbor_robot_token }}",
-                "auth": "{{ (harbor_robot_user + ':' + harbor_robot_token) | b64encode }}"
-              }
-            }
-          }
-        mode: '0600'
-      changed_when: false
-      no_log: true
-
     - name: Create Harbor registry pull secret in MLflow namespace
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -170,13 +153,8 @@
             name: harbor-registry-secret
           type: kubernetes.io/dockerconfigjson
           data:
-            .dockerconfigjson: "{{ lookup('file', '/tmp/mlflow-registry-auth.json') | b64encode }}"
-
-    - name: Remove temporary auth config file
-      ansible.builtin.file:
-        path: "/tmp/mlflow-registry-auth.json"
-        state: absent
-      changed_when: false
+            .dockerconfigjson: "{{ {'auths': {harbor_registry: {'username': harbor_robot_user, 'password': harbor_robot_token, 'auth': (harbor_robot_user + ':' + harbor_robot_token) | b64encode}}} | to_json | b64encode }}"
+      no_log: true
 
     - name: Check if MLflow database exists
       ansible.builtin.shell: |
