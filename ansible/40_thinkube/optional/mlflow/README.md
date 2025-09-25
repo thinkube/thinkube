@@ -91,7 +91,7 @@ MLflow uses built-in OIDC authentication with Keycloak:
 - **mlflow-user**: Standard user access
 
 ### User Management
-- Admin user (from inventory `admin_username`) automatically assigned mlflow-admin role
+- SSO user (from inventory `auth_realm_username`) automatically assigned mlflow-admin role
 - Additional users can be assigned roles in Keycloak
 - Automatic user group detection from Keycloak realm roles
 
@@ -125,7 +125,8 @@ Tests verify:
 Required inventory variables:
 - `domain_name`: Base domain for the cluster
 - `mlflow_hostname`: Hostname for MLflow access (e.g., mlflow.{{ domain_name }})
-- `admin_username`: Admin username for role assignments
+- `admin_username`: Keycloak admin username (for API access)
+- `auth_realm_username`: SSO user for role assignments (typically 'thinkube')
 - `kubeconfig`: Path to kubeconfig file
 - `postgres_hostname`: PostgreSQL server hostname
 - `seaweedfs_s3_hostname`: SeaweedFS S3 API hostname
