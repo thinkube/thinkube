@@ -163,14 +163,35 @@
       changed_when: db_drop.rc == 0
       ignore_errors: true
 
-    - name: Remove MLflow MinIO bucket
-      ansible.builtin.shell: |
-        mc alias set mlflow https://{{ minio_api_hostname }} {{ lookup('env', 'MINIO_ROOT_USER') }} {{ lookup('env', 'MINIO_ROOT_PASSWORD') }} --insecure && \
-        mc rb mlflow/{{ mlflow_artifacts_bucket }} --force --insecure || true
-      become: true
-      environment:
-        MC_INSECURE: "1"
+    - name: Get SeaweedFS S3 credentials
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: seaweedfs
+        name: seaweedfs-s3-config
+      register: seaweedfs_secret
+      failed_when: false
       ignore_errors: true
+
+    - name: Remove MLflow SeaweedFS bucket
+      ansible.builtin.shell: |
+        {% if seaweedfs_secret.resources | length > 0 %}
+        s3cmd --config=/dev/null \
+          --access_key="{{ seaweedfs_secret.resources[0].data.access_key | b64decode }}" \
+          --secret_key="{{ seaweedfs_secret.resources[0].data.secret_key | b64decode }}" \
+          --host="https://{{ seaweedfs_s3_hostname }}" \
+          --host-bucket="https://{{ seaweedfs_s3_hostname }}/%(bucket)s" \
+          --no-ssl-certificate-check \
+          --signature-v2 \
+          rb s3://{{ mlflow_artifacts_bucket }} --force 2>&1 || true
+        {% else %}
+        echo "SeaweedFS secret not found, skipping bucket removal"
+        {% endif %}
+      become: true
+      when: seaweedfs_secret.resources is defined
+      ignore_errors: true
+      no_log: true
 
     - name: Display cleanup status
       ansible.builtin.debug:
@@ -185,7 +206,7 @@
           - "  - Namespace: {{ mlflow_namespace }}"
           - "  - Database: {{ mlflow_db_name }}"
           - "  - Database user: {{ mlflow_db_user }}"
-          - "  - MinIO bucket: {{ mlflow_artifacts_bucket }}"
+          - "  - SeaweedFS bucket: {{ mlflow_artifacts_bucket }}"
           - "  - All secrets and ConfigMaps"
           - ""
           - "Note: Custom images remain in Harbor"

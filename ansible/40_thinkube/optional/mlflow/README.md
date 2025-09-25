@@ -1,6 +1,6 @@
 # MLflow Component
 
-MLflow is an open-source platform for managing the ML lifecycle, including experimentation, reproducibility, deployment, and a central model registry. This deployment provides a fully-featured MLflow tracking server with PostgreSQL backend, MinIO artifact storage, and Keycloak OIDC authentication.
+MLflow is an open-source platform for managing the ML lifecycle, including experimentation, reproducibility, deployment, and a central model registry. This deployment provides a fully-featured MLflow tracking server with PostgreSQL backend, SeaweedFS S3-compatible artifact storage (Apache 2.0 licensed), and Keycloak OIDC authentication.
 
 ## Overview
 
@@ -25,7 +25,7 @@ MLflow is an open-source platform for managing the ML lifecycle, including exper
 - MicroK8s cluster with ingress controller
 - Cert-manager with wildcard certificate
 - PostgreSQL database (core component)
-- MinIO object storage (core component)
+- SeaweedFS object storage (core component, Apache 2.0 licensed)
 - Keycloak instance running and accessible
 - Custom MLflow image built and available in Harbor registry
 - ADMIN_PASSWORD environment variable set
@@ -76,8 +76,9 @@ The database is created in the existing PostgreSQL instance deployed as a core c
 ## Storage Configuration
 
 MLflow artifact storage:
-- **Backend**: MinIO (S3-compatible)
+- **Backend**: SeaweedFS (Apache 2.0 licensed S3-compatible storage)
 - **Bucket**: `mlflow`
+- **Endpoint**: Internal cluster endpoint for performance
 - **Location**: Automatically created during deployment
 - **Local artifacts**: PersistentVolume for temporary storage
 
@@ -127,7 +128,7 @@ Required inventory variables:
 - `admin_username`: Admin username for role assignments
 - `kubeconfig`: Path to kubeconfig file
 - `postgres_hostname`: PostgreSQL server hostname
-- `minio_api_hostname`: MinIO API hostname
+- `seaweedfs_s3_hostname`: SeaweedFS S3 API hostname
 - `keycloak_url`: Keycloak server URL
 - `keycloak_realm`: Keycloak realm name
 - `harbor_registry`: Harbor registry domain
@@ -137,8 +138,6 @@ Required inventory variables:
 Environment variables:
 - `ADMIN_PASSWORD`: Admin password (required)
 - `MLFLOW_DB_PASSWORD`: Database password (optional)
-- `MINIO_ROOT_USER`: MinIO access key
-- `MINIO_ROOT_PASSWORD`: MinIO secret key
 
 ## Features
 
@@ -156,7 +155,7 @@ Environment variables:
 
 ### Artifact Storage
 - Store models, datasets, and files
-- S3-compatible MinIO backend
+- S3-compatible SeaweedFS backend (Apache 2.0 licensed)
 - Automatic artifact logging
 - Download artifacts via CLI or UI
 
@@ -224,12 +223,17 @@ kubectl run -it --rm psql --image=postgres:15 --restart=Never -- \
 
 ### Storage Issues
 ```bash
-# Check MinIO secret
+# Check SeaweedFS S3 secret
 kubectl get secret mlflow-s3-secret -n mlflow -o yaml
 
-# Test MinIO connectivity
-mc alias set mlflow https://{{ minio_api_hostname }} <access-key> <secret-key>
-mc ls mlflow/mlflow
+# Test SeaweedFS connectivity
+s3cmd --config=/dev/null \
+  --access_key="<access-key>" \
+  --secret_key="<secret-key>" \
+  --host="https://{{ seaweedfs_s3_hostname }}" \
+  --no-ssl-certificate-check \
+  --signature-v2 \
+  ls s3://mlflow/
 ```
 
 ### OIDC Issues
@@ -251,7 +255,7 @@ This will:
 - Delete all MLflow resources
 - Remove the namespace
 - Drop the database and user
-- Remove MinIO bucket
+- Remove SeaweedFS S3 bucket
 - Clean up all secrets and ConfigMaps
 - Preserve Keycloak client configuration
 - Preserve custom images in Harbor
@@ -259,19 +263,20 @@ This will:
 ## Notes
 
 - Database credentials are stored in Kubernetes secrets
-- Artifact storage uses MinIO with S3 protocol
+- Artifact storage uses SeaweedFS with S3-compatible protocol (Apache 2.0 licensed)
 - Custom image is required for OIDC support
 - Built-in OIDC replaces OAuth2 Proxy approach
 - All communication uses TLS encryption
 - Service is automatically registered in thinkube-control dashboard
 - Consider persistent volumes for production use
 - Database is backed up with PostgreSQL backup procedures
+- **License compliance**: SeaweedFS is Apache 2.0 licensed, ensuring compatibility with Thinkube's Apache license and public cloud integrations
 
 ## Dependencies
 
 This component depends on:
 - **PostgreSQL** (CORE-XXX): Database backend
-- **MinIO** (CORE-XXX): Artifact storage
+- **SeaweedFS** (CORE-XXX): S3-compatible artifact storage (Apache 2.0 licensed)
 - **Keycloak** (CORE-XXX): Authentication provider
 
 ## License
