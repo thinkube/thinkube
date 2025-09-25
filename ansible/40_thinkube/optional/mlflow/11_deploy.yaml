@@ -304,56 +304,6 @@
               requests:
                 storage: "{{ mlflow_capacity }}"
 
-    - name: Create custom Keycloak group detection plugin
-      ansible.builtin.copy:
-        dest: "/tmp/mlflow_keycloak_groups.py"
-        content: |
-          #!/usr/bin/env python3
-          """
-          Custom Keycloak group detection plugin for MLflow OIDC auth
-          This plugin extracts group/role information from Keycloak access tokens
-          """
-
-          def get_user_groups(access_token):
-              """
-              Extract groups from Keycloak access token
-
-              Args:
-                  access_token: The decoded access token from Keycloak
-
-              Returns:
-                  List of group/role names
-              """
-              try:
-                  if isinstance(access_token, dict):
-                      if 'realm_access' in access_token and 'roles' in access_token['realm_access']:
-                          return access_token['realm_access']['roles']
-                  else:
-                      import jwt
-                      try:
-                          decoded = jwt.decode(access_token, options={"verify_signature": False})
-                          if 'realm_access' in decoded and 'roles' in decoded['realm_access']:
-                              return decoded['realm_access']['roles']
-                      except Exception as jwt_error:
-                          print(f"Error decoding token: {jwt_error}")
-
-                  if isinstance(access_token, dict) and 'resource_access' in access_token:
-                      client_roles = []
-                      for client, data in access_token['resource_access'].items():
-                          if 'roles' in data:
-                              for role in data['roles']:
-                                  client_roles.append(f"{client}:{role}")
-                      if client_roles:
-                          return client_roles
-
-                  print("No roles found in token")
-                  return []
-              except Exception as e:
-                  print(f"Error extracting groups from token: {e}")
-                  return []
-        mode: '0644'
-      changed_when: false
-
     - name: Create ConfigMap for custom Keycloak group detection plugin
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -365,13 +315,50 @@
           metadata:
             name: mlflow-group-plugin
           data:
-            mlflow_keycloak_groups.py: "{{ lookup('file', '/tmp/mlflow_keycloak_groups.py') }}"
+            mlflow_keycloak_groups.py: |
+              #!/usr/bin/env python3
+              """
+              Custom Keycloak group detection plugin for MLflow OIDC auth
+              This plugin extracts group/role information from Keycloak access tokens
+              """
 
-    - name: Remove temporary plugin file
-      ansible.builtin.file:
-        path: "/tmp/mlflow_keycloak_groups.py"
-        state: absent
-      changed_when: false
+              def get_user_groups(access_token):
+                  """
+                  Extract groups from Keycloak access token
+
+                  Args:
+                      access_token: The decoded access token from Keycloak
+
+                  Returns:
+                      List of group/role names
+                  """
+                  try:
+                      if isinstance(access_token, dict):
+                          if 'realm_access' in access_token and 'roles' in access_token['realm_access']:
+                              return access_token['realm_access']['roles']
+                      else:
+                          import jwt
+                          try:
+                              decoded = jwt.decode(access_token, options={"verify_signature": False})
+                              if 'realm_access' in decoded and 'roles' in decoded['realm_access']:
+                                  return decoded['realm_access']['roles']
+                          except Exception as jwt_error:
+                              print(f"Error decoding token: {jwt_error}")
+
+                      if isinstance(access_token, dict) and 'resource_access' in access_token:
+                          client_roles = []
+                          for client, data in access_token['resource_access'].items():
+                              if 'roles' in data:
+                                  for role in data['roles']:
+                                      client_roles.append(f"{client}:{role}")
+                          if client_roles:
+                              return client_roles
+
+                      print("No roles found in token")
+                      return []
+                  except Exception as e:
+                      print(f"Error extracting groups from token: {e}")
+                      return []
 
     - name: Create MLflow Deployment
       kubernetes.core.k8s:
