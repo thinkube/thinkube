@@ -27,8 +27,10 @@ MLflow is an open-source platform for managing the ML lifecycle, including exper
 - PostgreSQL database (core component)
 - SeaweedFS object storage (core component, Apache 2.0 licensed)
 - Keycloak instance running and accessible
+- Harbor registry configured (core component)
 - Custom MLflow image built and available in Harbor registry
 - ADMIN_PASSWORD environment variable set
+- HARBOR_ROBOT_TOKEN in ~/.env (created during Harbor setup)
 - MLFLOW_DB_PASSWORD environment variable (optional, auto-generated if not set)
 
 ## Image Requirements
@@ -138,6 +140,7 @@ Required inventory variables:
 
 Environment variables:
 - `ADMIN_PASSWORD`: Admin password (required)
+- `HARBOR_ROBOT_TOKEN`: Harbor robot account token (required, stored in ~/.env)
 - `MLFLOW_DB_PASSWORD`: Database password (optional)
 
 ## Features

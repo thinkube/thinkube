@@ -75,10 +75,30 @@
     mlflow_tls_secret_name: "mlflow-tls-secret"
 
   tasks:
-    - name: Include common environment role for loading variables
-      ansible.builtin.include_role:
-        name: common/environment
-        tasks_from: main.yaml
+    - name: Load Harbor robot token from .env file
+      ansible.builtin.shell: |
+        if [ -f "{{ ansible_env.HOME }}/.env" ]; then
+          source {{ ansible_env.HOME }}/.env
+          echo $HARBOR_ROBOT_TOKEN
+        else
+          echo ""
+        fi
+      args:
+        executable: /bin/bash
+      register: robot_token_result
+      changed_when: false
+      no_log: true
+
+    - name: Set Harbor credentials facts
+      ansible.builtin.set_fact:
+        harbor_robot_user: "robot${{ harbor_robot_name }}"
+        harbor_robot_token: "{{ robot_token_result.stdout.strip() }}"
+      no_log: true
+
+    - name: Verify Harbor robot token is available
+      ansible.builtin.fail:
+        msg: "HARBOR_ROBOT_TOKEN not found in {{ ansible_env.HOME }}/.env. Please ensure Harbor is configured."
+      when: harbor_robot_token == ""
 
     - name: Create namespace for MLflow
       kubernetes.core.k8s:
