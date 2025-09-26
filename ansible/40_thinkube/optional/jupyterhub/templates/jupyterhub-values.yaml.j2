@@ -105,6 +105,28 @@ hub:
                   sys.exit(1)
 
               images = images_response.json()
+
+              # Query for JupyterHub configuration (defaults)
+              logger.info("Querying thinkube-control for JupyterHub configuration...")
+              config_response = requests.get(
+                  'http://backend.thinkube-control.svc.cluster.local:8000/api/v1/jupyterhub/config',
+                  headers={'Accept': 'application/json'},
+                  timeout=10
+              )
+
+              if config_response.status_code != 200:
+                  logger.warning(f"Failed to get JupyterHub config: {config_response.status_code}, using defaults")
+                  jupyterhub_config = {
+                      'default_image': 'jupyter-ml-cpu',
+                      'default_node': None,
+                      'default_cpu_cores': 4,
+                      'default_memory_gb': 8,
+                      'default_gpu_count': 0
+                  }
+              else:
+                  jupyterhub_config = config_response.json()
+                  logger.info(f"Loaded JupyterHub config: image={jupyterhub_config.get('default_image')}, node={jupyterhub_config.get('default_node')}, defaults=({jupyterhub_config['default_cpu_cores']}CPU, {jupyterhub_config['default_memory_gb']}GB, {jupyterhub_config['default_gpu_count']}GPU)")
+
               profiles = []
 
               # Find max available resources across all nodes
@@ -169,27 +191,27 @@ hub:
                       'image': {
                           'display_name': 'Select Image',
                           'choices': image_choices,
-                          'default': list(image_choices.keys())[0] if image_choices else 'base'
+                          'default': jupyterhub_config.get('default_image', list(image_choices.keys())[0] if image_choices else 'base')
                       },
                       'node': {
                           'display_name': 'Select Node',
                           'choices': node_choices,
-                          'default': list(node_choices.keys())[0] if node_choices else 'vilanova1'
+                          'default': jupyterhub_config.get('default_node') or (list(node_choices.keys())[0] if node_choices else 'vilanova1')
                       },
                       'cpu': {
                           'display_name': 'CPU Cores',
                           'choices': cpu_choices,
-                          'default': '4' if '4' in cpu_choices else list(cpu_choices.keys())[0]
+                          'default': str(jupyterhub_config['default_cpu_cores']) if str(jupyterhub_config['default_cpu_cores']) in cpu_choices else list(cpu_choices.keys())[0]
                       },
                       'memory': {
                           'display_name': 'Memory',
                           'choices': memory_choices,
-                          'default': '8G' if '8G' in memory_choices else list(memory_choices.keys())[0]
+                          'default': f"{jupyterhub_config['default_memory_gb']}G" if f"{jupyterhub_config['default_memory_gb']}G" in memory_choices else list(memory_choices.keys())[0]
                       },
                       'enable_gpu': {
                           'display_name': 'Number of GPUs',
                           'choices': gpu_choices,
-                          'default': '0'
+                          'default': str(jupyterhub_config['default_gpu_count'])
                       }
                   },
                   'kubespawner_override': {
