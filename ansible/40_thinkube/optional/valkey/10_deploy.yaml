@@ -1,0 +1,211 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/valkey/10_deploy.yaml
+# Description:
+#   Deploy Valkey (Redis-compatible) for infrastructure use in Kubernetes
+#
+# This playbook:
+#   1. Creates valkey namespace
+#   2. Creates persistent storage for Valkey data
+#   3. Deploys Valkey 8.1 with persistence enabled
+#   4. Creates ClusterIP and headless services
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - Valkey custom image must be available in Harbor (built by Harbor base images playbook)
+#   - HARBOR_ROBOT_TOKEN environment variable in ~/.env file
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/valkey/10_deploy.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Harbor registry domain
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Deploy Valkey (Redis-compatible)
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    valkey_namespace: "valkey"
+    valkey_deployment_name: "valkey"
+    valkey_service_name: "valkey"
+    valkey_headless_service_name: "valkey-headless"
+    valkey_image: "{{ harbor_registry }}/thinkube/valkey:8.1.0"
+    valkey_port: 6379
+    valkey_storage_class: "microk8s-hostpath"
+    valkey_persistence_size: "5Gi"
+
+  tasks:
+    - name: Load Harbor robot token from .env file
+      ansible.builtin.shell: |
+        if [ -f "{{ ansible_env.HOME }}/.env" ]; then
+          source {{ ansible_env.HOME }}/.env
+          echo $HARBOR_ROBOT_TOKEN
+        else
+          echo ""
+        fi
+      args:
+        executable: /bin/bash
+      register: robot_token_result
+      changed_when: false
+
+    - name: Set Harbor credentials facts
+      ansible.builtin.set_fact:
+        harbor_robot_user: "robot${{ harbor_robot_name }}"
+        harbor_robot_token: "{{ robot_token_result.stdout.strip() }}"
+
+    - name: Verify Harbor robot token is available
+      ansible.builtin.fail:
+        msg: "HARBOR_ROBOT_TOKEN not found in {{ ansible_env.HOME }}/.env. Please ensure Harbor is configured."
+      when: harbor_robot_token == ""
+
+    - name: Create namespace for Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ valkey_namespace }}"
+        kind: Namespace
+        state: present
+
+    - name: Create Harbor registry pull secret in Valkey namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: harbor-registry-secret
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: "{{ {'auths': {harbor_registry: {'username': harbor_robot_user, 'password': harbor_robot_token, 'auth': (harbor_robot_user + ':' + harbor_robot_token) | b64encode}}} | to_json | b64encode }}"
+
+    - name: Create PVC for Valkey data
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: valkey-data
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: "{{ valkey_storage_class }}"
+            resources:
+              requests:
+                storage: "{{ valkey_persistence_size }}"
+
+    - name: Deploy Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ valkey_deployment_name }}"
+            labels:
+              app: "{{ valkey_deployment_name }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: "{{ valkey_deployment_name }}"
+            template:
+              metadata:
+                labels:
+                  app: "{{ valkey_deployment_name }}"
+              spec:
+                imagePullSecrets:
+                - name: harbor-registry-secret
+                containers:
+                - name: valkey
+                  image: "{{ valkey_image }}"
+                  imagePullPolicy: Always
+                  command: ["valkey-server"]
+                  args:
+                    - "--save"
+                    - "900 1"
+                    - "--appendonly"
+                    - "yes"
+                    - "--protected-mode"
+                    - "no"
+                  ports:
+                  - containerPort: "{{ valkey_port }}"
+                    name: valkey
+                  resources:
+                    limits:
+                      memory: "256Mi"
+                      cpu: "200m"
+                    requests:
+                      memory: "128Mi"
+                      cpu: "100m"
+                  volumeMounts:
+                    - name: data
+                      mountPath: /data
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: valkey-data
+
+    - name: Create ClusterIP service for Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ valkey_service_name }}"
+            labels:
+              app: "{{ valkey_deployment_name }}"
+          spec:
+            type: ClusterIP
+            selector:
+              app: "{{ valkey_deployment_name }}"
+            ports:
+              - name: valkey
+                port: "{{ valkey_port }}"
+                targetPort: "{{ valkey_port }}"
+
+    - name: Create headless service for Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ valkey_headless_service_name }}"
+            labels:
+              app: "{{ valkey_deployment_name }}"
+          spec:
+            clusterIP: None
+            selector:
+              app: "{{ valkey_deployment_name }}"
+            ports:
+              - name: valkey
+                port: "{{ valkey_port }}"
+                targetPort: "{{ valkey_port }}"
+
+    - name: Final Valkey info
+      ansible.builtin.debug:
+        msg:
+          - "Valkey (Redis-compatible) deployed successfully."
+          - "Namespace: {{ valkey_namespace }}"
+          - "Image: {{ valkey_image }}"
+          - "Service: {{ valkey_service_name }}.{{ valkey_namespace }}.svc.cluster.local:{{ valkey_port }}"
+          - "Headless service: {{ valkey_headless_service_name }}.{{ valkey_namespace }}.svc.cluster.local:{{ valkey_port }}"
+          - "Persistence: {{ valkey_persistence_size }} on {{ valkey_storage_class }}"
+          - "Features: AOF persistence enabled, save snapshots every 900s if 1+ key changed"

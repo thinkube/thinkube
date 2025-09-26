@@ -60,6 +60,22 @@
         validate_certs: true
         status_code: [201, 409]
       register: library_project
+
+    - name: Ensure thinkube project exists in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects"
+        method: POST
+        headers:
+          Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
+        body_format: json
+        body:
+          project_name: "thinkube"
+          public: true
+          metadata:
+            public: "true"
+        validate_certs: true
+        status_code: [201, 409]
+      register: thinkube_project
       
     - name: Create build context directory
       ansible.builtin.file:
@@ -209,7 +225,151 @@
         - "latest"
       register: ai_inference_push
       changed_when: true
-      
+
+    - name: Template MLflow Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/mlflow.Dockerfile.j2"
+        dest: "{{ temp_dockerfiles_dir.path }}/mlflow.Dockerfile"
+
+    - name: Build MLflow custom image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/thinkube/mlflow-custom:latest \
+                     -f {{ temp_dockerfiles_dir.path }}/mlflow.Dockerfile \
+                     {{ base_images_dir }}
+      register: mlflow_build
+      changed_when: true
+
+    - name: Push MLflow custom image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/thinkube/mlflow-custom:latest
+      register: mlflow_push
+      changed_when: true
+
+    # Build Valkey from custom Dockerfile
+    - name: Template Valkey Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/valkey.Dockerfile.j2"
+        dest: "{{ temp_dockerfiles_dir.path }}/valkey.Dockerfile"
+
+    - name: Copy Valkey entrypoint script
+      ansible.builtin.copy:
+        src: "{{ local_base_images_dir }}/docker-entrypoint.sh"
+        dest: "{{ base_images_dir }}/docker-entrypoint.sh"
+        mode: '0755'
+
+    - name: Build Valkey image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/thinkube/valkey:8.1.0 \
+                     -t {{ harbor_registry }}/thinkube/valkey:latest \
+                     -f {{ temp_dockerfiles_dir.path }}/valkey.Dockerfile \
+                     {{ base_images_dir }}
+      register: valkey_build
+      changed_when: true
+
+    - name: Push Valkey images
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/thinkube/valkey:{{ item }}
+      loop:
+        - "8.1.0"
+        - "latest"
+      register: valkey_push
+      changed_when: true
+
+    # Build Jupyter custom images with Thinkube integration
+    - name: Template Thinkube environment file for Jupyter images
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/thinkube_env.j2"
+        dest: "{{ base_images_dir }}/.thinkube_env"
+        mode: '0644'
+
+    - name: Copy Thinkube services example notebook for Jupyter images
+      ansible.builtin.copy:
+        src: "{{ local_base_images_dir }}/thinkube_services.ipynb"
+        dest: "{{ base_images_dir }}/thinkube_services.ipynb"
+        mode: '0644'
+
+    - name: Template jupyter-ml-cpu Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/jupyter-ml-cpu.Dockerfile.j2"
+        dest: "{{ temp_dockerfiles_dir.path }}/jupyter-ml-cpu.Dockerfile"
+
+    - name: Build jupyter-ml-cpu image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/jupyter-ml-cpu:latest \
+                     -f {{ temp_dockerfiles_dir.path }}/jupyter-ml-cpu.Dockerfile \
+                     {{ base_images_dir }}
+      register: jupyter_ml_cpu_build
+      changed_when: true
+
+    - name: Push jupyter-ml-cpu image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/jupyter-ml-cpu:latest
+      register: jupyter_ml_cpu_push
+      changed_when: true
+
+    - name: Template jupyter-ml-gpu Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/jupyter-ml-gpu.Dockerfile.j2"
+        dest: "{{ temp_dockerfiles_dir.path }}/jupyter-ml-gpu.Dockerfile"
+
+    - name: Build jupyter-ml-gpu image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/jupyter-ml-gpu:latest \
+                     -f {{ temp_dockerfiles_dir.path }}/jupyter-ml-gpu.Dockerfile \
+                     {{ base_images_dir }}
+      register: jupyter_ml_gpu_build
+      changed_when: true
+
+    - name: Push jupyter-ml-gpu image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/jupyter-ml-gpu:latest
+      register: jupyter_ml_gpu_push
+      changed_when: true
+
+    - name: Template jupyter-fine-tuning Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/jupyter-fine-tuning.Dockerfile.j2"
+        dest: "{{ temp_dockerfiles_dir.path }}/jupyter-fine-tuning.Dockerfile"
+
+    - name: Build jupyter-fine-tuning image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/jupyter-fine-tuning:latest \
+                     -f {{ temp_dockerfiles_dir.path }}/jupyter-fine-tuning.Dockerfile \
+                     {{ base_images_dir }}
+      register: jupyter_fine_tuning_build
+      changed_when: true
+
+    - name: Push jupyter-fine-tuning image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/jupyter-fine-tuning:latest
+      register: jupyter_fine_tuning_push
+      changed_when: true
+
+    - name: Template jupyter-agent-dev Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/jupyter-agent-dev.Dockerfile.j2"
+        dest: "{{ temp_dockerfiles_dir.path }}/jupyter-agent-dev.Dockerfile"
+
+    - name: Build jupyter-agent-dev image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/jupyter-agent-dev:latest \
+                     -f {{ temp_dockerfiles_dir.path }}/jupyter-agent-dev.Dockerfile \
+                     {{ base_images_dir }}
+      register: jupyter_agent_dev_build
+      changed_when: true
+
+    - name: Push jupyter-agent-dev image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/jupyter-agent-dev:latest
+      register: jupyter_agent_dev_push
+      changed_when: true
+
     # Build tk-package-version from GitHub repository
     - name: Clone tk-package-version repository
       ansible.builtin.git:
@@ -283,6 +443,61 @@
           - destination: "{{ harbor_registry }}/library/ai-inference-base:latest"
             source: "custom-build"
             description: "AI inference base latest (CUDA 12.4)"
+          - destination: "{{ harbor_registry }}/thinkube/mlflow-custom:latest"
+            source: "custom-build"
+            description: "MLflow with OIDC auth, PostgreSQL and S3 support"
+            metadata:
+              base_image: "python:3.12-slim"
+              packages: "mlflow mlflow-oidc-auth psycopg2-binary boto3 PyJWT"
+          - destination: "{{ harbor_registry }}/thinkube/valkey:8.1.0"
+            source: "github.com/valkey-io/valkey-container"
+            description: "Valkey 8.1.0 Alpine - Redis OSS alternative"
+            metadata:
+              base_image: "alpine"
+              version: "8.1.0"
+          - destination: "{{ harbor_registry }}/thinkube/valkey:latest"
+            source: "github.com/valkey-io/valkey-container"
+            description: "Valkey latest - Redis OSS alternative"
+          - destination: "{{ harbor_registry }}/library/jupyter-ml-cpu:latest"
+            source: "custom-build"
+            description: "Jupyter ML Development (CPU) with PyTorch and Thinkube services"
+            metadata:
+              purpose: "jupyter"
+              display_name: "ML Development (CPU)"
+              default: true
+              base_image: "jupyter-scipy-notebook:latest"
+              packages: "torch pandas scikit-learn matplotlib"
+              services: "postgresql valkey qdrant opensearch mlflow seaweedfs weaviate litellm labelstudio"
+          - destination: "{{ harbor_registry }}/library/jupyter-ml-gpu:latest"
+            source: "custom-build"
+            description: "Jupyter ML Development (GPU) with CUDA 12.6 and Thinkube services"
+            metadata:
+              purpose: "jupyter"
+              display_name: "ML Development (GPU)"
+              default: false
+              requires_gpu: true
+              base_image: "cuda:12.6.0-cudnn-runtime-ubuntu24.04"
+              packages: "torch transformers datasets accelerate"
+              services: "postgresql valkey qdrant opensearch mlflow seaweedfs weaviate litellm labelstudio"
+          - destination: "{{ harbor_registry }}/library/jupyter-fine-tuning:latest"
+            source: "custom-build"
+            description: "Jupyter Fine-Tuning Lab with Unsloth and QLoRA"
+            metadata:
+              purpose: "jupyter"
+              display_name: "Fine-Tuning Lab"
+              default: false
+              requires_gpu: true
+              base_image: "jupyter-ml-gpu:latest"
+              packages: "unsloth bitsandbytes peft trl"
+          - destination: "{{ harbor_registry }}/library/jupyter-agent-dev:latest"
+            source: "custom-build"
+            description: "Jupyter Agent Development with LangChain and CrewAI"
+            metadata:
+              purpose: "jupyter"
+              display_name: "Agent Development"
+              default: false
+              base_image: "jupyter-ml-cpu:latest"
+              packages: "langchain crewai chromadb faiss"
           - destination: "{{ harbor_registry }}/library/tk-package-version:latest"
             source: "github.com/thinkube/tk-package-version"
             description: "MCP server for checking package versions across multiple registries"
@@ -307,6 +522,12 @@
           Test runner: {{ harbor_registry }}/library/test-runner:latest
           CI utils: {{ harbor_registry }}/library/ci-utils:latest
           AI inference: {{ harbor_registry }}/library/ai-inference-base:latest
+          MLflow custom: {{ harbor_registry }}/thinkube/mlflow-custom:latest
+          Valkey: {{ harbor_registry }}/thinkube/valkey:8.1.0
+          Jupyter ML CPU: {{ harbor_registry }}/library/jupyter-ml-cpu:latest
+          Jupyter ML GPU: {{ harbor_registry }}/library/jupyter-ml-gpu:latest
+          Jupyter Fine-Tuning: {{ harbor_registry }}/library/jupyter-fine-tuning:latest
+          Jupyter Agent Dev: {{ harbor_registry }}/library/jupyter-agent-dev:latest
           tk-package-version: {{ harbor_registry }}/library/tk-package-version:latest
 
           These images contain common dependencies and will speed up:

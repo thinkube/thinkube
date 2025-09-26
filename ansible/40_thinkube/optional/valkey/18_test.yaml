@@ -1,0 +1,135 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/valkey/18_test.yaml
+# Description:
+#   Tests Valkey deployment
+#   Verifies pod, service, and connectivity
+#
+# Requirements:
+#   - Valkey must be deployed (10_deploy.yaml)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/valkey/18_test.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Test Valkey Deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    valkey_namespace: "valkey"
+    test_results: []
+
+  tasks:
+    - name: "TEST 1: Check Valkey namespace"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ valkey_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Record namespace test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Valkey namespace exists: PASS'] }}"
+
+    - name: "TEST 2: Check Valkey pods"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ valkey_namespace }}"
+        label_selectors:
+          - app=valkey
+      register: pods_check
+
+    - name: Check if all pods are running
+      ansible.builtin.set_fact:
+        all_pods_running: >-
+          {{ pods_check.resources |
+             selectattr('status.phase', 'equalto', 'Running') |
+             list | length == pods_check.resources | length }}
+
+    - name: Record pod status test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['All Valkey pods running: ' + ('PASS' if all_pods_running else 'FAIL')] }}"
+
+    - name: "TEST 3: Check Valkey ClusterIP service"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ valkey_namespace }}"
+        name: valkey
+      register: service_check
+      failed_when: service_check.resources | length == 0
+
+    - name: Record ClusterIP service test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Valkey ClusterIP service exists: PASS'] }}"
+
+    - name: "TEST 4: Check Valkey headless service"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ valkey_namespace }}"
+        name: valkey-headless
+      register: headless_service_check
+      failed_when: headless_service_check.resources | length == 0
+
+    - name: Record headless service test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Valkey headless service exists: PASS'] }}"
+
+    - name: "TEST 5: Check Valkey PVC"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ valkey_namespace }}"
+        name: valkey-data
+      register: pvc_check
+      failed_when: pvc_check.resources | length == 0
+
+    - name: Check PVC status
+      ansible.builtin.assert:
+        that:
+          - pvc_check.resources[0].status.phase == "Bound"
+        fail_msg: "PVC is not bound"
+        success_msg: "PVC is bound"
+
+    - name: Record PVC test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Valkey PVC bound: PASS'] }}"
+
+    - name: "TEST 6: Test Valkey connectivity"
+      ansible.builtin.shell: |
+        kubectl run valkey-test --image=alpine --rm -i --restart=Never --namespace={{ valkey_namespace }} -- \
+          sh -c "apk add --no-cache redis && redis-cli -h valkey.{{ valkey_namespace }}.svc.cluster.local PING"
+      register: connectivity_test
+      changed_when: false
+      failed_when: "'PONG' not in connectivity_test.stdout"
+
+    - name: Record connectivity test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Valkey responds to PING: PASS'] }}"
+
+    - name: Display test results summary
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════════════"
+          - "Valkey Test Results"
+          - "════════════════════════════════════════════════════════"
+          - "{{ test_results }}"
+          - "════════════════════════════════════════════════════════"
+          - "All tests passed!"
+          - "════════════════════════════════════════════════════════"

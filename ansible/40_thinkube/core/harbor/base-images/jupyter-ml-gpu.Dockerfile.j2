@@ -1,0 +1,120 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Jupyter ML GPU - Machine Learning development environment with CUDA support
+# Base: NVIDIA CUDA 12.6 with cuDNN on Ubuntu 24.04
+# Includes: PyTorch with CUDA, transformers, and all Thinkube service clients
+
+FROM {{ harbor_registry }}/library/cuda:12.6.0-cudnn-runtime-ubuntu24.04
+
+# Avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python 3.12 and system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-venv \
+        python3-pip \
+        git \
+        wget \
+        curl \
+        vim \
+        build-essential \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/lib/python*/EXTERNALLY-MANAGED
+
+# Set Python 3.12 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+
+# Get existing UID 1000 user or create jovyan
+RUN if id 1000 2>/dev/null; then \
+        NB_USER=$(id -nu 1000); \
+        if [ "$NB_USER" != "jovyan" ]; then \
+            usermod -l jovyan -d /home/jovyan -m $NB_USER; \
+        fi; \
+    else \
+        useradd -m -s /bin/bash -N -u 1000 jovyan; \
+    fi
+
+ENV NB_UID=1000
+ENV NB_GID=100
+
+USER jovyan
+WORKDIR /home/jovyan
+
+# Install JupyterLab
+RUN python -m pip install --no-cache-dir --user \
+    jupyterlab
+
+# Install PyTorch with CUDA 12.6 support
+RUN python -m pip install --no-cache-dir --user \
+    torch \
+    torchvision \
+    torchaudio
+
+# Install Transformers and related libraries
+RUN python -m pip install --no-cache-dir --user \
+    transformers \
+    datasets \
+    accelerate
+
+# Install ML and data science libraries
+RUN python -m pip install --no-cache-dir --user \
+    pandas \
+    scikit-learn \
+    matplotlib \
+    seaborn \
+    plotly
+
+# Install Thinkube service clients - Deployed services
+RUN python -m pip install --no-cache-dir --user \
+    psycopg2-binary \
+    redis \
+    qdrant-client \
+    opensearch-py \
+    mlflow \
+    boto3
+
+# Install Thinkube service clients - Planned services
+RUN python -m pip install --no-cache-dir --user \
+    weaviate-client \
+    litellm \
+    label-studio-sdk
+
+# Install common utilities
+RUN python -m pip install --no-cache-dir --user \
+    python-dotenv \
+    requests \
+    httpx \
+    pydantic
+
+# Add user's local bin to PATH
+ENV PATH="/home/jovyan/.local/bin:${PATH}"
+
+# Copy Thinkube environment configuration
+USER root
+COPY .thinkube_env /home/jovyan/.thinkube_env
+RUN chown $NB_UID:$NB_GID /home/jovyan/.thinkube_env
+USER $NB_UID
+
+# Source Thinkube environment in bashrc
+RUN echo 'if [ -f /home/jovyan/.thinkube_env ]; then source /home/jovyan/.thinkube_env; fi' >> /home/jovyan/.bashrc
+
+# Create examples directory and copy example notebook
+RUN mkdir -p /home/jovyan/examples
+
+USER root
+COPY thinkube_services.ipynb /home/jovyan/examples/thinkube_services.ipynb
+RUN chown -R $NB_UID:$NB_GID /home/jovyan/examples
+USER $NB_UID
+
+# Expose JupyterLab port
+EXPOSE 8888
+
+# Start JupyterLab
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
+
+# 🤖 AI-assisted
