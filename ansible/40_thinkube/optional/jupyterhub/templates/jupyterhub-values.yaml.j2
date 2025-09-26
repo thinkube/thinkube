@@ -35,8 +35,8 @@ hub:
 
   extraConfig:
     00-spawner-config: |
-      # Set default URL to JupyterLab
-      c.Spawner.default_url = '/lab'
+      # Set default URL to JupyterLab opening in notebooks folder
+      c.Spawner.default_url = '/lab/tree/notebooks'
 
       # Configure KubeSpawner for faster pod deletion
       # Based on official KubeSpawner documentation
@@ -334,20 +334,44 @@ singleuser:
         - sh
         - -c
         - |
-          # Fix permissions for the home directory
-          echo "Fixing permissions for /home/jovyan"
-          chown -R 1000:100 /home/jovyan || echo "Warning: Could not change ownership of /home/jovyan"
-          chmod -R 775 /home/jovyan || echo "Warning: Could not change permissions of /home/jovyan"
+          # First time setup - check marker in persistent home
+          if [ ! -f "/home/jovyan/.thinkube-initialized" ]; then
+            echo "First time setup - creating directory structure..."
 
-          # Create subdirectories if they don't exist
-          for dir in notebooks datasets models work scratch; do
-            if [ ! -d "/home/jovyan/$dir" ]; then
-              echo "Creating directory /home/jovyan/$dir"
-              mkdir -p "/home/jovyan/$dir"
-              chown 1000:100 "/home/jovyan/$dir"
-              chmod 775 "/home/jovyan/$dir"
-            fi
-          done
+            # Create notebook subdirectories in SeaweedFS
+            mkdir -p /home/jovyan/notebooks/projects
+            mkdir -p /home/jovyan/notebooks/experiments
+            mkdir -p /home/jovyan/notebooks/agents
+            mkdir -p /home/jovyan/notebooks/fine-tuning
+            mkdir -p /home/jovyan/notebooks/examples
+
+            # Note: Examples will be copied by notebook startup script
+
+            # Create datasets structure
+            mkdir -p /home/jovyan/datasets/raw
+            mkdir -p /home/jovyan/datasets/processed
+            mkdir -p /home/jovyan/datasets/embeddings
+
+            # Create models structure
+            mkdir -p /home/jovyan/models/checkpoints
+            mkdir -p /home/jovyan/models/production
+            mkdir -p /home/jovyan/models/fine-tuned
+
+            # Create scratch structure (note: this is emptyDir, recreated each time)
+            mkdir -p /home/jovyan/scratch/tmp
+
+            # Mark as initialized
+            touch /home/jovyan/.thinkube-initialized
+            echo "First time setup complete"
+          else
+            echo "Directory structure already initialized"
+          fi
+
+          # Always fix permissions
+          echo "Fixing permissions..."
+          chown -R 1000:100 /home/jovyan
+          chmod -R 755 /home/jovyan
+          echo "Permissions fixed"
       securityContext:
         runAsUser: 0  # Run as root to fix permissions
       volumeMounts:
@@ -444,19 +468,8 @@ singleuser:
   # Start timeout (5 minutes for image pull)
   startTimeout: 300
 
-  # Lifecycle hooks for directory setup
-  lifecycleHooks:
-    postStart:
-      exec:
-        command:
-          - "sh"
-          - "-c"
-          - |
-            # Create notebook directories if they don't exist
-            mkdir -p /home/jovyan/notebooks/projects /home/jovyan/notebooks/experiments /home/jovyan/notebooks/agents /home/jovyan/notebooks/fine-tuning
-            mkdir -p /home/jovyan/datasets/raw /home/jovyan/datasets/processed /home/jovyan/datasets/embeddings
-            mkdir -p /home/jovyan/models/checkpoints /home/jovyan/models/production /home/jovyan/models/fine-tuned
-            mkdir -p /home/jovyan/scratch/tmp
+  # Lifecycle hooks - removed postStart as directories are created by init container
+  lifecycleHooks: {}
 
 # Ingress is handled separately in the deployment playbook
 ingress:

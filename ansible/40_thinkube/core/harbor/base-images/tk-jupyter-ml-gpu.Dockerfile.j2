@@ -103,18 +103,33 @@ USER $NB_UID
 # Source Thinkube environment in bashrc
 RUN echo 'if [ -f /home/jovyan/.thinkube_env ]; then source /home/jovyan/.thinkube_env; fi' >> /home/jovyan/.bashrc
 
-# Create examples directory and copy example notebook
-RUN mkdir -p /home/jovyan/examples
-
+# Copy examples to /opt where they won't be overlaid by volume mounts
 USER root
-COPY thinkube_services.ipynb /home/jovyan/examples/thinkube_services.ipynb
-RUN chown -R $NB_UID:$NB_GID /home/jovyan/examples
+RUN mkdir -p /opt/thinkube/examples
+COPY thinkube_services.ipynb /opt/thinkube/examples/thinkube_services.ipynb
+RUN chmod -R 755 /opt/thinkube
+
+# Create startup script to copy examples on first use
+RUN cat > /usr/local/bin/startup.sh << 'EOF'
+#!/bin/bash
+# Copy examples to notebooks folder if not already there
+if [ ! -f "/home/jovyan/notebooks/examples/.copied" ] && [ -d "/opt/thinkube/examples" ]; then
+  echo "Copying example notebooks to persistent storage..."
+  mkdir -p /home/jovyan/notebooks/examples
+  cp -r /opt/thinkube/examples/* /home/jovyan/notebooks/examples/ 2>/dev/null || true
+  touch /home/jovyan/notebooks/examples/.copied
+fi
+# Start JupyterLab
+exec jupyter lab "$@"
+EOF
+
+RUN chmod +x /usr/local/bin/startup.sh
 USER $NB_UID
 
 # Expose JupyterLab port
 EXPOSE 8888
 
-# Start JupyterLab
-CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
+# Start JupyterLab using startup script
+CMD ["/usr/local/bin/startup.sh", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
 
 # 🤖 AI-assisted
