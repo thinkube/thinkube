@@ -36,7 +36,7 @@ hub:
   extraConfig:
     00-spawner-config: |
       # Set default URL to JupyterLab opening in notebooks folder
-      c.Spawner.default_url = '/lab/tree/notebooks'
+      c.Spawner.default_url = '/lab/tree/thinkube/notebooks'
 
       # Configure KubeSpawner for faster pod deletion
       # Based on official KubeSpawner documentation
@@ -334,67 +334,70 @@ singleuser:
         - sh
         - -c
         - |
-          # First time setup - check marker in persistent home
-          if [ ! -f "/home/jovyan/.thinkube-initialized" ]; then
+          # First time setup - check marker in persistent area
+          if [ ! -f "/home/jovyan/thinkube/.thinkube-initialized" ]; then
             echo "First time setup - creating directory structure..."
 
+            # Create base thinkube directory
+            mkdir -p /home/jovyan/thinkube
+
             # Create notebook subdirectories in SeaweedFS
-            mkdir -p /home/jovyan/notebooks/projects
-            mkdir -p /home/jovyan/notebooks/experiments
-            mkdir -p /home/jovyan/notebooks/agents
-            mkdir -p /home/jovyan/notebooks/fine-tuning
-            mkdir -p /home/jovyan/notebooks/templates  # For read-only symlink
-            mkdir -p /home/jovyan/notebooks/examples   # For editable copies
+            mkdir -p /home/jovyan/thinkube/notebooks/projects
+            mkdir -p /home/jovyan/thinkube/notebooks/experiments
+            mkdir -p /home/jovyan/thinkube/notebooks/agents
+            mkdir -p /home/jovyan/thinkube/notebooks/fine-tuning
+            mkdir -p /home/jovyan/thinkube/notebooks/templates  # For read-only symlink
+            mkdir -p /home/jovyan/thinkube/notebooks/examples   # For editable copies
 
             # Note: Examples will be copied by notebook startup script
 
             # Create datasets structure
-            mkdir -p /home/jovyan/datasets/raw
-            mkdir -p /home/jovyan/datasets/processed
-            mkdir -p /home/jovyan/datasets/embeddings
+            mkdir -p /home/jovyan/thinkube/datasets/raw
+            mkdir -p /home/jovyan/thinkube/datasets/processed
+            mkdir -p /home/jovyan/thinkube/datasets/embeddings
 
             # Create models structure
-            mkdir -p /home/jovyan/models/checkpoints
-            mkdir -p /home/jovyan/models/production
-            mkdir -p /home/jovyan/models/fine-tuned
+            mkdir -p /home/jovyan/thinkube/models/checkpoints
+            mkdir -p /home/jovyan/thinkube/models/production
+            mkdir -p /home/jovyan/thinkube/models/fine-tuned
 
             # Create scratch structure (note: this is emptyDir, recreated each time)
             mkdir -p /home/jovyan/scratch/tmp
 
             # Mark as initialized
-            touch /home/jovyan/.thinkube-initialized
+            touch /home/jovyan/thinkube/.thinkube-initialized
             echo "First time setup complete"
           else
             echo "Directory structure already initialized"
           fi
 
-          # Always fix permissions
+          # Always fix permissions for persistent areas only
           echo "Fixing permissions..."
-          chown -R 1000:100 /home/jovyan
-          chmod -R 755 /home/jovyan
+          chown -R 1000:100 /home/jovyan/thinkube
+          chmod -R 755 /home/jovyan/thinkube
+          # Also fix scratch if it exists
+          if [ -d /home/jovyan/scratch ]; then
+            chown -R 1000:100 /home/jovyan/scratch
+            chmod -R 755 /home/jovyan/scratch
+          fi
           echo "Permissions fixed"
       securityContext:
         runAsUser: 0  # Run as root to fix permissions
       volumeMounts:
-        - name: home
-          mountPath: /home/jovyan
         - name: notebooks
-          mountPath: /home/jovyan/notebooks
+          mountPath: /home/jovyan/thinkube/notebooks
         - name: datasets
-          mountPath: /home/jovyan/datasets
+          mountPath: /home/jovyan/thinkube/datasets
         - name: models
-          mountPath: /home/jovyan/models
+          mountPath: /home/jovyan/thinkube/models
+        - name: scratch
+          mountPath: /home/jovyan/scratch
 
   # MANDATORY: SeaweedFS storage - no fallbacks
   storage:
     type: none  # We define volumes manually
     # Hybrid storage approach: SeaweedFS (persistent) + local scratch (performance)
     extraVolumes:
-    # Main home directory (MANDATORY - base persistent storage)
-    - name: home
-      persistentVolumeClaim:
-        claimName: jupyterhub-home-pvc
-
     # SeaweedFS for persistent notebooks (MANDATORY)
     - name: notebooks
       persistentVolumeClaim:
@@ -416,21 +419,17 @@ singleuser:
         sizeLimit: 100Gi
 
     extraVolumeMounts:
-    # Base home directory (SeaweedFS - persistent)
-    - name: home
-      mountPath: /home/jovyan
-
     # Primary notebook storage (SeaweedFS - persistent across nodes)
     - name: notebooks
-      mountPath: /home/jovyan/notebooks
+      mountPath: /home/jovyan/thinkube/notebooks
 
     # Datasets directory (SeaweedFS - persistent across nodes)
     - name: datasets
-      mountPath: /home/jovyan/datasets
+      mountPath: /home/jovyan/thinkube/datasets
 
     # Models directory (SeaweedFS - persistent across nodes)
     - name: models
-      mountPath: /home/jovyan/models
+      mountPath: /home/jovyan/thinkube/models
 
     # Fast local scratch space (emptyDir - temporary)
     - name: scratch
