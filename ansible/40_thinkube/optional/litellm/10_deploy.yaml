@@ -61,13 +61,13 @@
       ansible.builtin.set_fact:
         litellm_db_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
 
-    - name: Get PostgreSQL service info
+    - name: Check PostgreSQL service exists
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
         api_version: v1
         kind: Service
-        namespace: postgresql
-        name: postgresql
+        namespace: postgres
+        name: postgresql-official
       register: postgres_service
       failed_when: postgres_service.resources | length == 0
 
@@ -97,7 +97,7 @@
             LITELLM_SALT_KEY: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
             ADMIN_USERNAME: "{{ admin_username }}"
             ADMIN_PASSWORD: "{{ admin_password }}"
-            DATABASE_URL: "postgresql://litellm:{{ litellm_db_password }}@postgresql.postgresql.svc.cluster.local:5432/litellm"
+            DATABASE_URL: "postgresql://litellm:{{ litellm_db_password }}@postgresql-official.postgres.svc.cluster.local:5432/litellm"
             # SeaweedFS S3 credentials (using admin for now, should create specific user later)
             S3_BUCKET_NAME: "litellm-cache"
             S3_REGION_NAME: "us-east-1"
@@ -323,7 +323,7 @@
                 initContainers:
                   - name: wait-for-postgres
                     image: busybox:1.35
-                    command: ['sh', '-c', 'until nc -z postgresql.postgresql.svc.cluster.local 5432; do echo waiting for postgres; sleep 2; done;']
+                    command: ['sh', '-c', 'until nc -z postgresql-official.postgres.svc.cluster.local 5432; do echo waiting for postgres; sleep 2; done;']
                   - name: wait-for-seaweedfs
                     image: busybox:1.35
                     command: ['sh', '-c', 'until nc -z seaweedfs-s3.seaweedfs.svc.cluster.local 8333; do echo waiting for seaweedfs; sleep 2; done;']
@@ -337,7 +337,7 @@
                       - -c
                       - |
                         echo "Creating LiteLLM database and user..."
-                        psql -h postgresql.postgresql.svc.cluster.local -U postgres << EOF
+                        psql -h postgresql-official.postgres.svc.cluster.local -U postgres << EOF
                         CREATE DATABASE litellm;
                         CREATE USER litellm WITH PASSWORD '{{ litellm_db_password }}';
                         GRANT ALL PRIVILEGES ON DATABASE litellm TO litellm;
