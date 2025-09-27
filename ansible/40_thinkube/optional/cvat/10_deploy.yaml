@@ -31,7 +31,6 @@
     cvat_namespace: cvat
     cvat_server_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/cvat-server:latest"
     cvat_ui_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/cvat-ui:latest"
-    redis_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/redis:7-alpine"
     cvat_hostname: "cvat.{{ domain_name }}"
 
     # Keycloak settings for OAuth2 Proxy integration
@@ -203,55 +202,15 @@
               - port: 5432
                 targetPort: 5432
 
-    - name: Deploy Redis for CVAT
-      kubernetes.core.k8s:
+    - name: Get Valkey service info
+      kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: cvat-redis
-            namespace: "{{ cvat_namespace }}"
-          spec:
-            replicas: 1
-            selector:
-              matchLabels:
-                app: cvat-redis
-            template:
-              metadata:
-                labels:
-                  app: cvat-redis
-              spec:
-                containers:
-                  - name: redis
-                    image: "{{ redis_image }}"
-                    ports:
-                      - containerPort: 6379
-                    resources:
-                      requests:
-                        memory: "128Mi"
-                        cpu: "100m"
-                      limits:
-                        memory: "512Mi"
-                        cpu: "200m"
-
-    - name: Create Redis Service
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: cvat-redis
-            namespace: "{{ cvat_namespace }}"
-          spec:
-            selector:
-              app: cvat-redis
-            ports:
-              - port: 6379
-                targetPort: 6379
+        api_version: v1
+        kind: Service
+        namespace: valkey
+        name: valkey-master
+      register: valkey_service
+      failed_when: valkey_service.resources | length == 0
 
     - name: Deploy CVAT Backend
       kubernetes.core.k8s:
@@ -285,7 +244,7 @@
                       - name: ALLOWED_HOSTS
                         value: "{{ cvat_hostname }},cvat-backend,localhost"
                       - name: CVAT_REDIS_HOST
-                        value: "cvat-redis"
+                        value: "valkey-master.valkey.svc.cluster.local"
                       - name: CVAT_POSTGRES_HOST
                         value: "cvat-postgres"
                       - name: CVAT_POSTGRES_PORT
@@ -378,6 +337,9 @@
                   - name: wait-for-db
                     image: busybox:1.35
                     command: ['sh', '-c', 'until nc -z cvat-postgres 5432; do echo waiting for postgres; sleep 2; done;']
+                  - name: wait-for-valkey
+                    image: busybox:1.35
+                    command: ['sh', '-c', 'until nc -z valkey-master.valkey.svc.cluster.local 6379; do echo waiting for valkey; sleep 2; done;']
 
     - name: Create CVAT Backend Service
       kubernetes.core.k8s:
