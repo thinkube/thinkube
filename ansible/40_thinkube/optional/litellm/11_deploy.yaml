@@ -57,6 +57,43 @@
       ansible.builtin.set_fact:
         litellm_master_key: "sk-{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
 
+    - name: Get Keycloak admin token to retrieve client secret
+      ansible.builtin.uri:
+        url: "https://auth.{{ domain_name }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: password
+        validate_certs: true
+      register: keycloak_token
+
+    - name: Get LiteLLM client details from Keycloak
+      ansible.builtin.uri:
+        url: "https://auth.{{ domain_name }}/admin/realms/master/clients?clientId=litellm"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+      register: litellm_client
+
+    - name: Get client secret from Keycloak
+      ansible.builtin.uri:
+        url: "https://auth.{{ domain_name }}/admin/realms/master/clients/{{ litellm_client.json[0].id }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+      register: client_secret_response
+      when: litellm_client.json | length > 0
+
+    - name: Set client secret from Keycloak
+      ansible.builtin.set_fact:
+        litellm_client_secret: "{{ client_secret_response.json.value }}"
+      when: client_secret_response.json.value is defined
+
 
     - name: Check PostgreSQL service exists
       kubernetes.core.k8s_info:
@@ -95,6 +132,7 @@
             ADMIN_USERNAME: "{{ admin_username }}"
             ADMIN_PASSWORD: "{{ admin_password }}"
             DATABASE_URL: "postgresql://{{ admin_username }}:{{ admin_password }}@postgresql-official.postgres.svc.cluster.local:5432/litellm"
+            CLIENT_SECRET: "{{ litellm_client_secret }}"
             # SeaweedFS S3 credentials (using admin for now, should create specific user later)
             S3_BUCKET_NAME: "litellm-cache"
             S3_REGION_NAME: "us-east-1"
@@ -238,7 +276,10 @@
                       - name: GENERIC_CLIENT_ID
                         value: "litellm"
                       - name: GENERIC_CLIENT_SECRET
-                        value: ""  # Public client, no secret
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: CLIENT_SECRET
                       - name: GENERIC_AUTHORIZATION_ENDPOINT
                         value: "https://auth.{{ domain_name }}/realms/master/protocol/openid-connect/auth"
                       - name: GENERIC_TOKEN_ENDPOINT
