@@ -1,16 +1,18 @@
 ---
-# ansible/40_thinkube/optional/argilla/10_deploy.yaml
+# ansible/40_thinkube/optional/cvat/10_deploy.yaml
 # Description:
-#   Deploy Argilla data annotation platform on Kubernetes
-#   Provides NLP/LLM data curation and annotation capabilities
+#   Deploy CVAT computer vision annotation tool on Kubernetes
+#   Uses PostgreSQL backend and OAuth2 Proxy for authentication
 #
 # Requirements:
 #   - MicroK8s must be installed and running
 #   - Harbor registry must be available
+#   - PostgreSQL must be deployed
+#   - Keycloak must be deployed
 #
 # Usage:
 #   cd ~/thinkube
-#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/argilla/10_deploy.yaml
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/cvat/10_deploy.yaml
 #
 # Variables from inventory:
 #   - domain_name: Base domain for the cluster
@@ -21,16 +23,39 @@
 #
 # 🤖 [AI-generated]
 
-- name: Deploy Argilla on Kubernetes
+- name: Deploy CVAT on Kubernetes
   hosts: microk8s_control_plane
   gather_facts: true
 
   vars:
-    argilla_namespace: argilla
-    argilla_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/argilla:latest"
-    elasticsearch_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/elasticsearch:8.12.2"
-    oauth2_proxy_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/oauth2-proxy:latest"
-    argilla_hostname: "argilla.{{ domain_name }}"
+    cvat_namespace: cvat
+    cvat_server_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/cvat-server:latest"
+    cvat_ui_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/cvat-ui:latest"
+    redis_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/redis:7-alpine"
+    cvat_hostname: "cvat.{{ domain_name }}"
+
+    # Keycloak settings for OAuth2 Proxy integration
+    keycloak_url: "https://auth.{{ domain_name }}"
+    keycloak_realm: "master"
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ admin_password }}"
+
+    # OAuth2 Proxy settings
+    oauth2_proxy_namespace: "{{ cvat_namespace }}"
+    oauth2_proxy_name: "oauth2-proxy"
+    oauth2_proxy_client_id: "cvat"
+    oauth2_proxy_dashboard_host: "{{ cvat_hostname }}"
+    oauth2_proxy_oidc_issuer_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+    oauth2_proxy_cookie_domain: ".{{ domain_name }}"
+    oauth2_proxy_ingress_host: "{{ cvat_hostname }}"
+    oauth2_proxy_ingress_tls_secret_name: "{{ cvat_namespace }}-tls-secret"
+    oauth2_proxy_redirect_url: "https://{{ cvat_hostname }}/oauth2/callback"
+    oauth2_proxy_kubeconfig: "{{ kubeconfig }}"
+    oauth2_proxy_helm_bin: "{{ helm_bin | default('/snap/bin/microk8s.helm3') }}"
+    oauth2_proxy_keycloak_debug: false
+    oauth2_proxy_session_store_type: "cookie"
+    oauth2_proxy_ingress_enabled: true
+    oauth2_proxy_cookie_samesite: "lax"
 
   tasks:
     - name: Verify required variables are defined
@@ -43,19 +68,19 @@
           - admin_password is defined
         fail_msg: "Required variables are not defined. Please check your inventory."
 
-    - name: Create Argilla namespace
+    - name: Create CVAT namespace
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
-        name: "{{ argilla_namespace }}"
+        name: "{{ cvat_namespace }}"
         api_version: v1
         kind: Namespace
         state: present
 
-    - name: Generate random API key for Argilla
+    - name: Generate CVAT secret key
       ansible.builtin.set_fact:
-        argilla_api_key: "argilla.apikey.{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+        cvat_secret_key: "{{ lookup('password', '/dev/null length=50 chars=ascii_letters,digits') }}"
 
-    - name: Create Argilla secrets
+    - name: Create CVAT secrets
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -63,19 +88,19 @@
           apiVersion: v1
           kind: Secret
           metadata:
-            name: argilla-secrets
-            namespace: "{{ argilla_namespace }}"
+            name: cvat-secrets
+            namespace: "{{ cvat_namespace }}"
           type: Opaque
           stringData:
-            ARGILLA_API_KEY: "{{ argilla_api_key }}"
-            DEFAULT_USER_ENABLED: "true"
-            DEFAULT_USER_USERNAME: "{{ admin_username }}"
-            DEFAULT_USER_PASSWORD: "{{ admin_password }}"
-            DEFAULT_USER_API_KEY: "{{ argilla_api_key }}"
-            OAUTH2_PROXY_CLIENT_SECRET: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
-            OAUTH2_PROXY_COOKIE_SECRET: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') | b64encode }}"
+            DJANGO_SUPERUSER_USERNAME: "{{ admin_username }}"
+            DJANGO_SUPERUSER_PASSWORD: "{{ admin_password }}"
+            DJANGO_SUPERUSER_EMAIL: "admin@{{ domain_name }}"
+            SECRET_KEY: "{{ cvat_secret_key }}"
+            POSTGRES_USER: "cvat"
+            POSTGRES_PASSWORD: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+            POSTGRES_DB: "cvat"
 
-    - name: Create PersistentVolumeClaim for Elasticsearch
+    - name: Create PersistentVolumeClaims for CVAT
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -83,16 +108,22 @@
           apiVersion: v1
           kind: PersistentVolumeClaim
           metadata:
-            name: elasticsearch-data-pvc
-            namespace: "{{ argilla_namespace }}"
+            name: "{{ item.name }}"
+            namespace: "{{ cvat_namespace }}"
           spec:
             accessModes:
               - ReadWriteOnce
             resources:
               requests:
-                storage: 10Gi
+                storage: "{{ item.size }}"
+      loop:
+        - { name: cvat-data-pvc, size: 20Gi }
+        - { name: cvat-keys-pvc, size: 1Gi }
+        - { name: cvat-logs-pvc, size: 5Gi }
+        - { name: cvat-models-pvc, size: 10Gi }
+        - { name: postgres-data-pvc, size: 10Gi }
 
-    - name: Deploy Elasticsearch
+    - name: Deploy PostgreSQL for CVAT
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -100,60 +131,62 @@
           apiVersion: apps/v1
           kind: StatefulSet
           metadata:
-            name: elasticsearch
-            namespace: "{{ argilla_namespace }}"
+            name: cvat-postgres
+            namespace: "{{ cvat_namespace }}"
           spec:
-            serviceName: elasticsearch
+            serviceName: cvat-postgres
             replicas: 1
             selector:
               matchLabels:
-                app: elasticsearch
+                app: cvat-postgres
             template:
               metadata:
                 labels:
-                  app: elasticsearch
+                  app: cvat-postgres
               spec:
                 containers:
-                  - name: elasticsearch
-                    image: "{{ elasticsearch_image }}"
-                    ports:
-                      - containerPort: 9200
-                        name: http
-                      - containerPort: 9300
-                        name: transport
+                  - name: postgres
+                    image: postgres:15-alpine
                     env:
-                      - name: discovery.type
-                        value: single-node
-                      - name: cluster.name
-                        value: argilla-cluster
-                      - name: node.name
-                        value: argilla-node
-                      - name: ES_JAVA_OPTS
-                        value: "-Xms512m -Xmx512m"
-                      - name: xpack.security.enabled
-                        value: "false"
-                      - name: xpack.security.enrollment.enabled
-                        value: "false"
+                      - name: POSTGRES_USER
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_USER
+                      - name: POSTGRES_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_PASSWORD
+                      - name: POSTGRES_DB
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_DB
+                      - name: PGDATA
+                        value: /var/lib/postgresql/data/pgdata
+                    ports:
+                      - containerPort: 5432
                     volumeMounts:
-                      - name: data
-                        mountPath: /usr/share/elasticsearch/data
+                      - name: postgres-data
+                        mountPath: /var/lib/postgresql/data
                     resources:
                       requests:
+                        memory: "256Mi"
+                        cpu: "250m"
+                      limits:
                         memory: "1Gi"
                         cpu: "500m"
-                      limits:
-                        memory: "2Gi"
-                        cpu: "1"
             volumeClaimTemplates:
               - metadata:
-                  name: data
+                  name: postgres-data
                 spec:
                   accessModes: ["ReadWriteOnce"]
                   resources:
                     requests:
                       storage: 10Gi
 
-    - name: Create Elasticsearch Service
+    - name: Create PostgreSQL Service
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -161,17 +194,16 @@
           apiVersion: v1
           kind: Service
           metadata:
-            name: elasticsearch
-            namespace: "{{ argilla_namespace }}"
+            name: cvat-postgres
+            namespace: "{{ cvat_namespace }}"
           spec:
             selector:
-              app: elasticsearch
+              app: cvat-postgres
             ports:
-              - port: 9200
-                targetPort: 9200
-                name: http
+              - port: 5432
+                targetPort: 5432
 
-    - name: Deploy Argilla
+    - name: Deploy Redis for CVAT
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -179,63 +211,146 @@
           apiVersion: apps/v1
           kind: Deployment
           metadata:
-            name: argilla
-            namespace: "{{ argilla_namespace }}"
+            name: cvat-redis
+            namespace: "{{ cvat_namespace }}"
           spec:
             replicas: 1
             selector:
               matchLabels:
-                app: argilla
+                app: cvat-redis
             template:
               metadata:
                 labels:
-                  app: argilla
+                  app: cvat-redis
               spec:
                 containers:
-                  - name: argilla
-                    image: "{{ argilla_image }}"
+                  - name: redis
+                    image: "{{ redis_image }}"
                     ports:
-                      - containerPort: 6900
+                      - containerPort: 6379
+                    resources:
+                      requests:
+                        memory: "128Mi"
+                        cpu: "100m"
+                      limits:
+                        memory: "512Mi"
+                        cpu: "200m"
+
+    - name: Create Redis Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: cvat-redis
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            selector:
+              app: cvat-redis
+            ports:
+              - port: 6379
+                targetPort: 6379
+
+    - name: Deploy CVAT Backend
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: cvat-backend
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: cvat-backend
+            template:
+              metadata:
+                labels:
+                  app: cvat-backend
+              spec:
+                containers:
+                  - name: cvat-backend
+                    image: "{{ cvat_server_image }}"
+                    ports:
+                      - containerPort: 8080
                         name: http
                     env:
-                      - name: ARGILLA_ELASTICSEARCH
-                        value: "http://elasticsearch:9200"
-                      - name: ARGILLA_HOME_PATH
-                        value: "/var/lib/argilla"
-                      - name: ARGILLA_API_KEY
+                      - name: DJANGO_MODWSGI_EXTRA_ARGS
+                        value: ""
+                      - name: ALLOWED_HOSTS
+                        value: "{{ cvat_hostname }},cvat-backend,localhost"
+                      - name: CVAT_REDIS_HOST
+                        value: "cvat-redis"
+                      - name: CVAT_POSTGRES_HOST
+                        value: "cvat-postgres"
+                      - name: CVAT_POSTGRES_PORT
+                        value: "5432"
+                      - name: CVAT_POSTGRES_USER
                         valueFrom:
                           secretKeyRef:
-                            name: argilla-secrets
-                            key: ARGILLA_API_KEY
-                      - name: DEFAULT_USER_ENABLED
+                            name: cvat-secrets
+                            key: POSTGRES_USER
+                      - name: CVAT_POSTGRES_DBNAME
                         valueFrom:
                           secretKeyRef:
-                            name: argilla-secrets
-                            key: DEFAULT_USER_ENABLED
-                      - name: DEFAULT_USER_USERNAME
+                            name: cvat-secrets
+                            key: POSTGRES_DB
+                      - name: CVAT_POSTGRES_PASSWORD
                         valueFrom:
                           secretKeyRef:
-                            name: argilla-secrets
-                            key: DEFAULT_USER_USERNAME
-                      - name: DEFAULT_USER_PASSWORD
+                            name: cvat-secrets
+                            key: POSTGRES_PASSWORD
+                      - name: DJANGO_SECRET_KEY
                         valueFrom:
                           secretKeyRef:
-                            name: argilla-secrets
-                            key: DEFAULT_USER_PASSWORD
-                      - name: DEFAULT_USER_API_KEY
+                            name: cvat-secrets
+                            key: SECRET_KEY
+                      - name: DJANGO_SUPERUSER_USERNAME
                         valueFrom:
                           secretKeyRef:
-                            name: argilla-secrets
-                            key: DEFAULT_USER_API_KEY
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_USERNAME
+                      - name: DJANGO_SUPERUSER_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_PASSWORD
+                      - name: DJANGO_SUPERUSER_EMAIL
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_EMAIL
+                      - name: CVAT_SERVER_HOST
+                        value: "{{ cvat_hostname }}"
+                      - name: CVAT_SERVER_PORT
+                        value: "443"
+                      - name: CVAT_HTTPS
+                        value: "1"
+                      - name: USE_ALLAUTH_SOCIAL_ACCOUNTS
+                        value: "False"
+                    volumeMounts:
+                      - name: cvat-data
+                        mountPath: /home/django/data
+                      - name: cvat-keys
+                        mountPath: /home/django/keys
+                      - name: cvat-logs
+                        mountPath: /home/django/logs
+                      - name: cvat-models
+                        mountPath: /home/django/models
                     livenessProbe:
                       httpGet:
-                        path: /api/status
+                        path: /api/server/health/
                         port: http
                       initialDelaySeconds: 60
                       periodSeconds: 10
                     readinessProbe:
                       httpGet:
-                        path: /api/status
+                        path: /api/server/health/
                         port: http
                       initialDelaySeconds: 30
                       periodSeconds: 5
@@ -246,12 +361,25 @@
                       limits:
                         memory: "2Gi"
                         cpu: "1"
+                volumes:
+                  - name: cvat-data
+                    persistentVolumeClaim:
+                      claimName: cvat-data-pvc
+                  - name: cvat-keys
+                    persistentVolumeClaim:
+                      claimName: cvat-keys-pvc
+                  - name: cvat-logs
+                    persistentVolumeClaim:
+                      claimName: cvat-logs-pvc
+                  - name: cvat-models
+                    persistentVolumeClaim:
+                      claimName: cvat-models-pvc
                 initContainers:
-                  - name: wait-for-elasticsearch
+                  - name: wait-for-db
                     image: busybox:1.35
-                    command: ['sh', '-c', 'until nc -z elasticsearch 9200; do echo waiting for elasticsearch; sleep 2; done;']
+                    command: ['sh', '-c', 'until nc -z cvat-postgres 5432; do echo waiting for postgres; sleep 2; done;']
 
-    - name: Create Argilla Service (internal only)
+    - name: Create CVAT Backend Service
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -259,17 +387,17 @@
           apiVersion: v1
           kind: Service
           metadata:
-            name: argilla
-            namespace: "{{ argilla_namespace }}"
+            name: cvat-backend
+            namespace: "{{ cvat_namespace }}"
           spec:
             selector:
-              app: argilla
+              app: cvat-backend
             ports:
-              - port: 6900
-                targetPort: 6900
+              - port: 8080
+                targetPort: 8080
                 name: http
 
-    - name: Deploy OAuth2 Proxy
+    - name: Deploy CVAT UI
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -277,75 +405,33 @@
           apiVersion: apps/v1
           kind: Deployment
           metadata:
-            name: argilla-oauth2-proxy
-            namespace: "{{ argilla_namespace }}"
+            name: cvat-ui
+            namespace: "{{ cvat_namespace }}"
           spec:
             replicas: 1
             selector:
               matchLabels:
-                app: argilla-oauth2-proxy
+                app: cvat-ui
             template:
               metadata:
                 labels:
-                  app: argilla-oauth2-proxy
+                  app: cvat-ui
               spec:
                 containers:
-                  - name: oauth2-proxy
-                    image: "{{ oauth2_proxy_image }}"
-                    args:
-                      - --http-address=0.0.0.0:4180
-                      - --upstream=http://argilla:6900
-                      - --cookie-secure=true
-                      - --cookie-name=_oauth2_proxy_argilla
-                      - --provider=keycloak-oidc
-                      - --client-id=argilla
-                      - --oidc-issuer-url=https://auth.{{ domain_name }}/realms/master
-                      - --email-domain=*
-                      - --scope=openid email profile
-                      - --pass-authorization-header=true
-                      - --pass-access-token=true
-                      - --pass-user-headers=true
-                      - --set-authorization-header=true
-                      - --set-xauthrequest=true
-                      - --reverse-proxy=true
-                      - --whitelist-domain=.{{ domain_name }}
-                      - --cookie-domain=.{{ domain_name }}
-                      - --redirect-url=https://{{ argilla_hostname }}/oauth2/callback
-                    env:
-                      - name: OAUTH2_PROXY_CLIENT_SECRET
-                        valueFrom:
-                          secretKeyRef:
-                            name: argilla-secrets
-                            key: OAUTH2_PROXY_CLIENT_SECRET
-                      - name: OAUTH2_PROXY_COOKIE_SECRET
-                        valueFrom:
-                          secretKeyRef:
-                            name: argilla-secrets
-                            key: OAUTH2_PROXY_COOKIE_SECRET
+                  - name: cvat-ui
+                    image: "{{ cvat_ui_image }}"
                     ports:
-                      - containerPort: 4180
+                      - containerPort: 80
                         name: http
-                    livenessProbe:
-                      httpGet:
-                        path: /ping
-                        port: http
-                      initialDelaySeconds: 10
-                      periodSeconds: 10
-                    readinessProbe:
-                      httpGet:
-                        path: /ping
-                        port: http
-                      initialDelaySeconds: 5
-                      periodSeconds: 5
                     resources:
                       requests:
                         memory: "128Mi"
-                        cpu: "50m"
+                        cpu: "100m"
                       limits:
-                        memory: "256Mi"
+                        memory: "512Mi"
                         cpu: "200m"
 
-    - name: Create OAuth2 Proxy Service
+    - name: Create CVAT UI Service
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -353,14 +439,14 @@
           apiVersion: v1
           kind: Service
           metadata:
-            name: argilla-oauth2-proxy
-            namespace: "{{ argilla_namespace }}"
+            name: cvat-ui
+            namespace: "{{ cvat_namespace }}"
           spec:
             selector:
-              app: argilla-oauth2-proxy
+              app: cvat-ui
             ports:
               - port: 80
-                targetPort: 4180
+                targetPort: 80
                 name: http
 
     - name: Get wildcard certificate from default namespace
@@ -373,7 +459,7 @@
       register: wildcard_cert
       failed_when: wildcard_cert.resources | length == 0
 
-    - name: Copy wildcard certificate to Argilla namespace
+    - name: Copy wildcard certificate to CVAT namespace
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -381,14 +467,18 @@
           apiVersion: v1
           kind: Secret
           metadata:
-            name: "{{ argilla_namespace }}-tls-secret"
-            namespace: "{{ argilla_namespace }}"
+            name: "{{ cvat_namespace }}-tls-secret"
+            namespace: "{{ cvat_namespace }}"
           type: kubernetes.io/tls
           data:
             tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
 
-    - name: Create Argilla Ingress (points to OAuth2 proxy)
+    - name: Deploy OAuth2 Proxy with Keycloak authentication
+      ansible.builtin.include_role:
+        name: oauth2_proxy
+
+    - name: Create CVAT Main Ingress (secured via OAuth2)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -396,68 +486,101 @@
           apiVersion: networking.k8s.io/v1
           kind: Ingress
           metadata:
-            name: argilla
-            namespace: "{{ argilla_namespace }}"
+            name: cvat-ingress
+            namespace: "{{ cvat_namespace }}"
             annotations:
               cert-manager.io/cluster-issuer: letsencrypt-prod
-              nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+              nginx.ingress.kubernetes.io/proxy-body-size: "1024m"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "1200"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "1200"
+              nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
+              nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$escaped_request_uri"
+              nginx.ingress.kubernetes.io/auth-response-headers: "X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Access-Token,X-Auth-Request-Groups"
+              nginx.ingress.kubernetes.io/configuration-snippet: |
+                proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+                proxy_set_header X-Original-Method $request_method;
+                proxy_set_header X-Sent-From "nginx-ingress-controller";
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Auth-Request-Redirect $request_uri;
           spec:
             ingressClassName: nginx
             tls:
               - hosts:
-                  - "{{ argilla_hostname }}"
-                secretName: "{{ argilla_namespace }}-tls-secret"
+                  - "{{ cvat_hostname }}"
+                secretName: "{{ cvat_namespace }}-tls-secret"
             rules:
-              - host: "{{ argilla_hostname }}"
+              - host: "{{ cvat_hostname }}"
                 http:
                   paths:
+                    - path: /api
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: cvat-backend
+                          port:
+                            number: 8080
+                    - path: /static
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: cvat-backend
+                          port:
+                            number: 8080
+                    - path: /django-rq
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: cvat-backend
+                          port:
+                            number: 8080
                     - path: /
                       pathType: Prefix
                       backend:
                         service:
-                          name: argilla-oauth2-proxy
+                          name: cvat-ui
                           port:
                             number: 80
 
-    - name: Wait for Elasticsearch to be ready
+    - name: Wait for PostgreSQL to be ready
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
         api_version: apps/v1
         kind: StatefulSet
-        namespace: "{{ argilla_namespace }}"
-        name: elasticsearch
-      register: es_status
+        namespace: "{{ cvat_namespace }}"
+        name: cvat-postgres
+      register: postgres_status
       until:
-        - es_status.resources is defined
-        - es_status.resources | length > 0
-        - es_status.resources[0].status.readyReplicas is defined
-        - es_status.resources[0].status.readyReplicas == 1
+        - postgres_status.resources is defined
+        - postgres_status.resources | length > 0
+        - postgres_status.resources[0].status.readyReplicas is defined
+        - postgres_status.resources[0].status.readyReplicas == 1
       retries: 30
       delay: 10
 
-    - name: Wait for Argilla deployment to be ready
+    - name: Wait for CVAT Backend deployment to be ready
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
         api_version: apps/v1
         kind: Deployment
-        namespace: "{{ argilla_namespace }}"
-        name: argilla
-      register: deployment_status
+        namespace: "{{ cvat_namespace }}"
+        name: cvat-backend
+      register: backend_status
       until:
-        - deployment_status.resources is defined
-        - deployment_status.resources | length > 0
-        - deployment_status.resources[0].status.replicas is defined
-        - deployment_status.resources[0].status.readyReplicas is defined
-        - deployment_status.resources[0].status.replicas == deployment_status.resources[0].status.readyReplicas
+        - backend_status.resources is defined
+        - backend_status.resources | length > 0
+        - backend_status.resources[0].status.replicas is defined
+        - backend_status.resources[0].status.readyReplicas is defined
+        - backend_status.resources[0].status.replicas == backend_status.resources[0].status.readyReplicas
       retries: 30
       delay: 10
 
     - name: Display access information
       ansible.builtin.debug:
         msg:
-          - "Argilla has been deployed successfully!"
-          - "Access URL: https://{{ argilla_hostname }}"
+          - "CVAT has been deployed successfully!"
+          - "Access URL: https://{{ cvat_hostname }}"
           - "Default admin user: {{ admin_username }}"
           - "Default admin password: {{ admin_password }}"
-          - "API Key: {{ argilla_api_key }}"
           - "Note: SSO is configured via Keycloak OAuth2 proxy"
+          - "Computer vision annotation features are available"
