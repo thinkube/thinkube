@@ -27,6 +27,37 @@
           - kubeconfig is defined
         fail_msg: "kubeconfig is not defined"
 
+    - name: Get ClickHouseInstallation resources
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: clickhouse.altinity.com/v1
+        kind: ClickHouseInstallation
+        namespace: "{{ clickhouse_namespace }}"
+      register: chi_resources
+      ignore_errors: true
+
+    - name: Remove finalizers from ClickHouseInstallation resources
+      ansible.builtin.shell: |
+        kubectl --kubeconfig={{ kubeconfig }} patch clickhouseinstallation {{ item.metadata.name }} \
+          -n {{ clickhouse_namespace }} \
+          --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]' || true
+      loop: "{{ chi_resources.resources | default([]) }}"
+      when: chi_resources.resources is defined and chi_resources.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete ClickHouseInstallation resources directly
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: clickhouse.altinity.com/v1
+        kind: ClickHouseInstallation
+        namespace: "{{ clickhouse_namespace }}"
+        name: "{{ item.metadata.name }}"
+        state: absent
+        wait: false
+      loop: "{{ chi_resources.resources | default([]) }}"
+      when: chi_resources.resources is defined and chi_resources.resources | length > 0
+      ignore_errors: true
+
     - name: Delete ClickHouse namespace (deletes everything)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
