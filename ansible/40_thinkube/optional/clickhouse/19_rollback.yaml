@@ -1,0 +1,94 @@
+---
+# ansible/40_thinkube/optional/clickhouse/19_rollback.yaml
+# Description:
+#   Rollback/uninstall playbook for ClickHouse
+#   Removes all ClickHouse resources from the cluster
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/clickhouse/19_rollback.yaml
+#
+# 🤖 [AI-generated]
+
+- name: Rollback ClickHouse deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    clickhouse_namespace: clickhouse
+    helm_bin: "{{ helm_bin | default('/snap/bin/microk8s.helm3') }}"
+
+  tasks:
+    - name: Verify kubeconfig is defined
+      ansible.builtin.assert:
+        that:
+          - kubeconfig is defined
+        fail_msg: "kubeconfig is not defined"
+
+    - name: Check if ClickHouse namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ clickhouse_namespace }}"
+      register: namespace_check
+
+    - name: Uninstall ClickHouse Helm release
+      kubernetes.core.helm:
+        name: clickhouse
+        release_namespace: "{{ clickhouse_namespace }}"
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        wait: true
+        wait_timeout: 300
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete PersistentVolumeClaims
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ clickhouse_namespace }}"
+        state: absent
+        label_selectors:
+          - app.kubernetes.io/name=clickhouse
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete ClickHouse namespace (this will delete all remaining resources)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ clickhouse_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: absent
+        wait: true
+        wait_timeout: 300
+      when: namespace_check.resources | length > 0
+
+    - name: Remove Altinity Helm repository
+      kubernetes.core.helm_repository:
+        name: altinity
+        state: absent
+      ignore_errors: true
+
+    - name: Verify namespace is deleted
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ clickhouse_namespace }}"
+      register: final_check
+      failed_when: final_check.resources | length > 0
+
+    - name: Display rollback status
+      ansible.builtin.debug:
+        msg:
+          - "ClickHouse has been successfully removed from the cluster"
+          - "All resources in the {{ clickhouse_namespace }} namespace have been deleted"
+          - "All persistent volumes have been cleaned up"
+          - "Helm repository has been removed"
