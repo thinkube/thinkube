@@ -2,32 +2,57 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Jupyter ML CPU - Machine Learning development environment without GPU
-# Base: Jupyter SciPy Notebook (Python 3.12)
+# Base: Ubuntu 24.04 with Python 3.12
 # Includes: PyTorch CPU, ML libraries, and all Thinkube service clients
 
-FROM {{ harbor_registry }}/library/jupyter-scipy-notebook:latest
+FROM {{ harbor_registry }}/library/ubuntu:24.04
 
-USER root
+# Avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
+# Install Python 3.12 and system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-venv \
+        python3-pip \
         git \
         wget \
         curl \
         vim \
         build-essential \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/lib/python*/EXTERNALLY-MANAGED
 
-USER $NB_UID
+# Set Python 3.12 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
 
-# Install JupyterHub (needed for jupyterhub-singleuser command when spawned by hub)
-RUN pip install --no-cache-dir \
+# Get existing UID 1000 user or create jovyan
+RUN if id 1000 2>/dev/null; then \
+        NB_USER=$(id -nu 1000); \
+        if [ "$NB_USER" != "jovyan" ]; then \
+            usermod -l jovyan -d /home/jovyan -m $NB_USER; \
+        fi; \
+    else \
+        useradd -m -s /bin/bash -N -u 1000 jovyan; \
+    fi
+
+ENV NB_UID=1000
+ENV NB_GID=100
+
+USER jovyan
+WORKDIR /home/jovyan
+
+# Install JupyterLab and JupyterHub (needed for jupyterhub-singleuser command)
+RUN python -m pip install --no-cache-dir --user \
+    jupyterlab \
     jupyterhub
 
 # Install PyTorch CPU and ML libraries
 # Versions will be determined by MCP tk-package-version
-RUN pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir --user \
     torch \
     torchvision \
     pandas \
@@ -37,7 +62,7 @@ RUN pip install --no-cache-dir \
     plotly
 
 # Install Thinkube service clients - Deployed services
-RUN pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir --user \
     psycopg2-binary \
     redis \
     qdrant-client \
@@ -46,13 +71,13 @@ RUN pip install --no-cache-dir \
     boto3
 
 # Install Thinkube service clients - Planned services
-RUN pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir --user \
     weaviate-client \
     litellm \
     label-studio-sdk
 
 # Install common utilities
-RUN pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir --user \
     python-dotenv \
     requests \
     httpx \
