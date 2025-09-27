@@ -1,0 +1,100 @@
+---
+# ansible/40_thinkube/optional/clickhouse/10_deploy.yaml
+# Description:
+#   Deploy ClickHouse on Kubernetes using Altinity Operator
+#   Provides analytics database for CVAT and other services
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - Helm must be available
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/clickhouse/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#   - helm_bin: Path to helm binary
+#
+# 🤖 [AI-generated]
+
+- name: Deploy ClickHouse on Kubernetes
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    clickhouse_namespace: clickhouse
+    helm_bin: "{{ helm_bin | default('/snap/bin/microk8s.helm3') }}"
+
+  tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+        fail_msg: "Required variables are not defined"
+
+    - name: Create ClickHouse namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ clickhouse_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Add Altinity Helm repository
+      kubernetes.core.helm_repository:
+        name: altinity
+        repo_url: https://helm.altinity.com
+
+    - name: Deploy ClickHouse using Altinity chart
+      kubernetes.core.helm:
+        name: clickhouse
+        chart_ref: altinity/clickhouse
+        release_namespace: "{{ clickhouse_namespace }}"
+        kubeconfig: "{{ kubeconfig }}"
+        create_namespace: false
+        values:
+          clickhouse:
+            install: true
+            cluster:
+              name: clickhouse-cluster
+              layout:
+                shardsCount: 1
+                replicasCount: 1
+            user:
+              default:
+                password: "{{ admin_password }}"
+            settings:
+              default_database: default
+            persistence:
+              enabled: true
+              size: 10Gi
+              storageClass: microk8s-hostpath
+
+    - name: Wait for ClickHouse to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ clickhouse_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=clickhouse
+      register: clickhouse_pods
+      until:
+        - clickhouse_pods.resources is defined
+        - clickhouse_pods.resources | length > 0
+        - clickhouse_pods.resources[0].status.phase == "Running"
+      retries: 30
+      delay: 10
+
+    - name: Display ClickHouse connection info
+      ansible.builtin.debug:
+        msg:
+          - "ClickHouse has been deployed successfully!"
+          - "Service: clickhouse-clickhouse-cluster.{{ clickhouse_namespace }}.svc.cluster.local"
+          - "HTTP Port: 8123"
+          - "Native Port: 9000"
+          - "Default user: default"
+          - "Password: {{ admin_password }}"
