@@ -1,0 +1,342 @@
+---
+# ansible/40_thinkube/optional/litellm/10_deploy.yaml
+# Description:
+#   Deploy LiteLLM proxy server on Kubernetes
+#   Provides unified API for multiple LLM providers with cost tracking and load balancing
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - Harbor registry must be available
+#   - PostgreSQL database connection (optional, for persistence)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/litellm/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#   - harbor_registry: Harbor registry URL
+#   - admin_username: Admin username
+#   - admin_password: Admin password
+#
+# 🤖 [AI-generated]
+
+- name: Deploy LiteLLM on Kubernetes
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    litellm_namespace: litellm
+    litellm_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/litellm:latest"
+    litellm_hostname: "litellm.{{ domain_name }}"
+
+  tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+          - harbor_registry is defined
+          - admin_username is defined
+          - admin_password is defined
+        fail_msg: "Required variables are not defined. Please check your inventory."
+
+    - name: Create LiteLLM namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ litellm_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Generate LiteLLM master key
+      ansible.builtin.set_fact:
+        litellm_master_key: "sk-{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Create LiteLLM secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: litellm-secrets
+            namespace: "{{ litellm_namespace }}"
+          type: Opaque
+          stringData:
+            LITELLM_MASTER_KEY: "{{ litellm_master_key }}"
+            LITELLM_SALT_KEY: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+            ADMIN_USERNAME: "{{ admin_username }}"
+            ADMIN_PASSWORD: "{{ admin_password }}"
+
+    - name: Create LiteLLM ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: litellm-config
+            namespace: "{{ litellm_namespace }}"
+          data:
+            config.yaml: |
+              general_settings:
+                master_key: os.environ/LITELLM_MASTER_KEY
+                enable_jwt_auth: true
+                database_url: "sqlite:////app/data/litellm.db"
+                proxy_batch_write_at: 60
+                disable_spend_logs: false
+                ui_access_mode: "admin_only"
+
+              litellm_jwtauth:
+                # JWT field mappings
+                user_id_jwt_field: "sub"
+                team_ids_jwt_field: "groups"
+                roles_jwt_field: "roles"
+
+                # Sync settings
+                sync_user_role_and_teams: true
+                user_id_upsert: true
+
+                # Admin access
+                admin_jwt_scope: "litellm_proxy_admin"
+
+                # Public key TTL
+                public_key_ttl: 600
+
+                # Role mapping
+                jwt_litellm_role_map:
+                  - jwt_role: "litellm_proxy_admin"
+                    litellm_role: "proxy_admin"
+                  - jwt_role: "AI_ADMIN"
+                    litellm_role: "proxy_admin"
+                  - jwt_role: "AI_USER"
+                    litellm_role: "internal_user"
+
+              model_list:
+                # Users will configure their own models via the UI
+                # This is just a placeholder
+                - model_name: "test-model"
+                  litellm_params:
+                    model: "openai/gpt-3.5-turbo"
+                    api_key: "os.environ/OPENAI_API_KEY"  # Will be set via UI
+
+    - name: Create PersistentVolumeClaim for LiteLLM data
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: litellm-data-pvc
+            namespace: "{{ litellm_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 5Gi
+
+    - name: Deploy LiteLLM
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: litellm
+            namespace: "{{ litellm_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: litellm
+            template:
+              metadata:
+                labels:
+                  app: litellm
+              spec:
+                containers:
+                  - name: litellm
+                    image: "{{ litellm_image }}"
+                    command:
+                      - "litellm"
+                      - "--port"
+                      - "4000"
+                      - "--config"
+                      - "/app/config.yaml"
+                    ports:
+                      - containerPort: 4000
+                        name: http
+                    env:
+                      - name: LITELLM_MASTER_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: LITELLM_MASTER_KEY
+                      - name: LITELLM_SALT_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: LITELLM_SALT_KEY
+                      - name: UI_USERNAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: ADMIN_USERNAME
+                      - name: UI_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: ADMIN_PASSWORD
+                      - name: STORE_MODEL_IN_DB
+                        value: "True"
+                      - name: PROXY_BASE_URL
+                        value: "https://{{ litellm_hostname }}"
+                      - name: ALLOWED_IPS
+                        value: ""
+                      - name: DROP_PARAMS
+                        value: "False"
+                      - name: LITELLM_MODE
+                        value: "PRODUCTION"
+                    volumeMounts:
+                      - name: config
+                        mountPath: /app/config.yaml
+                        subPath: config.yaml
+                      - name: data
+                        mountPath: /app/data
+                    livenessProbe:
+                      httpGet:
+                        path: /health/liveliness
+                        port: http
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /health/readiness
+                        port: http
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                    resources:
+                      requests:
+                        memory: "256Mi"
+                        cpu: "100m"
+                      limits:
+                        memory: "1Gi"
+                        cpu: "500m"
+                volumes:
+                  - name: config
+                    configMap:
+                      name: litellm-config
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: litellm-data-pvc
+
+    - name: Create LiteLLM Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: litellm
+            namespace: "{{ litellm_namespace }}"
+          spec:
+            selector:
+              app: litellm
+            ports:
+              - port: 80
+                targetPort: 4000
+                name: http
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: thinkube-com-tls
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to LiteLLM namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ litellm_namespace }}-tls-secret"
+            namespace: "{{ litellm_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Create LiteLLM Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: litellm
+            namespace: "{{ litellm_namespace }}"
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+              nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+              nginx.ingress.kubernetes.io/proxy-connect-timeout: "600"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - "{{ litellm_hostname }}"
+                secretName: "{{ litellm_namespace }}-tls-secret"
+            rules:
+              - host: "{{ litellm_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: litellm
+                          port:
+                            number: 80
+
+    - name: Wait for LiteLLM deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ litellm_namespace }}"
+        name: litellm
+      register: deployment_status
+      until:
+        - deployment_status.resources is defined
+        - deployment_status.resources | length > 0
+        - deployment_status.resources[0].status.replicas is defined
+        - deployment_status.resources[0].status.readyReplicas is defined
+        - deployment_status.resources[0].status.replicas == deployment_status.resources[0].status.readyReplicas
+      retries: 30
+      delay: 10
+
+    - name: Display access information
+      ansible.builtin.debug:
+        msg:
+          - "LiteLLM has been deployed successfully!"
+          - "Access URL: https://{{ litellm_hostname }}"
+          - "Admin UI: https://{{ litellm_hostname }}/ui"
+          - "API Endpoint: https://{{ litellm_hostname }}/v1"
+          - "Master Key: {{ litellm_master_key }}"
+          - "Note: Save the master key securely - it cannot be retrieved later"
