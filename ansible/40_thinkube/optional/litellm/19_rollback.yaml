@@ -40,6 +40,58 @@
         name: "{{ litellm_namespace }}"
       register: namespace_check
 
+    - name: Drop LiteLLM database
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "litellm-db-cleanup-{{ ansible_date_time.epoch }}"
+            namespace: postgres
+          spec:
+            ttlSecondsAfterFinished: 60
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: drop-db
+                    image: postgres:15-alpine
+                    env:
+                      - name: PGPASSWORD
+                        value: "{{ admin_password }}"
+                      - name: PGHOST
+                        value: "postgresql-official.postgres.svc.cluster.local"
+                      - name: PGUSER
+                        value: "{{ admin_username }}"
+                      - name: PGDATABASE
+                        value: "postgres"
+                    command:
+                      - psql
+                      - -c
+                      - "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'litellm' AND pid <> pg_backend_pid(); DROP DATABASE IF EXISTS litellm;"
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Wait for database cleanup job to complete
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: batch/v1
+        kind: Job
+        namespace: postgres
+        label_selectors:
+          - "job-name=litellm-db-cleanup-{{ ansible_date_time.epoch }}"
+      register: cleanup_job
+      until:
+        - cleanup_job.resources | length > 0
+        - cleanup_job.resources[0].status.succeeded is defined
+        - cleanup_job.resources[0].status.succeeded == 1
+      retries: 10
+      delay: 5
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
     - name: Delete LiteLLM namespace (this will delete all resources in the namespace)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -110,4 +162,5 @@
         msg:
           - "LiteLLM has been successfully removed from the cluster"
           - "All resources in the {{ litellm_namespace }} namespace have been deleted"
+          - "LiteLLM database has been dropped from PostgreSQL"
           - "Keycloak client configuration has been removed"

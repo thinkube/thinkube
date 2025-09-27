@@ -57,9 +57,6 @@
       ansible.builtin.set_fact:
         litellm_master_key: "sk-{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
 
-    - name: Generate PostgreSQL password for LiteLLM
-      ansible.builtin.set_fact:
-        litellm_db_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
 
     - name: Check PostgreSQL service exists
       kubernetes.core.k8s_info:
@@ -97,7 +94,7 @@
             LITELLM_SALT_KEY: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
             ADMIN_USERNAME: "{{ admin_username }}"
             ADMIN_PASSWORD: "{{ admin_password }}"
-            DATABASE_URL: "postgresql://litellm:{{ litellm_db_password }}@postgresql-official.postgres.svc.cluster.local:5432/litellm"
+            DATABASE_URL: "postgresql://{{ admin_username }}:{{ admin_password }}@postgresql-official.postgres.svc.cluster.local:5432/litellm"
             # SeaweedFS S3 credentials (using admin for now, should create specific user later)
             S3_BUCKET_NAME: "litellm-cache"
             S3_REGION_NAME: "us-east-1"
@@ -323,25 +320,11 @@
                       - sh
                       - -c
                       - |
-                        echo "Creating LiteLLM database and user..."
-                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres << EOF
-                        -- Create database if it doesn't exist
-                        SELECT 'CREATE DATABASE litellm' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'litellm')\gexec
-                        -- Create user if it doesn't exist
-                        DO \$\$
-                        BEGIN
-                          IF NOT EXISTS (SELECT FROM pg_user WHERE usename = 'litellm') THEN
-                            CREATE USER litellm WITH PASSWORD '{{ litellm_db_password }}';
-                          END IF;
-                        END
-                        \$\$;
-                        -- Grant privileges
-                        GRANT ALL PRIVILEGES ON DATABASE litellm TO litellm;
-                        ALTER DATABASE litellm OWNER TO litellm;
-                        -- Connect to litellm database and grant schema permissions
-                        \c litellm
-                        GRANT ALL ON SCHEMA public TO litellm;
-                        EOF
+                        echo "Creating LiteLLM database if it doesn't exist..."
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'litellm'" | grep -q 1 || psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "CREATE DATABASE litellm"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE litellm TO {{ admin_username }}"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "ALTER DATABASE litellm OWNER TO {{ admin_username }}"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d litellm -c "GRANT ALL ON SCHEMA public TO {{ admin_username }}"
                         echo "Database initialization complete."
 
     - name: Create LiteLLM Service
