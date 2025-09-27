@@ -1,0 +1,326 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/chroma/10_deploy.yaml
+# Description:
+#   Deploy Chroma vector database with token authentication
+#   This playbook deploys Chroma as a stateful service with persistence
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - ADMIN_PASSWORD environment variable must be set
+#   - DNS must be configured for ingress
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/chroma/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - admin_username: Admin username for authentication
+#   - primary_ingress_class: Ingress controller class name
+#   - kubeconfig: Path to kubeconfig file
+#   - harbor_registry: Harbor registry domain
+#
+# Dependencies:
+#   - MicroK8s cluster
+#   - Ingress controller
+#
+# 🤖 AI-assisted
+
+- name: Deploy Chroma Vector Database
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    chroma_namespace: "chroma"
+    chroma_hostname: "chroma.{{ domain_name }}"
+    chroma_capacity: "10Gi"
+    storage_class_name: "microk8s-hostpath"
+
+    # Admin credentials for token authentication
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    # Chroma image from Harbor registry (latest version)
+    chroma_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/chroma:latest"
+    library_project: "library"  # Harbor's default library project
+
+    # TLS secret name
+    chroma_tls_secret_name: "chroma-tls-secret"
+
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - admin_username is defined
+          - admin_password is defined and admin_password != ""
+          - primary_ingress_class is defined
+          - kubeconfig is defined
+        fail_msg: "Required variables are not defined. Check inventory configuration."
+
+    - name: Create Chroma namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ chroma_namespace }}"
+            labels:
+              name: "{{ chroma_namespace }}"
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Chroma namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ chroma_tls_secret_name }}"
+            namespace: "{{ chroma_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Create Chroma authentication secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: chroma-auth
+            namespace: "{{ chroma_namespace }}"
+          type: Opaque
+          stringData:
+            auth-token: "{{ admin_password }}"
+            admin-username: "{{ admin_username }}"
+
+    - name: Create PersistentVolumeClaim for Chroma data
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: chroma-data-pvc
+            namespace: "{{ chroma_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            storageClassName: "{{ storage_class_name }}"
+            resources:
+              requests:
+                storage: "{{ chroma_capacity }}"
+
+    - name: Deploy Chroma StatefulSet
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: chroma
+            namespace: "{{ chroma_namespace }}"
+            labels:
+              app: chroma
+              thinkube.io/managed: "true"
+          spec:
+            serviceName: chroma-headless
+            replicas: 1
+            selector:
+              matchLabels:
+                app: chroma
+            template:
+              metadata:
+                labels:
+                  app: chroma
+              spec:
+                containers:
+                  - name: chroma
+                    image: "{{ chroma_image }}"
+                    ports:
+                      - containerPort: 8000
+                        name: http
+                    env:
+                      # Enable authentication with token
+                      - name: CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER
+                        value: "chromadb.auth.token.TokenConfigServerAuthCredentialsProvider"
+                      - name: CHROMA_SERVER_AUTH_PROVIDER
+                        value: "chromadb.auth.token.TokenAuthServerProvider"
+                      - name: CHROMA_SERVER_AUTH_TOKEN_TRANSPORT_HEADER
+                        value: "X_CHROMA_TOKEN"
+                      - name: CHROMA_SERVER_AUTH_CREDENTIALS
+                        valueFrom:
+                          secretKeyRef:
+                            name: chroma-auth
+                            key: auth-token
+                      # Allow access from any origin (needed for ingress)
+                      - name: CHROMA_SERVER_CORS_ALLOW_ORIGINS
+                        value: '["*"]'
+                      # Persistence configuration
+                      - name: PERSIST_DIRECTORY
+                        value: "/chroma/chroma"
+                      - name: IS_PERSISTENT
+                        value: "True"
+                      # Anonymized telemetry disabled for privacy
+                      - name: ANONYMIZED_TELEMETRY
+                        value: "False"
+                      # Server configuration
+                      - name: CHROMA_SERVER_HOST
+                        value: "0.0.0.0"
+                      - name: CHROMA_SERVER_PORT
+                        value: "8000"
+                      - name: CHROMA_SERVER_LOG_CONFIG
+                        value: "chromadb/log_config.yml"
+                    volumeMounts:
+                      - name: chroma-data
+                        mountPath: /chroma/chroma
+                    resources:
+                      requests:
+                        memory: "512Mi"
+                        cpu: "250m"
+                      limits:
+                        memory: "2Gi"
+                        cpu: "1"
+                    livenessProbe:
+                      httpGet:
+                        path: /api/v1/heartbeat
+                        port: http
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /api/v1/heartbeat
+                        port: http
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                volumes:
+                  - name: chroma-data
+                    persistentVolumeClaim:
+                      claimName: chroma-data-pvc
+
+    - name: Create Chroma headless service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: chroma-headless
+            namespace: "{{ chroma_namespace }}"
+            labels:
+              app: chroma
+          spec:
+            clusterIP: None
+            selector:
+              app: chroma
+            ports:
+              - name: http
+                port: 8000
+                targetPort: 8000
+
+    - name: Create Chroma service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: chroma
+            namespace: "{{ chroma_namespace }}"
+            labels:
+              app: chroma
+              thinkube.io/managed: "true"
+          spec:
+            type: ClusterIP
+            selector:
+              app: chroma
+            ports:
+              - name: http
+                port: 80
+                targetPort: 8000
+                protocol: TCP
+
+    - name: Create Chroma Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: chroma-ingress
+            namespace: "{{ chroma_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ chroma_hostname }}"
+                secretName: "{{ chroma_tls_secret_name }}"
+            rules:
+              - host: "{{ chroma_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: chroma
+                          port:
+                            number: 80
+
+    - name: Wait for Chroma deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ chroma_namespace }}"
+        name: chroma
+        wait: true
+        wait_condition:
+          type: Complete
+          status: "True"
+        wait_timeout: 300
+      register: deployment_status
+
+    - name: Display deployment status
+      ansible.builtin.debug:
+        msg: |
+          Chroma deployment completed successfully!
+
+          API endpoint: https://{{ chroma_hostname }}
+          Authentication: Token-based (use admin password in X-Chroma-Token header)
+
+          Example usage with curl:
+          curl -H "X-Chroma-Token: ${ADMIN_PASSWORD}" https://{{ chroma_hostname }}/api/v1/collections
+
+          To check the status:
+          kubectl -n {{ chroma_namespace }} get pods
