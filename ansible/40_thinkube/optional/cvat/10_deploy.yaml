@@ -195,7 +195,7 @@
                 containers:
                   - name: cvat-backend
                     image: "{{ cvat_server_image }}"
-                    command: ["/patched/backend_entrypoint.sh"]
+                    command: ["./backend_entrypoint.sh"]
                     args: ["init", "run", "server"]
                     ports:
                       - containerPort: 8080
@@ -204,11 +204,11 @@
                       - name: DJANGO_MODWSGI_EXTRA_ARGS
                         value: ""
                       - name: CVAT_ANALYTICS
-                        value: "0"
+                        value: "1"
                       - name: CLICKHOUSE_HOST
-                        value: "valkey.valkey.svc.cluster.local"
+                        value: "clickhouse-clickhouse-cluster.clickhouse.svc.cluster.local"
                       - name: CLICKHOUSE_PORT
-                        value: "6379"
+                        value: "8123"
                       - name: ALLOWED_HOSTS
                         value: "{{ cvat_hostname }},cvat-backend,localhost"
                       - name: CVAT_REDIS_HOST
@@ -269,8 +269,6 @@
                       - name: USE_ALLAUTH_SOCIAL_ACCOUNTS
                         value: "False"
                     volumeMounts:
-                      - name: backend-entrypoint
-                        mountPath: /patched
                       - name: cvat-data
                         mountPath: /home/django/data
                       - name: cvat-keys
@@ -299,8 +297,6 @@
                         memory: "2Gi"
                         cpu: "1"
                 volumes:
-                  - name: backend-entrypoint
-                    emptyDir: {}
                   - name: cvat-data
                     persistentVolumeClaim:
                       claimName: cvat-data-pvc
@@ -314,26 +310,15 @@
                     persistentVolumeClaim:
                       claimName: cvat-models-pvc
                 initContainers:
-                  - name: patch-entrypoint
-                    image: "{{ cvat_server_image }}"
-                    command:
-                      - sh
-                      - -c
-                      - |
-                        cp ./backend_entrypoint.sh /patched/backend_entrypoint.sh
-                        # Comment out ClickHouse calls when analytics disabled
-                        sed -i 's/^wait_for_clickhouse$/# wait_for_clickhouse (analytics disabled)/' /patched/backend_entrypoint.sh
-                        sed -i 's|^python components/analytics/clickhouse/init.py$|# python components/analytics/clickhouse/init.py (analytics disabled)|' /patched/backend_entrypoint.sh
-                        chmod +x /patched/backend_entrypoint.sh
-                    volumeMounts:
-                      - name: backend-entrypoint
-                        mountPath: /patched
                   - name: wait-for-db
                     image: busybox:1.35
                     command: ['sh', '-c', 'until nc -z postgresql-official.postgres.svc.cluster.local 5432; do echo waiting for postgres; sleep 2; done;']
                   - name: wait-for-valkey
                     image: busybox:1.35
                     command: ['sh', '-c', 'until nc -z valkey.valkey.svc.cluster.local 6379; do echo waiting for valkey; sleep 2; done;']
+                  - name: wait-for-clickhouse
+                    image: busybox:1.35
+                    command: ['sh', '-c', 'until nc -z clickhouse-clickhouse-cluster.clickhouse.svc.cluster.local 8123; do echo waiting for clickhouse; sleep 2; done;']
 
     - name: Create CVAT Backend Service
       kubernetes.core.k8s:
