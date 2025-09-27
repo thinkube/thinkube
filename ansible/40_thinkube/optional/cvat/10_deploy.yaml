@@ -97,8 +97,8 @@
             DJANGO_SUPERUSER_PASSWORD: "{{ admin_password }}"
             DJANGO_SUPERUSER_EMAIL: "admin@{{ domain_name }}"
             SECRET_KEY: "{{ cvat_secret_key }}"
-            POSTGRES_USER: "cvat"
-            POSTGRES_PASSWORD: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+            POSTGRES_USER: "{{ admin_username }}"
+            POSTGRES_PASSWORD: "{{ admin_password }}"
             POSTGRES_DB: "cvat"
 
     - name: Create PersistentVolumeClaims for CVAT
@@ -122,87 +122,45 @@
         - { name: cvat-keys-pvc, size: 1Gi }
         - { name: cvat-logs-pvc, size: 5Gi }
         - { name: cvat-models-pvc, size: 10Gi }
-        - { name: postgres-data-pvc, size: 10Gi }
 
-    - name: Deploy PostgreSQL for CVAT
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: apps/v1
-          kind: StatefulSet
-          metadata:
-            name: cvat-postgres
-            namespace: "{{ cvat_namespace }}"
-          spec:
-            serviceName: cvat-postgres
-            replicas: 1
-            selector:
-              matchLabels:
-                app: cvat-postgres
-            template:
-              metadata:
-                labels:
-                  app: cvat-postgres
-              spec:
-                containers:
-                  - name: postgres
-                    image: postgres:15-alpine
-                    env:
-                      - name: POSTGRES_USER
-                        valueFrom:
-                          secretKeyRef:
-                            name: cvat-secrets
-                            key: POSTGRES_USER
-                      - name: POSTGRES_PASSWORD
-                        valueFrom:
-                          secretKeyRef:
-                            name: cvat-secrets
-                            key: POSTGRES_PASSWORD
-                      - name: POSTGRES_DB
-                        valueFrom:
-                          secretKeyRef:
-                            name: cvat-secrets
-                            key: POSTGRES_DB
-                      - name: PGDATA
-                        value: /var/lib/postgresql/data/pgdata
-                    ports:
-                      - containerPort: 5432
-                    volumeMounts:
-                      - name: postgres-data
-                        mountPath: /var/lib/postgresql/data
-                    resources:
-                      requests:
-                        memory: "256Mi"
-                        cpu: "250m"
-                      limits:
-                        memory: "1Gi"
-                        cpu: "500m"
-            volumeClaimTemplates:
-              - metadata:
-                  name: postgres-data
-                spec:
-                  accessModes: ["ReadWriteOnce"]
-                  resources:
-                    requests:
-                      storage: 10Gi
-
-    - name: Create PostgreSQL Service
+    - name: Create CVAT database in PostgreSQL
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
           apiVersion: v1
-          kind: Service
+          kind: Pod
           metadata:
-            name: cvat-postgres
+            name: cvat-db-init
             namespace: "{{ cvat_namespace }}"
           spec:
-            selector:
-              app: cvat-postgres
-            ports:
-              - port: 5432
-                targetPort: 5432
+            restartPolicy: Never
+            containers:
+              - name: create-db
+                image: postgres:15-alpine
+                command:
+                  - sh
+                  - -c
+                  - |
+                    psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'cvat'" | grep -q 1 || psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "CREATE DATABASE cvat"
+                env:
+                  - name: PGPASSWORD
+                    value: "{{ admin_password }}"
+
+    - name: Wait for database creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        name: cvat-db-init
+        namespace: "{{ cvat_namespace }}"
+      register: db_init_pod
+      until:
+        - db_init_pod.resources is defined
+        - db_init_pod.resources | length > 0
+        - db_init_pod.resources[0].status.phase == "Succeeded"
+      retries: 30
+      delay: 5
 
     - name: Get Valkey service info
       kubernetes.core.k8s_info:
@@ -249,7 +207,7 @@
                       - name: CVAT_REDIS_HOST
                         value: "valkey.valkey.svc.cluster.local"
                       - name: CVAT_POSTGRES_HOST
-                        value: "cvat-postgres"
+                        value: "postgresql-official.postgres.svc.cluster.local"
                       - name: CVAT_POSTGRES_PORT
                         value: "5432"
                       - name: CVAT_POSTGRES_USER
@@ -339,7 +297,7 @@
                 initContainers:
                   - name: wait-for-db
                     image: busybox:1.35
-                    command: ['sh', '-c', 'until nc -z cvat-postgres 5432; do echo waiting for postgres; sleep 2; done;']
+                    command: ['sh', '-c', 'until nc -z postgresql-official.postgres.svc.cluster.local 5432; do echo waiting for postgres; sleep 2; done;']
                   - name: wait-for-valkey
                     image: busybox:1.35
                     command: ['sh', '-c', 'until nc -z valkey.valkey.svc.cluster.local 6379; do echo waiting for valkey; sleep 2; done;']
