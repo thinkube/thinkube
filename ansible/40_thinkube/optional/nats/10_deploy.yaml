@@ -1,0 +1,177 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/nats/10_deploy.yaml
+# Description:
+#   Deploy NATS messaging system with JetStream for real-time pub/sub
+#
+# Requirements:
+#   - MicroK8s must be installed
+#   - Helm must be installed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/nats/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - nats_namespace: Namespace for NATS
+#   - kubeconfig: Path to kubeconfig file
+#   - helm_bin: Path to Helm binary
+#   - harbor_registry: Harbor registry URL
+#   - library_project: Harbor library project name
+#
+# Dependencies:
+#   - CORE-001: MicroK8s must be installed
+#   - CORE-002: Helm must be installed
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy NATS with JetStream
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Common settings
+    k8s_namespace: "{{ nats_namespace }}"
+
+    # TLS settings
+    tls_secret_name: "nats-tls-secret"
+
+  tasks:
+    ###########################################################################
+    # Step 1: Create Namespace and TLS Secret
+    ###########################################################################
+    - name: Ensure NATS namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ k8s_namespace }}"
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to NATS namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ tls_secret_name }}"
+            namespace: "{{ k8s_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###########################################################################
+    # Step 2: Deploy NATS with Helm
+    ###########################################################################
+    - name: Add NATS Helm repository
+      kubernetes.core.helm_repository:
+        binary_path: "{{ helm_bin }}"
+        name: nats
+        repo_url: "https://nats-io.github.io/k8s/helm/charts/"
+        state: present
+
+    - name: Update Helm repos for NATS
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+      changed_when: false
+
+    - name: Deploy NATS with JetStream
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        kubeconfig: "{{ kubeconfig }}"
+        name: "nats"
+        chart_ref: "nats/nats"
+        release_namespace: "{{ k8s_namespace }}"
+        create_namespace: false
+        reset_values: true
+        force: true
+        update_repo_cache: true
+        values:
+          nats:
+            image:
+              repository: "{{ harbor_registry }}/{{ library_project | default('library') }}/nats"
+              tag: "2.10.24-alpine"
+              pullPolicy: IfNotPresent
+
+            # JetStream configuration
+            jetstream:
+              enabled: true
+              fileStore:
+                pvc:
+                  enabled: true
+                  storageClassName: ""
+                  size: 10Gi
+
+            # Single replica for homelab
+            cluster:
+              enabled: false
+              replicas: 1
+
+            # Resource limits (homelab-appropriate)
+            resources:
+              requests:
+                cpu: "500m"
+                memory: "512Mi"
+              limits:
+                cpu: "1"
+                memory: "2Gi"
+
+            # Service configuration (internal only)
+            service:
+              enabled: true
+              type: ClusterIP
+              ports:
+                client: 4222
+                cluster: 6222
+                monitor: 8222
+
+            # Monitoring endpoint
+            natsBox:
+              enabled: true
+              image:
+                repository: "{{ harbor_registry }}/{{ library_project | default('library') }}/nats-box"
+                tag: "0.14.5"
+
+    ###########################################################################
+    # Step 3: Wait for NATS to be ready
+    ###########################################################################
+    - name: Wait for NATS pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ k8s_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=nats"
+      register: nats_pods
+      until: >
+        nats_pods.resources | length == 1 and
+        nats_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length == 1
+      retries: 30
+      delay: 10
+
+    - name: Display deployment results
+      ansible.builtin.debug:
+        msg:
+          - "NATS deployment complete!"
+          - "Namespace: {{ k8s_namespace }}"
+          - "Service: nats.{{ k8s_namespace }}.svc.cluster.local:4222"
+          - "Single replica (homelab)"
+          - "JetStream: Enabled with persistent storage"
+        verbosity: 0

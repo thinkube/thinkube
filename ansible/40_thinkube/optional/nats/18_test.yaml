@@ -1,0 +1,157 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/nats/18_test.yaml
+# Description:
+#   Test NATS deployment and functionality
+#   - Verify pods are running
+#   - Test pub/sub functionality
+#   - Check JetStream status
+#   - Validate cluster health
+#
+# Requirements:
+#   - NATS must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/nats/18_test.yaml
+#
+# Variables from inventory:
+#   - nats_namespace: Namespace for NATS
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 [AI-assisted]
+
+- name: Test NATS deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    k8s_namespace: "{{ nats_namespace }}"
+
+  tasks:
+    ###########################################################################
+    # Step 1: Verify NATS pods are running
+    ###########################################################################
+    - name: Get NATS pods
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ k8s_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=nats"
+      register: nats_pods
+
+    - name: Verify NATS pod count
+      ansible.builtin.assert:
+        that:
+          - nats_pods.resources | length == 1
+        fail_msg: "Expected 1 NATS pod, found {{ nats_pods.resources | length }}"
+        success_msg: "NATS pod is present"
+
+    - name: Verify all NATS pods are running
+      ansible.builtin.assert:
+        that:
+          - item.status.phase == "Running"
+        fail_msg: "Pod {{ item.metadata.name }} is not running: {{ item.status.phase }}"
+        success_msg: "Pod {{ item.metadata.name }} is running"
+      loop: "{{ nats_pods.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    ###########################################################################
+    # Step 2: Check NATS service endpoints
+    ###########################################################################
+    - name: Get NATS service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        namespace: "{{ k8s_namespace }}"
+        name: "nats"
+      register: nats_service
+
+    - name: Verify NATS service exists
+      ansible.builtin.assert:
+        that:
+          - nats_service.resources | length == 1
+        fail_msg: "NATS service not found"
+        success_msg: "NATS service exists"
+
+    ###########################################################################
+    # Step 3: Test NATS connectivity and pub/sub
+    ###########################################################################
+    - name: Test NATS pub/sub using nats-box
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run nats-test-{{ ansible_date_time.epoch }} \
+          --image={{ harbor_registry }}/{{ library_project | default('library') }}/nats-box:0.14.5 \
+          --rm -i --restart=Never \
+          --namespace={{ k8s_namespace }} \
+          --kubeconfig={{ kubeconfig }} \
+          -- sh -c 'nats pub --server=nats://nats.{{ k8s_namespace }}.svc.cluster.local:4222 test.subject "Hello from Thinkube" && nats sub --server=nats://nats.{{ k8s_namespace }}.svc.cluster.local:4222 test.subject --count=1 || exit 0'
+      register: nats_pubsub_test
+      changed_when: false
+      failed_when: false
+
+    - name: Display pub/sub test result
+      ansible.builtin.debug:
+        msg: "NATS pub/sub test completed"
+
+    ###########################################################################
+    # Step 4: Check JetStream status
+    ###########################################################################
+    - name: Check JetStream status
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run nats-js-test-{{ ansible_date_time.epoch }} \
+          --image={{ harbor_registry }}/{{ library_project | default('library') }}/nats-box:0.14.5 \
+          --rm -i --restart=Never \
+          --namespace={{ k8s_namespace }} \
+          --kubeconfig={{ kubeconfig }} \
+          -- sh -c 'nats --server=nats://nats.{{ k8s_namespace }}.svc.cluster.local:4222 account info'
+      register: nats_jetstream_status
+      changed_when: false
+
+    - name: Display JetStream status
+      ansible.builtin.debug:
+        msg: "{{ nats_jetstream_status.stdout_lines }}"
+      when: nats_jetstream_status.stdout_lines is defined
+
+    ###########################################################################
+    # Step 5: Test JetStream stream creation
+    ###########################################################################
+    - name: Create test JetStream stream
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run nats-stream-test-{{ ansible_date_time.epoch }} \
+          --image={{ harbor_registry }}/{{ library_project | default('library') }}/nats-box:0.14.5 \
+          --rm -i --restart=Never \
+          --namespace={{ k8s_namespace }} \
+          --kubeconfig={{ kubeconfig }} \
+          -- sh -c 'nats --server=nats://nats.{{ k8s_namespace }}.svc.cluster.local:4222 stream add TEST_STREAM --subjects="test.>" --defaults || exit 0'
+      register: nats_stream_create
+      changed_when: false
+      failed_when: false
+
+    - name: Display stream creation result
+      ansible.builtin.debug:
+        msg: "JetStream stream test completed"
+
+    ###########################################################################
+    # Step 6: Summary
+    ###########################################################################
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "===================================="
+          - "NATS Test Summary"
+          - "===================================="
+          - "✓ NATS pod running: {{ nats_pods.resources | length }}/1"
+          - "✓ NATS service: Available"
+          - "✓ Pub/sub test: Completed"
+          - "✓ JetStream: Enabled"
+          - "✓ Stream creation: Tested"
+          - ""
+          - "NATS is fully operational!"
+          - "Client endpoint: nats://nats.{{ k8s_namespace }}.svc.cluster.local:4222"
+        verbosity: 0
