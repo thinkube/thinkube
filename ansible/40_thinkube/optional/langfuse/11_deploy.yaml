@@ -44,6 +44,9 @@
     # TLS settings
     tls_secret_name: "langfuse-tls-secret"
 
+    # Admin password from environment
+    admin_password: "{{ lookup('env','ADMIN_PASSWORD') }}"
+
     # PostgreSQL settings
     postgres_admin_user: "{{ admin_username }}"
     langfuse_db_name: "langfuse_db"
@@ -111,11 +114,53 @@
         keycloak_client_secret: "{{ oauth_secret.resources[0].data['client_secret'] | b64decode }}"
 
     ###########################################################################
-    # Step 3: Set PostgreSQL Password
+    # Step 3: Create S3 Buckets for Langfuse
     ###########################################################################
-    - name: Set PostgreSQL admin password from environment
+    - name: Get SeaweedFS S3 credentials from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: seaweedfs-s3-config
+        namespace: seaweedfs
+      register: seaweedfs_secret
+      failed_when: seaweedfs_secret.resources | length == 0
+
+    - name: Set SeaweedFS credentials as facts
       ansible.builtin.set_fact:
-        postgres_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+        s3_access_key: "{{ seaweedfs_secret.resources[0].data.access_key | b64decode }}"
+        s3_secret_key: "{{ seaweedfs_secret.resources[0].data.secret_key | b64decode }}"
+        seaweedfs_s3_hostname: "s3.{{ domain_name }}"
+        langfuse_s3_events_bucket: "langfuse-events"
+        langfuse_s3_media_bucket: "langfuse-media"
+
+    - name: Create Langfuse events bucket in SeaweedFS
+      ansible.builtin.shell: |
+        s3cmd --config=/dev/null \
+          --access_key="{{ s3_access_key }}" \
+          --secret_key="{{ s3_secret_key }}" \
+          --host="https://{{ seaweedfs_s3_hostname }}" \
+          --host-bucket="https://{{ seaweedfs_s3_hostname }}/%(bucket)s" \
+          --no-ssl-certificate-check \
+          --signature-v2 \
+          mb s3://{{ langfuse_s3_events_bucket }} 2>&1 || true
+      register: s3_events_result
+      become: true
+      changed_when: "'Bucket created' in s3_events_result.stdout or s3_events_result.rc == 0"
+
+    - name: Create Langfuse media bucket in SeaweedFS
+      ansible.builtin.shell: |
+        s3cmd --config=/dev/null \
+          --access_key="{{ s3_access_key }}" \
+          --secret_key="{{ s3_secret_key }}" \
+          --host="https://{{ seaweedfs_s3_hostname }}" \
+          --host-bucket="https://{{ seaweedfs_s3_hostname }}/%(bucket)s" \
+          --no-ssl-certificate-check \
+          --signature-v2 \
+          mb s3://{{ langfuse_s3_media_bucket }} 2>&1 || true
+      register: s3_media_result
+      become: true
+      changed_when: "'Bucket created' in s3_media_result.stdout or s3_media_result.rc == 0"
 
     ###########################################################################
     # Step 4: Create Langfuse Secrets
@@ -127,6 +172,15 @@
     - name: Generate SALT
       ansible.builtin.set_fact:
         langfuse_salt: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Generate ENCRYPTION_KEY (64-char hex string for 256-bit encryption)
+      ansible.builtin.shell: openssl rand -hex 32
+      register: encryption_key_result
+      changed_when: false
+
+    - name: Set ENCRYPTION_KEY fact
+      ansible.builtin.set_fact:
+        langfuse_encryption_key: "{{ encryption_key_result.stdout }}"
 
     - name: Create Langfuse configuration secret
       kubernetes.core.k8s:
@@ -140,19 +194,43 @@
             namespace: "{{ k8s_namespace }}"
           type: Opaque
           stringData:
-            DATABASE_URL: "postgresql://{{ langfuse_db_user }}:{{ postgres_admin_password }}@{{ langfuse_db_internal_host }}:5432/{{ langfuse_db_name }}"
+            # Database configuration
+            DATABASE_URL: "postgresql://{{ langfuse_db_user }}:{{ admin_password }}@{{ langfuse_db_internal_host }}:5432/{{ langfuse_db_name }}"
+            # ClickHouse configuration
             CLICKHOUSE_URL: "http://clickhouse-clickhouse.clickhouse.svc.cluster.local:8123"
-            CLICKHOUSE_MIGRATION_URL: "clickhouse://default:{{ postgres_admin_password }}@clickhouse-clickhouse.clickhouse.svc.cluster.local:9000"
+            CLICKHOUSE_MIGRATION_URL: "clickhouse://default:{{ admin_password }}@clickhouse-clickhouse.clickhouse.svc.cluster.local:9000"
             CLICKHOUSE_CLUSTER_ENABLED: "false"
             CLICKHOUSE_USER: "default"
-            CLICKHOUSE_PASSWORD: "{{ postgres_admin_password }}"
+            CLICKHOUSE_PASSWORD: "{{ admin_password }}"
+            # Redis configuration (Langfuse v3 requirement)
+            REDIS_HOST: "valkey.valkey.svc.cluster.local"
+            REDIS_PORT: "6379"
+            # Encryption (Langfuse v3 requirement - 64-char hex string)
+            ENCRYPTION_KEY: "{{ langfuse_encryption_key }}"
+            # S3 Event Upload configuration (Langfuse v3 requirement)
+            LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "{{ langfuse_s3_events_bucket }}"
+            LANGFUSE_S3_EVENT_UPLOAD_REGION: "us-east-1"
+            LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://seaweedfs-s3.seaweedfs.svc.cluster.local:8333"
+            LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "{{ s3_access_key }}"
+            LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: "{{ s3_secret_key }}"
+            LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+            # S3 Media Upload configuration (Langfuse v3 requirement)
+            LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "{{ langfuse_s3_media_bucket }}"
+            LANGFUSE_S3_MEDIA_UPLOAD_REGION: "us-east-1"
+            LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://seaweedfs-s3.seaweedfs.svc.cluster.local:8333"
+            LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "{{ s3_access_key }}"
+            LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: "{{ s3_secret_key }}"
+            LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+            # NextAuth configuration
             NEXTAUTH_URL: "https://{{ langfuse_hostname }}"
             NEXTAUTH_SECRET: "{{ nextauth_secret }}"
             SALT: "{{ langfuse_salt }}"
+            # Keycloak OIDC configuration
             AUTH_CUSTOM_CLIENT_ID: "{{ langfuse_client_id }}"
             AUTH_CUSTOM_CLIENT_SECRET: "{{ keycloak_client_secret }}"
             AUTH_CUSTOM_ISSUER: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
             AUTH_CUSTOM_NAME: "Keycloak"
+            # Initial organization/project configuration
             LANGFUSE_INIT_ORG_ID: "thinkube"
             LANGFUSE_INIT_ORG_NAME: "Thinkube"
             LANGFUSE_INIT_PROJECT_ID: "default"
@@ -191,7 +269,7 @@
                     image: "{{ harbor_registry }}/{{ library_project | default('library') }}/postgres:16-alpine"
                     env:
                       - name: PGPASSWORD
-                        value: "{{ postgres_admin_password }}"
+                        value: "{{ admin_password }}"
                     command:
                       - sh
                       - -c
