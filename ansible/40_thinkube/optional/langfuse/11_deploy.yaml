@@ -45,13 +45,10 @@
     tls_secret_name: "langfuse-tls-secret"
 
     # PostgreSQL settings
-    postgres_namespace: "postgres"
-    postgres_release_name: "postgresql-official"
-    postgres_host: "{{ postgres_release_name }}.{{ postgres_namespace }}.svc.cluster.local"
-    postgres_port: "5432"
     postgres_admin_user: "{{ admin_username }}"
     langfuse_db_name: "langfuse_db"
     langfuse_db_user: "{{ admin_username }}"
+    langfuse_db_internal_host: "postgresql-official.postgres.svc.cluster.local"
 
     # Keycloak settings
     langfuse_client_id: "langfuse"
@@ -97,40 +94,7 @@
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
 
     ###########################################################################
-    # Step 2: Setup PostgreSQL Database
-    ###########################################################################
-    - name: Set PostgreSQL admin password from environment
-      ansible.builtin.set_fact:
-        postgres_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
-
-    - name: Check if Langfuse database exists
-      ansible.builtin.shell: |
-        PGPASSWORD="{{ postgres_admin_password }}" psql -h {{ postgres_host }} -p 5432 -U {{ postgres_admin_user }} -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='{{ langfuse_db_name }}'"
-      register: db_check
-      become: true
-      changed_when: false
-
-    - name: Create Langfuse database if it doesn't exist
-      ansible.builtin.shell: |
-        PGPASSWORD="{{ postgres_admin_password }}" psql -h {{ postgres_host }} -p 5432 -U {{ postgres_admin_user }} -d postgres -c "
-        CREATE DATABASE {{ langfuse_db_name }};
-        "
-      register: db_create
-      become: true
-      when: db_check.stdout.find('1') == -1
-      changed_when: db_create.rc == 0
-
-    - name: Grant privileges on Langfuse database
-      ansible.builtin.shell: |
-        PGPASSWORD="{{ postgres_admin_password }}" psql -h {{ postgres_host }} -p 5432 -U {{ postgres_admin_user }} -d postgres -c "
-        GRANT ALL PRIVILEGES ON DATABASE {{ langfuse_db_name }} TO {{ langfuse_db_user }};
-        ALTER DATABASE {{ langfuse_db_name }} OWNER TO {{ langfuse_db_user }};
-        "
-      become: true
-      changed_when: false
-
-    ###########################################################################
-    # Step 3: Get Keycloak OAuth Credentials
+    # Step 2: Get Keycloak OAuth Credentials
     ###########################################################################
     - name: Get Keycloak OAuth secret
       kubernetes.core.k8s_info:
@@ -145,6 +109,13 @@
     - name: Extract OAuth client secret
       ansible.builtin.set_fact:
         keycloak_client_secret: "{{ oauth_secret.resources[0].data['client-secret'] | b64decode }}"
+
+    ###########################################################################
+    # Step 3: Set PostgreSQL Password
+    ###########################################################################
+    - name: Set PostgreSQL admin password from environment
+      ansible.builtin.set_fact:
+        postgres_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
 
     ###########################################################################
     # Step 4: Create Langfuse Secrets
@@ -169,7 +140,7 @@
             namespace: "{{ k8s_namespace }}"
           type: Opaque
           stringData:
-            DATABASE_URL: "postgresql://{{ langfuse_db_user }}:{{ postgres_admin_password }}@{{ postgres_host }}:{{ postgres_port }}/{{ langfuse_db_name }}"
+            DATABASE_URL: "postgresql://{{ langfuse_db_user }}:{{ postgres_admin_password }}@{{ langfuse_db_internal_host }}:5432/{{ langfuse_db_name }}"
             NEXTAUTH_URL: "https://{{ langfuse_hostname }}"
             NEXTAUTH_SECRET: "{{ nextauth_secret }}"
             SALT: "{{ langfuse_salt }}"
@@ -207,6 +178,25 @@
                 labels:
                   app: langfuse
               spec:
+                initContainers:
+                  - name: wait-for-postgres
+                    image: busybox:1.35
+                    command: ['sh', '-c', 'until nc -z postgresql-official.postgres.svc.cluster.local 5432; do echo waiting for postgres; sleep 2; done;']
+                  - name: init-db
+                    image: "{{ harbor_registry }}/{{ library_project | default('library') }}/postgres:16-alpine"
+                    env:
+                      - name: PGPASSWORD
+                        value: "{{ postgres_admin_password }}"
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        echo "Creating Langfuse database if it doesn't exist..."
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '{{ langfuse_db_name }}'" | grep -q 1 || psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "CREATE DATABASE {{ langfuse_db_name }}"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE {{ langfuse_db_name }} TO {{ admin_username }}"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "ALTER DATABASE {{ langfuse_db_name }} OWNER TO {{ admin_username }}"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d {{ langfuse_db_name }} -c "GRANT ALL ON SCHEMA public TO {{ admin_username }}"
+                        echo "Database initialization complete."
                 containers:
                   - name: langfuse
                     image: "{{ harbor_registry }}/library/langfuse:3.113.0"
