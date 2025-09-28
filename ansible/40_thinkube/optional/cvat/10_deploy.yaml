@@ -281,6 +281,8 @@
                         value: "False"
                       - name: IAM_OPA_BUNDLE
                         value: "1"
+                      - name: DJANGO_SETTINGS_MODULE
+                        value: "cvat.settings.thinkube_sso"
                     volumeMounts:
                       - name: cvat-data
                         mountPath: /home/django/data
@@ -290,6 +292,13 @@
                         mountPath: /home/django/logs
                       - name: cvat-models
                         mountPath: /home/django/models
+                      - name: oauth2-middleware
+                        mountPath: /home/django/cvat/apps/thinkube_auth
+                        readOnly: true
+                      - name: django-settings-overlay
+                        mountPath: /home/django/cvat/settings/thinkube_sso.py
+                        subPath: settings_overlay.py
+                        readOnly: true
                     livenessProbe:
                       httpGet:
                         path: /api/server/about
@@ -323,6 +332,12 @@
                   - name: cvat-models
                     persistentVolumeClaim:
                       claimName: cvat-models-pvc
+                  - name: oauth2-middleware
+                    configMap:
+                      name: cvat-oauth2-middleware
+                  - name: django-settings-overlay
+                    configMap:
+                      name: cvat-django-settings-overlay
                 initContainers:
                   - name: wait-for-db
                     image: "{{ harbor_registry }}/{{ library_project | default('library') }}/busybox:latest"
@@ -393,6 +408,36 @@
                           secretKeyRef:
                             name: cvat-secrets
                             key: SECRET_KEY
+
+    - name: Create ConfigMap for OAuth2 Proxy RemoteUser middleware
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cvat-oauth2-middleware
+            namespace: "{{ cvat_namespace }}"
+          data:
+            middleware.py: "{{ lookup('file', 'templates/remote_user_middleware.py.j2') }}"
+            __init__.py: |
+              # Make this directory a Python package
+              from .middleware import OAuth2ProxyRemoteUserMiddleware, OAuth2ProxyRemoteUserBackend
+              __all__ = ['OAuth2ProxyRemoteUserMiddleware', 'OAuth2ProxyRemoteUserBackend']
+
+    - name: Create ConfigMap for Django settings overlay
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cvat-django-settings-overlay
+            namespace: "{{ cvat_namespace }}"
+          data:
+            settings_overlay.py: "{{ lookup('file', 'templates/django_settings_overlay.py.j2') }}"
 
     - name: Create CVAT Backend Service
       kubernetes.core.k8s:
