@@ -53,9 +53,14 @@
     oauth2_proxy_kubeconfig: "{{ kubeconfig }}"
     oauth2_proxy_helm_bin: "{{ helm_bin | default('/snap/bin/microk8s.helm3') }}"
     oauth2_proxy_keycloak_debug: false
-    oauth2_proxy_session_store_type: "cookie"
+    oauth2_proxy_session_store_type: "redis"  # Valkey is Redis-compatible
+    oauth2_proxy_redis_service: "ephemeral-valkey"  # Match the Valkey service name
     oauth2_proxy_ingress_enabled: true
-    oauth2_proxy_cookie_samesite: "lax"
+    oauth2_proxy_cookie_samesite: "none"
+
+    # Valkey settings for OAuth2 session storage
+    valkey_namespace: "{{ argilla_namespace }}"
+    valkey_kubeconfig: "{{ kubeconfig }}"
 
   tasks:
     - name: Verify required variables are defined
@@ -237,6 +242,12 @@
             tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
 
+    - name: Deploy Ephemeral Valkey for OAuth2 session storage
+      ansible.builtin.include_role:
+        name: valkey/ephemeral_valkey
+      vars:
+        valkey_registry: "{{ harbor_registry }}/library"
+
     - name: Deploy OAuth2 Proxy with Keycloak authentication
       ansible.builtin.include_role:
         name: oauth2_proxy
@@ -257,8 +268,6 @@
               nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
               nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$escaped_request_uri"
               nginx.ingress.kubernetes.io/auth-response-headers: "X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Access-Token,X-Auth-Request-Groups"
-              nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
-              nginx.ingress.kubernetes.io/proxy-buffers-number: "4"
           spec:
             ingressClassName: nginx
             tls:
