@@ -333,6 +333,66 @@
                   - name: wait-for-clickhouse
                     image: "{{ harbor_registry }}/{{ library_project | default('library') }}/busybox:latest"
                     command: ['sh', '-c', 'until nc -z clickhouse-clickhouse.clickhouse.svc.cluster.local 8123; do echo waiting for clickhouse; sleep 2; done;']
+                  - name: create-superuser
+                    image: "{{ cvat_backend_image }}"
+                    command:
+                      - /bin/bash
+                      - -c
+                      - |
+                        python manage.py migrate --noinput
+                        python manage.py shell <<EOF
+                        from django.contrib.auth import get_user_model
+                        User = get_user_model()
+                        if not User.objects.filter(username='$DJANGO_SUPERUSER_USERNAME').exists():
+                            User.objects.create_superuser(
+                                username='$DJANGO_SUPERUSER_USERNAME',
+                                email='$DJANGO_SUPERUSER_EMAIL',
+                                password='$DJANGO_SUPERUSER_PASSWORD'
+                            )
+                            print('Superuser created successfully')
+                        else:
+                            print('Superuser already exists')
+                        EOF
+                    env:
+                      - name: DJANGO_SUPERUSER_USERNAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_USERNAME
+                      - name: DJANGO_SUPERUSER_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_PASSWORD
+                      - name: DJANGO_SUPERUSER_EMAIL
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_EMAIL
+                      - name: CVAT_POSTGRES_HOST
+                        value: "postgresql-official.postgres.svc.cluster.local"
+                      - name: CVAT_POSTGRES_PORT
+                        value: "5432"
+                      - name: CVAT_POSTGRES_USER
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_USER
+                      - name: CVAT_POSTGRES_DBNAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_DB
+                      - name: CVAT_POSTGRES_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_PASSWORD
+                      - name: DJANGO_SECRET_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: SECRET_KEY
 
     - name: Create CVAT Backend Service
       kubernetes.core.k8s:
