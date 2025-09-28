@@ -1,0 +1,91 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/argilla/10_configure_keycloak.yaml
+# Description:
+#   Configure Keycloak OIDC client for Argilla authentication
+#   Adapted from ansible/40_thinkube/optional/monitoring/12_configure_grafana_keycloak.yaml
+#
+# Requirements:
+#   - Keycloak must be deployed and accessible
+#   - ADMIN_PASSWORD environment variable set
+#   - MicroK8s cluster with control plane
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/argilla/10_configure_keycloak.yaml
+#
+# Variables from inventory:
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username for all applications
+#   - argilla_hostname: Hostname for Argilla access
+#   - kubeconfig: Path to kubectl configuration
+#   - argilla_namespace: Namespace for Argilla
+#
+# Dependencies:
+#   - CORE-006: Keycloak must be deployed
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Keycloak "argilla" OIDC client
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    # Keycloak connection info - map to expected variable names
+    keycloak_admin_user: "{{ admin_username }}"
+    keycloak_admin_username: "{{ admin_username }}"  # Role expects this variable name
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    keycloak_validate_certs: false
+    keycloak_debug: true
+
+    # "argilla" client details
+    argilla_client_id: "argilla"
+
+    # Kubernetes secret details
+    argilla_k8s_namespace: "{{ argilla_namespace }}"
+    argilla_k8s_secret_name: "argilla-oauth-secret"
+
+  tasks:
+    - name: Setup Argilla Keycloak integration
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_setup
+      vars:
+        # Client configuration
+        keycloak_setup_client_id: "{{ argilla_client_id }}"
+        keycloak_setup_client_body:
+          clientId: "{{ argilla_client_id }}"
+          enabled: true
+          protocol: "openid-connect"
+          standardFlowEnabled: true
+          implicitFlowEnabled: false
+          directAccessGrantsEnabled: true
+          publicClient: false
+          redirectUris:
+            - "https://{{ argilla_hostname }}/oauth/keycloak/callback"
+          webOrigins:
+            - "https://{{ argilla_hostname }}"
+            - "+"
+          attributes:
+            "access.token.lifespan": "3600"
+            "post.logout.redirect.uris": "+"
+          defaultClientScopes:
+            - "email"
+            - "profile"
+            - "openid"
+            - "offline_access"
+          optionalClientScopes:
+            - "address"
+            - "phone"
+
+        # No client protocol mappers - Argilla doesn't use OIDC role mapping
+
+        # No realm roles - Argilla manages roles internally
+
+        # Kubernetes secret
+        keycloak_setup_k8s_secret:
+          namespace: "{{ argilla_k8s_namespace }}"
+          name: "{{ argilla_k8s_secret_name }}"
+          kubeconfig: "{{ kubeconfig }}"

@@ -1,18 +1,18 @@
 ---
-# ansible/40_thinkube/optional/argilla/10_deploy.yaml
+# ansible/40_thinkube/optional/argilla/11_deploy.yaml
 # Description:
 #   Deploy Argilla data annotation platform on Kubernetes
-#   Uses OpenSearch backend and OAuth2 Proxy for authentication
+#   Uses OpenSearch backend and native Keycloak OIDC authentication
 #
 # Requirements:
 #   - MicroK8s must be installed and running
 #   - Harbor registry must be available
 #   - OpenSearch must be deployed
-#   - Keycloak must be deployed
+#   - Keycloak must be deployed and configured (10_configure_keycloak.yaml)
 #
 # Usage:
 #   cd ~/thinkube
-#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/argilla/10_deploy.yaml
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/argilla/11_deploy.yaml
 #
 # Variables from inventory:
 #   - domain_name: Base domain for the cluster
@@ -35,32 +35,9 @@
     # Get admin password from environment
     admin_password: "{{ lookup('env','ADMIN_PASSWORD') }}"
 
-    # Keycloak settings for OAuth2 Proxy integration
+    # Keycloak settings for OIDC integration
     keycloak_url: "https://auth.{{ domain_name }}"
-    keycloak_admin_username: "{{ admin_username }}"
-    keycloak_admin_password: "{{ admin_password }}"
-
-    # OAuth2 Proxy settings
-    oauth2_proxy_namespace: "{{ argilla_namespace }}"
-    oauth2_proxy_name: "oauth2-proxy"
-    oauth2_proxy_client_id: "argilla"
-    oauth2_proxy_dashboard_host: "{{ argilla_hostname }}"
-    oauth2_proxy_oidc_issuer_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
-    oauth2_proxy_cookie_domain: ".{{ domain_name }}"
-    oauth2_proxy_ingress_host: "{{ argilla_hostname }}"
-    oauth2_proxy_ingress_tls_secret_name: "{{ argilla_namespace }}-tls-secret"
-    oauth2_proxy_redirect_url: "https://{{ argilla_hostname }}/oauth2/callback"
-    oauth2_proxy_kubeconfig: "{{ kubeconfig }}"
-    oauth2_proxy_helm_bin: "{{ helm_bin | default('/snap/bin/microk8s.helm3') }}"
-    oauth2_proxy_keycloak_debug: false
-    oauth2_proxy_session_store_type: "redis"  # Valkey is Redis-compatible
-    oauth2_proxy_redis_service: "ephemeral-valkey"  # Match the Valkey service name
-    oauth2_proxy_ingress_enabled: true
-    oauth2_proxy_cookie_samesite: "none"
-
-    # Valkey settings for OAuth2 session storage
-    valkey_namespace: "{{ argilla_namespace }}"
-    valkey_kubeconfig: "{{ kubeconfig }}"
+    keycloak_oidc_endpoint: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
 
   tasks:
     - name: Verify required variables are defined
@@ -175,6 +152,15 @@
                           secretKeyRef:
                             name: argilla-secrets
                             key: DEFAULT_USER_API_KEY
+                      - name: SOCIAL_AUTH_KEYCLOAK_OIDC_ENDPOINT
+                        value: "{{ keycloak_oidc_endpoint }}"
+                      - name: ARGILLA_AUTH_OAUTH_CFG
+                        value: "/app/.oauth.yml"
+                    volumeMounts:
+                      - name: oauth-config
+                        mountPath: /app/.oauth.yml
+                        subPath: .oauth.yml
+                        readOnly: true
                     livenessProbe:
                       httpGet:
                         path: /api/status
@@ -194,6 +180,10 @@
                       limits:
                         memory: "2Gi"
                         cpu: "1"
+                volumes:
+                  - name: oauth-config
+                    configMap:
+                      name: argilla-oauth-config
                 initContainers:
                   - name: wait-for-opensearch
                     image: busybox:1.35
@@ -242,17 +232,39 @@
             tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
 
-    - name: Deploy Ephemeral Valkey for OAuth2 session storage
-      ansible.builtin.include_role:
-        name: valkey/ephemeral_valkey
-      vars:
-        valkey_registry: "{{ harbor_registry }}/library"
+    - name: Get Argilla OAuth secret from Kubernetes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ argilla_namespace }}"
+        name: argilla-oauth-secret
+      register: oauth_secret
+      failed_when: oauth_secret.resources | length == 0
 
-    - name: Deploy OAuth2 Proxy with Keycloak authentication
-      ansible.builtin.include_role:
-        name: oauth2_proxy
+    - name: Decode OAuth client credentials
+      ansible.builtin.set_fact:
+        argilla_client_id: "{{ oauth_secret.resources[0].data.client_id | b64decode }}"
+        argilla_client_secret: "{{ oauth_secret.resources[0].data.client_secret | b64decode }}"
 
-    - name: Create Argilla Dashboard Ingress (secured via OAuth2)
+    - name: Create .oauth.yml ConfigMap for Argilla
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: argilla-oauth-config
+            namespace: "{{ argilla_namespace }}"
+          data:
+            .oauth.yml: |
+              providers:
+                - name: keycloak
+                  client_id: "{{ argilla_client_id }}"
+                  client_secret: "{{ argilla_client_secret }}"
+
+    - name: Create Argilla Dashboard Ingress
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -265,9 +277,6 @@
             annotations:
               cert-manager.io/cluster-issuer: letsencrypt-prod
               nginx.ingress.kubernetes.io/proxy-body-size: "100m"
-              nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
-              nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$escaped_request_uri"
-              nginx.ingress.kubernetes.io/auth-response-headers: "X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Access-Token,X-Auth-Request-Groups"
           spec:
             ingressClassName: nginx
             tls:
