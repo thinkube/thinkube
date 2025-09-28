@@ -26,8 +26,12 @@
 
   vars:
     k8s_namespace: "langfuse"
+    postgres_namespace: "postgres"
+    postgres_release_name: "postgresql-official"
+    postgres_host: "{{ postgres_release_name }}.{{ postgres_namespace }}.svc.cluster.local"
+    postgres_admin_user: "{{ admin_username }}"
     langfuse_db_name: "langfuse_db"
-    langfuse_db_user: "langfuse_user"
+    langfuse_db_user: "{{ admin_username }}"
 
   tasks:
     ###########################################################################
@@ -45,29 +49,18 @@
     # Step 2: Clean up PostgreSQL database
     ###########################################################################
     - name: Get PostgreSQL admin password
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: postgres
-        name: postgres-postgresql
-      register: postgres_secret
-      failed_when: false
+      ansible.builtin.set_fact:
+        postgres_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
 
-    - name: Drop Langfuse database and user
-      kubernetes.core.k8s_exec:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: postgres
-        pod: postgres-postgresql-0
-        command: >
-          psql -U postgres -c "
-          DROP DATABASE IF EXISTS {{ langfuse_db_name }};
-          DROP USER IF EXISTS {{ langfuse_db_user }};
-          "
+    - name: Drop Langfuse database
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ postgres_admin_password }}" psql -h {{ postgres_host }} -p 5432 -U {{ postgres_admin_user }} -d postgres -c "
+        DROP DATABASE IF EXISTS {{ langfuse_db_name }};
+        "
       register: db_drop
+      become: true
       failed_when: false
-      changed_when: "'DROP DATABASE' in db_drop.stdout or 'DROP ROLE' in db_drop.stdout"
-      when: postgres_secret.resources | length > 0
+      changed_when: "'DROP DATABASE' in db_drop.stdout"
 
     ###########################################################################
     # Step 3: Display rollback completion
@@ -79,5 +72,4 @@
           - "-----------------------------------"
           - "Removed namespace: {{ k8s_namespace }}"
           - "Dropped database: {{ langfuse_db_name }}"
-          - "Dropped user: {{ langfuse_db_user }}"
           - "-----------------------------------"
