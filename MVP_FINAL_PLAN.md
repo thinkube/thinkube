@@ -2,18 +2,16 @@
 
 ## 🎯 CURRENT STATUS (Last Updated: Sept 30, 2025)
 
-**MVP Progress: 80% Complete**
+**MVP Progress: 93% Complete**
 
 ✅ **Phase 1 (JupyterHub):** COMPLETE
 ✅ **Phase 2 (Docker Images):** COMPLETE
 ✅ **Phase 3 (Core Services):** COMPLETE (LiteLLM, MLflow, CVAT, Argilla)
-⚠️ **Phase 4 (Supporting):** 33% (Qdrant done, Langfuse & NATS pending)
+✅ **Phase 4 (Supporting):** COMPLETE (Qdrant, Langfuse, NATS all deployed)
 ❌ **Phase 5 (Templates):** NOT STARTED
 
 **Remaining Work:**
-1. Deploy Langfuse (LLM observability)
-2. Deploy NATS (real-time messaging)
-3. Create production templates
+1. Create production templates (tkt-langchain-agent, tkt-fine-tuning-job)
 
 ## Executive Summary
 
@@ -229,9 +227,9 @@ Notebook Development → Test → Export → Template → Production
 - [x] MLflow tracks experiment (deployed Sept 27, 2025, migrated to SeaweedFS)
 - [x] ~~Label Studio~~ → CVAT (computer vision) + Argilla (NLP/LLM) - Both with SSO working
 
-### ⚠️ Week 4 Checkpoint (Supporting) - PARTIAL
-- [ ] Langfuse shows LLM traces - **NOT DEPLOYED**
-- [ ] NATS pub/sub working - **NOT DEPLOYED**
+### ✅ Week 4 Checkpoint (Supporting) - COMPLETE
+- [x] Langfuse shows LLM traces (deployed Sept 30, 2025)
+- [x] NATS pub/sub working (deployed Sept 30, 2025)
 - [x] Qdrant stores vectors (deployed Sept 12, 2025)
 
 ### ❌ Week 5 Checkpoint (Production) - NOT STARTED
@@ -278,8 +276,8 @@ graph TD
 5. ✅ Agent frameworks (LangChain in Jupyter) - **AVAILABLE** (tk-jupyter-ml-cpu/gpu images)
 
 ### Important Gaps (Status as of Sept 30, 2025)
-6. ❌ LLM Observability (Langfuse) - **NOT DEPLOYED**
-7. ❌ Real-time messaging (NATS) - **NOT DEPLOYED**
+6. ✅ LLM Observability (Langfuse) - **DEPLOYED** (Sept 30, 2025)
+7. ✅ Real-time messaging (NATS) - **DEPLOYED** (Sept 30, 2025)
 8. ✅ ML experiment tracking (MLflow) - **DEPLOYED** (Sept 27, 2025, migrated to SeaweedFS)
 9. ✅ Multi-agent orchestration (CrewAI in Jupyter) - **AVAILABLE** (in Jupyter images)
 
