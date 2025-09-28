@@ -1,0 +1,330 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/langfuse/11_deploy.yaml
+# Description:
+#   Deploy Langfuse LLM observability platform with PostgreSQL and Keycloak OIDC
+#
+# Requirements:
+#   - MicroK8s must be installed
+#   - PostgreSQL must be deployed (core component)
+#   - Keycloak must be deployed and configured
+#   - Harbor registry must be accessible
+#   - ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/langfuse/11_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#   - harbor_registry: Harbor registry URL
+#   - keycloak_url: Keycloak URL
+#   - keycloak_realm: Keycloak realm name
+#
+# Dependencies:
+#   - CORE-005: PostgreSQL must be deployed
+#   - CORE-006: Keycloak must be deployed
+#   - Harbor registry must have langfuse image
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy Langfuse
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Common settings
+    k8s_namespace: "langfuse"
+    langfuse_hostname: "langfuse.{{ domain_name }}"
+
+    # TLS settings
+    tls_secret_name: "langfuse-tls-secret"
+
+    # PostgreSQL settings
+    postgres_host: "postgres-postgresql.postgres.svc.cluster.local"
+    postgres_port: "5432"
+    langfuse_db_name: "langfuse_db"
+    langfuse_db_user: "langfuse_user"
+
+    # Keycloak settings
+    langfuse_client_id: "langfuse"
+    langfuse_oauth_secret_name: "langfuse-oauth-secret"
+
+  tasks:
+    ###########################################################################
+    # Step 1: Create Namespace and TLS Secret
+    ###########################################################################
+    - name: Ensure Langfuse namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ k8s_namespace }}"
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Langfuse namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ tls_secret_name }}"
+            namespace: "{{ k8s_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###########################################################################
+    # Step 2: Setup PostgreSQL Database
+    ###########################################################################
+    - name: Get PostgreSQL admin password
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: postgres
+        name: postgres-postgresql
+      register: postgres_secret
+      failed_when: postgres_secret.resources | length == 0
+
+    - name: Set PostgreSQL admin password
+      ansible.builtin.set_fact:
+        postgres_admin_password: "{{ postgres_secret.resources[0].data['postgres-password'] | b64decode }}"
+
+    - name: Generate Langfuse database password
+      ansible.builtin.set_fact:
+        langfuse_db_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Create Langfuse database and user
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgres-postgresql-0
+        command: >
+          psql -U postgres -c "
+          CREATE DATABASE {{ langfuse_db_name }};
+          CREATE USER {{ langfuse_db_user }} WITH PASSWORD '{{ langfuse_db_password }}';
+          GRANT ALL PRIVILEGES ON DATABASE {{ langfuse_db_name }} TO {{ langfuse_db_user }};
+          ALTER DATABASE {{ langfuse_db_name }} OWNER TO {{ langfuse_db_user }};
+          "
+      register: db_create
+      failed_when: false
+      changed_when: "'CREATE DATABASE' in db_create.stdout or 'CREATE ROLE' in db_create.stdout"
+
+    ###########################################################################
+    # Step 3: Get Keycloak OAuth Credentials
+    ###########################################################################
+    - name: Get Keycloak OAuth secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ k8s_namespace }}"
+        name: "{{ langfuse_oauth_secret_name }}"
+      register: oauth_secret
+      failed_when: oauth_secret.resources | length == 0
+
+    - name: Extract OAuth client secret
+      ansible.builtin.set_fact:
+        keycloak_client_secret: "{{ oauth_secret.resources[0].data['client-secret'] | b64decode }}"
+
+    ###########################################################################
+    # Step 4: Create Langfuse Secrets
+    ###########################################################################
+    - name: Generate NEXTAUTH_SECRET
+      ansible.builtin.set_fact:
+        nextauth_secret: "{{ lookup('password', '/dev/null length=64 chars=ascii_letters,digits') }}"
+
+    - name: Generate SALT
+      ansible.builtin.set_fact:
+        langfuse_salt: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Create Langfuse configuration secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: langfuse-config
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          stringData:
+            DATABASE_URL: "postgresql://{{ langfuse_db_user }}:{{ langfuse_db_password }}@{{ postgres_host }}:{{ postgres_port }}/{{ langfuse_db_name }}"
+            NEXTAUTH_URL: "https://{{ langfuse_hostname }}"
+            NEXTAUTH_SECRET: "{{ nextauth_secret }}"
+            SALT: "{{ langfuse_salt }}"
+            AUTH_CUSTOM_CLIENT_ID: "{{ langfuse_client_id }}"
+            AUTH_CUSTOM_CLIENT_SECRET: "{{ keycloak_client_secret }}"
+            AUTH_CUSTOM_ISSUER: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+            AUTH_CUSTOM_NAME: "Keycloak"
+            LANGFUSE_INIT_ORG_ID: "thinkube"
+            LANGFUSE_INIT_ORG_NAME: "Thinkube"
+            LANGFUSE_INIT_PROJECT_ID: "default"
+            LANGFUSE_INIT_PROJECT_NAME: "Default Project"
+
+    ###########################################################################
+    # Step 5: Deploy Langfuse
+    ###########################################################################
+    - name: Create Langfuse Deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: langfuse
+            namespace: "{{ k8s_namespace }}"
+            labels:
+              app: langfuse
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: langfuse
+            template:
+              metadata:
+                labels:
+                  app: langfuse
+              spec:
+                containers:
+                  - name: langfuse
+                    image: "{{ harbor_registry }}/library/langfuse:3.113.0"
+                    imagePullPolicy: IfNotPresent
+                    ports:
+                      - name: http
+                        containerPort: 3000
+                        protocol: TCP
+                    envFrom:
+                      - secretRef:
+                          name: langfuse-config
+                    resources:
+                      requests:
+                        cpu: "500m"
+                        memory: "1Gi"
+                      limits:
+                        cpu: "2"
+                        memory: "4Gi"
+                    livenessProbe:
+                      httpGet:
+                        path: /api/public/health
+                        port: http
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 3
+                    readinessProbe:
+                      httpGet:
+                        path: /api/public/health
+                        port: http
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                      timeoutSeconds: 3
+                      failureThreshold: 3
+
+    ###########################################################################
+    # Step 6: Create Langfuse Service
+    ###########################################################################
+    - name: Create Langfuse Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: langfuse
+            namespace: "{{ k8s_namespace }}"
+            labels:
+              app: langfuse
+          spec:
+            type: ClusterIP
+            ports:
+              - port: 3000
+                targetPort: http
+                protocol: TCP
+                name: http
+            selector:
+              app: langfuse
+
+    ###########################################################################
+    # Step 7: Create Langfuse Ingress
+    ###########################################################################
+    - name: Create Langfuse Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: langfuse
+            namespace: "{{ k8s_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ langfuse_hostname }}"
+                secretName: "{{ tls_secret_name }}"
+            rules:
+              - host: "{{ langfuse_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: langfuse
+                          port:
+                            number: 3000
+
+    ###########################################################################
+    # Step 8: Wait for Langfuse to be ready
+    ###########################################################################
+    - name: Wait for Langfuse pods to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ k8s_namespace }}"
+        label_selectors:
+          - "app=langfuse"
+      register: langfuse_pods
+      until: >
+        langfuse_pods.resources | length > 0 and
+        langfuse_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+      retries: 30
+      delay: 10
+
+    - name: Display deployment results
+      ansible.builtin.debug:
+        msg:
+          - "Langfuse deployment complete!"
+          - "URL: https://{{ langfuse_hostname }}"
+          - "Database: {{ langfuse_db_name }}"
+          - "Authentication: Keycloak OIDC"
+        verbosity: 0

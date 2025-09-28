@@ -1,0 +1,100 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/langfuse/10_configure_keycloak.yaml
+# Description:
+#   Configure Keycloak OIDC client for Langfuse authentication
+#   Adapted from LiteLLM and Argilla Keycloak configuration
+#
+# Requirements:
+#   - Keycloak must be deployed and accessible
+#   - ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/langfuse/10_configure_keycloak.yaml
+#
+# Variables from inventory:
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username for all applications
+#   - domain_name: Base domain name
+#   - kubeconfig: Path to kubectl configuration
+#
+# Dependencies:
+#   - CORE-006: Keycloak must be deployed
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Keycloak "langfuse" OIDC client
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    # Keycloak connection info
+    keycloak_admin_user: "{{ admin_username }}"
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    keycloak_validate_certs: false
+    keycloak_debug: true
+
+    # Langfuse client details
+    langfuse_client_id: "langfuse"
+    langfuse_namespace: "langfuse"
+    langfuse_hostname: "langfuse.{{ domain_name }}"
+
+    # Kubernetes secret details
+    langfuse_k8s_namespace: "{{ langfuse_namespace }}"
+    langfuse_k8s_secret_name: "langfuse-oauth-secret"
+
+  tasks:
+    - name: Ensure Langfuse namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ langfuse_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Setup Langfuse Keycloak integration
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_setup
+      vars:
+        # Client configuration
+        keycloak_setup_client_id: "{{ langfuse_client_id }}"
+        keycloak_setup_client_body:
+          clientId: "{{ langfuse_client_id }}"
+          enabled: true
+          protocol: "openid-connect"
+          standardFlowEnabled: true
+          implicitFlowEnabled: false
+          directAccessGrantsEnabled: true
+          publicClient: false
+          redirectUris:
+            - "https://{{ langfuse_hostname }}/api/auth/callback/keycloak"
+            - "https://{{ langfuse_hostname }}/*"
+          webOrigins:
+            - "https://{{ langfuse_hostname }}"
+            - "+"
+          attributes:
+            "access.token.lifespan": "3600"
+            "post.logout.redirect.uris": "+"
+          defaultClientScopes:
+            - "email"
+            - "profile"
+            - "openid"
+            - "offline_access"
+          optionalClientScopes:
+            - "address"
+            - "phone"
+
+        # No client protocol mappers - Langfuse uses standard OIDC
+
+        # No realm roles - Langfuse manages roles internally
+
+        # Kubernetes secret
+        keycloak_setup_k8s_secret:
+          namespace: "{{ langfuse_k8s_namespace }}"
+          name: "{{ langfuse_k8s_secret_name }}"
+          kubeconfig: "{{ kubeconfig }}"

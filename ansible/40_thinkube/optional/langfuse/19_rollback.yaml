@@ -1,0 +1,83 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/langfuse/19_rollback.yaml
+# Description:
+#   Rollback Langfuse deployment and clean up all resources
+#
+# Requirements:
+#   - MicroK8s must be installed
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/langfuse/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubectl configuration
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 [AI-assisted]
+
+- name: Rollback Langfuse deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    k8s_namespace: "langfuse"
+    langfuse_db_name: "langfuse_db"
+    langfuse_db_user: "langfuse_user"
+
+  tasks:
+    ###########################################################################
+    # Step 1: Delete Kubernetes resources
+    ###########################################################################
+    - name: Delete Langfuse namespace (and all resources within)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: Namespace
+        name: "{{ k8s_namespace }}"
+      failed_when: false
+
+    ###########################################################################
+    # Step 2: Clean up PostgreSQL database
+    ###########################################################################
+    - name: Get PostgreSQL admin password
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: postgres
+        name: postgres-postgresql
+      register: postgres_secret
+      failed_when: false
+
+    - name: Drop Langfuse database and user
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgres-postgresql-0
+        command: >
+          psql -U postgres -c "
+          DROP DATABASE IF EXISTS {{ langfuse_db_name }};
+          DROP USER IF EXISTS {{ langfuse_db_user }};
+          "
+      register: db_drop
+      failed_when: false
+      changed_when: "'DROP DATABASE' in db_drop.stdout or 'DROP ROLE' in db_drop.stdout"
+      when: postgres_secret.resources | length > 0
+
+    ###########################################################################
+    # Step 3: Display rollback completion
+    ###########################################################################
+    - name: Display rollback completion
+      ansible.builtin.debug:
+        msg:
+          - "Langfuse rollback completed"
+          - "-----------------------------------"
+          - "Removed namespace: {{ k8s_namespace }}"
+          - "Dropped database: {{ langfuse_db_name }}"
+          - "Dropped user: {{ langfuse_db_user }}"
+          - "-----------------------------------"
