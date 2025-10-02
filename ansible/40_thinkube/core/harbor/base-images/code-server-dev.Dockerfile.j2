@@ -1,0 +1,430 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Thinkube code-server Development Image
+# Complete development platform built on Ubuntu 24.04 LTS
+#
+# Built from: ansible/40_thinkube/core/harbor/16_build_codeserver_image.yaml
+# Registry: {{ harbor_registry }}/library/code-server-dev:latest
+#
+# Includes:
+# - Ubuntu 24.04 LTS with Python 3.12
+# - Node.js 20.x LTS + code-server
+# - Platform tools: kubectl, helm, k9s, podman, buildah, skopeo
+# - Ansible + copier (system-wide, always available)
+# - Thinkube services: argo, argocd, gh, tea (gitea), nats
+# - Development: jq, yq, ripgrep, fd, bat, httpie
+# - Database clients: psql, redis-tools
+# - Python tools: mlflow, devpi-client, ansible-lint
+
+FROM {{ harbor_registry }}/library/ubuntu:24.04
+
+USER root
+
+# Set environment to non-interactive to avoid prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+
+###############################################################################
+# System Packages - Foundation
+###############################################################################
+RUN apt-get update && apt-get install -y \
+    # Build essentials
+    build-essential \
+    curl \
+    wget \
+    git \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    # Python 3.12 and development tools
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    # System management
+    sudo \
+    # Utilities
+    vim \
+    nano \
+    less \
+    tree \
+    unzip \
+    zip \
+    # Shells
+    zsh \
+    fish \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3.12 as default python3
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+# Remove PEP 668 EXTERNALLY-MANAGED marker (safe in containers)
+RUN rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
+
+###############################################################################
+# Create thinkube user (UID 1000) - replacing default ubuntu user
+###############################################################################
+# Delete the ubuntu user that comes with Ubuntu 24.04 base image
+RUN userdel -r ubuntu 2>/dev/null || true
+
+# Create thinkube user with UID 1000
+RUN useradd -m -u 1000 -s /bin/bash thinkube
+
+# Add thinkube user to sudoers with NOPASSWD for development convenience
+RUN echo "thinkube ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/thinkube && \
+    chmod 0440 /etc/sudoers.d/thinkube
+
+###############################################################################
+# Node.js 20.x LTS - Required for code-server
+###############################################################################
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+###############################################################################
+# code-server - VSCode in the browser
+###############################################################################
+RUN curl -fsSL https://code-server.dev/install.sh | sh
+
+# Create code symlink for Claude Code IDE integration
+RUN if [ -f /usr/bin/code-server ]; then \
+        ln -s /usr/bin/code-server /usr/bin/code; \
+        echo "✅ Created symlink: /usr/bin/code -> /usr/bin/code-server"; \
+    else \
+        echo "❌ ERROR: /usr/bin/code-server not found!"; \
+        exit 1; \
+    fi && \
+    if [ -d /usr/lib/code-server/lib/vscode/bin/remote-cli ]; then \
+        ln -s /usr/lib/code-server/lib/vscode/bin/remote-cli/code-server /usr/lib/code-server/lib/vscode/bin/remote-cli/code; \
+        echo "✅ Created remote-cli symlink"; \
+    fi
+
+###############################################################################
+# Setup thinkube user directories
+###############################################################################
+RUN mkdir -p /home/thinkube/.local/share/code-server && \
+    mkdir -p /home/thinkube/workspace && \
+    mkdir -p /home/thinkube/.kube && \
+    mkdir -p /home/thinkube/.config/containers && \
+    chown -R thinkube:thinkube /home/thinkube
+
+###############################################################################
+# Container Tools - Podman (not Docker!)
+###############################################################################
+RUN apt-get update && apt-get install -y \
+    podman \
+    buildah \
+    skopeo \
+    podman-compose \
+    && rm -rf /var/lib/apt/lists/*
+
+###############################################################################
+# Database Clients
+###############################################################################
+RUN apt-get update && apt-get install -y \
+    postgresql-client \
+    redis-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+###############################################################################
+# Modern CLI Utilities
+###############################################################################
+RUN apt-get update && apt-get install -y \
+    jq \
+    gettext-base \
+    ripgrep \
+    fd-find \
+    bat \
+    httpie \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create symlinks for Ubuntu-specific command names
+RUN ln -sf /usr/bin/batcat /usr/local/bin/bat && \
+    ln -sf /usr/bin/fdfind /usr/local/bin/fd
+
+###############################################################################
+# Nerd Fonts - Properly integrated with code-server's /_static route
+###############################################################################
+# Download and extract Nerd Fonts
+RUN mkdir -p /tmp/nerdfonts && cd /tmp/nerdfonts && \
+    for font in FiraCode JetBrainsMono Hack CascadiaCode; do \
+        wget -q https://github.com/ryanoasis/nerd-fonts/releases/download/v3.1.1/${font}.zip && \
+        unzip -q ${font}.zip -d ${font} && \
+        rm ${font}.zip; \
+    done
+
+# Convert TTF to WOFF2 and install to code-server static directory
+RUN apt-get update && apt-get install -y woff2 && \
+    mkdir -p /usr/lib/code-server/src/browser/media/fonts && \
+    cd /tmp/nerdfonts && \
+    find . -name "*NerdFont-Regular.ttf" -o -name "*NerdFont-Bold.ttf" | while read ttf; do \
+        woff2_compress "$ttf"; \
+        cp "${ttf%.ttf}.woff2" /usr/lib/code-server/src/browser/media/fonts/; \
+    done && \
+    apt-get remove -y woff2 && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* /tmp/nerdfonts
+
+# Create fonts.css with @font-face declarations (avoiding heredoc to prevent parsing issues)
+RUN printf '%s\n' \
+    '@font-face {' \
+    '    font-family: "FiraCode Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/FiraCodeNerdFont-Regular.woff2") format("woff2");' \
+    '    font-weight: 400;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "FiraCode Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/FiraCodeNerdFont-Bold.woff2") format("woff2");' \
+    '    font-weight: 700;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "JetBrainsMono Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/JetBrainsMonoNerdFont-Regular.woff2") format("woff2");' \
+    '    font-weight: 400;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "JetBrainsMono Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/JetBrainsMonoNerdFont-Bold.woff2") format("woff2");' \
+    '    font-weight: 700;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "Hack Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/HackNerdFont-Regular.woff2") format("woff2");' \
+    '    font-weight: 400;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "Hack Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/HackNerdFont-Bold.woff2") format("woff2");' \
+    '    font-weight: 700;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "CaskaydiaCove Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/CaskaydiaCoveNerdFont-Regular.woff2") format("woff2");' \
+    '    font-weight: 400;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "CaskaydiaCove Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/CaskaydiaCoveNerdFont-Bold.woff2") format("woff2");' \
+    '    font-weight: 700;' \
+    '    font-style: normal;' \
+    '}' \
+    > /usr/lib/code-server/src/browser/pages/fonts.css
+
+# Inject font CSS into workbench.html (where the actual VS Code UI loads)
+RUN WORKBENCH="/usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.html" && \
+    if [ -f "$WORKBENCH" ]; then \
+        sed -i 's|</head>|<link rel="stylesheet" href="{{ "{{" }}BASE{{ "}}" }}/_static/src/browser/pages/fonts.css">&|' "$WORKBENCH" && \
+        echo "✅ Injected Nerd Fonts CSS into workbench.html"; \
+    else \
+        echo "❌ ERROR: workbench.html not found at $WORKBENCH"; \
+        exit 1; \
+    fi
+
+# Set proper ownership for thinkube user
+RUN chown -R thinkube:thinkube /usr/lib/code-server/src/browser/media/fonts && \
+    chown thinkube:thinkube /usr/lib/code-server/src/browser/pages/fonts.css && \
+    chown thinkube:thinkube /usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.html
+
+# Verification output during build
+RUN echo "✅ Installed Nerd Fonts:" && \
+    ls -lh /usr/lib/code-server/src/browser/media/fonts/*.woff2 | awk '{print "  ", $9, "(" $5 ")"}'
+
+###############################################################################
+# Starship Prompt - Pre-install for all shells
+###############################################################################
+RUN curl -sS https://starship.rs/install.sh | sh -s -- -y
+
+###############################################################################
+# Kubernetes Tools
+###############################################################################
+
+# kubectl - Kubernetes CLI
+RUN curl -LO "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" && \
+    chmod +x kubectl && \
+    mv kubectl /usr/local/bin/kubectl
+
+# Helm - Kubernetes Package Manager
+RUN curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# k9s - Terminal UI for Kubernetes
+RUN curl -sL https://github.com/derailed/k9s/releases/download/v0.32.0/k9s_Linux_amd64.tar.gz | \
+    tar xz -C /tmp && \
+    mv /tmp/k9s /usr/local/bin/ && \
+    chmod +x /usr/local/bin/k9s
+
+# stern - Multi-pod log tailing
+RUN curl -sL https://github.com/stern/stern/releases/download/v1.28.0/stern_1.28.0_linux_amd64.tar.gz | \
+    tar xz -C /tmp && \
+    mv /tmp/stern /usr/local/bin/ && \
+    chmod +x /usr/local/bin/stern
+
+# kubectx and kubens - Context/namespace switcher
+RUN git clone --depth 1 https://github.com/ahmetb/kubectx /opt/kubectx && \
+    ln -s /opt/kubectx/kubectx /usr/local/bin/kubectx && \
+    ln -s /opt/kubectx/kubens /usr/local/bin/kubens
+
+###############################################################################
+# Argo Tools (Workflows + CD)
+###############################################################################
+
+# Argo Workflows CLI
+RUN curl -sLO https://github.com/argoproj/argo-workflows/releases/download/v3.5.5/argo-linux-amd64.gz && \
+    gunzip argo-linux-amd64.gz && \
+    chmod +x argo-linux-amd64 && \
+    mv argo-linux-amd64 /usr/local/bin/argo
+
+# ArgoCD CLI
+RUN curl -sSL -o /usr/local/bin/argocd \
+    https://github.com/argoproj/argo-cd/releases/download/v2.10.0/argocd-linux-amd64 && \
+    chmod +x /usr/local/bin/argocd
+
+###############################################################################
+# Git Tools
+###############################################################################
+
+# GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
+    dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
+    https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+    apt-get update && \
+    apt-get install -y gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Gitea CLI (tea)
+RUN curl -sL https://dl.gitea.io/tea/0.9.2/tea-0.9.2-linux-amd64 -o /usr/local/bin/tea && \
+    chmod +x /usr/local/bin/tea
+
+###############################################################################
+# Thinkube Service CLIs
+###############################################################################
+
+# NATS CLI
+RUN curl -sf https://binaries.nats.dev/nats-io/natscli/nats@latest | sh && \
+    mv nats /usr/local/bin/
+
+# yq - YAML processor
+RUN wget -q https://github.com/mikefarah/yq/releases/download/v4.40.5/yq_linux_amd64 -O /usr/local/bin/yq && \
+    chmod +x /usr/local/bin/yq
+
+###############################################################################
+# Python CLI Tools (installed as thinkube user)
+###############################################################################
+USER thinkube
+
+# Install all Python tools in user space
+# This includes platform tools (ansible, copier) and development tools
+# No venv needed - tools are always available regardless of project venvs
+RUN pip3 install --user --no-cache-dir \
+    ansible \
+    ansible-core \
+    copier \
+    kubernetes \
+    mlflow \
+    devpi-client \
+    ansible-lint
+
+# Add user bin to PATH
+ENV PATH="/home/thinkube/.local/bin:${PATH}"
+
+###############################################################################
+# Configuration and Environment
+###############################################################################
+
+# Create config directories
+RUN mkdir -p /home/thinkube/.config/nats
+
+# Create default ansible.cfg
+RUN mkdir -p /home/thinkube/.ansible && \
+    echo '[defaults]' > /home/thinkube/.ansible.cfg && \
+    echo 'inventory = /home/thinkube/workspace/thinkube/inventory/inventory.yaml' >> /home/thinkube/.ansible.cfg && \
+    echo 'host_key_checking = False' >> /home/thinkube/.ansible.cfg && \
+    echo 'remote_user = thinkube' >> /home/thinkube/.ansible.cfg && \
+    echo '' >> /home/thinkube/.ansible.cfg && \
+    echo '[ssh_connection]' >> /home/thinkube/.ansible.cfg && \
+    echo 'ssh_args = -o ForwardAgent=yes' >> /home/thinkube/.ansible.cfg && \
+    echo 'pipelining = True' >> /home/thinkube/.ansible.cfg
+
+###############################################################################
+# Setup script for environment variables
+###############################################################################
+
+# Create environment setup script
+RUN echo '#!/bin/bash' > /home/thinkube/.setup-thinkube-env.sh && \
+    echo '# Thinkube Development Environment' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo '' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo '# Kubernetes' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'export KUBECONFIG=/home/thinkube/.kube/config' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo '' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo '# Argo' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'export ARGO_NAMESPACE=argo-workflows' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'export ARGO_SERVER=argo-workflows.argo-workflows.svc.cluster.local:2746' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo '' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo '# Ansible' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'export ANSIBLE_CONFIG=/home/thinkube/.ansible.cfg' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo '' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo '# Python tools' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo '' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo '# Aliases' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'alias k=kubectl' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'alias kgp="kubectl get pods"' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'alias kgs="kubectl get svc"' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'alias kgn="kubectl get nodes"' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'alias kd="kubectl describe"' >> /home/thinkube/.setup-thinkube-env.sh && \
+    echo 'alias kl="kubectl logs"' >> /home/thinkube/.setup-thinkube-env.sh && \
+    chmod +x /home/thinkube/.setup-thinkube-env.sh
+
+# Add to bashrc
+RUN echo '' >> /home/thinkube/.bashrc && \
+    echo '# Thinkube development environment' >> /home/thinkube/.bashrc && \
+    echo 'if [ -f ~/.setup-thinkube-env.sh ]; then' >> /home/thinkube/.bashrc && \
+    echo '    source ~/.setup-thinkube-env.sh' >> /home/thinkube/.bashrc && \
+    echo 'fi' >> /home/thinkube/.bashrc
+
+###############################################################################
+# Labels and Metadata
+###############################################################################
+LABEL maintainer="Thinkube Project"
+LABEL description="code-server development environment for Thinkube platform"
+LABEL version="2.0"
+LABEL thinkube.component="code-server-dev"
+LABEL thinkube.python="3.12"
+LABEL thinkube.nodejs="20.x"
+LABEL thinkube.ansible="system-wide"
+LABEL thinkube.tools.kubectl="v1.30.0"
+LABEL thinkube.tools.helm="installed"
+LABEL thinkube.tools.argo="v3.5.5"
+LABEL thinkube.tools.argocd="v2.10.0"
+LABEL thinkube.tools.podman="installed"
+
+###############################################################################
+# Health check
+###############################################################################
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/ || exit 1
+
+WORKDIR /home/thinkube/workspace
+
+# Expose code-server port
+EXPOSE 8080
+
+# Start code-server
+CMD ["code-server", "--bind-addr", "0.0.0.0:8080", "."]
