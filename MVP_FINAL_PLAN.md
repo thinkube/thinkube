@@ -1,6 +1,6 @@
 # MVP Final Implementation Plan - JupyterHub First Strategy
 
-## 🎯 CURRENT STATUS (Last Updated: Sept 30, 2025)
+## 🎯 CURRENT STATUS (Last Updated: Sept 28, 2025)
 
 **MVP Progress: 93% Complete**
 
@@ -8,10 +8,12 @@
 ✅ **Phase 2 (Docker Images):** COMPLETE
 ✅ **Phase 3 (Core Services):** COMPLETE (LiteLLM, MLflow, CVAT, Argilla)
 ✅ **Phase 4 (Supporting):** COMPLETE (Qdrant, Langfuse, NATS all deployed)
+❌ **Phase 4.5 (Tech Debt & Dev Platform):** NOT STARTED ⬅️ **NEXT**
 ❌ **Phase 5 (Templates):** NOT STARTED
 
 **Remaining Work:**
-1. Create production templates (tkt-langchain-agent, tkt-fine-tuning-job)
+1. **Phase 4.5**: Transform code-server into self-hosting development platform AND prepare for public release (5-6 weeks)
+2. **Phase 5**: Create production templates (tkt-langchain-agent, tkt-fine-tuning-job)
 
 ## Executive Summary
 
@@ -127,7 +129,79 @@ Auth: Keycloak SSO integration
 - **NATS** - Real-time messaging
 - **Qdrant** - Vector database
 
-### Phase 4: Production Templates (Week 5) 🟢 ENHANCEMENT
+### Phase 4.5: Technical Debt and Development Platform (Weeks ~5-6) 🟡 CRITICAL
+
+**Status**: ❌ NOT STARTED ⬅️ **NEXT PHASE**
+**Goal**: Transform code-server into self-hosting development platform AND prepare for public release
+
+#### 📘 Detailed Documentation
+
+This phase has its own comprehensive documentation set:
+
+- 📋 **[Phase 4.5 Timeline](PHASE_4_5_TIMELINE.md)** - Overall schedule and coordination
+- 🛠️ **[CLI Tools Inventory](CODE_SERVER_CLI_TOOLS.md)** - Complete list of 30+ tools needed
+- 💻 **[code-server Enhancement Plan](CODE_SERVER_ENHANCEMENT_PLAN.md)** - Week 1 implementation details
+- 🌍 **[Public Release Preparation](PUBLIC_RELEASE_PREPARATION.md)** - Weeks 2-5 execution plan
+
+#### Quick Summary
+
+**Week 1**: Enhance code-server with all CLI tools (PRIVATE - no public exposure)
+- Install 30+ CLI tools: Ansible, kubectl, helm, argo, argocd, nats, mlflow, devpi, etc.
+- Configure VS Code extensions
+- Create wrapper scripts for seamless execution
+- Enable complete Thinkube development from browser
+
+**Week 2**: Main repository security and license audit (PRIVATE)
+- Add copyright headers to ~274 YAML files + Python/Shell scripts
+- Security audit (remove hardcoded credentials)
+- Create CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md
+- Update README.md for public audience
+
+**Week 3**: thinkube-control goes public (FIRST PUBLIC REPO)
+- Audit copyright headers in Python, Vue, JS, TypeScript files
+- Transfer from `cmxela/thinkube-control` to `thinkube/thinkube-control`
+- Make repository public
+- Update all references
+
+**Week 4**: Main repository goes public (MORE VISIBLE)
+- Final security review
+- Configure GitHub (issues, discussions, templates, branch protection)
+- Set up basic GitHub Actions
+- Make thinkube/thinkube public
+
+**Week 5**: Installer separation and public launch (🚀 LAUNCH!)
+- Extract installer to `thinkube/thinkube-installer`
+- Set up CI/CD for amd64 + arm64 .deb packages
+- Update install script URLs
+- Make installer public = **OFFICIAL LAUNCH**
+
+**Week 6**: Documentation and polish (OPTIONAL)
+- Update MVP with results
+- Create video walkthroughs
+- Write blog posts
+- Respond to community feedback
+
+#### Why Before Phase 5?
+
+1. **Development Environment**: Phase 5 templates can be developed from code-server
+2. **Public Repositories**: Community can contribute to template development
+3. **Professional Presence**: Public repos and installer make Thinkube accessible
+4. **Self-Hosting Showcase**: Developing Thinkube from Thinkube demonstrates the platform
+
+#### Deliverables
+
+- [ ] code-server can run Ansible playbooks, kubectl, all service CLIs
+- [ ] All repositories have proper copyright headers
+- [ ] Security audit passed (no exposed secrets)
+- [ ] Professional public documentation
+- [ ] thinkube-control is public
+- [ ] Main repository is public
+- [ ] Public installer available: `curl -sSL https://raw.githubusercontent.com/thinkube/thinkube-installer/main/scripts/install.sh | bash`
+- [ ] Thinkube successfully launched to public! 🎉
+
+---
+
+### Phase 5: Production Templates (After Phase 4.5) 🟢 ENHANCEMENT
 
 **Goal:** Enable production deployment of notebook-developed code
 

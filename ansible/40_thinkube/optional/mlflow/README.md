@@ -39,7 +39,7 @@ MLflow requires a custom Docker image with OIDC support and additional dependenc
 
 Expected image location:
 ```
-{{ harbor_registry }}/{{ harbor_project }}/mlflow-custom:latest
+{{ harbor_registry }}/library/mlflow-custom:latest
 ```
 
 ## Deployment

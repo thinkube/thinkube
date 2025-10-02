@@ -1,0 +1,295 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/15_build_jupyter_images.yaml
+# Description:
+#   Build and push custom Jupyter notebook images to Harbor library project
+#   These images contain Thinkube services integration and specialized ML packages
+#
+# Requirements:
+#   - Harbor registry deployed and accessible
+#   - Podman installed on the MicroK8s control plane node
+#   - Harbor admin credentials
+#   - Base images mirrored to Harbor (13_mirror_public_images.yaml must run first)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/15_build_jupyter_images.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Harbor registry hostname
+#   - admin_password: Admin password from environment
+#
+# Dependencies:
+#   - CORE-008: Harbor deployed
+#   - 13_mirror_public_images.yaml: Base Jupyter images mirrored
+#
+# 🤖 [AI-assisted]
+
+- name: Build and Push Jupyter Images to Harbor
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    local_base_images_dir: "{{ playbook_dir }}/base-images"
+    base_images_dir: "/tmp/harbor-base-images"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    - name: Install podman (ensure it's available)
+      ansible.builtin.apt:
+        name: podman
+        state: present
+        update_cache: yes
+      become: true
+      when: ansible_os_family == "Debian"
+
+    - name: Ensure library project exists in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects"
+        method: POST
+        headers:
+          Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
+        body_format: json
+        body:
+          project_name: "library"
+          public: true
+          metadata:
+            public: "true"
+        validate_certs: true
+        status_code: [201, 409]
+      register: library_project
+
+    - name: Create build context directory
+      ansible.builtin.file:
+        path: "{{ base_images_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create temp directory for templated Dockerfiles
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: jupyter-dockerfiles
+      register: temp_dockerfiles_dir
+
+    - name: Template Thinkube environment file for Jupyter images
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/thinkube_env.j2"
+        dest: "{{ base_images_dir }}/.thinkube_env"
+        mode: '0644'
+
+    - name: Copy Thinkube services example notebook for Jupyter images
+      ansible.builtin.copy:
+        src: "{{ local_base_images_dir }}/thinkube_services.ipynb"
+        dest: "{{ base_images_dir }}/thinkube_services.ipynb"
+        mode: '0644'
+
+    - name: Template tk-jupyter-ml-cpu Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/tk-jupyter-ml-cpu.Dockerfile.j2"
+        dest: "{{ temp_dockerfiles_dir.path }}/tk-jupyter-ml-cpu.Dockerfile"
+
+    - name: Template startup.sh for tk-jupyter-ml-cpu
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/startup.sh.j2"
+        dest: "{{ base_images_dir }}/startup.sh"
+      vars:
+        image_name: "tk-jupyter-ml-cpu"
+
+    - name: Build tk-jupyter-ml-cpu image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/tk-jupyter-ml-cpu:latest \
+                     -f {{ temp_dockerfiles_dir.path }}/tk-jupyter-ml-cpu.Dockerfile \
+                     {{ base_images_dir }}
+      register: tk_jupyter_ml_cpu_build
+      changed_when: true
+
+    - name: Login to Harbor
+      ansible.builtin.shell: |
+        echo {{ admin_password }} | podman login {{ harbor_registry }} -u admin --password-stdin --tls-verify=true
+      changed_when: false
+      no_log: true
+
+    - name: Push tk-jupyter-ml-cpu image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/tk-jupyter-ml-cpu:latest
+      register: tk_jupyter_ml_cpu_push
+      changed_when: tk_jupyter_ml_cpu_push.rc == 0
+      failed_when: tk_jupyter_ml_cpu_push.rc != 0
+      retries: 2
+      delay: 10
+
+    - name: Template tk-jupyter-ml-gpu Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/tk-jupyter-ml-gpu.Dockerfile.j2"
+        dest: "{{ temp_dockerfiles_dir.path }}/tk-jupyter-ml-gpu.Dockerfile"
+
+    - name: Template startup.sh for tk-jupyter-ml-gpu
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/startup.sh.j2"
+        dest: "{{ base_images_dir }}/startup.sh"
+      vars:
+        image_name: "tk-jupyter-ml-gpu"
+
+    - name: Build tk-jupyter-ml-gpu image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/tk-jupyter-ml-gpu:latest \
+                     -f {{ temp_dockerfiles_dir.path }}/tk-jupyter-ml-gpu.Dockerfile \
+                     {{ base_images_dir }}
+      register: tk_jupyter_ml_gpu_build
+      changed_when: true
+
+    - name: Push tk-jupyter-ml-gpu image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/tk-jupyter-ml-gpu:latest
+      register: tk_jupyter_ml_gpu_push
+      changed_when: tk_jupyter_ml_gpu_push.rc == 0
+      failed_when: tk_jupyter_ml_gpu_push.rc != 0
+      retries: 2
+      delay: 10
+
+    - name: Template tk-jupyter-fine-tuning Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/tk-jupyter-fine-tuning.Dockerfile.j2"
+        dest: "{{ temp_dockerfiles_dir.path }}/tk-jupyter-fine-tuning.Dockerfile"
+
+    - name: Template startup.sh for tk-jupyter-fine-tuning
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/startup.sh.j2"
+        dest: "{{ base_images_dir }}/startup.sh"
+      vars:
+        image_name: "tk-jupyter-fine-tuning"
+
+    - name: Build tk-jupyter-fine-tuning image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/tk-jupyter-fine-tuning:latest \
+                     -f {{ temp_dockerfiles_dir.path }}/tk-jupyter-fine-tuning.Dockerfile \
+                     {{ base_images_dir }}
+      register: tk_jupyter_fine_tuning_build
+      changed_when: true
+
+    - name: Push tk-jupyter-fine-tuning image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/tk-jupyter-fine-tuning:latest
+      register: tk_jupyter_fine_tuning_push
+      changed_when: tk_jupyter_fine_tuning_push.rc == 0
+      failed_when: tk_jupyter_fine_tuning_push.rc != 0
+      retries: 2
+      delay: 10
+
+    - name: Template tk-jupyter-agent-dev Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/tk-jupyter-agent-dev.Dockerfile.j2"
+        dest: "{{ temp_dockerfiles_dir.path }}/tk-jupyter-agent-dev.Dockerfile"
+
+    - name: Template startup.sh for tk-jupyter-agent-dev
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/startup.sh.j2"
+        dest: "{{ base_images_dir }}/startup.sh"
+      vars:
+        image_name: "tk-jupyter-agent-dev"
+
+    - name: Build tk-jupyter-agent-dev image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/tk-jupyter-agent-dev:latest \
+                     -f {{ temp_dockerfiles_dir.path }}/tk-jupyter-agent-dev.Dockerfile \
+                     {{ base_images_dir }}
+      register: tk_jupyter_agent_dev_build
+      changed_when: true
+
+    - name: Push tk-jupyter-agent-dev image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/tk-jupyter-agent-dev:latest
+      register: tk_jupyter_agent_dev_push
+      changed_when: tk_jupyter_agent_dev_push.rc == 0
+      failed_when: tk_jupyter_agent_dev_push.rc != 0
+      retries: 2
+      delay: 10
+
+    - name: Clean up temp dockerfiles directory
+      ansible.builtin.file:
+        path: "{{ temp_dockerfiles_dir.path }}"
+        state: absent
+      when: temp_dockerfiles_dir.path is defined
+
+    - name: Create manifest for Jupyter images
+      include_role:
+        name: container_deployment/image_manifest
+      vars:
+        manifest_images:
+          - destination: "{{ harbor_registry }}/library/tk-jupyter-ml-cpu:latest"
+            source: "custom-build"
+            description: "Jupyter ML Development (CPU) with PyTorch and Thinkube services"
+            metadata:
+              purpose: "jupyter"
+              display_name: "ML Development (CPU)"
+              default: true
+              base_image: "jupyter-scipy-notebook:latest"
+              packages: "torch pandas scikit-learn matplotlib"
+              services: "postgresql valkey qdrant opensearch mlflow seaweedfs weaviate litellm labelstudio"
+          - destination: "{{ harbor_registry }}/library/tk-jupyter-ml-gpu:latest"
+            source: "custom-build"
+            description: "Jupyter ML Development (GPU) with CUDA 12.6 and Thinkube services"
+            metadata:
+              purpose: "jupyter"
+              display_name: "ML Development (GPU)"
+              default: false
+              requires_gpu: true
+              base_image: "cuda:12.6.0-cudnn-runtime-ubuntu24.04"
+              packages: "torch transformers datasets accelerate"
+              services: "postgresql valkey qdrant opensearch mlflow seaweedfs weaviate litellm labelstudio"
+          - destination: "{{ harbor_registry }}/library/tk-jupyter-fine-tuning:latest"
+            source: "custom-build"
+            description: "Jupyter Fine-Tuning Lab with Unsloth and QLoRA"
+            metadata:
+              purpose: "jupyter"
+              display_name: "Fine-Tuning Lab"
+              default: false
+              requires_gpu: true
+              base_image: "jupyter-ml-gpu:latest"
+              packages: "unsloth bitsandbytes peft trl"
+          - destination: "{{ harbor_registry }}/library/tk-jupyter-agent-dev:latest"
+            source: "custom-build"
+            description: "Jupyter Agent Development with LangChain and CrewAI"
+            metadata:
+              purpose: "jupyter"
+              display_name: "Agent Development"
+              default: false
+              base_image: "jupyter-ml-cpu:latest"
+              packages: "langchain crewai chromadb faiss"
+        manifest_category: "jupyter"
+        manifest_source: "built"
+        manifest_namespace: "registry"
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          ✅ Jupyter Images Built and Pushed Successfully
+          ════════════════════════════════════════════════════════
+
+          TK Jupyter ML CPU: {{ harbor_registry }}/library/tk-jupyter-ml-cpu:latest
+          TK Jupyter ML GPU: {{ harbor_registry }}/library/tk-jupyter-ml-gpu:latest
+          TK Jupyter Fine-Tuning: {{ harbor_registry }}/library/tk-jupyter-fine-tuning:latest
+          TK Jupyter Agent Dev: {{ harbor_registry }}/library/tk-jupyter-agent-dev:latest
+
+          These images include Thinkube services integration:
+          - PostgreSQL, Valkey (Redis), Qdrant, OpenSearch
+          - MLflow, SeaweedFS, Weaviate
+          - LiteLLM, Label Studio
+
+          Specialized packages:
+          - ML CPU: PyTorch, pandas, scikit-learn, matplotlib
+          - ML GPU: PyTorch + CUDA 12.6, transformers, datasets
+          - Fine-Tuning: Unsloth, QLoRA, bitsandbytes, PEFT, TRL
+          - Agent Dev: LangChain, CrewAI, ChromaDB, FAISS
+
+          Run this playbook separately from JupyterHub deployment
+          for faster iteration during image development.
+          ════════════════════════════════════════════════════════

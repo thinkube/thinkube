@@ -38,7 +38,7 @@ ansible/40_thinkube/core/harbor/14_build_base_images.yaml
 
 Expected image location:
 ```
-{{ harbor_registry }}/thinkube/valkey:8.1.0
+{{ harbor_registry }}/library/valkey:8.1.0
 ```
 
 ## Deployment
