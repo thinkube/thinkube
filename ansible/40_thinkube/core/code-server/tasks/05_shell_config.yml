@@ -1,0 +1,173 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Adapted from ansible/misc/tasks/05_shell_config.yml
+# Shell Configuration - Configure all shells to load functions and aliases
+
+# Configure Bash for Thinkube
+- name: Check if bashrc has Thinkube config
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      grep -q "THINKUBE SHELL FUNCTIONS" {{ user_home }}/.bashrc
+  register: bashrc_configured
+  failed_when: false
+  changed_when: false
+  tags: [bash, thinkube]
+
+- name: Configure Bash for Thinkube
+  ansible.builtin.shell:
+    cmd: |
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+        bash -c 'cat >> {{ user_home }}/.bashrc << '\''BASHEOF'\''
+
+      # BEGIN THINKUBE SHELL FUNCTIONS
+      # Initialize Starship prompt
+      if command -v starship >/dev/null 2>&1; then
+          eval "$(starship init bash)"
+      fi
+
+      # Load Thinkube shared functions and aliases
+      if [ -f "{{ thinkube_system_dir }}/load_functions.sh" ]; then
+          source "{{ thinkube_system_dir }}/load_functions.sh"
+      fi
+
+      # Load shared aliases function (which loads the actual aliases)
+      if [ -f "{{ thinkube_system_functions_dir }}/load_aliases.sh" ]; then
+          source "{{ thinkube_system_functions_dir }}/load_aliases.sh"
+      fi
+      # END THINKUBE SHELL FUNCTIONS
+      BASHEOF'
+  when: bashrc_configured.rc != 0
+  changed_when: true
+  tags: [bash, thinkube]
+
+# Configure Zsh for Thinkube
+- name: Ensure zsh config file exists
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      touch {{ user_home }}/.zshrc
+  changed_when: false
+  tags: [zsh, thinkube]
+
+- name: Check if zshrc has Thinkube config
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      grep -q "THINKUBE SHELL FUNCTIONS" {{ user_home }}/.zshrc
+  register: zshrc_configured
+  failed_when: false
+  changed_when: false
+  tags: [zsh, thinkube]
+
+- name: Configure Zsh for Thinkube
+  ansible.builtin.shell:
+    cmd: |
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+        bash -c 'cat >> {{ user_home }}/.zshrc << '\''ZSHEOF'\''
+
+      # BEGIN THINKUBE SHELL FUNCTIONS
+      # Initialize Starship prompt
+      if command -v starship >/dev/null 2>&1; then
+          eval "$(starship init zsh)"
+      fi
+
+      # Load Thinkube shared functions
+      if [ -f "{{ thinkube_system_dir }}/load_functions.sh" ]; then
+          source "{{ thinkube_system_dir }}/load_functions.sh"
+      fi
+
+      # Load shared aliases function (which loads the actual aliases)
+      if [ -f "{{ thinkube_system_functions_dir }}/load_aliases.sh" ]; then
+          source "{{ thinkube_system_functions_dir }}/load_aliases.sh"
+      fi
+      # END THINKUBE SHELL FUNCTIONS
+      ZSHEOF'
+  when: zshrc_configured.rc != 0
+  changed_when: true
+  tags: [zsh, thinkube]
+
+# Configure Fish for Thinkube
+- name: Ensure fish config directory exists
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      mkdir -p {{ fish_config_dir }}
+  changed_when: false
+  tags: [fish, thinkube]
+
+- name: Ensure fish config file exists
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      touch {{ fish_config_dir }}/config.fish
+  changed_when: false
+  tags: [fish, thinkube]
+
+- name: Check if fish config has Thinkube config
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      grep -q "THINKUBE SHELL FUNCTIONS" {{ fish_config_dir }}/config.fish
+  register: fish_configured
+  failed_when: false
+  changed_when: false
+  tags: [fish, thinkube]
+
+- name: Configure Fish for Thinkube
+  ansible.builtin.shell:
+    cmd: |
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+        bash -c 'cat >> {{ fish_config_dir }}/config.fish << '\''FISHEOF'\''
+
+      # BEGIN THINKUBE SHELL FUNCTIONS
+      # Prevent infinite recursion in case of misconfiguration
+      if set -q __THINKUBE_FISH_LOADING
+          return 0
+      end
+      set -g __THINKUBE_FISH_LOADING 1
+
+      # Initialize Starship prompt
+      if type -q starship
+          # Additional safety check - ensure starship command actually works
+          if starship --version >/dev/null 2>&1
+              starship init fish | source
+          end
+      end
+
+      # Load Thinkube shared functions
+      if test -f "{{ thinkube_system_dir }}/load_functions.fish"
+          source "{{ thinkube_system_dir }}/load_functions.fish"
+      end
+
+      # NOTE: Aliases are now loaded by the functions loader
+      # Do not load aliases separately to avoid recursive loading
+
+      # Clear loading flag
+      set -e __THINKUBE_FISH_LOADING
+      # END THINKUBE SHELL FUNCTIONS
+      FISHEOF'
+  when: fish_configured.rc != 0
+  changed_when: true
+  tags: [fish, thinkube]
+
+- name: Display shell configuration summary
+  ansible.builtin.debug:
+    msg: |
+      Shell configuration complete!
+
+      All three shells are now configured:
+      - Bash: {{ user_home }}/.bashrc
+      - Zsh: {{ user_home }}/.zshrc
+      - Fish: {{ fish_config_dir }}/config.fish
+
+      Each shell is configured with:
+      ✅ Starship prompt
+      ✅ Thinkube functions
+      ✅ Grouped aliases system
+
+      To activate in running shells:
+      - Bash/Zsh: source ~/.bashrc (or ~/.zshrc)
+      - Fish: source ~/.config/fish/config.fish

@@ -1,0 +1,410 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Adapted from ansible/misc/tasks/03_aliases_system.yml
+# Aliases System Setup - Enhanced with group filtering support
+# Creates aliases via kubectl exec in code-server pod
+
+# Export common aliases to JSON format in pod
+- name: Create temp file with aliases JSON
+  ansible.builtin.copy:
+    dest: /tmp/common_aliases.json
+    content: "{{ common_aliases | to_nice_json }}"
+    mode: '0644'
+  delegate_to: vilanova1
+
+- name: Copy aliases JSON to pod
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl cp
+      /tmp/common_aliases.json
+      {{ code_server_namespace }}/{{ codeserver_pod }}:{{ thinkube_system_aliases_dir }}/common_aliases.json
+  changed_when: true
+
+- name: Clean up temp aliases JSON
+  ansible.builtin.file:
+    path: /tmp/common_aliases.json
+    state: absent
+  delegate_to: vilanova1
+
+# Create enhanced alias generator with group support for Bash/Zsh
+- name: Create shared aliases generator for Bash/Zsh with group filtering
+  ansible.builtin.shell:
+    cmd: |
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+        bash -c 'cat > {{ thinkube_system_aliases_dir }}/generate_aliases.sh << '\''GENEOF'\''
+      #!/bin/bash
+      # Generate aliases from shared JSON definition for Bash/Zsh shells
+      # Enhanced with group filtering support
+
+      ALIASES_JSON="{{ thinkube_system_aliases_dir }}/common_aliases.json"
+      GENERATED_ALIASES_FILE="{{ thinkube_system_aliases_dir }}/generated_aliases.sh"
+      USER_ALIASES_DIR="{{ thinkube_user_aliases_dir }}"
+
+      # Check if jq is installed
+      if ! command -v jq &> /dev/null; then
+          echo "Error: jq is required but not installed. Please install jq." >&2
+          exit 1
+      fi
+
+      # Start with a fresh file
+      echo "#!/bin/bash" > "$GENERATED_ALIASES_FILE"
+      echo "# Auto-generated aliases - DO NOT EDIT" >> "$GENERATED_ALIASES_FILE"
+      echo "# Generated on $(date)" >> "$GENERATED_ALIASES_FILE"
+      echo "" >> "$GENERATED_ALIASES_FILE"
+
+      # Generate aliases from JSON
+      jq -r ".[] | \"# \" + .description + \" [\" + .group + \"]\\nalias \" + .name + \"=\\\"\" + .command + \"\\\"\"" "$ALIASES_JSON" >> "$GENERATED_ALIASES_FILE"
+
+      # Add any user-defined alias files
+      if [ -d "$USER_ALIASES_DIR" ]; then
+          for user_alias_file in "$USER_ALIASES_DIR"/*.sh; do
+              if [ -f "$user_alias_file" ]; then
+                  echo "" >> "$GENERATED_ALIASES_FILE"
+                  echo "# Including user alias file: $(basename "$user_alias_file")" >> "$GENERATED_ALIASES_FILE"
+                  cat "$user_alias_file" >> "$GENERATED_ALIASES_FILE"
+              fi
+          done
+      fi
+
+      echo "" >> "$GENERATED_ALIASES_FILE"
+      echo "# Enhanced aliases command with group filtering" >> "$GENERATED_ALIASES_FILE"
+      cat >> "$GENERATED_ALIASES_FILE" << '\''ALIASEOF'\''
+      aliases() {
+        local show_group=""
+        local show_groups=false
+
+        # Process command line options
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --group|-g)
+              show_group="$2"
+              shift 2
+              ;;
+            --groups)
+              show_groups=true
+              shift
+              ;;
+            --help|-h)
+              echo "Usage: aliases [options]"
+              echo "Options:"
+              echo "  --groups        List all available groups"
+              echo "  --group <name>  Show aliases for specific group"
+              echo "  -g <name>       Shortcut for --group"
+              echo ""
+              echo "Examples:"
+              echo "  aliases --groups     # List all groups"
+              echo "  aliases -g k8s       # Show Kubernetes aliases"
+              echo "  aliases -g git       # Show Git aliases"
+              return 0
+              ;;
+            *)
+              shift
+              ;;
+          esac
+        done
+
+        local aliases_json="{{ thinkube_system_aliases_dir }}/common_aliases.json"
+
+        if [ "$show_groups" = true ]; then
+          echo "Available alias groups:"
+          echo "----------------------"
+          jq -r ".[].group" "$aliases_json" | sort -u | while read group; do
+            local count=$(jq -r "[.[] | select(.group == \"$group\")] | length" "$aliases_json")
+            printf "  %-15s (%d aliases)\n" "$group" "$count"
+          done
+          return 0
+        fi
+
+        if [ -n "$show_group" ]; then
+          echo "Aliases in group: $show_group"
+          echo "-----------------------------"
+          jq -r ".[] | select(.group == \"$show_group\") | \"  \" + .name + \" = \" + .command + \"  # \" + .description" "$aliases_json"
+          return 0
+        fi
+
+        echo "All loaded aliases (use --help for filtering options):"
+        echo "------------------------------------------------------"
+        alias | sort
+      }
+      ALIASEOF
+
+      chmod 644 "$GENERATED_ALIASES_FILE"
+      echo "Generated aliases for Bash/Zsh with group support"
+      GENEOF
+      chmod +x {{ thinkube_system_aliases_dir }}/generate_aliases.sh'
+  changed_when: true
+  tags: [thinkube, aliases]
+
+# Create enhanced abbreviation generator with group support for Fish
+- name: Create shared abbreviation generator for Fish with group filtering
+  ansible.builtin.shell:
+    cmd: |
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+        bash -c 'cat > {{ thinkube_system_aliases_dir }}/generate_abbreviations.fish << '\''GENEOF'\''
+      #!/usr/bin/env fish
+      # Generate abbreviations from shared JSON definition for Fish shell
+      # Enhanced with group filtering support
+
+      # Prevent recursive execution
+      if set -q __THINKUBE_GENERATING_ABBREVIATIONS
+          echo "Already generating abbreviations. Preventing recursive execution."
+          exit 0
+      end
+      set -g __THINKUBE_GENERATING_ABBREVIATIONS 1
+
+      set ALIASES_JSON "{{ thinkube_system_aliases_dir }}/common_aliases.json"
+      set GENERATED_ABBR_FILE "{{ thinkube_system_aliases_dir }}/generated_abbreviations.fish"
+      set USER_ALIASES_DIR "{{ thinkube_user_aliases_dir }}"
+
+      # Check if jq is installed
+      if not type -q jq
+          echo "Error: jq is required but not installed. Please install jq." >&2
+          exit 1
+      end
+
+      # Start with a fresh file
+      echo "# Auto-generated abbreviations - DO NOT EDIT" > $GENERATED_ABBR_FILE
+      echo "# Generated on "(date) >> $GENERATED_ABBR_FILE
+      echo "" >> $GENERATED_ABBR_FILE
+
+      # First, erase any existing abbreviations with the same names to avoid conflicts
+      for line in (jq -r ".[] | .name" $ALIASES_JSON)
+          echo "abbr -e $line 2>/dev/null; or true  # Erase if exists" >> $GENERATED_ABBR_FILE
+      end
+
+      echo "" >> $GENERATED_ABBR_FILE
+
+      # Generate abbreviations from JSON with group info in comments
+      for line in (jq -r ".[] | \"# \" + .description + \" [\" + .group + \"]\\nabbr -a \" + .name + \" \\\"\" + .command + \"\\\"\"" $ALIASES_JSON)
+          echo $line >> $GENERATED_ABBR_FILE
+      end
+
+      # Add any user-defined abbreviation files
+      if test -d "$USER_ALIASES_DIR"
+          for user_abbr_file in $USER_ALIASES_DIR/*.fish
+              if test -f $user_abbr_file
+                  echo "" >> $GENERATED_ABBR_FILE
+                  echo "# Including user abbreviation file: "(basename $user_abbr_file) >> $GENERATED_ABBR_FILE
+                  cat $user_abbr_file >> $GENERATED_ABBR_FILE
+              end
+          end
+      end
+
+      echo "" >> $GENERATED_ABBR_FILE
+      echo "# Enhanced aliases function with group filtering for Fish" >> $GENERATED_ABBR_FILE
+      echo "function aliases" >> $GENERATED_ABBR_FILE
+      echo "  set show_group \"\"" >> $GENERATED_ABBR_FILE
+      echo "  set show_groups false" >> $GENERATED_ABBR_FILE
+      echo "" >> $GENERATED_ABBR_FILE
+      echo "  argparse '\''g/group='\'' '\''groups'\'' '\''h/help'\'' -- \$argv" >> $GENERATED_ABBR_FILE
+      echo "" >> $GENERATED_ABBR_FILE
+      echo "  if set -q _flag_h; or set -q _flag_help" >> $GENERATED_ABBR_FILE
+      echo "    echo \"Usage: aliases [options]\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"Options:\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"  --groups        List all available groups\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"  --group <name>  Show aliases for specific group\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"  -g <name>       Shortcut for --group\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"Examples:\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"  aliases --groups     # List all groups\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"  aliases -g k8s       # Show Kubernetes aliases\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"  aliases -g git       # Show Git aliases\"" >> $GENERATED_ABBR_FILE
+      echo "    return 0" >> $GENERATED_ABBR_FILE
+      echo "  end" >> $GENERATED_ABBR_FILE
+      echo "" >> $GENERATED_ABBR_FILE
+      echo "  set aliases_json \"{{ thinkube_system_aliases_dir }}/common_aliases.json\"" >> $GENERATED_ABBR_FILE
+      echo "" >> $GENERATED_ABBR_FILE
+      echo "  if set -q _flag_groups" >> $GENERATED_ABBR_FILE
+      echo "    echo \"Available alias groups:\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"----------------------\"" >> $GENERATED_ABBR_FILE
+      echo "    jq -r '\''.[].group'\'' \$aliases_json | sort -u | while read group" >> $GENERATED_ABBR_FILE
+      echo "      set count (jq -r \"[.[] | select(.group == \\\"\$group\\\")] | length\" \$aliases_json)" >> $GENERATED_ABBR_FILE
+      echo "      printf \"  %-15s (%d aliases)\\n\" \$group \$count" >> $GENERATED_ABBR_FILE
+      echo "    end" >> $GENERATED_ABBR_FILE
+      echo "    return 0" >> $GENERATED_ABBR_FILE
+      echo "  end" >> $GENERATED_ABBR_FILE
+      echo "" >> $GENERATED_ABBR_FILE
+      echo "  if set -q _flag_g; or set -q _flag_group" >> $GENERATED_ABBR_FILE
+      echo "    if set -q _flag_g" >> $GENERATED_ABBR_FILE
+      echo "      set show_group \$_flag_g" >> $GENERATED_ABBR_FILE
+      echo "    else" >> $GENERATED_ABBR_FILE
+      echo "      set show_group \$_flag_group" >> $GENERATED_ABBR_FILE
+      echo "    end" >> $GENERATED_ABBR_FILE
+      echo "    echo \"Aliases in group: \$show_group\"" >> $GENERATED_ABBR_FILE
+      echo "    echo \"-----------------------------\"" >> $GENERATED_ABBR_FILE
+      echo "    jq -r \".[] | select(.group == \\\"\$show_group\\\") | \\\"  \\\" + .name + \\\" = \\\" + .command + \\\"  # \\\" + .description\" \$aliases_json" >> $GENERATED_ABBR_FILE
+      echo "    return 0" >> $GENERATED_ABBR_FILE
+      echo "  end" >> $GENERATED_ABBR_FILE
+      echo "" >> $GENERATED_ABBR_FILE
+      echo "  echo \"All loaded abbreviations (use --help for filtering options):\"" >> $GENERATED_ABBR_FILE
+      echo "  echo \"-----------------------------------------------------------\"" >> $GENERATED_ABBR_FILE
+      echo "  abbr | sort" >> $GENERATED_ABBR_FILE
+      echo "end" >> $GENERATED_ABBR_FILE
+
+      chmod 644 $GENERATED_ABBR_FILE
+      echo "Generated abbreviations for Fish with group support"
+      GENEOF
+      chmod +x {{ thinkube_system_aliases_dir }}/generate_abbreviations.fish'
+  changed_when: true
+  tags: [thinkube, aliases]
+
+# Create alias loader function for Bash/Zsh (already includes load_aliases function)
+- name: Create alias loader function for Bash/Zsh
+  ansible.builtin.shell:
+    cmd: |
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+        bash -c 'cat > {{ thinkube_system_functions_dir }}/load_aliases.sh << '\''LOADEOF'\''
+      #!/bin/bash
+      # Function to load and maintain shared aliases
+
+      # Prevent recursive loading
+      if [ -n "$__THINKUBE_ALIASES_LOADED" ]; then
+        return 0
+      fi
+      __THINKUBE_ALIASES_LOADED=1
+
+      load_aliases() {
+        local generate_script="{{ thinkube_system_aliases_dir }}/generate_aliases.sh"
+        local aliases_file="{{ thinkube_system_aliases_dir }}/generated_aliases.sh"
+        local force_regenerate=false
+
+        # Process command line options
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --regenerate|-r)
+              force_regenerate=true
+              shift
+              ;;
+            *)
+              shift
+              ;;
+          esac
+        done
+
+        # Regenerate if needed
+        if [ "$force_regenerate" = true ] || [ ! -f "$aliases_file" ]; then
+          echo "Regenerating shared aliases..."
+          "$generate_script"
+        fi
+
+        # Source the aliases file
+        if [ -f "$aliases_file" ]; then
+          source "$aliases_file"
+          echo "Loaded shared aliases. Use '\''aliases --help'\'' for options."
+        else
+          echo "Error: Aliases file not found: $aliases_file"
+          return 1
+        fi
+      }
+
+      # Auto-load aliases when this file is sourced
+      load_aliases
+      LOADEOF
+      chmod 644 {{ thinkube_system_functions_dir }}/load_aliases.sh'
+  changed_when: true
+  tags: [thinkube, aliases]
+
+# Create alias loader function for Fish
+- name: Create alias loader function for Fish
+  ansible.builtin.shell:
+    cmd: |
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+        bash -c 'cat > {{ thinkube_system_functions_dir }}/load_aliases.fish << '\''LOADEOF'\''
+      #!/usr/bin/env fish
+      # Function to load and maintain shared aliases (as fish abbreviations)
+
+      # Prevent recursive loading
+      if set -q __THINKUBE_ALIASES_LOADED
+        return 0
+      end
+      set -g __THINKUBE_ALIASES_LOADED 1
+
+      function load_aliases
+        set generate_script "{{ thinkube_system_aliases_dir }}/generate_abbreviations.fish"
+        set abbr_file "{{ thinkube_system_aliases_dir }}/generated_abbreviations.fish"
+        set force_regenerate false
+
+        # Process command line options
+        argparse '\''r/regenerate'\'' -- $argv
+
+        if test -n "$_flag_r"; or test -n "$_flag_regenerate"
+          set force_regenerate true
+        end
+
+        # Regenerate if needed
+        if test "$force_regenerate" = true; or test ! -f "$abbr_file"
+          echo "Regenerating shared abbreviations..."
+          "$generate_script"
+        end
+
+        # Source the abbreviations file
+        if test -f "$abbr_file"
+          source "$abbr_file"
+          echo "Loaded shared abbreviations. Use '\''aliases --help'\'' for options."
+        else
+          echo "Error: Abbreviations file not found: $abbr_file"
+          return 1
+        end
+      end
+
+      # Auto-load abbreviations when this file is sourced
+      # Only load if not already loaded in this session
+      if not set -q __THINKUBE_ABBREVIATIONS_LOADED
+        set -g __THINKUBE_ABBREVIATIONS_LOADED 1
+        load_aliases
+      end
+      LOADEOF
+      chmod 644 {{ thinkube_system_functions_dir }}/load_aliases.fish'
+  changed_when: true
+  tags: [thinkube, aliases]
+
+# Run the generators during playbook execution
+- name: Generate aliases for Bash/Zsh
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      {{ thinkube_system_aliases_dir }}/generate_aliases.sh
+  changed_when: true
+  tags: [thinkube, aliases]
+
+- name: Generate abbreviations for Fish
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      fish --no-config {{ thinkube_system_aliases_dir }}/generate_abbreviations.fish
+  changed_when: true
+  tags: [thinkube, aliases]
+
+# Create example user alias files
+- name: Create example user aliases for Bash/Zsh
+  ansible.builtin.shell:
+    cmd: |
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+        bash -c 'if [ ! -f {{ thinkube_user_aliases_dir }}/example.sh ]; then
+          cat > {{ thinkube_user_aliases_dir }}/example.sh << '\''EXEOF'\''
+      #!/bin/bash
+      # Example user alias file - Edit this or create new .sh files in this directory
+
+      # alias my_custom_alias='\''command --flag'\''
+      EXEOF
+          chmod 644 {{ thinkube_user_aliases_dir }}/example.sh
+        fi'
+  changed_when: true
+  tags: [thinkube, aliases]
+
+- name: Create example user abbreviations for Fish
+  ansible.builtin.shell:
+    cmd: |
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+        bash -c 'if [ ! -f {{ thinkube_user_aliases_dir }}/example.fish ]; then
+          cat > {{ thinkube_user_aliases_dir }}/example.fish << '\''EXEOF'\''
+      # Example user abbreviation file - Edit this or create new .fish files in this directory
+
+      # abbr -a my_custom_abbr '\''command --flag'\''
+      EXEOF
+          chmod 644 {{ thinkube_user_aliases_dir }}/example.fish
+        fi'
+  changed_when: true
+  tags: [thinkube, aliases]
