@@ -125,28 +125,40 @@
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "mkdir -p /home/thinkube/thinkube-platform"
-          
+
+    - name: Fetch repository metadata from thinkube-metadata
+      ansible.builtin.uri:
+        url: "https://raw.githubusercontent.com/thinkube/thinkube-metadata/main/repositories.json"
+        return_content: yes
+      register: repo_metadata
+      failed_when: repo_metadata.status != 200
+
+    - name: Parse repository list for development cloning
+      ansible.builtin.set_fact:
+        repos_to_clone: "{{ (repo_metadata.content | from_json).repositories | selectattr('clone_for_development', 'equalto', true) | map(attribute='full_name') | list }}"
+      failed_when: repos_to_clone | length == 0
+
     - name: Clone platform repositories
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "
             set -e
             echo '===== Cloning platform repositories ====='
-            
+
             # Check if SSH key exists
             if [ -f /home/thinkube/.ssh/github_ed25519 ]; then
               echo 'GitHub SSH key found at /home/thinkube/.ssh/github_ed25519'
               chmod 600 /home/thinkube/.ssh/github_ed25519
-              
-              # Define repositories to clone
+
+              # Repository list fetched from thinkube-metadata
               REPOS=(
-                'thinkube/thinkube'
-                'thinkube/thinkube-control'
-                'thinkube/thinkube-cicd-monitor'
-                'thinkube/thinkube-ai-integration'
-                'thinkube/tkt-webapp-vue-fastapi'
+                {% for repo in repos_to_clone %}
+                '{{ repo }}'
+                {% endfor %}
               )
-              
+
+              echo \"Cloning {{ repos_to_clone | length }} repositories from metadata...\"
+
               # Clone or update each repository
               for repo in \"\${REPOS[@]}\"; do
                 repo_name=\$(basename \$repo)
@@ -167,6 +179,7 @@
             else
               echo 'ERROR: No SSH key found at /home/thinkube/.ssh/github_ed25519'
               echo 'Please ensure GitHub SSH key is properly configured'
+              exit 1
             fi
           "
           
