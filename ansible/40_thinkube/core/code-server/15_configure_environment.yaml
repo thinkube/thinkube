@@ -189,12 +189,12 @@
 
     - name: Configure kubectl (copy kubeconfig from MicroK8s)
       ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ kubeconfig }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/kubeconfig
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "
             mkdir -p /home/thinkube/.kube
-            cat > /home/thinkube/.kube/config << 'KUBECONFIG_EOF'
-$(cat {{ kubeconfig }})
-KUBECONFIG_EOF
+            mv /tmp/kubeconfig /home/thinkube/.kube/config
             chmod 600 /home/thinkube/.kube/config
             echo '✅ kubectl configured'
           "
@@ -235,20 +235,22 @@ KUBECONFIG_EOF
       register: argo_sa_secret
       failed_when: argo_sa_secret.resources | length == 0
 
-    - name: Configure Argo Workflows CLI
+    - name: Create Argo Workflows config from template
+      ansible.builtin.template:
+        src: templates/argo_config.j2
+        dest: /tmp/argo-config
+        mode: '0600'
+      vars:
+        argo_service_account_token: "{{ argo_sa_secret.resources[0].data.token | b64decode }}"
+      no_log: true
+
+    - name: Copy Argo config to code-server pod
       ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "
-            mkdir -p /home/thinkube/.config/argo
-            cat > /home/thinkube/.config/argo/config << 'ARGO_EOF'
-server: {{ argo_grpc_domain }}:443
-namespace: argo
-token: {{ argo_sa_secret.resources[0].data.token | b64decode }}
-secure: true
-ARGO_EOF
-            chmod 600 /home/thinkube/.config/argo/config
-            echo '✅ Argo Workflows CLI configured'
-          "
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- mkdir -p /home/thinkube/.config/argo
+        {{ kubectl_bin }} cp /tmp/argo-config {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.config/argo/config
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- chmod 600 /home/thinkube/.config/argo/config
+        rm -f /tmp/argo-config
+        echo '✅ Argo Workflows CLI configured'
       no_log: true
 
     - name: Get Gitea admin token
@@ -274,27 +276,34 @@ ARGO_EOF
           "
       no_log: true
 
-    - name: Configure Harbor/Docker credentials
-      ansible.builtin.shell: |
-        # Read Harbor robot token from control plane .env file
-        HARBOR_TOKEN=$(grep HARBOR_ROBOT_TOKEN {{ ansible_env.HOME }}/.env | cut -d= -f2 | tr -d '"')
+    - name: Read Harbor robot token from .env
+      ansible.builtin.shell: grep HARBOR_ROBOT_TOKEN {{ ansible_env.HOME }}/.env | cut -d= -f2 | tr -d '"'
+      register: harbor_token_result
+      changed_when: false
+      no_log: true
 
-        # Configure docker with Harbor credentials
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "
-            mkdir -p /home/thinkube/.docker
-            cat > /home/thinkube/.docker/config.json << 'DOCKER_EOF'
-{
-  \"auths\": {
-    \"{{ harbor_registry }}\": {
-      \"auth\": \"$(echo -n 'robot\${{ harbor_robot_name }}:'$HARBOR_TOKEN | base64 -w0)\"
-    }
-          }
-}
-DOCKER_EOF
-            chmod 600 /home/thinkube/.docker/config.json
-            echo '✅ Harbor/Docker credentials configured'
-          "
+    - name: Create Harbor auth base64 string
+      ansible.builtin.shell: echo -n 'robot${{ harbor_robot_name }}:{{ harbor_token_result.stdout }}' | base64 -w0
+      register: harbor_auth_result
+      changed_when: false
+      no_log: true
+
+    - name: Create Docker config from template
+      ansible.builtin.template:
+        src: templates/docker-config.json.j2
+        dest: /tmp/docker-config.json
+        mode: '0600'
+      vars:
+        harbor_auth_b64: "{{ harbor_auth_result.stdout }}"
+      no_log: true
+
+    - name: Copy Docker config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- mkdir -p /home/thinkube/.docker
+        {{ kubectl_bin }} cp /tmp/docker-config.json {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.docker/config.json
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- chmod 600 /home/thinkube/.docker/config.json
+        rm -f /tmp/docker-config.json
+        echo '✅ Harbor/Docker credentials configured'
       no_log: true
 
     - name: Create CLI tools test script from template
