@@ -197,6 +197,26 @@
       ansible.builtin.set_fact:
         langfuse_admin_api_key: "{{ admin_api_key_result.stdout }}"
 
+    - name: Generate Langfuse project public key
+      ansible.builtin.shell: |
+        echo "lf_pk_$(openssl rand -hex 16)"
+      register: project_public_key_result
+      changed_when: false
+
+    - name: Set project public key fact
+      ansible.builtin.set_fact:
+        langfuse_project_public_key: "{{ project_public_key_result.stdout }}"
+
+    - name: Generate Langfuse project secret key
+      ansible.builtin.shell: |
+        echo "lf_sk_$(openssl rand -hex 32)"
+      register: project_secret_key_result
+      changed_when: false
+
+    - name: Set project secret key fact
+      ansible.builtin.set_fact:
+        langfuse_project_secret_key: "{{ project_secret_key_result.stdout }}"
+
     - name: Create Langfuse configuration secret
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -250,6 +270,8 @@
             LANGFUSE_INIT_ORG_NAME: "{{ langfuse_init_org_name }}"
             LANGFUSE_INIT_PROJECT_ID: "{{ langfuse_init_project_id }}"
             LANGFUSE_INIT_PROJECT_NAME: "{{ langfuse_init_project_name }}"
+            LANGFUSE_INIT_PROJECT_PUBLIC_KEY: "{{ langfuse_project_public_key }}"
+            LANGFUSE_INIT_PROJECT_SECRET_KEY: "{{ langfuse_project_secret_key }}"
             # Admin API configuration
             ADMIN_API_KEY: "{{ langfuse_admin_api_key }}"
 
@@ -419,42 +441,14 @@
       retries: 30
       delay: 10
 
-    - name: Wait for organization initialization to complete
-      ansible.builtin.uri:
-        url: "https://{{ langfuse_hostname }}/api/admin/organizations/{{ langfuse_init_org_id }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ langfuse_admin_api_key }}"
-        validate_certs: false
-        status_code: 200
-      register: org_check
-      until: org_check.status == 200
-      retries: 30
-      delay: 10
-
-    - name: Create Langfuse API keys via Admin API
-      ansible.builtin.uri:
-        url: "https://{{ langfuse_hostname }}/api/admin/organizations/{{ langfuse_init_org_id }}/apiKeys"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ langfuse_admin_api_key }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          note: "Auto-generated for code-server CLI"
-        validate_certs: false
-        status_code: 201
-      register: langfuse_api_keys
-      no_log: true
-
     - name: Create Langfuse credentials from template
       ansible.builtin.template:
         src: templates/langfuse-credentials.yaml.j2
         dest: /tmp/langfuse-credentials
         mode: '0600'
       vars:
-        langfuse_api_public_key: "{{ langfuse_api_keys.json.publicKey }}"
-        langfuse_api_secret_key: "{{ langfuse_api_keys.json.secretKey }}"
+        langfuse_api_public_key: "{{ langfuse_project_public_key }}"
+        langfuse_api_secret_key: "{{ langfuse_project_secret_key }}"
       no_log: true
 
     - name: Get code-server pod name
