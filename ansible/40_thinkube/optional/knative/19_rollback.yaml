@@ -134,24 +134,35 @@
 
     - name: Wait for pods to terminate
       ansible.builtin.shell: |
-        set -e
         # Wait up to 60 seconds for pods to terminate
         for i in $(seq 1 12); do
           REMAINING_PODS=0
+          ALL_NAMESPACES_GONE=true
+
           for NS in knative-serving knative-eventing kourier-system; do
             if {{ kubectl_bin }} get namespace $NS &>/dev/null; then
+              ALL_NAMESPACES_GONE=false
               COUNT=$({{ kubectl_bin }} get pods -n $NS --no-headers 2>/dev/null | wc -l || echo 0)
               REMAINING_PODS=$((REMAINING_PODS + COUNT))
             fi
           done
 
+          # If all namespaces are gone, pods are gone too
+          if [ "$ALL_NAMESPACES_GONE" = true ]; then
+            echo "All namespaces deleted, pods are gone"
+            exit 0
+          fi
+
+          # If namespaces exist but no pods, we're done
           if [ "$REMAINING_PODS" -eq 0 ]; then
             echo "All pods terminated"
             exit 0
           fi
+
           echo "Waiting for $REMAINING_PODS pods to terminate... (attempt $i/12)"
           sleep 5
         done
+
         echo "ERROR: Pods still running after timeout"
         exit 1
       environment:
