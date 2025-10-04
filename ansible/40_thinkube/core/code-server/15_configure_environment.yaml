@@ -182,7 +182,141 @@
               exit 1
             fi
           "
-          
+
+    ###################################################################
+    # Configure CLI Tools for Development
+    ###################################################################
+
+    - name: Configure kubectl (copy kubeconfig from MicroK8s)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            mkdir -p /home/thinkube/.kube
+            cat > /home/thinkube/.kube/config << 'KUBECONFIG_EOF'
+$(cat {{ kubeconfig }})
+KUBECONFIG_EOF
+            chmod 600 /home/thinkube/.kube/config
+            echo '✅ kubectl configured'
+          "
+
+    - name: Configure GitHub CLI (gh auth)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            echo '{{ lookup('env', 'GITHUB_TOKEN') }}' | gh auth login --with-token
+            gh auth status
+            echo '✅ GitHub CLI authenticated'
+          "
+      no_log: true
+      when: lookup('env', 'GITHUB_TOKEN') != ''
+
+    - name: Configure ArgoCD CLI
+      ansible.builtin.shell: |
+        # Read ArgoCD token from control plane .env file
+        ARGOCD_TOKEN=$(grep ARGOCD_DEPLOYMENT_SECRET {{ ansible_env.HOME }}/.env | cut -d= -f2 | tr -d '"')
+
+        # Copy token to code-server and login
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            argocd login {{ argocd_grpc_hostname }} \
+              --auth-token '$ARGOCD_TOKEN' \
+              --grpc-web
+            echo '✅ ArgoCD CLI configured'
+          "
+      no_log: true
+
+    - name: Get Argo Workflows service account token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: argo
+        name: argo-workflows-server-sa-token
+      register: argo_sa_secret
+      failed_when: argo_sa_secret.resources | length == 0
+
+    - name: Configure Argo Workflows CLI
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            mkdir -p /home/thinkube/.config/argo
+            cat > /home/thinkube/.config/argo/config << 'ARGO_EOF'
+server: {{ argo_grpc_domain }}:443
+namespace: argo
+token: {{ argo_sa_secret.resources[0].data.token | b64decode }}
+secure: true
+ARGO_EOF
+            chmod 600 /home/thinkube/.config/argo/config
+            echo '✅ Argo Workflows CLI configured'
+          "
+      no_log: true
+
+    - name: Get Gitea admin token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: gitea
+        name: gitea-admin-token
+      register: gitea_token_secret
+      failed_when: gitea_token_secret.resources | length == 0
+
+    - name: Configure Tea (Gitea CLI)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            tea login add \
+              --name {{ gitea_hostname }} \
+              --url https://{{ gitea_hostname }} \
+              --token '{{ gitea_token_secret.resources[0].data.token | b64decode }}' \
+              --insecure
+            echo '✅ Tea (Gitea CLI) configured'
+          "
+      no_log: true
+
+    - name: Configure Harbor/Docker credentials
+      ansible.builtin.shell: |
+        # Read Harbor robot token from control plane .env file
+        HARBOR_TOKEN=$(grep HARBOR_ROBOT_TOKEN {{ ansible_env.HOME }}/.env | cut -d= -f2 | tr -d '"')
+
+        # Configure docker with Harbor credentials
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            mkdir -p /home/thinkube/.docker
+            cat > /home/thinkube/.docker/config.json << 'DOCKER_EOF'
+{
+  \"auths\": {
+    \"{{ harbor_registry }}\": {
+      \"auth\": \"$(echo -n 'robot\${{ harbor_robot_name }}:'$HARBOR_TOKEN | base64 -w0)\"
+    }
+          }
+}
+DOCKER_EOF
+            chmod 600 /home/thinkube/.docker/config.json
+            echo '✅ Harbor/Docker credentials configured'
+          "
+      no_log: true
+
+    - name: Create CLI tools test script from template
+      ansible.builtin.template:
+        src: templates/test-cli-tools.sh.j2
+        dest: /tmp/test-cli-tools-{{ ansible_date_time.epoch }}.sh
+        mode: '0755'
+      register: test_script
+
+    - name: Copy test script to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ test_script.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/test-cli-tools.sh \
+          -c code-server
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          chmod +x /home/thinkube/test-cli-tools.sh
+
+    - name: Clean up temporary test script
+      ansible.builtin.file:
+        path: "{{ test_script.dest }}"
+        state: absent
+
     - name: Create VS Code workspace settings content
       ansible.builtin.set_fact:
         vscode_workspace_settings: |

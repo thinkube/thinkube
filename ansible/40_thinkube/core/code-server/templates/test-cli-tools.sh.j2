@@ -1,0 +1,143 @@
+#!/bin/bash
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Test script for all CLI tools configured in code-server
+# Usage: /home/thinkube/test-cli-tools.sh
+
+set +e  # Don't exit on first error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Track results
+FAILED_TESTS=0
+PASSED_TESTS=0
+
+echo "======================================================================"
+echo "  Thinkube CLI Tools Configuration Test"
+echo "======================================================================"
+echo ""
+
+# Helper function to test a CLI tool
+test_cli() {
+    local name="$1"
+    local test_command="$2"
+    local is_optional="${3:-false}"
+
+    echo -n "Testing ${name}... "
+
+    if eval "$test_command" &>/dev/null; then
+        echo -e "${GREEN}✅ PASS${NC}"
+        ((PASSED_TESTS++))
+    else
+        if [ "$is_optional" = "true" ]; then
+            echo -e "${YELLOW}⊘ SKIP (optional service not installed)${NC}"
+        else
+            echo -e "${RED}❌ FAIL${NC}"
+            ((FAILED_TESTS++))
+        fi
+    fi
+}
+
+echo "=== Core CLI Tools ==="
+echo ""
+
+# Test kubectl
+test_cli "kubectl" "kubectl cluster-info"
+
+# Test GitHub CLI
+test_cli "GitHub CLI (gh)" "gh auth status"
+
+# Test ArgoCD CLI
+test_cli "ArgoCD CLI" "argocd version"
+
+# Test Argo Workflows CLI
+test_cli "Argo Workflows CLI" "argo version"
+
+# Test Tea (Gitea CLI)
+test_cli "Tea (Gitea CLI)" "tea login list"
+
+# Test Docker/Harbor
+test_cli "Docker (Harbor registry)" "grep '{{ harbor_registry }}' ~/.docker/config.json"
+
+# Test git configuration
+echo -n "Testing git config... "
+if git config --get user.name &>/dev/null && git config --get user.email &>/dev/null; then
+    echo -e "${GREEN}✅ PASS${NC} (user: $(git config --get user.name))"
+    ((PASSED_TESTS++))
+else
+    echo -e "${RED}❌ FAIL${NC}"
+    ((FAILED_TESTS++))
+fi
+
+echo ""
+echo "=== Optional CLI Tools ==="
+echo ""
+
+# Test Argilla (Python client)
+test_cli "Argilla client" "[ -f ~/.argilla/config.yaml ]" "true"
+
+# Test CVAT
+test_cli "CVAT config" "[ -f ~/.cvat/config.yaml ]" "true"
+
+# Test MLflow
+echo -n "Testing MLflow config... "
+if [ -n "$MLFLOW_TRACKING_URI" ]; then
+    echo -e "${GREEN}✅ PASS${NC} (URI: $MLFLOW_TRACKING_URI)"
+    ((PASSED_TESTS++))
+elif grep -q "MLFLOW_TRACKING_URI" ~/.bashrc 2>/dev/null; then
+    echo -e "${YELLOW}⊘ SKIP (configured but not sourced in current shell)${NC}"
+else
+    echo -e "${YELLOW}⊘ SKIP (optional service not installed)${NC}"
+fi
+
+# Test Grafana
+test_cli "Grafana config" "[ -f ~/.grafana/credentials ]" "true"
+
+# Test OpenSearch
+test_cli "OpenSearch config" "[ -f ~/.opensearch/config.yaml ]" "true"
+
+# Test Weaviate
+test_cli "Weaviate config" "[ -f ~/.weaviate/config.json ]" "true"
+
+# Test ClickHouse
+test_cli "ClickHouse config" "[ -f ~/.clickhouse-client/config.xml ]" "true"
+
+# Test LiteLLM
+echo -n "Testing LiteLLM config... "
+if [ -n "$LITELLM_ENDPOINT" ]; then
+    echo -e "${GREEN}✅ PASS${NC} (Endpoint: $LITELLM_ENDPOINT)"
+    ((PASSED_TESTS++))
+elif grep -q "LITELLM_ENDPOINT" ~/.bashrc 2>/dev/null; then
+    echo -e "${YELLOW}⊘ SKIP (configured but not sourced in current shell)${NC}"
+else
+    echo -e "${YELLOW}⊘ SKIP (optional service not installed)${NC}"
+fi
+
+# Test Langfuse
+test_cli "Langfuse config" "[ -f ~/.langfuse/credentials ]" "true"
+
+echo ""
+echo "======================================================================"
+echo "  Test Results"
+echo "======================================================================"
+echo -e "Passed: ${GREEN}${PASSED_TESTS}${NC}"
+echo -e "Failed: ${RED}${FAILED_TESTS}${NC}"
+echo ""
+
+if [ $FAILED_TESTS -eq 0 ]; then
+    echo -e "${GREEN}✅ All configured CLI tools are working correctly!${NC}"
+    exit 0
+else
+    echo -e "${RED}❌ Some CLI tools failed configuration tests.${NC}"
+    echo ""
+    echo "Troubleshooting:"
+    echo "1. Re-run: ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/15_configure_environment.yaml"
+    echo "2. Check logs for specific failures"
+    echo "3. Verify all required services are deployed"
+    exit 1
+fi

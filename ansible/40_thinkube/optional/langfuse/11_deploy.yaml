@@ -182,6 +182,15 @@
       ansible.builtin.set_fact:
         langfuse_encryption_key: "{{ encryption_key_result.stdout }}"
 
+    - name: Generate Langfuse Admin API key
+      ansible.builtin.shell: openssl rand -hex 32
+      register: admin_api_key_result
+      changed_when: false
+
+    - name: Set ADMIN_API_KEY fact
+      ansible.builtin.set_fact:
+        langfuse_admin_api_key: "{{ admin_api_key_result.stdout }}"
+
     - name: Create Langfuse configuration secret
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -235,6 +244,8 @@
             LANGFUSE_INIT_ORG_NAME: "Thinkube"
             LANGFUSE_INIT_PROJECT_ID: "default"
             LANGFUSE_INIT_PROJECT_NAME: "Default Project"
+            # Admin API configuration
+            ADMIN_API_KEY: "{{ langfuse_admin_api_key }}"
 
     ###########################################################################
     # Step 5: Deploy Langfuse
@@ -392,6 +403,50 @@
       retries: 30
       delay: 10
 
+    - name: Wait for Langfuse to be fully ready
+      ansible.builtin.uri:
+        url: "https://{{ langfuse_hostname }}/api/public/health"
+        validate_certs: false
+        status_code: 200
+      register: langfuse_health
+      until: langfuse_health.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Create Langfuse API keys via Admin API
+      ansible.builtin.uri:
+        url: "https://{{ langfuse_hostname }}/api/admin/organizations/thinkube/apiKeys"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ langfuse_admin_api_key }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          note: "Auto-generated for code-server CLI"
+        validate_certs: false
+        status_code: 201
+      register: langfuse_api_keys
+      no_log: true
+
+    - name: Configure Langfuse CLI in code-server with real keys
+      ansible.builtin.shell: |
+        # Get code-server pod name
+        POD_NAME=$({{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}')
+
+        # Configure Langfuse with real API keys
+        {{ kubectl_bin }} exec -n code-server $POD_NAME -- \
+          bash -c "
+            mkdir -p /home/thinkube/.langfuse
+            cat > /home/thinkube/.langfuse/credentials << 'LANGFUSE_EOF'
+url: https://{{ langfuse_hostname }}
+public_key: {{ langfuse_api_keys.json.publicKey }}
+secret_key: {{ langfuse_api_keys.json.secretKey }}
+LANGFUSE_EOF
+            chmod 600 /home/thinkube/.langfuse/credentials
+            echo '✅ Langfuse CLI configured in code-server'
+          "
+      no_log: true
+
     - name: Display deployment results
       ansible.builtin.debug:
         msg:
@@ -399,4 +454,5 @@
           - "URL: https://{{ langfuse_hostname }}"
           - "Database: {{ langfuse_db_name }}"
           - "Authentication: Keycloak OIDC"
+          - "CLI: Configured in code-server with auto-generated API keys"
         verbosity: 0
