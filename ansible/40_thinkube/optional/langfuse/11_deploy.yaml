@@ -428,23 +428,25 @@
       register: langfuse_api_keys
       no_log: true
 
-    - name: Configure Langfuse CLI in code-server with real keys
-      ansible.builtin.shell: |
-        # Get code-server pod name
-        POD_NAME=$({{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}')
+    - name: Create Langfuse credentials from template
+      ansible.builtin.template:
+        src: templates/langfuse-credentials.yaml.j2
+        dest: /tmp/langfuse-credentials
+        mode: '0600'
+      no_log: true
 
-        # Configure Langfuse with real API keys
-        {{ kubectl_bin }} exec -n code-server $POD_NAME -- \
-          bash -c "
-            mkdir -p /home/thinkube/.langfuse
-            cat > /home/thinkube/.langfuse/credentials << 'LANGFUSE_EOF'
-url: https://{{ langfuse_hostname }}
-public_key: {{ langfuse_api_keys.json.publicKey }}
-secret_key: {{ langfuse_api_keys.json.secretKey }}
-LANGFUSE_EOF
-            chmod 600 /home/thinkube/.langfuse/credentials
-            echo '✅ Langfuse CLI configured in code-server'
-          "
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy Langfuse credentials to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.langfuse
+        {{ kubectl_bin }} cp /tmp/langfuse-credentials code-server/{{ code_server_pod.stdout }}:/home/thinkube/.langfuse/credentials
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.langfuse/credentials
+        rm -f /tmp/langfuse-credentials
+        echo '✅ Langfuse CLI configured in code-server'
       no_log: true
 
     - name: Display deployment results
