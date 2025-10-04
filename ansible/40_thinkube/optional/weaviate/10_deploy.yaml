@@ -345,24 +345,25 @@
       retries: 30
       delay: 10
 
-    - name: Configure Weaviate CLI in code-server
-      ansible.builtin.shell: |
-        # Get code-server pod name
-        POD_NAME=$({{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}')
+    - name: Create Weaviate config from template
+      ansible.builtin.template:
+        src: templates/weaviate-config.json.j2
+        dest: /tmp/weaviate-config.json
+        mode: '0600'
+      no_log: true
 
-        # Configure Weaviate client
-        {{ kubectl_bin }} exec -n code-server $POD_NAME -- \
-          bash -c "
-            mkdir -p /home/thinkube/.weaviate
-            cat > /home/thinkube/.weaviate/config.json << 'WEAVIATE_EOF'
-{
-  \"url\": \"https://{{ weaviate_hostname }}\",
-  \"api_key\": \"{{ admin_password }}\"
-}
-WEAVIATE_EOF
-            chmod 600 /home/thinkube/.weaviate/config.json
-            echo '✅ Weaviate CLI configured in code-server'
-          "
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy Weaviate config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.weaviate
+        {{ kubectl_bin }} cp /tmp/weaviate-config.json code-server/{{ code_server_pod.stdout }}:/home/thinkube/.weaviate/config.json
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.weaviate/config.json
+        rm -f /tmp/weaviate-config.json
+        echo '✅ Weaviate CLI configured in code-server'
       no_log: true
 
     - name: Display deployment status
