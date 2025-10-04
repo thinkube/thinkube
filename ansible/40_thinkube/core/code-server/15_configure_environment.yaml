@@ -194,8 +194,10 @@
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "
             mkdir -p /home/thinkube/.kube
-            mv /tmp/kubeconfig /home/thinkube/.kube/config
+            # Modify kubeconfig to use in-cluster API server address
+            sed 's|https://127.0.0.1:16443|https://kubernetes.default.svc.cluster.local:443|g' /tmp/kubeconfig > /home/thinkube/.kube/config
             chmod 600 /home/thinkube/.kube/config
+            rm /tmp/kubeconfig
             echo '✅ kubectl configured'
           "
 
@@ -210,17 +212,21 @@
       no_log: true
       when: github_token is defined and github_token | length > 0
 
+    - name: Get ArgoCD token from .env
+      ansible.builtin.shell: grep ARGOCD_DEPLOYMENT_SECRET {{ ansible_env.HOME }}/.env | cut -d= -f2 | tr -d '"'
+      register: argocd_token_result
+      changed_when: false
+      no_log: true
+
     - name: Configure ArgoCD CLI
       ansible.builtin.shell: |
-        # Read ArgoCD token from control plane .env file
-        ARGOCD_TOKEN=$(grep ARGOCD_DEPLOYMENT_SECRET {{ ansible_env.HOME }}/.env | cut -d= -f2 | tr -d '"')
-
-        # Copy token to code-server and login
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "
+            mkdir -p /home/thinkube/.config/argocd
             argocd login {{ argocd_grpc_hostname }} \
-              --auth-token '$ARGOCD_TOKEN' \
-              --grpc-web
+              --auth-token '{{ argocd_token_result.stdout }}' \
+              --grpc-web \
+              --insecure
             echo '✅ ArgoCD CLI configured'
           "
       no_log: true
