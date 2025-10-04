@@ -692,23 +692,25 @@
       retries: 30
       delay: 10
 
-    - name: Configure CVAT CLI in code-server
-      ansible.builtin.shell: |
-        # Get code-server pod name
-        POD_NAME=$({{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}')
+    - name: Create CVAT config from template
+      ansible.builtin.template:
+        src: templates/cvat-config.yaml.j2
+        dest: /tmp/cvat-config.yaml
+        mode: '0600'
+      no_log: true
 
-        # Configure CVAT client
-        {{ kubectl_bin }} exec -n code-server $POD_NAME -- \
-          bash -c "
-            mkdir -p /home/thinkube/.cvat
-            cat > /home/thinkube/.cvat/config.yaml << 'CVAT_EOF'
-host: https://{{ cvat_hostname }}
-username: {{ admin_username }}
-password: {{ admin_password }}
-CVAT_EOF
-            chmod 600 /home/thinkube/.cvat/config.yaml
-            echo '✅ CVAT CLI configured in code-server'
-          "
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy CVAT config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.cvat
+        {{ kubectl_bin }} cp /tmp/cvat-config.yaml code-server/{{ code_server_pod.stdout }}:/home/thinkube/.cvat/config.yaml
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.cvat/config.yaml
+        rm -f /tmp/cvat-config.yaml
+        echo '✅ CVAT CLI configured in code-server'
       no_log: true
 
     - name: Display access information

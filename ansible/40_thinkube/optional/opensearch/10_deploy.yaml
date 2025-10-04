@@ -850,23 +850,25 @@
     ###################################################################
     # 18. Configure OpenSearch CLI in code-server
     ###################################################################
-    - name: Configure OpenSearch CLI in code-server
-      ansible.builtin.shell: |
-        # Get code-server pod name
-        POD_NAME=$({{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}')
+    - name: Create OpenSearch config from template
+      ansible.builtin.template:
+        src: templates/opensearch-config.yaml.j2
+        dest: /tmp/opensearch-config.yaml
+        mode: '0600'
+      no_log: true
 
-        # Configure OpenSearch client
-        {{ kubectl_bin }} exec -n code-server $POD_NAME -- \
-          bash -c "
-            mkdir -p /home/thinkube/.opensearch
-            cat > /home/thinkube/.opensearch/config.yaml << 'OPENSEARCH_EOF'
-endpoint: https://{{ opensearch_hostname }}
-username: {{ admin_username }}
-password: {{ admin_password }}
-OPENSEARCH_EOF
-            chmod 600 /home/thinkube/.opensearch/config.yaml
-            echo '✅ OpenSearch CLI configured in code-server'
-          "
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy OpenSearch config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.opensearch
+        {{ kubectl_bin }} cp /tmp/opensearch-config.yaml code-server/{{ code_server_pod.stdout }}:/home/thinkube/.opensearch/config.yaml
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.opensearch/config.yaml
+        rm -f /tmp/opensearch-config.yaml
+        echo '✅ OpenSearch CLI configured in code-server'
       no_log: true
 
     ###################################################################
