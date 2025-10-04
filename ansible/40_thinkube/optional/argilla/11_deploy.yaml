@@ -312,22 +312,25 @@
       retries: 30
       delay: 10
 
-    - name: Configure Argilla CLI in code-server
-      ansible.builtin.shell: |
-        # Get code-server pod name
-        POD_NAME=$({{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}')
+    - name: Create Argilla config from template
+      ansible.builtin.template:
+        src: templates/argilla-config.yaml.j2
+        dest: /tmp/argilla-config.yaml
+        mode: '0600'
+      no_log: true
 
-        # Configure Argilla client
-        {{ kubectl_bin }} exec -n code-server $POD_NAME -- \
-          bash -c "
-            mkdir -p /home/thinkube/.argilla
-            cat > /home/thinkube/.argilla/config.yaml << 'ARGILLA_EOF'
-api_url: https://{{ argilla_hostname }}
-api_key: {{ argilla_api_key }}
-ARGILLA_EOF
-            chmod 600 /home/thinkube/.argilla/config.yaml
-            echo '✅ Argilla CLI configured in code-server'
-          "
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy Argilla config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.argilla
+        {{ kubectl_bin }} cp /tmp/argilla-config.yaml code-server/{{ code_server_pod.stdout }}:/home/thinkube/.argilla/config.yaml
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.argilla/config.yaml
+        rm -f /tmp/argilla-config.yaml
+        echo '✅ Argilla CLI configured in code-server'
       no_log: true
 
     - name: Display access information
