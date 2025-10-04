@@ -122,7 +122,7 @@
         set -e
         # Delete all services
         for NS in knative-serving knative-eventing kourier-system; do
-          if {{ kubectl_bin }} get namespace $NS &>/dev/null; then
+          if {{ kubectl_bin }} get pods -n $NS --no-headers 2>/dev/null | grep -q .; then
             echo "Deleting services in $NS..."
             {{ kubectl_bin }} delete service --all -n $NS --timeout=60s --ignore-not-found=true
           fi
@@ -132,17 +132,23 @@
       changed_when: true
       register: service_cleanup
 
-    - name: Delete thinkube-service-config ConfigMap from knative-serving
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: ConfigMap
-        name: thinkube-service-config
-        namespace: knative-serving
-        state: absent
-        wait: true
-        wait_timeout: 30
-      failed_when: false
+    - name: Force delete all stuck pods in Knative namespaces
+      ansible.builtin.shell: |
+        set -e
+        for NS in knative-serving knative-eventing kourier-system; do
+          echo "Force deleting pods in $NS..."
+          PODS=$({{ kubectl_bin }} get pods -n $NS --no-headers 2>/dev/null | awk '{print $1}' || true)
+          if [ -n "$PODS" ]; then
+            for POD in $PODS; do
+              echo "Force deleting pod $POD in $NS..."
+              {{ kubectl_bin }} delete pod $POD -n $NS --force --grace-period=0 --ignore-not-found=true || true
+            done
+          fi
+        done
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: force_delete_pods
 
     - name: Delete Knative namespaces (force)
       ansible.builtin.shell: |
