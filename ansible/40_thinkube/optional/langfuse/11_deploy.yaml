@@ -413,19 +413,84 @@
       retries: 30
       delay: 10
 
-    - name: Create Langfuse API keys via Admin API
-      ansible.builtin.uri:
-        url: "https://{{ langfuse_hostname }}/api/admin/organizations/thinkube/apiKeys"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ langfuse_admin_api_key }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          note: "Auto-generated for code-server CLI"
-        validate_certs: false
-        status_code: 201
-      register: langfuse_api_keys
+    - name: Generate Langfuse public key
+      ansible.builtin.shell: |
+        echo "pk-lf-$(openssl rand -hex 16)"
+      register: langfuse_public_key
+      changed_when: false
+
+    - name: Generate Langfuse secret key
+      ansible.builtin.shell: |
+        echo "sk-lf-$(openssl rand -hex 32)"
+      register: langfuse_secret_key
+      changed_when: false
+
+    - name: Hash secret key with bcrypt for database
+      ansible.builtin.shell: |
+        python3 -c "
+        import bcrypt
+        secret = '{{ langfuse_secret_key.stdout }}'
+        hashed = bcrypt.hashpw(secret.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        print(hashed)
+        "
+      register: langfuse_hashed_secret
+      changed_when: false
+      no_log: true
+
+    - name: Create fast hash with SHA-256
+      ansible.builtin.shell: |
+        python3 -c "
+        import hashlib
+        secret = '{{ langfuse_secret_key.stdout }}'
+        salt = '{{ langfuse_salt }}'
+        fast_hash = hashlib.sha256((secret + salt).encode('utf-8')).hexdigest()
+        print(fast_hash)
+        "
+      register: langfuse_fast_hash
+      changed_when: false
+      no_log: true
+
+    - name: Create display secret key (first 6 + last 4 chars)
+      ansible.builtin.set_fact:
+        langfuse_display_secret: "{{ langfuse_secret_key.stdout[:6] }}...{{ langfuse_secret_key.stdout[-4:] }}"
+      no_log: true
+
+    - name: Get project ID from database
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ admin_password }}" psql -h postgresql-official.postgres.svc.cluster.local \
+          -U {{ admin_username }} -d {{ langfuse_db_name }} -t -c \
+          "SELECT id FROM projects WHERE name = 'Default Project' LIMIT 1;"
+      register: langfuse_project_id
+      changed_when: false
+      no_log: true
+
+    - name: Insert API key into database
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ admin_password }}" psql -h postgresql-official.postgres.svc.cluster.local \
+          -U {{ admin_username }} -d {{ langfuse_db_name }} -c \
+          "INSERT INTO api_keys (
+            id,
+            note,
+            public_key,
+            hashed_secret_key,
+            display_secret_key,
+            project_id,
+            fast_hashed_secret_key,
+            created_at,
+            updated_at
+          ) VALUES (
+            gen_random_uuid(),
+            'Auto-generated for code-server CLI',
+            '{{ langfuse_public_key.stdout }}',
+            '{{ langfuse_hashed_secret.stdout }}',
+            '{{ langfuse_display_secret }}',
+            '{{ langfuse_project_id.stdout | trim }}',
+            '{{ langfuse_fast_hash.stdout }}',
+            NOW(),
+            NOW()
+          );"
+      register: api_key_insert
+      changed_when: api_key_insert.rc == 0
       no_log: true
 
     - name: Create Langfuse credentials from template
@@ -433,6 +498,9 @@
         src: templates/langfuse-credentials.yaml.j2
         dest: /tmp/langfuse-credentials
         mode: '0600'
+      vars:
+        langfuse_api_public_key: "{{ langfuse_public_key.stdout }}"
+        langfuse_api_secret_key: "{{ langfuse_secret_key.stdout }}"
       no_log: true
 
     - name: Get code-server pod name
@@ -456,5 +524,8 @@
           - "URL: https://{{ langfuse_hostname }}"
           - "Database: {{ langfuse_db_name }}"
           - "Authentication: Keycloak OIDC"
-          - "CLI: Configured in code-server with auto-generated API keys"
+          - ""
+          - "Default Organization: thinkube"
+          - "Default Project: default"
+          - "CLI configured in code-server with auto-generated API keys"
         verbosity: 0
