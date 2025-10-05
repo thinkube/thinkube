@@ -78,51 +78,63 @@ echo ""
 echo "=== Optional CLI Tools ==="
 echo ""
 
-# Test Argilla (Python client)
-test_cli "Argilla client" "python3 -c 'import argilla' 2>/dev/null" "true"
+# Test Argilla (verify connection to API)
+test_cli "Argilla client" "python3 -c 'import argilla; argilla.init()' 2>/dev/null" "true"
 
-# Test CVAT
-test_cli "CVAT CLI" "cvat-cli --version 2>/dev/null || [ -f ~/.cvat/config.yaml ]" "true"
+# Test CVAT (verify credentials work with API call)
+test_cli "CVAT CLI" "cvat-cli --auth ~/.cvat/config.yaml ls 2>/dev/null" "true"
 
 # Test MLflow
 echo -n "Testing MLflow config... "
 if [ -n "$MLFLOW_TRACKING_URI" ]; then
-    echo -e "${GREEN}✅ PASS${NC} (URI: $MLFLOW_TRACKING_URI)"
-    ((PASSED_TESTS++))
+    # Try to connect to MLflow tracking server
+    if python3 -c "import mlflow; mlflow.set_tracking_uri('$MLFLOW_TRACKING_URI'); mlflow.search_experiments()" 2>/dev/null; then
+        echo -e "${GREEN}✅ PASS${NC} (URI: $MLFLOW_TRACKING_URI)"
+        ((PASSED_TESTS++))
+    else
+        echo -e "${RED}❌ FAIL${NC} (Cannot connect to $MLFLOW_TRACKING_URI)"
+        ((FAILED_TESTS++))
+    fi
 elif grep -q "MLFLOW_TRACKING_URI" ~/.bashrc 2>/dev/null; then
     echo -e "${YELLOW}⊘ SKIP (configured but not sourced in current shell)${NC}"
 else
     echo -e "${YELLOW}⊘ SKIP (optional service not installed)${NC}"
 fi
 
-# Test Grafana (credentials file is sufficient for web UI tool)
-test_cli "Grafana config" "[ -f ~/.grafana/credentials ]" "true"
+# Test Grafana (verify credentials work with API call)
+test_cli "Grafana API" "[ -f ~/.grafana/credentials ] && python3 -c 'import requests, os; creds=open(os.path.expanduser(\"~/.grafana/credentials\")).read().strip().split(\":\"); requests.get(\"https://grafana.{{ domain_name }}/api/health\", auth=(creds[0], creds[1]), verify=False).raise_for_status()' 2>/dev/null" "true"
 
-# Test OpenSearch
-test_cli "OpenSearch client" "python3 -c 'from opensearchpy import OpenSearch' 2>/dev/null || [ -f ~/.opensearch/config.yaml ]" "true"
+# Test OpenSearch (verify connection with credentials)
+test_cli "OpenSearch client" "python3 -c 'from opensearchpy import OpenSearch; import yaml; config=yaml.safe_load(open(\"$HOME/.opensearch/config.yaml\")); client=OpenSearch([{\"host\": config[\"host\"], \"port\": config[\"port\"]}], http_auth=(config[\"username\"], config[\"password\"]), use_ssl=True, verify_certs=False); client.info()' 2>/dev/null" "true"
 
-# Test Weaviate
-test_cli "Weaviate client" "python3 -c 'import weaviate' 2>/dev/null || [ -f ~/.weaviate/config.json ]" "true"
+# Test Weaviate (verify connection with API key)
+test_cli "Weaviate client" "python3 -c 'import weaviate, json; config=json.load(open(\"$HOME/.weaviate/config.json\")); client=weaviate.Client(url=config[\"url\"], auth_client_secret=weaviate.AuthApiKey(api_key=config[\"api_key\"])); client.is_ready()' 2>/dev/null" "true"
 
-# Test ClickHouse
+# Test ClickHouse (verify credentials work with actual query)
 test_cli "ClickHouse client" "clickhouse-client --query 'SELECT 1' 2>/dev/null" "true"
 
 # Test LiteLLM
 echo -n "Testing LiteLLM config... "
 if [ -n "$LITELLM_ENDPOINT" ]; then
-    echo -e "${GREEN}✅ PASS${NC} (Endpoint: $LITELLM_ENDPOINT)"
-    ((PASSED_TESTS++))
+    # Try to connect to LiteLLM API
+    if curl -s -f -k "$LITELLM_ENDPOINT/health" >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ PASS${NC} (Endpoint: $LITELLM_ENDPOINT)"
+        ((PASSED_TESTS++))
+    else
+        echo -e "${RED}❌ FAIL${NC} (Cannot connect to $LITELLM_ENDPOINT)"
+        ((FAILED_TESTS++))
+    fi
 elif grep -q "LITELLM_ENDPOINT" ~/.bashrc 2>/dev/null; then
     echo -e "${YELLOW}⊘ SKIP (configured but not sourced in current shell)${NC}"
 else
     echo -e "${YELLOW}⊘ SKIP (optional service not installed)${NC}"
 fi
 
-# Test Langfuse
-test_cli "Langfuse SDK" "python3 -c 'import langfuse' 2>/dev/null || [ -f ~/.langfuse/credentials ]" "true"
+# Test Langfuse (verify API keys work)
+test_cli "Langfuse SDK" "python3 -c 'from langfuse import Langfuse; import configparser; config=configparser.ConfigParser(); config.read(\"$HOME/.langfuse/credentials\"); langfuse=Langfuse(public_key=config[\"langfuse\"][\"public_key\"], secret_key=config[\"langfuse\"][\"secret_key\"], host=config[\"langfuse\"][\"host\"]); langfuse.auth_check()' 2>/dev/null" "true"
 
-# Test DevPi
-test_cli "DevPi client" "devpi --version 2>/dev/null || pip show devpi-client 2>/dev/null" "true"
+# Test DevPi (verify credentials work by connecting to server)
+test_cli "DevPi client" "devpi use https://{{ devpi_api_hostname }} 2>/dev/null && devpi list 2>/dev/null" "true"
 
 echo ""
 echo "======================================================================"
