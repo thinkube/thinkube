@@ -49,9 +49,62 @@
           type: Ready
           status: "True"
         wait_timeout: 300
-        
+
     # NOTE: Node.js 20.x and code symlink are now installed in the Docker image
     # No need to install them here
+
+    ###################################################################
+    # Create base shell configuration
+    # NOTE: /home/thinkube is mounted from shared-code volume, which hides
+    # the .bashrc created in the Docker image. We must recreate it here.
+    ###################################################################
+    - name: Create base .bashrc with starship and environment setup
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.bashrc << "EOF"
+        # ~/.bashrc: executed by bash(1) for non-login shells.
+
+        # If not running interactively, don't do anything
+        case $- in
+            *i*) ;;
+              *) return;;
+        esac
+
+        # History configuration
+        HISTCONTROL=ignoreboth
+        HISTSIZE=1000
+        HISTFILESIZE=2000
+        shopt -s histappend
+
+        # Check window size after each command
+        shopt -s checkwinsize
+
+        # Enable color support
+        if [ -x /usr/bin/dircolors ]; then
+            test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+            alias ls="ls --color=auto"
+            alias grep="grep --color=auto"
+        fi
+
+        # Common aliases
+        alias ll="ls -alF"
+        alias la="ls -A"
+        alias l="ls -CF"
+
+        # Source Thinkube development environment from system location
+        # (stored in /etc to avoid being hidden by /home/thinkube volume mount)
+        if [ -f /etc/thinkube/setup-env.sh ]; then
+            source /etc/thinkube/setup-env.sh
+        fi
+
+        # Initialize Starship prompt
+        if command -v starship >/dev/null 2>&1; then
+            eval "$(starship init bash)"
+        fi
+
+        # Source service environment variables from deployed services
+        [ -f ~/.config/thinkube/service-env.sh ] && source ~/.config/thinkube/service-env.sh
+        EOF'
 
     - name: Configure npm for global installations
       ansible.builtin.shell: |
