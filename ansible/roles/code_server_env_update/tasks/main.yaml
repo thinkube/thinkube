@@ -1,0 +1,128 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/roles/code_server_env_update/tasks/main.yaml
+# Description:
+#   Updates code-server environment variables from all deployed optional services
+#   This role queries service discovery ConfigMaps and extracts environment variables
+#
+# Usage:
+#   include_role:
+#     name: code_server_env_update
+#
+# Requirements:
+#   - Kubernetes cluster access
+#   - kubeconfig and kubectl_bin variables defined
+#
+# 🤖 AI-assisted
+
+- name: Check if code-server pod exists
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo ""
+  register: code_server_pod_check
+  changed_when: false
+  failed_when: false
+
+- name: Set code-server pod name fact
+  ansible.builtin.set_fact:
+    code_server_pod_name: "{{ code_server_pod_check.stdout | trim }}"
+
+- name: Skip if code-server not deployed
+  ansible.builtin.debug:
+    msg: "Code-server not deployed, skipping environment update"
+  when: code_server_pod_name == ""
+
+- name: Get all service discovery ConfigMaps
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: ConfigMap
+    label_selectors:
+      - thinkube.io/service-type=optional
+  register: service_configmaps
+  when: code_server_pod_name != ""
+
+- name: Extract environment variables from all services
+  ansible.builtin.set_fact:
+    all_env_vars: >-
+      {{
+        service_configmaps.resources
+        | map(attribute='data')
+        | map('dict2items')
+        | flatten
+        | selectattr('key', 'equalto', 'service.yaml')
+        | map(attribute='value')
+        | map('from_yaml')
+        | selectattr('service', 'defined')
+        | map(attribute='service')
+        | selectattr('environment_variables', 'defined')
+        | map(attribute='environment_variables')
+        | flatten
+        | list
+      }}
+  when:
+    - code_server_pod_name != ""
+    - service_configmaps.resources | length > 0
+
+- name: Generate service environment file content
+  ansible.builtin.set_fact:
+    service_env_content: |
+      #!/bin/bash
+      # Auto-generated from service discovery ConfigMaps
+      # DO NOT EDIT MANUALLY - Changes will be overwritten
+      # Regenerated on code-server configuration and service deployments
+      # Generated: {{ ansible_date_time.iso8601 }}
+
+      {% if all_env_vars is defined and all_env_vars | length > 0 %}
+      {% for env_var in all_env_vars %}
+      export {{ env_var.name }}="{{ env_var.value }}"
+      {% endfor %}
+      {% else %}
+      # No environment variables defined by optional services
+      {% endif %}
+  when: code_server_pod_name != ""
+
+- name: Create thinkube config directory in code-server
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
+      bash -c "mkdir -p /home/thinkube/.config/thinkube"
+  when: code_server_pod_name != ""
+
+- name: Update service environment file in code-server
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
+      bash -c 'cat > /home/thinkube/.config/thinkube/service-env.sh << "EOF"
+    {{ service_env_content }}
+    EOF'
+  when: code_server_pod_name != ""
+
+- name: Make service environment file executable
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
+      chmod +x /home/thinkube/.config/thinkube/service-env.sh
+  when: code_server_pod_name != ""
+
+- name: Add service-env.sh to .bashrc if not present
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
+      bash -c "
+        if ! grep -q 'service-env.sh' /home/thinkube/.bashrc 2>/dev/null; then
+          echo '' >> /home/thinkube/.bashrc
+          echo '# Source service environment variables from deployed services' >> /home/thinkube/.bashrc
+          echo '[ -f ~/.config/thinkube/service-env.sh ] && source ~/.config/thinkube/service-env.sh' >> /home/thinkube/.bashrc
+          echo '✅ Added service-env.sh to .bashrc'
+        else
+          echo '✅ service-env.sh already in .bashrc'
+        fi
+      "
+  register: bashrc_update
+  changed_when: "'Added' in bashrc_update.stdout"
+  when: code_server_pod_name != ""
+
+- name: Display environment variables configured
+  ansible.builtin.debug:
+    msg:
+      - "Code-server environment updated with {{ all_env_vars | default([]) | length }} environment variables"
+      - "{% if all_env_vars is defined and all_env_vars | length > 0 %}Variables: {{ all_env_vars | map(attribute='name') | join(', ') }}{% else %}No environment variables configured{% endif %}"
+  when: code_server_pod_name != ""
