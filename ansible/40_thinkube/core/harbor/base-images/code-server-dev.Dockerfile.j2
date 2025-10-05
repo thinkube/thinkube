@@ -106,7 +106,13 @@ RUN if [ -f /usr/bin/code-server ]; then \
 RUN jq '.nameShort = "Thinkube" | .nameLong = "Thinkube" | .applicationName = "thinkube"' \
     /usr/lib/code-server/lib/vscode/product.json > /tmp/product.json && \
     mv /tmp/product.json /usr/lib/code-server/lib/vscode/product.json && \
-    echo "✅ Customized code-server branding to Thinkube"
+    if jq -e '.nameShort == "Thinkube" and .nameLong == "Thinkube" and .applicationName == "thinkube"' /usr/lib/code-server/lib/vscode/product.json > /dev/null; then \
+        echo "✅ Customized code-server branding to Thinkube"; \
+    else \
+        echo "❌ ERROR: Branding customization failed"; \
+        jq . /usr/lib/code-server/lib/vscode/product.json; \
+        exit 1; \
+    fi
 
 ###############################################################################
 # Setup thinkube user directories
@@ -231,11 +237,24 @@ RUN printf '%s\n' \
     '}' \
     > /usr/lib/code-server/src/browser/pages/fonts.css
 
+###############################################################################
+# Custom Favicon - Thinkube Code Icon
+###############################################################################
+# Download Thinkube code icon BEFORE injecting into workbench.html
+RUN curl -sL https://raw.githubusercontent.com/thinkube/thinkube/main/thinkube-control/frontend/public/icons/tk_code.svg \
+    -o /usr/lib/code-server/src/browser/media/favicon.svg && \
+    echo "✅ Custom Thinkube favicon downloaded"
+
 # Inject font CSS and custom favicon into workbench.html (where the actual VS Code UI loads)
 RUN WORKBENCH="/usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.html" && \
     if [ -f "$WORKBENCH" ]; then \
         sed -i 's|</head>|<link rel="stylesheet" href="{{ "{{" }}BASE{{ "}}" }}/_static/src/browser/pages/fonts.css"><link rel="icon" type="image/svg+xml" href="{{ "{{" }}BASE{{ "}}" }}/_static/src/browser/media/favicon.svg">&|' "$WORKBENCH" && \
-        echo "✅ Injected Nerd Fonts CSS and custom favicon into workbench.html"; \
+        if grep -q "favicon.svg" "$WORKBENCH"; then \
+            echo "✅ Injected Nerd Fonts CSS and custom favicon into workbench.html"; \
+        else \
+            echo "❌ ERROR: Failed to inject favicon into workbench.html"; \
+            exit 1; \
+        fi \
     else \
         echo "❌ ERROR: workbench.html not found at $WORKBENCH"; \
         exit 1; \
@@ -250,15 +269,6 @@ RUN chown -R thinkube:thinkube /usr/lib/code-server/src/browser/media/fonts && \
 # Verification output during build
 RUN echo "✅ Installed Nerd Fonts:" && \
     ls -lh /usr/lib/code-server/src/browser/media/fonts/*.woff2 | awk '{print "  ", $9, "(" $5 ")"}'
-
-###############################################################################
-# Custom Favicon - Thinkube Code Icon
-###############################################################################
-# Download Thinkube code icon and use it as favicon
-RUN curl -sL https://raw.githubusercontent.com/thinkube/thinkube/main/thinkube-control/frontend/public/icons/tk_code.svg \
-    -o /usr/lib/code-server/src/browser/media/favicon.svg && \
-    chown thinkube:thinkube /usr/lib/code-server/src/browser/media/favicon.svg && \
-    echo "✅ Custom Thinkube favicon installed"
 
 ###############################################################################
 # Starship Prompt - Pre-install for all shells
