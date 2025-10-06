@@ -314,25 +314,6 @@
           data:
             mlflow_keycloak_groups.py: "{{ lookup('template', 'templates/mlflow_keycloak_groups.py.j2') }}"
 
-    - name: Create MLflow basic auth ConfigMap
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ mlflow_namespace }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: mlflow-basic-auth
-          data:
-            basic_auth.ini: |
-              [mlflow]
-              default_permission = READ
-              database_uri = sqlite:////mlflow/local-artifacts/basic_auth.db
-              admin_username = {{ admin_username }}
-              admin_password = {{ lookup('env', 'ADMIN_PASSWORD') }}
-              authorization_function = mlflow.server.auth:authenticate_request_basic_auth
-
     - name: Create MLflow Deployment
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -363,22 +344,16 @@
                     configMap:
                       name: mlflow-group-plugin
                       defaultMode: 420
-                  - name: auth-config
-                    configMap:
-                      name: mlflow-basic-auth
-                      defaultMode: 420
                 containers:
                   - name: mlflow
                     image: "{{ harbor_registry }}/library/mlflow-custom:latest"
                     command: ["mlflow"]
-                    args: ["server", "--host=0.0.0.0", "--port=5000", "--backend-store-uri=postgresql://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)", "--default-artifact-root=s3://mlflow/", "--app-name", "basic-auth"]
+                    args: ["server", "--host=0.0.0.0", "--port=5000", "--backend-store-uri=postgresql://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)", "--default-artifact-root=s3://mlflow/", "--app-name", "oidc-auth"]
                     volumeMounts:
                       - name: mlflow-storage
                         mountPath: /mlflow/local-artifacts
                       - name: plugins
                         mountPath: /mlflow/plugins
-                      - name: auth-config
-                        mountPath: /mlflow/auth
                     env:
                       - name: PYTHONPATH
                         value: "/mlflow/plugins"
@@ -424,8 +399,6 @@
                             key: S3_ENDPOINT_URL
                       - name: MLFLOW_S3_IGNORE_TLS
                         value: "true"
-                      - name: MLFLOW_AUTH_CONFIG_PATH
-                        value: "/mlflow/auth/basic_auth.ini"
                     ports:
                       - containerPort: 5000
                         name: http
