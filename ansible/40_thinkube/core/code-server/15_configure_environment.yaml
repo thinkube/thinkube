@@ -690,7 +690,7 @@
         dest: /tmp/vscode-settings-{{ ansible_date_time.epoch }}.json
         mode: '0644'
       register: temp_settings_file
-      
+
     - name: Ensure VS Code user settings directory exists on host with correct permissions
       ansible.builtin.file:
         path: "{{ code_source_path }}/.local/share/code-server/User"
@@ -700,22 +700,52 @@
         mode: '0755'
       become: true
 
-    - name: Remove existing settings file if present (from host)
-      ansible.builtin.file:
+    - name: Check if existing settings file exists on host
+      ansible.builtin.stat:
         path: "{{ code_source_path }}/.local/share/code-server/User/settings.json"
-        state: absent
-      become: true
+      register: existing_settings_file
 
-    - name: Copy settings file to pod
+    - name: Read existing settings if present
+      ansible.builtin.slurp:
+        src: "{{ code_source_path }}/.local/share/code-server/User/settings.json"
+      register: existing_settings
+      when: existing_settings_file.stat.exists
+
+    - name: Parse existing settings
+      ansible.builtin.set_fact:
+        existing_vscode_settings: "{{ existing_settings.content | b64decode | from_json }}"
+      when: existing_settings_file.stat.exists
+
+    - name: Parse template settings
+      ansible.builtin.set_fact:
+        template_vscode_settings: "{{ lookup('file', temp_settings_file.dest) | from_json }}"
+
+    - name: Merge template with existing settings (preserving custom configs like apiToken)
+      ansible.builtin.set_fact:
+        merged_vscode_settings: "{{ existing_vscode_settings | default({}) | combine(template_vscode_settings, recursive=True) }}"
+
+    - name: Write merged settings to temporary file
+      ansible.builtin.copy:
+        content: "{{ merged_vscode_settings | to_nice_json(indent=4) }}"
+        dest: /tmp/vscode-settings-merged-{{ ansible_date_time.epoch }}.json
+        mode: '0644'
+      register: merged_settings_file
+
+    - name: Copy merged settings file to pod
       ansible.builtin.shell: |
-        {{ kubectl_bin }} cp {{ temp_settings_file.dest }} \
+        {{ kubectl_bin }} cp {{ merged_settings_file.dest }} \
           {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.local/share/code-server/User/settings.json \
           -c code-server
       register: extension_config
-      
-    - name: Clean up temporary file
+
+    - name: Clean up temporary template file
       ansible.builtin.file:
         path: "{{ temp_settings_file.dest }}"
+        state: absent
+
+    - name: Clean up temporary merged file
+      ansible.builtin.file:
+        path: "{{ merged_settings_file.dest }}"
         state: absent
       
     - name: Display extension configuration output
