@@ -14,21 +14,26 @@ if [ -z "$MLFLOW_AUTH_USERNAME" ] || [ -z "$MLFLOW_AUTH_PASSWORD" ] || [ -z "$ML
 fi
 
 # Get token from Keycloak using Resource Owner Password Credentials flow
-TOKEN_RESPONSE=$(curl -s -k -X POST "$MLFLOW_KEYCLOAK_TOKEN_URL" \
+TEMP_TOKEN_FILE=$(mktemp)
+curl -s -k -X POST "$MLFLOW_KEYCLOAK_TOKEN_URL" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     -d "grant_type=password" \
     -d "client_id=$MLFLOW_KEYCLOAK_CLIENT_ID" \
     -d "client_secret=$MLFLOW_CLIENT_SECRET" \
     -d "username=$MLFLOW_AUTH_USERNAME" \
-    -d "password=$MLFLOW_AUTH_PASSWORD")
+    -d "password=$MLFLOW_AUTH_PASSWORD" > "$TEMP_TOKEN_FILE"
 
 # Extract access token
-export MLFLOW_TRACKING_TOKEN=$(printf '%s' "$TOKEN_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('access_token', ''))")
+export MLFLOW_TRACKING_TOKEN=$(python3 -c "import json; data = json.load(open('$TEMP_TOKEN_FILE')); print(data.get('access_token', ''))")
 
 if [ -z "$MLFLOW_TRACKING_TOKEN" ]; then
     echo "Error: Failed to parse token from Keycloak response"
+    cat "$TEMP_TOKEN_FILE"
+    rm -f "$TEMP_TOKEN_FILE"
     return 1
 fi
 
-EXPIRES_IN=$(printf '%s' "$TOKEN_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('expires_in', 'unknown'))")
+EXPIRES_IN=$(python3 -c "import json; data = json.load(open('$TEMP_TOKEN_FILE')); print(data.get('expires_in', 'unknown'))")
+rm -f "$TEMP_TOKEN_FILE"
+
 echo "MLflow authentication successful. Token expires in $EXPIRES_IN seconds."
