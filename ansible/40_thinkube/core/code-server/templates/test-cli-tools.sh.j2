@@ -91,28 +91,54 @@ test_cli "CVAT CLI" "cvat-cli --auth ~/.cvat/config.yaml ls 2>/dev/null" "true"
 # Test MLflow
 echo -n "Testing MLflow config... "
 if [ -n "$MLFLOW_TRACKING_URI" ]; then
-    echo "" # New line for debug output
-    echo "DEBUG: MLFLOW_TRACKING_URI=$MLFLOW_TRACKING_URI"
-    echo "DEBUG: Sourcing mlflow-auth.sh..."
+    echo "" # New line for output
 
     # Get MLflow authentication token
     if [ -f ~/mlflow-auth.sh ]; then
-        source ~/mlflow-auth.sh
+        source ~/mlflow-auth.sh > /dev/null 2>&1
     fi
 
-    echo "DEBUG: After sourcing, MLFLOW_TRACKING_TOKEN=${MLFLOW_TRACKING_TOKEN:0:20}..."
-    echo "DEBUG: Attempting Python SDK connection..."
-
     # Try to connect to MLflow tracking server using Python SDK
-    # Note: Must explicitly export token for Python subprocess to see it
     if [ -n "$MLFLOW_TRACKING_TOKEN" ]; then
         export MLFLOW_TRACKING_TOKEN
-        if timeout 10 python3 -c "import mlflow; mlflow.set_tracking_uri('$MLFLOW_TRACKING_URI'); mlflow.search_experiments()"; then
+        MLFLOW_OUTPUT=$(timeout 10 python3 -c "import mlflow; mlflow.set_tracking_uri('$MLFLOW_TRACKING_URI'); mlflow.search_experiments()" 2>&1)
+        MLFLOW_EXIT=$?
+        if [ $MLFLOW_EXIT -eq 0 ]; then
             echo -e "${GREEN}✅ PASS${NC} (URI: $MLFLOW_TRACKING_URI)"
             ((PASSED_TESTS++))
         else
-            echo -e "${RED}❌ FAIL${NC} (Cannot connect to $MLFLOW_TRACKING_URI)"
-            ((FAILED_TESTS++))
+            # Check if error is due to user not being initialized
+            if echo "$MLFLOW_OUTPUT" | grep -q "User .* not found"; then
+                echo -e "${YELLOW}⚠ SETUP REQUIRED${NC}"
+                echo ""
+                echo "MLflow requires first-time user initialization via web browser."
+                echo ""
+                echo "Please follow these steps:"
+                echo "  1. Open this URL in your browser: ${MLFLOW_TRACKING_URI}"
+                echo "  2. Log in with your Keycloak credentials"
+                echo "  3. Once you see the MLflow dashboard, your user is initialized"
+                echo "  4. Press ENTER to continue testing..."
+                echo ""
+                read -p "Press ENTER after completing the browser login: "
+
+                # Retry the connection
+                MLFLOW_OUTPUT=$(timeout 10 python3 -c "import mlflow; mlflow.set_tracking_uri('$MLFLOW_TRACKING_URI'); mlflow.search_experiments()" 2>&1)
+                MLFLOW_EXIT=$?
+                if [ $MLFLOW_EXIT -eq 0 ]; then
+                    echo -e "${GREEN}✅ PASS${NC} (URI: $MLFLOW_TRACKING_URI)"
+                    ((PASSED_TESTS++))
+                else
+                    echo -e "${RED}❌ FAIL${NC} (Still cannot connect after initialization)"
+                    echo "Error: $MLFLOW_OUTPUT"
+                    ((FAILED_TESTS++))
+                fi
+            else
+                echo -e "${RED}❌ FAIL${NC} (Cannot connect to $MLFLOW_TRACKING_URI)"
+                if [ -n "$MLFLOW_OUTPUT" ]; then
+                    echo "Error: $MLFLOW_OUTPUT"
+                fi
+                ((FAILED_TESTS++))
+            fi
         fi
     else
         echo -e "${RED}❌ FAIL${NC} (Token not set - run 'source ~/mlflow-auth.sh' first)"
