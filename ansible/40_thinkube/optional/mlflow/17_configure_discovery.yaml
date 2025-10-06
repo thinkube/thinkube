@@ -28,9 +28,25 @@
 
   vars:
     mlflow_hostname: "mlflow.{{ domain_name }}"
+    mlflow_namespace: "mlflow"
+    mlflow_client_id: "mlflow"
     auth_realm_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
   tasks:
+    - name: Get MLflow client secret from K8s secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ mlflow_namespace }}"
+        name: oauth2-proxy-secret
+      register: mlflow_secret
+      failed_when: mlflow_secret.resources | length == 0
+
+    - name: Set client secret fact
+      ansible.builtin.set_fact:
+        mlflow_client_secret: "{{ mlflow_secret.resources[0].data['client-secret'] | b64decode }}"
+
     - name: Create service discovery ConfigMap
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -86,6 +102,8 @@
                     value: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
                   - name: MLFLOW_KEYCLOAK_CLIENT_ID
                     value: "mlflow"
+                  - name: MLFLOW_CLIENT_SECRET
+                    value: "{{ mlflow_client_secret }}"
 
     - name: Verify ConfigMap creation
       kubernetes.core.k8s_info:
