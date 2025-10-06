@@ -1,0 +1,34 @@
+#!/usr/bin/env fish
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# MLflow Authentication Helper (Fish shell version)
+# Gets a token from Keycloak and sets MLFLOW_TRACKING_TOKEN
+# Usage: source ~/mlflow-auth.fish
+
+if test -z "$MLFLOW_AUTH_USERNAME"; or test -z "$MLFLOW_AUTH_PASSWORD"; or test -z "$MLFLOW_KEYCLOAK_TOKEN_URL"
+    echo "Error: MLflow authentication variables not set. Please run:"
+    echo "  ./scripts/run_ansible.sh ansible/40_thinkube/optional/mlflow/17_configure_discovery.yaml"
+    echo "  ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/15_configure_environment.yaml"
+    return 1
+end
+
+# Get token from Keycloak using Resource Owner Password Credentials flow
+set TOKEN_RESPONSE (curl -s -k -X POST "$MLFLOW_KEYCLOAK_TOKEN_URL" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=password" \
+    -d "client_id=$MLFLOW_KEYCLOAK_CLIENT_ID" \
+    -d "username=$MLFLOW_AUTH_USERNAME" \
+    -d "password=$MLFLOW_AUTH_PASSWORD")
+
+# Extract access token
+set -gx MLFLOW_TRACKING_TOKEN (echo "$TOKEN_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('access_token', ''))" 2>/dev/null)
+
+if test -z "$MLFLOW_TRACKING_TOKEN"
+    echo "Error: Failed to get MLflow token from Keycloak"
+    echo "Response: $TOKEN_RESPONSE"
+    return 1
+end
+
+set expires_in (echo "$TOKEN_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('expires_in', 'unknown'))" 2>/dev/null)
+echo "MLflow authentication successful. Token expires in $expires_in seconds."
