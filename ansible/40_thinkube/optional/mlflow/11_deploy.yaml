@@ -470,50 +470,7 @@
             selector:
               app: mlflow
 
-    - name: Add oauth2-proxy Helm repository
-      kubernetes.core.helm_repository:
-        binary_path: "{{ helm_bin }}"
-        name: oauth2-proxy
-        repo_url: "https://oauth2-proxy.github.io/manifests"
-        state: present
-
-    - name: Update Helm repo for oauth2-proxy
-      ansible.builtin.command: "{{ helm_bin }} repo update"
-      changed_when: false
-      failed_when: false
-
-    - name: Deploy oauth2-proxy for MLflow web UI
-      kubernetes.core.helm:
-        binary_path: "{{ helm_bin }}"
-        name: "mlflow-oauth2-proxy"
-        chart_ref: "oauth2-proxy/oauth2-proxy"
-        release_namespace: "{{ mlflow_namespace }}"
-        create_namespace: false
-        reset_values: true
-        force: true
-        update_repo_cache: true
-        values:
-          ingress:
-            enabled: false
-          service:
-            type: ClusterIP
-            portNumber: 80
-          extraArgs:
-            - --provider=keycloak-oidc
-            - --client-id={{ mlflow_client_id }}
-            - --client-secret={{ lookup('env', 'MLFLOW_CLIENT_SECRET') }}
-            - --redirect-url=https://{{ mlflow_hostname }}/oauth2/callback
-            - --oidc-issuer-url={{ keycloak_url }}/realms/{{ keycloak_realm }}
-            - --cookie-domain={{ mlflow_hostname }}
-            - --cookie-secure=true
-            - --cookie-samesite=lax
-            - --cookie-refresh=1h
-            - --reverse-proxy
-            - --set-xauthrequest=true
-            - --upstream=http://mlflow.{{ mlflow_namespace }}.svc.cluster.local:5000
-            - --http-address=0.0.0.0:4180
-
-    - name: Create oauth2-proxy Ingress for /oauth2
+    - name: Create MLflow Ingress
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         namespace: "{{ mlflow_namespace }}"
@@ -522,71 +479,9 @@
           apiVersion: networking.k8s.io/v1
           kind: Ingress
           metadata:
-            name: mlflow-oauth2
-            annotations:
-              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-          spec:
-            ingressClassName: "{{ primary_ingress_class }}"
-            tls:
-              - hosts:
-                  - "{{ mlflow_hostname }}"
-                secretName: "{{ mlflow_tls_secret_name }}"
-            rules:
-              - host: "{{ mlflow_hostname }}"
-                http:
-                  paths:
-                    - path: /oauth2
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: mlflow-oauth2-proxy
-                          port:
-                            number: 80
-
-    - name: Create MLflow API Ingress (direct access for SDK)
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ mlflow_namespace }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: mlflow-api
+            name: mlflow
             annotations:
               nginx.ingress.kubernetes.io/proxy-body-size: "0"
-          spec:
-            ingressClassName: "{{ primary_ingress_class }}"
-            tls:
-              - hosts:
-                  - "{{ mlflow_hostname }}"
-                secretName: "{{ mlflow_tls_secret_name }}"
-            rules:
-              - host: "{{ mlflow_hostname }}"
-                http:
-                  paths:
-                    - path: /api
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: mlflow
-                          port:
-                            number: 5000
-
-    - name: Create MLflow Web UI Ingress (SSO protected)
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ mlflow_namespace }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: mlflow-web
-            annotations:
-              nginx.ingress.kubernetes.io/proxy-body-size: "0"
-              nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
-              nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$escaped_request_uri"
           spec:
             ingressClassName: "{{ primary_ingress_class }}"
             tls:
@@ -608,18 +503,14 @@
     - name: Final MLflow info
       ansible.builtin.debug:
         msg:
-          - "MLflow tracking server deployed with dual authentication."
+          - "MLflow tracking server deployed with built-in OIDC auth integration."
           - "Namespace: {{ mlflow_namespace }}"
           - "TLS secret: {{ mlflow_tls_secret_name }}"
           - "MLflow UI: https://{{ mlflow_hostname }}"
           - "Database: MLflow database '{{ mlflow_db_name }}' created (using admin user for access)"
           - "Artifacts: SeaweedFS S3 bucket '{{ mlflow_artifacts_bucket }}' created"
           - "Image: {{ harbor_registry }}/library/mlflow-custom:latest"
-          - ""
-          - "Authentication:"
-          - "  - Web UI: SSO via oauth2-proxy (Keycloak)"
-          - "  - API/SDK: Basic auth (admin credentials)"
-          - "  - Admin username: {{ admin_username }}"
-          - "  - API endpoints (/api/*) bypass SSO for SDK access"
-          - ""
+          - "Authentication is handled through MLflow OIDC auth plugin"
+          - "Uses Keycloak realm {{ keycloak_realm }} with client ID: {{ mlflow_client_id }}"
+          - "User group: mlflow-user, Admin group: mlflow-admin"
           - "Storage: SeaweedFS (Apache 2.0 licensed S3-compatible storage)"
