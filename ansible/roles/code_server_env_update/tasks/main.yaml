@@ -65,9 +65,9 @@
     - code_server_pod_name != ""
     - service_configmaps.resources | length > 0
 
-- name: Generate service environment file content
+- name: Generate service environment file content (Bash/Zsh)
   ansible.builtin.set_fact:
-    service_env_content: |
+    service_env_bash_content: |
       #!/bin/bash
       # Auto-generated from service discovery ConfigMaps
       # DO NOT EDIT MANUALLY - Changes will be overwritten
@@ -83,24 +83,50 @@
       {% endif %}
   when: code_server_pod_name != ""
 
+- name: Generate service environment file content (Fish)
+  ansible.builtin.set_fact:
+    service_env_fish_content: |
+      #!/usr/bin/env fish
+      # Auto-generated from service discovery ConfigMaps
+      # DO NOT EDIT MANUALLY - Changes will be overwritten
+      # Regenerated on code-server configuration and service deployments
+      # Generated: {{ ansible_date_time.iso8601 }}
+
+      {% if all_env_vars is defined and all_env_vars | length > 0 %}
+      {% for env_var in all_env_vars %}
+      set -gx {{ env_var.name }} "{{ env_var.value }}"
+      {% endfor %}
+      {% else %}
+      # No environment variables defined by optional services
+      {% endif %}
+  when: code_server_pod_name != ""
+
 - name: Create thinkube config directory in code-server
   ansible.builtin.shell: |
     {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
       bash -c "mkdir -p /home/thinkube/.config/thinkube"
   when: code_server_pod_name != ""
 
-- name: Update service environment file in code-server
+- name: Update service environment file (Bash/Zsh) in code-server
   ansible.builtin.shell: |
     {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
       bash -c 'cat > /home/thinkube/.config/thinkube/service-env.sh << "EOF"
-    {{ service_env_content }}
+    {{ service_env_bash_content }}
     EOF'
   when: code_server_pod_name != ""
 
-- name: Make service environment file executable
+- name: Update service environment file (Fish) in code-server
   ansible.builtin.shell: |
     {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
-      chmod +x /home/thinkube/.config/thinkube/service-env.sh
+      bash -c 'cat > /home/thinkube/.config/thinkube/service-env.fish << "EOF"
+    {{ service_env_fish_content }}
+    EOF'
+  when: code_server_pod_name != ""
+
+- name: Make service environment files executable
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
+      bash -c "chmod +x /home/thinkube/.config/thinkube/service-env.sh /home/thinkube/.config/thinkube/service-env.fish"
   when: code_server_pod_name != ""
 
 - name: Add service-env.sh to .bashrc if not present
@@ -118,6 +144,40 @@
       "
   register: bashrc_update
   changed_when: "'Added' in bashrc_update.stdout"
+  when: code_server_pod_name != ""
+
+- name: Add service-env.sh to .zshrc if not present
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
+      bash -c "
+        if ! grep -q 'service-env.sh' /home/thinkube/.zshrc 2>/dev/null; then
+          echo '' >> /home/thinkube/.zshrc
+          echo '# Source service environment variables from deployed services' >> /home/thinkube/.zshrc
+          echo '[ -f ~/.config/thinkube/service-env.sh ] && source ~/.config/thinkube/service-env.sh' >> /home/thinkube/.zshrc
+          echo '✅ Added service-env.sh to .zshrc'
+        else
+          echo '✅ service-env.sh already in .zshrc'
+        fi
+      "
+  register: zshrc_update
+  changed_when: "'Added' in zshrc_update.stdout"
+  when: code_server_pod_name != ""
+
+- name: Add service-env.fish to config.fish if not present
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
+      bash -c "
+        if ! grep -q 'service-env.fish' /home/thinkube/.config/fish/config.fish 2>/dev/null; then
+          echo '' >> /home/thinkube/.config/fish/config.fish
+          echo '# Source service environment variables from deployed services' >> /home/thinkube/.config/fish/config.fish
+          echo 'test -f ~/.config/thinkube/service-env.fish; and source ~/.config/thinkube/service-env.fish' >> /home/thinkube/.config/fish/config.fish
+          echo '✅ Added service-env.fish to config.fish'
+        else
+          echo '✅ service-env.fish already in config.fish'
+        fi
+      "
+  register: fish_update
+  changed_when: "'Added' in fish_update.stdout"
   when: code_server_pod_name != ""
 
 - name: Display environment variables configured

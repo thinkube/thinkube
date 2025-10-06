@@ -54,56 +54,180 @@
     # No need to install them here
 
     ###################################################################
-    # Create base shell configuration
-    # NOTE: /home/thinkube is mounted from shared-code volume, which hides
-    # the .bashrc created in the Docker image. We must recreate it here.
+    # Create environment setup scripts (cross-shell compatible)
+    # NOTE: Stored in ~/.thinkube_shared_shell (same location as aliases/functions from playbook 14)
+    # Contains ONLY environment variables - aliases managed by playbook 14's JSON system
     ###################################################################
-    - name: Create base .bashrc with starship and environment setup
+    - name: Create Bash/Zsh environment setup script
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c 'cat > /home/thinkube/.bashrc << "EOF"
-        # ~/.bashrc: executed by bash(1) for non-login shells.
+          bash -c 'mkdir -p /home/thinkube/.thinkube_shared_shell && cat > /home/thinkube/.thinkube_shared_shell/env_setup.sh << "EOF"
+        #!/bin/bash
+        # Thinkube Environment Variables (Bash/Zsh compatible)
+        # Created by 15_configure_environment.yaml
+        # NOTE: Aliases are managed by the JSON system in playbook 14
 
-        # If not running interactively, don't do anything
-        case $- in
-            *i*) ;;
-              *) return;;
-        esac
+        # Kubernetes
+        export KUBECONFIG=/home/thinkube/.kube/config
 
-        # History configuration
-        HISTCONTROL=ignoreboth
-        HISTSIZE=1000
-        HISTFILESIZE=2000
-        shopt -s histappend
+        # Argo
+        export ARGO_NAMESPACE=argo
+        export ARGO_SERVER=argo-workflows-server.argo.svc.cluster.local:2746
 
-        # Check window size after each command
-        shopt -s checkwinsize
+        # Ansible
+        export ANSIBLE_CONFIG=/home/thinkube/.ansible.cfg
 
-        # Enable color support
-        if [ -x /usr/bin/dircolors ]; then
-            test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
-            alias ls="ls --color=auto"
-            alias grep="grep --color=auto"
-        fi
+        # Python tools
+        export PATH="$HOME/.local/bin:$PATH"
 
-        # Common aliases
-        alias ll="ls -alF"
-        alias la="ls -A"
-        alias l="ls -CF"
+        # npm global packages
+        export PATH="/home/thinkube/.npm-global/bin:$PATH"
 
-        # Source Thinkube development environment from system location
-        # (stored in /etc to avoid being hidden by /home/thinkube volume mount)
-        if [ -f /etc/thinkube/setup-env.sh ]; then
-            source /etc/thinkube/setup-env.sh
-        fi
+        # DevPi package index
+        export DEVPI_INDEX=https://{{ devpi_api_hostname }}/{{ admin_username }}/dev/+simple/
+        EOF
+        chmod +x /home/thinkube/.thinkube_shared_shell/env_setup.sh
+        echo "✅ Bash/Zsh environment setup created"'
 
-        # Initialize Starship prompt
-        if command -v starship >/dev/null 2>&1; then
-            eval "$(starship init bash)"
+    - name: Create Fish environment setup script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.thinkube_shared_shell/env_setup.fish << "EOF"
+        # Thinkube Environment Variables (Fish compatible)
+        # Created by 15_configure_environment.yaml
+        # NOTE: Aliases are managed by the JSON system in playbook 14
+
+        # Kubernetes
+        set -gx KUBECONFIG /home/thinkube/.kube/config
+
+        # Argo
+        set -gx ARGO_NAMESPACE argo
+        set -gx ARGO_SERVER argo-workflows-server.argo.svc.cluster.local:2746
+
+        # Ansible
+        set -gx ANSIBLE_CONFIG /home/thinkube/.ansible.cfg
+
+        # Python tools
+        set -gx PATH $HOME/.local/bin $PATH
+
+        # npm global packages
+        set -gx PATH /home/thinkube/.npm-global/bin $PATH
+
+        # DevPi package index
+        set -gx DEVPI_INDEX https://{{ devpi_api_hostname }}/{{ admin_username }}/dev/+simple/
+        EOF
+        chmod +x /home/thinkube/.thinkube_shared_shell/env_setup.fish
+        echo "✅ Fish environment setup created"'
+
+    ###################################################################
+    # Append environment sourcing to existing shell configs
+    # NOTE: Shell configs are created by playbook 14 (14_configure_shell.yaml)
+    # We only add environment variable sourcing, not overwriting anything
+    ###################################################################
+    - name: Check if Bash has environment sourcing
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          grep -q "THINKUBE ENV SETUP" /home/thinkube/.bashrc
+      register: bash_env_configured
+      failed_when: false
+      changed_when: false
+
+    - name: Append environment sourcing to Bash config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat >> /home/thinkube/.bashrc << "EOF"
+
+        # BEGIN THINKUBE ENV SETUP
+        # Source Thinkube environment variables
+        if [ -f ~/.thinkube_shared_shell/env_setup.sh ]; then
+            source ~/.thinkube_shared_shell/env_setup.sh
         fi
 
         # Source service environment variables from deployed services
-        [ -f ~/.config/thinkube/service-env.sh ] && source ~/.config/thinkube/service-env.sh
+        if [ -f ~/.config/thinkube/service-env.sh ]; then
+            source ~/.config/thinkube/service-env.sh
+        fi
+        # END THINKUBE ENV SETUP
+        EOF'
+      when: bash_env_configured.rc != 0
+
+    - name: Check if Zsh has environment sourcing
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          grep -q "THINKUBE ENV SETUP" /home/thinkube/.zshrc
+      register: zsh_env_configured
+      failed_when: false
+      changed_when: false
+
+    - name: Append environment sourcing to Zsh config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat >> /home/thinkube/.zshrc << "EOF"
+
+        # BEGIN THINKUBE ENV SETUP
+        # Source Thinkube environment variables
+        if [ -f ~/.thinkube_shared_shell/env_setup.sh ]; then
+            source ~/.thinkube_shared_shell/env_setup.sh
+        fi
+
+        # Source service environment variables from deployed services
+        if [ -f ~/.config/thinkube/service-env.sh ]; then
+            source ~/.config/thinkube/service-env.sh
+        fi
+        # END THINKUBE ENV SETUP
+        EOF'
+      when: zsh_env_configured.rc != 0
+
+    - name: Check if Fish has environment sourcing
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          grep -q "THINKUBE ENV SETUP" /home/thinkube/.config/fish/config.fish
+      register: fish_env_configured
+      failed_when: false
+      changed_when: false
+
+    - name: Append environment sourcing to Fish config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat >> /home/thinkube/.config/fish/config.fish << "EOF"
+
+        # BEGIN THINKUBE ENV SETUP
+        # Source Thinkube environment variables
+        if test -f ~/.thinkube_shared_shell/env_setup.fish
+            source ~/.thinkube_shared_shell/env_setup.fish
+        end
+
+        # Source service environment variables from deployed services
+        if test -f ~/.config/thinkube/service-env.sh
+            bass source ~/.config/thinkube/service-env.sh
+        end
+        # END THINKUBE ENV SETUP
+        EOF'
+      when: fish_env_configured.rc != 0
+
+    ###################################################################
+    # Create .bash_profile and .profile to source .bashrc
+    # NOTE: Bash login shells read .bash_profile, not .bashrc
+    # Code-server terminals start as login shells
+    ###################################################################
+    - name: Create .bash_profile to source .bashrc
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.bash_profile << "EOF"
+        # Source .bashrc for login shells
+        if [ -f ~/.bashrc ]; then
+            source ~/.bashrc
+        fi
+        EOF'
+
+    - name: Create .profile to source .bashrc
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.profile << "EOF"
+        # Source .bashrc for login shells
+        if [ -f ~/.bashrc ]; then
+            source ~/.bashrc
+        fi
         EOF'
 
     - name: Configure npm for global installations
@@ -112,24 +236,12 @@
           bash -c "
             mkdir -p /home/thinkube/.npm-global
             npm config set prefix '/home/thinkube/.npm-global'
-            
-            # Add to PATH in shell configs only if not already present
-            if ! grep -q '/home/thinkube/.npm-global/bin' /home/thinkube/.bashrc 2>/dev/null; then
-              echo 'export PATH=/home/thinkube/.npm-global/bin:\$PATH' >> /home/thinkube/.bashrc
-            fi
-            
-            if ! grep -q '/home/thinkube/.npm-global/bin' /home/thinkube/.profile 2>/dev/null; then
-              echo 'export PATH=/home/thinkube/.npm-global/bin:\$PATH' >> /home/thinkube/.profile
-            fi
           "
-          
+
     - name: Install Claude Code
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -l -c "
-            npm config set prefix '/home/thinkube/.npm-global'
-            npm install -g @anthropic-ai/claude-code
-          "
+          bash -l -c "npm install -g @anthropic-ai/claude-code"
           
     - name: Create claude wrapper script content
       ansible.builtin.set_fact:
@@ -218,15 +330,21 @@
                 if [ ! -d \"/home/thinkube/thinkube-platform/\$repo_name\" ]; then
                   echo \"Cloning \$repo...\"
                   GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
-                    git clone \"git@github.com:\$repo.git\" \"/home/thinkube/thinkube-platform/\$repo_name\" || \
-                    echo \"Warning: Failed to clone \$repo (may be private or not exist)\"
+                    git clone \"git@github.com:\$repo.git\" \"/home/thinkube/thinkube-platform/\$repo_name\"
                 else
                   echo \"\$repo_name already exists, pulling latest changes...\"
                   cd \"/home/thinkube/thinkube-platform/\$repo_name\"
                   # Reset any local changes to avoid merge conflicts
                   git reset --hard HEAD
-                  GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
-                    git pull || echo \"Warning: Failed to pull latest changes for \$repo_name\"
+                  # Fetch and force update to latest from origin
+                  echo \"Fetching latest from origin for \$repo_name...\"
+                  if GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' git fetch origin 2>&1; then
+                    echo \"Resetting to origin/main for \$repo_name...\"
+                    git reset --hard origin/main
+                  else
+                    echo \"ERROR: Failed to fetch from origin for \$repo_name\"
+                    exit 1
+                  fi
                 fi
               done
             else
@@ -235,6 +353,11 @@
               exit 1
             fi
           "
+      register: clone_result
+
+    - name: Display repository cloning output
+      ansible.builtin.debug:
+        var: clone_result.stdout_lines
 
     ###################################################################
     # Configure CLI Tools for Development
@@ -406,11 +529,6 @@
         EOF
             chmod 600 /home/thinkube/.pypirc
 
-            # Add DevPi environment variable to bashrc
-            if ! grep -q 'DEVPI_INDEX' /home/thinkube/.bashrc; then
-              echo 'export DEVPI_INDEX=https://{{ devpi_api_hostname }}/{{ admin_username }}/dev/+simple/' >> /home/thinkube/.bashrc
-            fi
-
             echo '✅ DevPi client configured'
           "
 
@@ -436,6 +554,26 @@
     - name: Clean up temporary test script
       ansible.builtin.file:
         path: "{{ test_script.dest }}"
+        state: absent
+
+    - name: Create Fish CLI tools test script from template
+      ansible.builtin.template:
+        src: templates/test-cli-tools.fish.j2
+        dest: /tmp/test-cli-tools-{{ ansible_date_time.epoch }}.fish
+        mode: '0755'
+      register: test_script_fish
+
+    - name: Copy Fish test script to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ test_script_fish.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/test-cli-tools.fish \
+          -c code-server
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          chmod +x /home/thinkube/test-cli-tools.fish
+
+    - name: Clean up temporary Fish test script
+      ansible.builtin.file:
+        path: "{{ test_script_fish.dest }}"
         state: absent
 
     - name: Create VS Code workspace settings content
@@ -480,13 +618,6 @@
               "**/node_modules": true,
               "**/tmp": true,
               "**/.bash_history": true
-            },
-            "terminal.integrated.defaultProfile.linux": "bash",
-            "terminal.integrated.profiles.linux": {
-              "bash": {
-                "path": "/bin/bash",
-                "args": ["-l"]
-              }
             }
           }
           
@@ -574,6 +705,7 @@
       ansible.builtin.debug:
         msg:
           - "✅ Code-server environment configured successfully"
+          - "✅ Cross-shell environment (Bash, Zsh, Fish) configured"
           - "✅ Node.js and npm installed"
           - "✅ Claude Code installed and available"
           - "✅ Python and Ansible installed"
@@ -588,5 +720,9 @@
           - "  - thinkube-ai-integration (via symlink from platform repo)"
           - "  - thinkube-cicd-monitor (via symlink from platform repo)"
           - "  - Hooks are configured for Ansible playbook review"
+          - ""
+          - "Test CLI tools:"
+          - "  - Bash: ./test-cli-tools.sh"
+          - "  - Fish: fish test-cli-tools.fish"
           - ""
           - "💡 Reload browser to see Nerd Font icons in terminal"
