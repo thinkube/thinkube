@@ -104,6 +104,60 @@ All packages are pinned to specific versions for reproducibility:
    - `admin_username`: Admin username
    - `system_username`: System user
 
+## Examples Repository
+
+JupyterHub uses a public GitHub repository for example notebooks:
+- **Repository**: https://github.com/thinkube/jupyter-examples
+- **Structure**: Organized by image type (common, ml-cpu, ml-gpu, fine-tuning, agent-dev)
+- **Auto-sync**: Examples updated daily via CronJob
+- **Fail-fast**: Deployment fails if examples repository unavailable
+
+### Examples Architecture
+
+```
+/home/jovyan/thinkube/
+├── examples-repo/          # Read-only mount of cloned repository
+│   └── jupyter-examples/
+│       ├── common/         # Examples for all images
+│       ├── ml-cpu/        # CPU-specific examples
+│       ├── ml-gpu/        # GPU-specific examples
+│       ├── fine-tuning/   # Fine-tuning examples
+│       └── agent-dev/     # Agent development examples
+├── notebooks/
+│   ├── templates/         # Symlink to examples-repo (read-only)
+│   └── examples/          # Editable copies per image type
+└── ...
+```
+
+### Managing Examples
+
+**For maintainers updating examples**:
+1. Clone repository: `git clone https://github.com/thinkube/jupyter-examples.git`
+2. Edit notebooks (outputs must be stripped)
+3. Clean notebooks: `nbstripout notebook.ipynb`
+4. Validate: `./scripts/validate_notebooks.sh`
+5. Commit and push to GitHub
+6. Examples auto-sync daily, or trigger manually:
+   ```bash
+   kubectl create job --from=cronjob/jupyter-examples-sync manual-sync -n jupyterhub
+   ```
+
+**Cleaning tools (required before commit)**:
+```bash
+# Install tools
+pip install nbstripout pre-commit
+
+# Install pre-commit hooks (auto-cleans on commit)
+cd jupyter-examples
+pre-commit install
+
+# Manual cleaning
+nbstripout notebook.ipynb
+
+# Validate all notebooks are clean
+./scripts/validate_notebooks.sh
+```
+
 ## Deployment Process
 
 ### 1. Build Custom ML/AI Images
@@ -130,7 +184,17 @@ This will:
 
 **Note**: Keycloak must already be configured with the JupyterHub client. The deployment retrieves the existing OIDC secret.
 
-### 3. Verify Deployment
+### 3. Configure Examples Auto-Sync
+
+```bash
+./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/12_configure_examples_sync.yaml
+```
+
+This creates:
+- CronJob for daily sync of examples repository
+- Manual trigger capability for immediate updates
+
+### 4. Verify Deployment
 
 ```bash
 ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/18_test.yaml
@@ -138,6 +202,7 @@ This will:
 
 This verifies:
 - SeaweedFS volume accessibility
+- Examples repository availability
 - Custom image availability
 - GPU detection (if available)
 - Service health
@@ -163,14 +228,25 @@ JupyterHub dynamically discovers available images from thinkube-control. Users c
 
 #### Directory Structure
 ```
-/home/jovyan/thinkube/notebooks/
-├── templates/           # Read-only example notebooks from image
-├── examples/           # Your editable copies
-│   ├── tk-jupyter-ml-cpu/
-│   ├── tk-jupyter-ml-gpu/
-│   └── tk-jupyter-scipy/
-├── datasets/           # Shared datasets (500GB SeaweedFS)
-└── models/            # Trained models (200GB SeaweedFS)
+/home/jovyan/thinkube/
+├── examples-repo/              # Read-only cloned repository
+│   └── jupyter-examples/
+│       ├── common/             # Examples for all images
+│       ├── ml-cpu/
+│       ├── ml-gpu/
+│       ├── fine-tuning/
+│       └── agent-dev/
+├── notebooks/
+│   ├── templates/              # Symlink to examples-repo (read-only)
+│   ├── examples/               # Your editable copies (per image type)
+│   │   ├── tk-jupyter-ml-cpu/
+│   │   ├── tk-jupyter-ml-gpu/
+│   │   ├── tk-jupyter-fine-tuning/
+│   │   └── tk-jupyter-agent-dev/
+│   ├── projects/               # Your project notebooks
+│   └── experiments/            # Experimental work
+├── datasets/                   # Shared datasets (500GB SeaweedFS)
+└── models/                     # Trained models (200GB SeaweedFS)
 ```
 
 #### Persistent Storage (SeaweedFS)
@@ -270,9 +346,16 @@ microk8s.kubectl logs -n jupyterhub jupyter-<username>
    - Check Keycloak client configuration in Keycloak admin console
 
 6. **Examples Not Available**:
-   - Check startup.sh is executed as entrypoint
-   - Verify `/opt/thinkube/examples/` exists in image
-   - Check symlink creation in startup logs
+   - Verify examples repository cloned: `kubectl logs -n jupyterhub job/clone-jupyter-examples`
+   - Check examples PVC exists: `kubectl get pvc -n jupyterhub jupyterhub-examples-pvc`
+   - Verify sync job: `kubectl get cronjobs -n jupyterhub jupyter-examples-sync`
+   - Check pod startup logs for examples copying
+   - Manual sync: `kubectl create job --from=cronjob/jupyter-examples-sync manual-sync -n jupyterhub`
+
+7. **Examples Out of Date**:
+   - Trigger manual sync: `kubectl create job --from=cronjob/jupyter-examples-sync manual-sync -n jupyterhub`
+   - Check sync job logs: `kubectl logs -n jupyterhub job/manual-sync`
+   - Verify CronJob schedule: `kubectl get cronjob -n jupyterhub jupyter-examples-sync -o yaml`
 
 ## Performance Considerations
 
@@ -290,14 +373,18 @@ microk8s.kubectl logs -n jupyterhub jupyter-<username>
 
 ## Architecture Benefits
 
-The volume mount strategy at `/home/jovyan/thinkube/` provides:
+The examples repository and volume mount strategy provides:
 
-1. **Package Preservation**: Python packages in `.local/` remain accessible
-2. **Clean Separation**: Image content and user data don't conflict
-3. **Multi-Image Support**: Different images can coexist without conflicts
-4. **Persistence**: SeaweedFS ensures notebooks survive pod restarts
-5. **Simplicity**: No complex workarounds for package visibility
-6. **Dynamic Discovery**: New images automatically available without config changes
+1. **Decoupled Updates**: Examples updated without rebuilding Docker images
+2. **Version Control**: Public GitHub repository enables community contributions
+3. **Auto-Sync**: Daily updates keep examples fresh automatically
+4. **Fail-Fast**: Deployment fails immediately if dependencies unavailable
+5. **Image-Aware**: Each image type gets relevant examples only
+6. **Package Preservation**: Python packages in `.local/` remain accessible
+7. **Clean Separation**: Image content and user data don't conflict
+8. **Multi-Image Support**: Different images can coexist without conflicts
+9. **Persistence**: SeaweedFS ensures notebooks survive pod restarts
+10. **Dynamic Discovery**: New images automatically available without config changes
 
 ## License
 
