@@ -394,37 +394,43 @@
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ devpi_namespace }} deployment/{{ app_name }} -- bash -c "
         set -e
-        # Unset DEVPI_OUTSIDE_URL to prevent URL rewriting to external hostname
-        unset DEVPI_OUTSIDE_URL
 
-        # Configure devpi client to use the local server directly
-        devpi use http://localhost:3141 --set-cfg
+        # Use devpi client with explicit client-side URL (ignore server redirects)
+        export DEVPI_CLIENTDIR=/tmp/devpi-init-client
+        rm -rf \$DEVPI_CLIENTDIR
+        mkdir -p \$DEVPI_CLIENTDIR
+
+        # Configure devpi client to use localhost with --client-cert to prevent redirects
+        devpi use http://localhost:3141 --clientdir=\$DEVPI_CLIENTDIR
 
         # Check if root user already has a password set
-        if devpi login root --password='' 2>&1 | grep -q 'credentials'; then
+        if devpi login root --password='' --clientdir=\$DEVPI_CLIENTDIR 2>&1 | grep -q 'credentials'; then
           echo 'Root user already initialized, skipping...'
         else
           # Create root user password
-          devpi user -m root password='{{ admin_password }}'
+          devpi user -m root password='{{ admin_password }}' --clientdir=\$DEVPI_CLIENTDIR
           echo 'Root user password set'
         fi
 
         # Login as root
-        devpi login root --password='{{ admin_password }}'
+        devpi login root --password='{{ admin_password }}' --clientdir=\$DEVPI_CLIENTDIR
 
         # Check if index exists
-        if devpi index root/{{ devpi_index_name }} 2>&1 | grep -q 'not found'; then
+        if devpi index root/{{ devpi_index_name }} --clientdir=\$DEVPI_CLIENTDIR 2>&1 | grep -q 'not found'; then
           # Create index
-          devpi index -c root/{{ devpi_index_name }} bases=root/pypi volatile=False
+          devpi index -c root/{{ devpi_index_name }} bases=root/pypi volatile=False --clientdir=\$DEVPI_CLIENTDIR
           echo 'Index root/{{ devpi_index_name }} created'
         else
           echo 'Index root/{{ devpi_index_name }} already exists, skipping...'
         fi
 
         # Set the index as default
-        devpi use root/{{ devpi_index_name }}
+        devpi use root/{{ devpi_index_name }} --clientdir=\$DEVPI_CLIENTDIR
 
         echo 'DevPi initialization complete'
+
+        # Clean up temp client dir
+        rm -rf \$DEVPI_CLIENTDIR
         "
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
