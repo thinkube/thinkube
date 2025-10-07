@@ -17,7 +17,25 @@ RUN apt-get update && apt-get install -y \
     curl \
     wget \
     vim \
+    ca-certificates \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20.x LTS (required for Claude Code CLI)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI globally
+RUN npm install -g @anthropic-ai/claude-code
+
+# Create claude wrapper script to ensure it's in PATH
+RUN printf '#!/bin/bash\n\
+# Wrapper script for Claude Code CLI\n\
+export PATH="/usr/local/lib/node_modules/.bin:$PATH"\n\
+exec /usr/local/bin/claude "$@"\n' > /usr/local/bin/claude-wrapper && \
+    chmod +x /usr/local/bin/claude-wrapper && \
+    ln -sf /usr/local/bin/claude-wrapper /usr/bin/claude
 
 # Set python3.12 as default
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
