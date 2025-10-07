@@ -101,44 +101,46 @@ if [ -n "$MLFLOW_TRACKING_URI" ]; then
     # Try to connect to MLflow tracking server using Python SDK
     if [ -n "$MLFLOW_TRACKING_TOKEN" ]; then
         export MLFLOW_TRACKING_TOKEN
-        MLFLOW_OUTPUT=$(timeout 10 python3 -c "import mlflow; mlflow.set_tracking_uri('$MLFLOW_TRACKING_URI'); mlflow.search_experiments()" 2>&1)
-        MLFLOW_EXIT=$?
-        if [ $MLFLOW_EXIT -eq 0 ]; then
+
+        # First, do a quick API check to see if user is initialized
+        # Using a short timeout to fail fast if user doesn't exist
+        QUICK_CHECK=$(timeout 3 python3 -c "import mlflow; mlflow.set_tracking_uri('$MLFLOW_TRACKING_URI'); mlflow.search_experiments()" 2>&1)
+        QUICK_EXIT=$?
+
+        if [ $QUICK_EXIT -eq 0 ]; then
             echo -e "${GREEN}✅ PASS${NC} (URI: $MLFLOW_TRACKING_URI)"
             ((PASSED_TESTS++))
-        else
-            # Check if error is due to user not being initialized
-            if echo "$MLFLOW_OUTPUT" | grep -q "User .* not found"; then
-                echo -e "${YELLOW}⚠ SETUP REQUIRED${NC}"
-                echo ""
-                echo "MLflow requires first-time user initialization via web browser."
-                echo ""
-                echo "Please follow these steps:"
-                echo "  1. Open this URL in your browser: ${MLFLOW_TRACKING_URI}"
-                echo "  2. Log in with your Keycloak credentials"
-                echo "  3. Once you see the MLflow dashboard, your user is initialized"
-                echo "  4. Press ENTER to continue testing..."
-                echo ""
-                read -p "Press ENTER after completing the browser login: "
+        elif [ $QUICK_EXIT -eq 124 ]; then
+            # Timeout means the request is hanging - likely user not initialized
+            echo -e "${YELLOW}⚠ SETUP REQUIRED${NC}"
+            echo ""
+            echo "MLflow requires first-time user initialization via web browser."
+            echo ""
+            echo "Please follow these steps:"
+            echo "  1. Open this URL in your browser: ${MLFLOW_TRACKING_URI}"
+            echo "  2. Log in with your Keycloak credentials"
+            echo "  3. Once you see the MLflow dashboard, your user is initialized"
+            echo ""
+            read -p "Press ENTER after completing the browser login: "
 
-                # Retry the connection
-                MLFLOW_OUTPUT=$(timeout 10 python3 -c "import mlflow; mlflow.set_tracking_uri('$MLFLOW_TRACKING_URI'); mlflow.search_experiments()" 2>&1)
-                MLFLOW_EXIT=$?
-                if [ $MLFLOW_EXIT -eq 0 ]; then
-                    echo -e "${GREEN}✅ PASS${NC} (URI: $MLFLOW_TRACKING_URI)"
-                    ((PASSED_TESTS++))
-                else
-                    echo -e "${RED}❌ FAIL${NC} (Still cannot connect after initialization)"
-                    echo "Error: $MLFLOW_OUTPUT"
-                    ((FAILED_TESTS++))
-                fi
+            # Retry the connection with normal timeout
+            MLFLOW_OUTPUT=$(timeout 10 python3 -c "import mlflow; mlflow.set_tracking_uri('$MLFLOW_TRACKING_URI'); mlflow.search_experiments()" 2>&1)
+            MLFLOW_EXIT=$?
+            if [ $MLFLOW_EXIT -eq 0 ]; then
+                echo -e "${GREEN}✅ PASS${NC} (URI: $MLFLOW_TRACKING_URI)"
+                ((PASSED_TESTS++))
             else
-                echo -e "${RED}❌ FAIL${NC} (Cannot connect to $MLFLOW_TRACKING_URI)"
-                if [ -n "$MLFLOW_OUTPUT" ]; then
-                    echo "Error: $MLFLOW_OUTPUT"
-                fi
+                echo -e "${RED}❌ FAIL${NC} (Still cannot connect after initialization)"
+                echo "Please verify you successfully logged in via the browser"
                 ((FAILED_TESTS++))
             fi
+        else
+            # Other error
+            echo -e "${RED}❌ FAIL${NC} (Cannot connect to $MLFLOW_TRACKING_URI)"
+            if [ -n "$QUICK_CHECK" ]; then
+                echo "Error: $QUICK_CHECK"
+            fi
+            ((FAILED_TESTS++))
         fi
     else
         echo -e "${RED}❌ FAIL${NC} (Token not set - run 'source ~/mlflow-auth.sh' first)"
