@@ -372,6 +372,61 @@
           status: "True"
         wait_timeout: 300
 
+    - name: Wait for DevPi pod to be running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ devpi_namespace }}"
+        label_selectors:
+          - app={{ app_name }}
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+
+    - name: Initialize DevPi with root user and index
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ devpi_namespace }} deployment/{{ app_name }} -- bash -c '
+        # Configure devpi client to use the local server
+        devpi use http://localhost:3141
+
+        # Check if root user already has a password set
+        if devpi login root --password="" 2>&1 | grep -q "credentials"; then
+          echo "Root user already initialized, skipping..."
+        else
+          # Create root user password
+          devpi user -m root password={{ admin_password }}
+          echo "Root user password set"
+        fi
+
+        # Login as root
+        devpi login root --password={{ admin_password }}
+
+        # Check if index exists
+        if devpi index root/{{ devpi_index_name }} 2>&1 | grep -q "not found"; then
+          # Create index
+          devpi index -c root/{{ devpi_index_name }} bases=root/pypi volatile=False
+          echo "Index root/{{ devpi_index_name }} created"
+        else
+          echo "Index root/{{ devpi_index_name }} already exists, skipping..."
+        fi
+
+        # Set the index as default
+        devpi use root/{{ devpi_index_name }}
+
+        echo "DevPi initialization complete"
+        '
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: init_result
+      changed_when: "'password set' in init_result.stdout or 'created' in init_result.stdout"
+
+    - name: Display initialization result
+      ansible.builtin.debug:
+        var: init_result.stdout_lines
+
     - name: Display deployment summary
       ansible.builtin.debug:
         msg:
@@ -380,4 +435,8 @@
           - "Web interface (Keycloak protected): https://{{ devpi_dashboard_hostname }}"
           - "API endpoint (direct access): https://{{ devpi_api_hostname }}"
           - "Container image: {{ harbor_registry }}/{{ harbor_project }}/{{ app_name }}:{{ image_tag }}"
+          - "-----------------------------------"
+          - "Root user: root"
+          - "Root password: {{ admin_password }}"
+          - "Default index: root/{{ devpi_index_name }}"
           - "-----------------------------------"
