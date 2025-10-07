@@ -30,6 +30,21 @@
     langfuse_hostname: "langfuse.{{ domain_name }}"
 
   tasks:
+    - name: Get Langfuse keys from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: langfuse-config
+        namespace: "{{ k8s_namespace }}"
+      register: langfuse_secret
+      failed_when: langfuse_secret.resources | length == 0
+
+    - name: Set Langfuse keys facts
+      ansible.builtin.set_fact:
+        langfuse_public_key: "{{ langfuse_secret.resources[0].data['LANGFUSE_INIT_PROJECT_PUBLIC_KEY'] | b64decode }}"
+        langfuse_secret_key: "{{ langfuse_secret.resources[0].data['LANGFUSE_INIT_PROJECT_SECRET_KEY'] | b64decode }}"
+
     - name: Create service discovery ConfigMap
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -72,6 +87,14 @@
                   namespace: "{{ k8s_namespace }}"
                   min_replicas: 1
                   can_disable: true
+
+                environment_variables:
+                  - name: LANGFUSE_HOST
+                    value: "https://{{ langfuse_hostname }}"
+                  - name: LANGFUSE_PUBLIC_KEY
+                    value: "{{ langfuse_public_key }}"
+                  - name: LANGFUSE_SECRET_KEY
+                    value: "{{ langfuse_secret_key }}"
 
     - name: Verify ConfigMap creation
       kubernetes.core.k8s_info:
