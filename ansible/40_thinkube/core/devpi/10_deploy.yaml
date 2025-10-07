@@ -250,15 +250,16 @@
         oauth2_proxy_ingress_host: "{{ devpi_dashboard_hostname }}"
         oauth2_proxy_ingress_tls_secret_name: "{{ tls_secret_name }}"
 
-    # Create deployment manifest from template
-    - name: Create DevPi deployment manifest
+    # Create deployment manifest from template WITHOUT outside-url for initialization
+    - name: Create DevPi deployment manifest (without outside-url)
       ansible.builtin.template:
         src: deployment.yaml.j2
         dest: "/tmp/devpi-deployment.yaml"
       vars:
         devpi_image: "{{ harbor_registry }}/library/{{ app_name }}:{{ image_tag }}"
+        devpi_outside_url_enabled: false
 
-    - name: Apply DevPi deployment
+    - name: Apply DevPi deployment (without outside-url)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -439,8 +440,8 @@
                     rm -rf $DEVPI_CLIENTDIR
                     mkdir -p $DEVPI_CLIENTDIR
 
-                    # Connect via devpi-api hostname (no OAuth2)
-                    devpi use https://{{ devpi_api_hostname }} --clientdir=$DEVPI_CLIENTDIR
+                    # Connect via internal service (no outside-url rewriting at this point)
+                    devpi use http://devpi.{{ devpi_namespace }}.svc.cluster.local:3141 --clientdir=$DEVPI_CLIENTDIR
 
                     # Check if root user has a password
                     if devpi login root --password='' --clientdir=$DEVPI_CLIENTDIR 2>&1 | grep -q 'credentials'; then
@@ -488,6 +489,34 @@
     - name: Display initialization logs
       ansible.builtin.debug:
         var: init_logs.stdout_lines
+
+    # Now redeploy with outside-url enabled for proper operation
+    - name: Create DevPi deployment manifest (with outside-url)
+      ansible.builtin.template:
+        src: deployment.yaml.j2
+        dest: "/tmp/devpi-deployment-final.yaml"
+      vars:
+        devpi_image: "{{ harbor_registry }}/library/{{ app_name }}:{{ image_tag }}"
+        devpi_outside_url_enabled: true
+
+    - name: Apply DevPi deployment (with outside-url)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        src: "/tmp/devpi-deployment-final.yaml"
+
+    - name: Wait for DevPi deployment to be ready (after outside-url enabled)
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ app_name }}"
+        namespace: "{{ devpi_namespace }}"
+        wait: true
+        wait_condition:
+          type: Progressing
+          status: "True"
+        wait_timeout: 300
 
     - name: Display deployment summary
       ansible.builtin.debug:
