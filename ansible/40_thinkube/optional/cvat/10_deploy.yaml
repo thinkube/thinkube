@@ -58,9 +58,7 @@
     oauth2_proxy_redis_service: "ephemeral-valkey"  # Match the Valkey service name
     oauth2_proxy_ingress_enabled: true
     oauth2_proxy_cookie_samesite: "none"
-    # Use skip-auth-regex instead of skip-auth-route (works better with ingress)
-    oauth2_proxy_skip_auth_regex:  # Skip OAuth2 for API access (allows cvat-cli to work)
-      - "^/api/"
+    # API access is handled by separate ingress (cvat-api-ingress) without OAuth2
 
     # Valkey settings for OAuth2 session storage
     valkey_namespace: "{{ cvat_namespace }}"
@@ -616,6 +614,42 @@
       ansible.builtin.include_role:
         name: oauth2_proxy
 
+    - name: Create CVAT API Ingress (bypasses OAuth2 for CLI access)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: cvat-api-ingress
+            namespace: "{{ cvat_namespace }}"
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+              nginx.ingress.kubernetes.io/proxy-body-size: "1024m"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "1200"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "1200"
+              nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+              nginx.ingress.kubernetes.io/proxy-buffers-number: "4"
+              # NO auth-url or auth-signin annotations - allows cvat-cli basic auth
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - "{{ cvat_hostname }}"
+                secretName: "{{ cvat_namespace }}-tls-secret"
+            rules:
+              - host: "{{ cvat_hostname }}"
+                http:
+                  paths:
+                    - path: /api
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: cvat-backend
+                          port:
+                            number: 8080
+
     - name: Create CVAT Main Ingress (secured via OAuth2)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -646,13 +680,6 @@
               - host: "{{ cvat_hostname }}"
                 http:
                   paths:
-                    - path: /api
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: cvat-backend
-                          port:
-                            number: 8080
                     - path: /static
                       pathType: Prefix
                       backend:
