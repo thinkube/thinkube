@@ -3,9 +3,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Test script for all CLI tools configured in code-server
-# Usage: /home/thinkube/test-cli-tools.sh
+# Usage: /home/thinkube/test-cli-tools.sh [-v]
+#   -v: Verbose mode - show all command output
 
 set +e  # Don't exit on first error
+
+# Parse command line arguments
+VERBOSE=0
+while getopts "v" opt; do
+    case $opt in
+        v)
+            VERBOSE=1
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            echo "Usage: $0 [-v]"
+            exit 1
+            ;;
+    esac
+done
 
 # Source environment configuration
 [ -f ~/.thinkube_shared_shell/env_setup.sh ] && source ~/.thinkube_shared_shell/env_setup.sh
@@ -34,15 +50,31 @@ test_cli() {
 
     echo -n "Testing ${name}... "
 
-    if eval "$test_command" &>/dev/null; then
-        echo -e "${GREEN}✅ PASS${NC}"
-        ((PASSED_TESTS++))
-    else
-        if [ "$is_optional" = "true" ]; then
-            echo -e "${YELLOW}⊘ SKIP (optional service not installed)${NC}"
+    if [ "$VERBOSE" = "1" ]; then
+        # In verbose mode, show command output
+        if eval "$test_command"; then
+            echo -e "${GREEN}✅ PASS${NC}"
+            ((PASSED_TESTS++))
         else
-            echo -e "${RED}❌ FAIL${NC}"
-            ((FAILED_TESTS++))
+            if [ "$is_optional" = "true" ]; then
+                echo -e "${YELLOW}⊘ SKIP (optional service not installed)${NC}"
+            else
+                echo -e "${RED}❌ FAIL${NC}"
+                ((FAILED_TESTS++))
+            fi
+        fi
+    else
+        # In normal mode, suppress output
+        if eval "$test_command" &>/dev/null; then
+            echo -e "${GREEN}✅ PASS${NC}"
+            ((PASSED_TESTS++))
+        else
+            if [ "$is_optional" = "true" ]; then
+                echo -e "${YELLOW}⊘ SKIP (optional service not installed)${NC}"
+            else
+                echo -e "${RED}❌ FAIL${NC}"
+                ((FAILED_TESTS++))
+            fi
         fi
     fi
 }
@@ -84,14 +116,28 @@ if [ -n "$DEVPI_URL" ] && [ -n "$DEVPI_USERNAME" ] && [ -n "$DEVPI_PASSWORD" ]; 
     # Use temporary clientdir to avoid conflicts with server URL rewriting
     DEVPI_TEST_DIR=$(mktemp -d)
     # Configure devpi to use the API endpoint (no OAuth2)
-    if devpi use "$DEVPI_URL" --clientdir="$DEVPI_TEST_DIR" 2>/dev/null && \
-       devpi login "$DEVPI_USERNAME" --password="$DEVPI_PASSWORD" --clientdir="$DEVPI_TEST_DIR" 2>/dev/null && \
-       devpi use "$DEVPI_INDEX" --clientdir="$DEVPI_TEST_DIR" 2>/dev/null; then
-        echo -e "${GREEN}✅ PASS${NC}"
-        ((PASSED_TESTS++))
+    if [ "$VERBOSE" = "1" ]; then
+        # Verbose mode - show output
+        if devpi use "$DEVPI_URL" --clientdir="$DEVPI_TEST_DIR" && \
+           devpi login "$DEVPI_USERNAME" --password="$DEVPI_PASSWORD" --clientdir="$DEVPI_TEST_DIR" && \
+           devpi use "$DEVPI_INDEX" --clientdir="$DEVPI_TEST_DIR"; then
+            echo -e "${GREEN}✅ PASS${NC}"
+            ((PASSED_TESTS++))
+        else
+            echo -e "${RED}❌ FAIL${NC} (CLI authentication or index access failed)"
+            ((FAILED_TESTS++))
+        fi
     else
-        echo -e "${RED}❌ FAIL${NC} (CLI authentication or index access failed)"
-        ((FAILED_TESTS++))
+        # Normal mode - suppress output
+        if devpi use "$DEVPI_URL" --clientdir="$DEVPI_TEST_DIR" &>/dev/null && \
+           devpi login "$DEVPI_USERNAME" --password="$DEVPI_PASSWORD" --clientdir="$DEVPI_TEST_DIR" &>/dev/null && \
+           devpi use "$DEVPI_INDEX" --clientdir="$DEVPI_TEST_DIR" &>/dev/null; then
+            echo -e "${GREEN}✅ PASS${NC}"
+            ((PASSED_TESTS++))
+        else
+            echo -e "${RED}❌ FAIL${NC} (CLI authentication or index access failed)"
+            ((FAILED_TESTS++))
+        fi
     fi
     rm -rf "$DEVPI_TEST_DIR"
 else
