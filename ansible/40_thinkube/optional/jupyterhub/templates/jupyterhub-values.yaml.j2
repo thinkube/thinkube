@@ -346,10 +346,8 @@ singleuser:
             mkdir -p /home/jovyan/thinkube/notebooks/experiments
             mkdir -p /home/jovyan/thinkube/notebooks/agents
             mkdir -p /home/jovyan/thinkube/notebooks/fine-tuning
-            mkdir -p /home/jovyan/thinkube/notebooks/templates  # For read-only symlink
-            mkdir -p /home/jovyan/thinkube/notebooks/examples   # For editable copies
-
-            # Note: Examples will be copied by notebook startup script
+            mkdir -p /home/jovyan/thinkube/notebooks/templates  # For read-only templates from examples
+            mkdir -p /home/jovyan/thinkube/notebooks/examples   # For editable copies from examples
 
             # Create datasets structure
             mkdir -p /home/jovyan/thinkube/datasets/raw
@@ -392,9 +390,35 @@ singleuser:
           mountPath: /home/jovyan/thinkube/models
         - name: scratch
           mountPath: /home/jovyan/scratch
-        - name: examples
-          mountPath: /home/jovyan/thinkube/examples-repo
-          readOnly: true
+
+    # Clone examples repository on each pod start
+    - name: clone-examples
+      image: alpine/git:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          # Check if examples already exist (from previous pod)
+          if [ -d "/home/jovyan/thinkube/notebooks/examples/.git" ]; then
+            echo "Examples repository already cloned, pulling latest changes..."
+            cd /home/jovyan/thinkube/notebooks/examples
+            git pull origin main || echo "Failed to pull, continuing with existing examples"
+          else
+            echo "Cloning examples repository..."
+            git clone https://github.com/thinkube/jupyter-examples.git /home/jovyan/thinkube/notebooks/examples
+          fi
+
+          # Fix ownership for jovyan user
+          chown -R 1000:100 /home/jovyan/thinkube/notebooks/examples
+          chmod -R 755 /home/jovyan/thinkube/notebooks/examples
+          echo "Examples repository ready"
+      securityContext:
+        runAsUser: 0  # Run as root to clone and set permissions
+      volumeMounts:
+        - name: notebooks
+          mountPath: /home/jovyan/thinkube/notebooks
 
   # MANDATORY: SeaweedFS storage - no fallbacks
   storage:
@@ -421,11 +445,6 @@ singleuser:
       emptyDir:
         sizeLimit: 100Gi
 
-    # Examples repository (read-only)
-    - name: examples
-      persistentVolumeClaim:
-        claimName: jupyterhub-examples-pvc
-
     extraVolumeMounts:
     # Primary notebook storage (SeaweedFS - persistent across nodes)
     - name: notebooks
@@ -442,11 +461,6 @@ singleuser:
     # Fast local scratch space (emptyDir - temporary)
     - name: scratch
       mountPath: /home/jovyan/scratch
-
-    # Examples repository (read-only)
-    - name: examples
-      mountPath: /home/jovyan/thinkube/examples-repo
-      readOnly: true
 
   # Image configuration
   image:

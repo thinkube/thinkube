@@ -80,23 +80,8 @@
               requests:
                 storage: 100Gi
 
-    - name: Create SeaweedFS PVC for examples repository
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: jupyterhub-examples-pvc
-            namespace: "{{ jupyterhub_namespace }}"
-          spec:
-            accessModes:
-              - ReadWriteMany
-            storageClassName: seaweedfs-storage
-            resources:
-              requests:
-                storage: 10Gi
+    # Note: Examples repository is now cloned by init container in each pod
+    # No longer using shared PVC due to SeaweedFS CSI limitations with multi-node RWX
 
     - name: Create SeaweedFS PVC for datasets
       kubernetes.core.k8s:
@@ -160,83 +145,8 @@
             tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
 
-    # Step 5.5: Wait for PVC to be bound before cloning
-    - name: Wait for examples PVC to be bound
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: PersistentVolumeClaim
-        namespace: "{{ jupyterhub_namespace }}"
-        name: jupyterhub-examples-pvc
-      register: pvc_check
-      until: pvc_check.resources[0].status.phase == "Bound"
-      retries: 30
-      delay: 2
-
-    # Step 5.6: Clone examples repository to PVC
-    - name: Delete old clone job if exists
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: absent
-        api_version: batch/v1
-        kind: Job
-        namespace: "{{ jupyterhub_namespace }}"
-        name: clone-jupyter-examples
-
-    - name: Create Job to clone examples repository
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: batch/v1
-          kind: Job
-          metadata:
-            name: clone-jupyter-examples
-            namespace: "{{ jupyterhub_namespace }}"
-          spec:
-            ttlSecondsAfterFinished: 300
-            template:
-              spec:
-                restartPolicy: Never
-                containers:
-                  - name: git-clone
-                    image: alpine/git:latest
-                    command:
-                      - sh
-                      - -c
-                      - |
-                        set -e
-                        if [ -d /examples/jupyter-examples/.git ]; then
-                          echo "Repository already cloned, pulling latest changes..."
-                          cd /examples/jupyter-examples
-                          git pull origin main
-                        else
-                          echo "Cloning examples repository..."
-                          git clone https://github.com/thinkube/jupyter-examples.git /examples/jupyter-examples
-                        fi
-                        echo "Examples repository ready at /examples/jupyter-examples"
-                    volumeMounts:
-                      - name: examples
-                        mountPath: /examples
-                volumes:
-                  - name: examples
-                    persistentVolumeClaim:
-                      claimName: jupyterhub-examples-pvc
-
-    - name: Wait for examples clone job to complete
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: batch/v1
-        kind: Job
-        namespace: "{{ jupyterhub_namespace }}"
-        name: clone-jupyter-examples
-        wait: true
-        wait_condition:
-          type: Complete
-          status: "True"
-        wait_timeout: 300
-      register: clone_job_result
-      failed_when: clone_job_result.resources[0].status.succeeded is not defined or clone_job_result.resources[0].status.succeeded != 1
+    # Step 5.5: Examples are now cloned by init container in each pod
+    # No separate clone job needed - this ensures reliable multi-node operation
 
     # Step 6: Verify images are available in thinkube-control
     # Images are already synced on thinkube-control startup from ConfigMaps
