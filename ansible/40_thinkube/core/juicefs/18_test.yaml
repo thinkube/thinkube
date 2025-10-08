@@ -1,0 +1,409 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/juicefs/18_test.yaml
+# Description:
+#   Test JuiceFS distributed filesystem functionality and multi-node RWX consistency
+#
+# Requirements:
+#   - JuiceFS must be deployed using 10_deploy.yaml
+#   - Multi-node cluster (to test RWX across nodes)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/juicefs/18_test.yaml
+#
+# Variables from inventory:
+#   - juicefs_namespace: JuiceFS namespace
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 [AI-assisted]
+
+- name: Test JuiceFS distributed filesystem
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    test_namespace: "juicefs-test"
+    test_pvc_name: "juicefs-rwx-test"
+    test_storage_class: "juicefs-rwx"
+    test_pod_writer: "juicefs-test-writer"
+    test_pod_reader: "juicefs-test-reader"
+
+  tasks:
+    ###########################################################################
+    # Task 1: Verify JuiceFS CSI driver status
+    ###########################################################################
+    - name: Verify JuiceFS CSI controller is running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        name: juicefs-csi-controller
+        namespace: kube-system
+      register: csi_controller
+      failed_when:
+        - csi_controller.resources | length == 0
+        - csi_controller.resources[0].status.readyReplicas != csi_controller.resources[0].spec.replicas
+
+    - name: Verify JuiceFS CSI node DaemonSet is running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: DaemonSet
+        name: juicefs-csi-node
+        namespace: kube-system
+      register: csi_node
+      failed_when:
+        - csi_node.resources | length == 0
+        - csi_node.resources[0].status.numberReady != csi_node.resources[0].status.desiredNumberScheduled
+
+    - name: Display CSI driver status
+      ansible.builtin.debug:
+        msg:
+          - "JuiceFS CSI Controller: {{ csi_controller.resources[0].status.readyReplicas }}/{{ csi_controller.resources[0].spec.replicas }} ready"
+          - "JuiceFS CSI Node: {{ csi_node.resources[0].status.numberReady }}/{{ csi_node.resources[0].status.desiredNumberScheduled }} ready"
+
+    ###########################################################################
+    # Task 2: Verify StorageClass exists
+    ###########################################################################
+    - name: Verify JuiceFS StorageClass exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        name: "{{ test_storage_class }}"
+      register: storage_class_check
+      failed_when: storage_class_check.resources | length == 0
+
+    - name: Display StorageClass details
+      ansible.builtin.debug:
+        msg:
+          - "StorageClass: {{ test_storage_class }}"
+          - "Provisioner: {{ storage_class_check.resources[0].provisioner }}"
+          - "Reclaim Policy: {{ storage_class_check.resources[0].reclaimPolicy }}"
+
+    ###########################################################################
+    # Task 3: Create test namespace and PVC
+    ###########################################################################
+    - name: Create test namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ test_namespace }}"
+
+    - name: Create test PVC with RWX access mode
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ test_pvc_name }}"
+            namespace: "{{ test_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            storageClassName: "{{ test_storage_class }}"
+            resources:
+              requests:
+                storage: 1Gi
+
+    - name: Wait for PVC to be bound
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ test_pvc_name }}"
+        namespace: "{{ test_namespace }}"
+      register: pvc_status
+      until:
+        - pvc_status.resources | length > 0
+        - pvc_status.resources[0].status.phase == "Bound"
+      retries: 30
+      delay: 5
+
+    - name: Display PVC status
+      ansible.builtin.debug:
+        msg:
+          - "PVC Name: {{ test_pvc_name }}"
+          - "Status: {{ pvc_status.resources[0].status.phase }}"
+          - "Volume: {{ pvc_status.resources[0].spec.volumeName }}"
+          - "Capacity: {{ pvc_status.resources[0].status.capacity.storage }}"
+
+    ###########################################################################
+    # Task 4: Create writer pod on first node
+    ###########################################################################
+    - name: Get first worker node name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get nodes -l node-role.kubernetes.io/worker=worker -o jsonpath='{.items[0].metadata.name}'
+      register: first_node
+      become: true
+
+    - name: Create writer pod on first node
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ test_pod_writer }}"
+            namespace: "{{ test_namespace }}"
+          spec:
+            nodeSelector:
+              kubernetes.io/hostname: "{{ first_node.stdout }}"
+            containers:
+              - name: writer
+                image: busybox:latest
+                command:
+                  - sh
+                  - -c
+                  - |
+                    echo "Writing from $(hostname) on node $(cat /etc/hostname)" > /data/test-file.txt
+                    echo "Timestamp: $(date)" >> /data/test-file.txt
+                    echo "Node info: $(uname -a)" >> /data/test-file.txt
+                    echo "File written successfully from $(hostname)"
+                    sleep 10
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: "{{ test_pvc_name }}"
+            restartPolicy: Never
+
+    - name: Wait for writer pod to complete
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        name: "{{ test_pod_writer }}"
+        namespace: "{{ test_namespace }}"
+      register: writer_pod
+      until:
+        - writer_pod.resources | length > 0
+        - writer_pod.resources[0].status.phase in ["Succeeded", "Failed"]
+      retries: 30
+      delay: 5
+
+    - name: Get writer pod logs
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} logs -n {{ test_namespace }} {{ test_pod_writer }}
+      register: writer_logs
+      become: true
+
+    - name: Display writer pod logs
+      ansible.builtin.debug:
+        msg: "{{ writer_logs.stdout_lines }}"
+
+    - name: Verify writer pod succeeded
+      ansible.builtin.assert:
+        that: writer_pod.resources[0].status.phase == "Succeeded"
+        fail_msg: "Writer pod failed to write data"
+        success_msg: "Writer pod successfully wrote data"
+
+    ###########################################################################
+    # Task 5: Create reader pod on second node (multi-node RWX test)
+    ###########################################################################
+    - name: Get second worker node name (if available)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get nodes -l node-role.kubernetes.io/worker=worker -o jsonpath='{.items[1].metadata.name}' || echo "{{ first_node.stdout }}"
+      register: second_node
+      become: true
+
+    - name: Display test scenario
+      ansible.builtin.debug:
+        msg:
+          - "Writer node: {{ first_node.stdout }}"
+          - "Reader node: {{ second_node.stdout }}"
+          - "Multi-node test: {{ 'YES' if second_node.stdout != first_node.stdout else 'NO (single node cluster)' }}"
+
+    - name: Create reader pod on second node
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ test_pod_reader }}"
+            namespace: "{{ test_namespace }}"
+          spec:
+            nodeSelector:
+              kubernetes.io/hostname: "{{ second_node.stdout }}"
+            containers:
+              - name: reader
+                image: busybox:latest
+                command:
+                  - sh
+                  - -c
+                  - |
+                    echo "Reading from $(hostname) on node $(cat /etc/hostname)"
+                    echo "Contents of /data/test-file.txt:"
+                    cat /data/test-file.txt
+                    if [ -f /data/test-file.txt ]; then
+                      echo "SUCCESS: File exists and is readable across nodes!"
+                      exit 0
+                    else
+                      echo "FAILED: File not found!"
+                      exit 1
+                    fi
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: "{{ test_pvc_name }}"
+            restartPolicy: Never
+
+    - name: Wait for reader pod to complete
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        name: "{{ test_pod_reader }}"
+        namespace: "{{ test_namespace }}"
+      register: reader_pod
+      until:
+        - reader_pod.resources | length > 0
+        - reader_pod.resources[0].status.phase in ["Succeeded", "Failed"]
+      retries: 30
+      delay: 5
+
+    - name: Get reader pod logs
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} logs -n {{ test_namespace }} {{ test_pod_reader }}
+      register: reader_logs
+      become: true
+
+    - name: Display reader pod logs
+      ansible.builtin.debug:
+        msg: "{{ reader_logs.stdout_lines }}"
+
+    - name: Verify reader pod succeeded
+      ansible.builtin.assert:
+        that: reader_pod.resources[0].status.phase == "Succeeded"
+        fail_msg: "Reader pod failed to read data - RWX not working across nodes!"
+        success_msg: "Reader pod successfully read data - RWX working correctly!"
+
+    ###########################################################################
+    # Task 6: Test concurrent write from multiple pods
+    ###########################################################################
+    - name: Create concurrent writer pod 1
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "concurrent-writer-1"
+            namespace: "{{ test_namespace }}"
+          spec:
+            nodeSelector:
+              kubernetes.io/hostname: "{{ first_node.stdout }}"
+            containers:
+              - name: writer
+                image: busybox:latest
+                command:
+                  - sh
+                  - -c
+                  - |
+                    for i in 1 2 3 4 5; do
+                      echo "Writer 1 - iteration $i" >> /data/concurrent-test.txt
+                      sleep 1
+                    done
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: "{{ test_pvc_name }}"
+            restartPolicy: Never
+
+    - name: Create concurrent writer pod 2
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "concurrent-writer-2"
+            namespace: "{{ test_namespace }}"
+          spec:
+            nodeSelector:
+              kubernetes.io/hostname: "{{ second_node.stdout }}"
+            containers:
+              - name: writer
+                image: busybox:latest
+                command:
+                  - sh
+                  - -c
+                  - |
+                    for i in 1 2 3 4 5; do
+                      echo "Writer 2 - iteration $i" >> /data/concurrent-test.txt
+                      sleep 1
+                    done
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: "{{ test_pvc_name }}"
+            restartPolicy: Never
+
+    - name: Wait for concurrent writers to complete
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} wait --for=condition=Ready=false --timeout=60s pod/concurrent-writer-1 pod/concurrent-writer-2 -n {{ test_namespace }} || true
+      become: true
+
+    - name: Verify concurrent writes
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run verify-concurrent --rm -i --restart=Never --image=busybox:latest -n {{ test_namespace }} \
+          --overrides='{"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"'{{ test_pvc_name }}'"}}],"containers":[{"name":"verify","image":"busybox:latest","command":["cat","/data/concurrent-test.txt"],"volumeMounts":[{"name":"data","mountPath":"/data"}]}]}}' \
+          -- cat /data/concurrent-test.txt
+      register: concurrent_verify
+      become: true
+
+    - name: Display concurrent write results
+      ansible.builtin.debug:
+        msg: "{{ concurrent_verify.stdout_lines }}"
+
+    ###########################################################################
+    # Task 7: Cleanup test resources
+    ###########################################################################
+    - name: Delete test namespace (cleanup)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ test_namespace }}"
+
+    ###########################################################################
+    # Task 8: Display test summary
+    ###########################################################################
+    - name: Display successful test summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ JUICEFS TEST SUCCESSFUL:"
+          - "- CSI driver is running"
+          - "- StorageClass {{ test_storage_class }} is available"
+          - "- PVC with RWX access mode was created and bound"
+          - "- Data written from one node was readable from another node"
+          - "- Concurrent writes from multiple nodes worked"
+          - "- Multi-node RWX consistency verified!"

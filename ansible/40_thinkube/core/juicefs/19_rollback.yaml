@@ -1,0 +1,266 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/juicefs/19_rollback.yaml
+# Description:
+#   Rollback JuiceFS deployment by removing all resources
+#   WARNING: This will remove the JuiceFS CSI driver and StorageClass
+#   Any PVCs using the StorageClass will become unusable
+#
+# Requirements:
+#   - JuiceFS must have been deployed using 10_deploy.yaml
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/juicefs/19_rollback.yaml
+#
+# Variables from inventory:
+#   - juicefs_namespace: JuiceFS namespace
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 [AI-assisted]
+
+- name: Rollback JuiceFS distributed filesystem deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Admin password from environment variable
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    # JuiceFS configuration
+    juicefs_storage_class_name: "juicefs-rwx"
+    juicefs_secret_name: "juicefs-secret"
+
+    # PostgreSQL connection
+    postgres_internal_host: "postgresql-official.{{ postgres_namespace }}.svc.cluster.local"
+    postgres_port: "5432"
+    postgres_database: "juicefs"
+
+    # SeaweedFS S3 configuration
+    s3_bucket: "juicefs-data"
+
+  pre_tasks:
+    - name: Check for required variables
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined or item | length == 0
+      loop:
+        - juicefs_namespace
+        - kubectl_bin
+
+    - name: Warning about data loss
+      ansible.builtin.debug:
+        msg:
+          - "⚠️  WARNING: This will remove JuiceFS CSI driver and StorageClass"
+          - "⚠️  Any PVCs using juicefs-rwx StorageClass will become unusable"
+          - "⚠️  Existing data in JuiceFS volumes will be preserved in PostgreSQL/SeaweedFS"
+          - "⚠️  but will be inaccessible without the CSI driver"
+
+  tasks:
+    ###########################################################################
+    # Task 1: Check for active PVCs using JuiceFS
+    ###########################################################################
+    - name: Check for PVCs using JuiceFS StorageClass
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pvc --all-namespaces -o json | \
+        jq -r '.items[] | select(.spec.storageClassName=="'{{ juicefs_storage_class_name }}'") | "\(.metadata.namespace)/\(.metadata.name)"'
+      register: juicefs_pvcs
+      become: true
+      changed_when: false
+      failed_when: false
+
+    - name: Display warning if PVCs exist
+      ansible.builtin.debug:
+        msg:
+          - "⚠️  WARNING: Found {{ juicefs_pvcs.stdout_lines | length }} PVCs using JuiceFS:"
+          - "{{ juicefs_pvcs.stdout_lines }}"
+          - "These PVCs will become unusable after rollback!"
+      when: juicefs_pvcs.stdout_lines | length > 0
+
+    - name: Confirm rollback if PVCs exist
+      ansible.builtin.pause:
+        prompt: "Continue with rollback? (yes/no)"
+      register: confirm_rollback
+      when: juicefs_pvcs.stdout_lines | length > 0
+
+    - name: Abort rollback if not confirmed
+      ansible.builtin.fail:
+        msg: "Rollback aborted by user"
+      when:
+        - juicefs_pvcs.stdout_lines | length > 0
+        - confirm_rollback.user_input | default('no') != 'yes'
+
+    ###########################################################################
+    # Task 2: Remove StorageClass
+    ###########################################################################
+    - name: Check if JuiceFS StorageClass exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get storageclass {{ juicefs_storage_class_name }} --ignore-not-found
+      register: storageclass_exists
+      become: true
+      changed_when: false
+      failed_when: false
+
+    - name: Delete JuiceFS StorageClass
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        definition:
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: "{{ juicefs_storage_class_name }}"
+      when: storageclass_exists.stdout != ""
+      register: delete_storageclass
+
+    ###########################################################################
+    # Task 3: Uninstall JuiceFS CSI Driver (Helm)
+    ###########################################################################
+    - name: Check if JuiceFS CSI driver is installed
+      ansible.builtin.shell: |
+        /snap/bin/helm list -n kube-system | grep juicefs-csi-driver || echo "not-installed"
+      register: helm_check
+      become: true
+      changed_when: false
+
+    - name: Uninstall JuiceFS CSI driver via Helm
+      ansible.builtin.shell: |
+        /snap/bin/helm uninstall juicefs-csi-driver -n kube-system
+      when: "'not-installed' not in helm_check.stdout"
+      register: helm_uninstall
+      become: true
+
+    - name: Wait for CSI driver pods to terminate
+      ansible.builtin.shell: |
+        timeout=60
+        while {{ kubectl_bin }} get pods -n kube-system -l app.kubernetes.io/name=juicefs-csi-driver 2>/dev/null | grep -v "NAME" > /dev/null; do
+          sleep 2
+          timeout=$((timeout - 2))
+          if [ $timeout -le 0 ]; then
+            echo "Timeout waiting for pods to terminate"
+            exit 1
+          fi
+        done
+      when: helm_uninstall is defined and helm_uninstall.changed
+      register: wait_pods
+      become: true
+      failed_when: false
+
+    ###########################################################################
+    # Task 4: Remove JuiceFS configuration secret
+    ###########################################################################
+    - name: Delete JuiceFS configuration secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ juicefs_secret_name }}"
+            namespace: "{{ juicefs_namespace }}"
+      register: delete_secret
+
+    ###########################################################################
+    # Task 5: Clean up S3 bucket (optional - commented out by default)
+    ###########################################################################
+    - name: Display S3 bucket cleanup note
+      ansible.builtin.debug:
+        msg:
+          - "ℹ️  JuiceFS data remains in SeaweedFS bucket: {{ s3_bucket }}"
+          - "ℹ️  To delete data, manually run: s3cmd rb s3://{{ s3_bucket }} --force"
+          - "ℹ️  (Commented out by default to preserve data)"
+
+    # Uncomment to automatically delete S3 bucket and data
+    # - name: Delete S3 bucket for JuiceFS
+    #   ansible.builtin.shell: |
+    #     {{ kubectl_bin }} exec -n {{ seaweedfs_namespace }} -l app.kubernetes.io/component=filer -- \
+    #       sh -c 's3.bucket.delete -name={{ s3_bucket }} | weed shell -master=seaweedfs-master:9333'
+    #   register: bucket_delete
+    #   become: true
+    #   failed_when: false
+
+    ###########################################################################
+    # Task 6: Clean up PostgreSQL database (optional - commented out by default)
+    ###########################################################################
+    - name: Display PostgreSQL cleanup note
+      ansible.builtin.debug:
+        msg:
+          - "ℹ️  JuiceFS metadata remains in PostgreSQL database: {{ postgres_database }}"
+          - "ℹ️  To delete metadata, manually run: DROP DATABASE {{ postgres_database }};"
+          - "ℹ️  (Commented out by default to preserve data)"
+
+    # Uncomment to automatically delete PostgreSQL database
+    # - name: Verify admin password available
+    #   ansible.builtin.assert:
+    #     that: admin_password != ''
+    #     fail_msg: "ADMIN_PASSWORD environment variable must be set"
+    #   when: false  # Change to true to enable
+    #
+    # - name: Delete JuiceFS database from PostgreSQL
+    #   ansible.builtin.shell: |
+    #     {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/postgresql-official -- \
+    #       psql -U {{ admin_username }} -d mydatabase -c "DROP DATABASE IF EXISTS {{ postgres_database }}"
+    #   environment:
+    #     PGPASSWORD: "{{ admin_password }}"
+    #   register: db_delete
+    #   become: true
+    #   when: false  # Change to true to enable
+
+    ###########################################################################
+    # Task 7: Remove JuiceFS namespace (optional)
+    ###########################################################################
+    - name: Check for other resources in JuiceFS namespace
+      ansible.builtin.shell: |
+        resources=$({{ kubectl_bin }} get all -n {{ juicefs_namespace }} -o json 2>/dev/null | jq '.items | length' || echo "0")
+        echo $resources
+      register: remaining_resources
+      become: true
+      changed_when: false
+      failed_when: false
+
+    - name: Delete JuiceFS namespace if empty
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ juicefs_namespace }}"
+      when: remaining_resources.stdout == "0"
+      register: delete_namespace
+
+    ###########################################################################
+    # Task 8: Remove Helm repository (optional)
+    ###########################################################################
+    - name: Remove JuiceFS Helm repository
+      ansible.builtin.shell: |
+        /snap/bin/helm repo remove juicefs
+      register: helm_repo_remove
+      become: true
+      failed_when: false
+      changed_when: "'has been removed' in helm_repo_remove.stdout"
+
+    ###########################################################################
+    # Task 9: Display rollback summary
+    ###########################################################################
+    - name: Display rollback summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ JuiceFS ROLLBACK COMPLETED:"
+          - "- StorageClass deletion: {{ 'Performed' if delete_storageclass is defined and delete_storageclass.changed else 'Not needed' }}"
+          - "- CSI driver uninstall: {{ 'Performed' if helm_uninstall is defined and helm_uninstall.changed else 'Not needed' }}"
+          - "- Configuration secret deletion: {{ 'Performed' if delete_secret is defined and delete_secret.changed else 'Not needed' }}"
+          - "- Namespace deletion: {{ 'Performed' if delete_namespace is defined and delete_namespace.changed else 'Skipped - namespace preserved' }}"
+          - "- Helm repository removal: {{ 'Performed' if helm_repo_remove is defined and helm_repo_remove.changed else 'Not needed' }}"
+          - ""
+          - "DATA PRESERVATION:"
+          - "- PostgreSQL database '{{ postgres_database }}': PRESERVED (manual cleanup required)"
+          - "- SeaweedFS bucket '{{ s3_bucket }}': PRESERVED (manual cleanup required)"
+          - ""
+          - "To completely remove JuiceFS data:"
+          - "1. Delete PostgreSQL database: DROP DATABASE {{ postgres_database }};"
+          - "2. Delete SeaweedFS bucket: s3cmd rb s3://{{ s3_bucket }} --force"

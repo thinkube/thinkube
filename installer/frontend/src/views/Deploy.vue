@@ -371,7 +371,15 @@ const buildPlaybookQueue = () => {
     title: 'Installing SeaweedFS',
     name: 'ansible/40_thinkube/core/seaweedfs/00_install.yaml'
   })
-  
+
+  // JuiceFS for distributed RWX storage (requires PostgreSQL and SeaweedFS)
+  queue.push({
+    id: 'juicefs',
+    phase: 'kubernetes',
+    title: 'Installing JuiceFS Distributed Filesystem',
+    name: 'ansible/40_thinkube/core/juicefs/00_install.yaml'
+  })
+
   // Argo Workflows
   queue.push({
     id: 'argo-workflows',
