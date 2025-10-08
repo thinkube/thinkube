@@ -39,6 +39,9 @@
     # Admin password from environment variable
     admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
+    # Helm binary path
+    helm_bin: /snap/bin/microk8s.helm3
+
     # JuiceFS configuration
     juicefs_volume_name: "thinkube-shared"
     juicefs_storage_class_name: "juicefs-rwx"
@@ -164,8 +167,8 @@
     ###########################################################################
     - name: Add JuiceFS Helm repository
       ansible.builtin.shell: |
-        /snap/bin/helm repo add juicefs https://juicedata.github.io/charts/
-        /snap/bin/helm repo update
+        {{ helm_bin }} repo add juicefs https://juicedata.github.io/charts/
+        {{ helm_bin }} repo update
       register: helm_repo_add
       changed_when: "'has been added' in helm_repo_add.stdout or 'Update Complete' in helm_repo_add.stdout"
       become: true
@@ -202,21 +205,41 @@
       changed_when: false
       become: true
 
-    - name: Install JuiceFS CSI driver via Helm
+    - name: Install JuiceFS CSI driver via Helm using Harbor registry
       ansible.builtin.shell: |
-        /snap/bin/helm install juicefs-csi-driver juicefs/juicefs-csi-driver \
+        {{ helm_bin }} install juicefs-csi-driver juicefs/juicefs-csi-driver \
           --namespace kube-system \
           --version {{ juicefs_csi_version }} \
+          --set image.repository={{ harbor_registry }}/library/juicefs-csi-driver \
+          --set image.tag=v{{ juicefs_csi_version }} \
+          --set sidecars.livenessProbeImage.repository={{ harbor_registry }}/library/livenessprobe \
+          --set sidecars.livenessProbeImage.tag=v2.14.0 \
+          --set sidecars.nodeDriverRegistrarImage.repository={{ harbor_registry }}/library/csi-node-driver-registrar \
+          --set sidecars.nodeDriverRegistrarImage.tag=v2.12.0 \
+          --set sidecars.csiProvisionerImage.repository={{ harbor_registry }}/library/csi-provisioner \
+          --set sidecars.csiProvisionerImage.tag=v5.1.0 \
+          --set jfsMountImage.repository={{ harbor_registry }}/library/juicefs-mount \
+          --set jfsMountImage.tag=ce-v1.2.1 \
           --set storageClasses[0].enabled=false
       when: "'not-installed' in helm_check.stdout"
       register: helm_install
       become: true
 
-    - name: Upgrade JuiceFS CSI driver if already installed
+    - name: Upgrade JuiceFS CSI driver if already installed using Harbor registry
       ansible.builtin.shell: |
-        /snap/bin/helm upgrade juicefs-csi-driver juicefs/juicefs-csi-driver \
+        {{ helm_bin }} upgrade juicefs-csi-driver juicefs/juicefs-csi-driver \
           --namespace kube-system \
           --version {{ juicefs_csi_version }} \
+          --set image.repository={{ harbor_registry }}/library/juicefs-csi-driver \
+          --set image.tag=v{{ juicefs_csi_version }} \
+          --set sidecars.livenessProbeImage.repository={{ harbor_registry }}/library/livenessprobe \
+          --set sidecars.livenessProbeImage.tag=v2.14.0 \
+          --set sidecars.nodeDriverRegistrarImage.repository={{ harbor_registry }}/library/csi-node-driver-registrar \
+          --set sidecars.nodeDriverRegistrarImage.tag=v2.12.0 \
+          --set sidecars.csiProvisionerImage.repository={{ harbor_registry }}/library/csi-provisioner \
+          --set sidecars.csiProvisionerImage.tag=v5.1.0 \
+          --set jfsMountImage.repository={{ harbor_registry }}/library/juicefs-mount \
+          --set jfsMountImage.tag=ce-v1.2.1 \
           --set storageClasses[0].enabled=false
       when: "'not-installed' not in helm_check.stdout"
       register: helm_upgrade
