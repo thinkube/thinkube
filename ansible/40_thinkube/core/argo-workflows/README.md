@@ -5,7 +5,7 @@ This component deploys [Argo Workflows](https://argoproj.github.io/workflows/) a
 ## Features
 
 - Full deployment of Argo Workflows and Argo Events with Keycloak SSO integration
-- Configuration of artifact storage using MinIO
+- Configuration of artifact storage using S3-compatible storage (SeaweedFS)
 - Secure UI and gRPC access with TLS certificates (via cert-manager)
 - CLI installation and token-based authentication
 - Test workflow execution
@@ -16,7 +16,7 @@ This component deploys [Argo Workflows](https://argoproj.github.io/workflows/) a
 - MicroK8s Kubernetes cluster (CORE-001 and CORE-002)
 - Cert-Manager (CORE-003) for TLS certificates
 - Keycloak (CORE-004) for SSO authentication
-- MinIO (CORE-006) for artifact storage
+- S3-compatible storage (SeaweedFS) for artifact storage
 
 ## Deployment
 
@@ -68,7 +68,7 @@ cd ~/thinkube
 ADMIN_PASSWORD=your_password ./scripts/run_ansible.sh ansible/40_thinkube/core/argo-workflows/13_setup_artifacts.yaml
 ```
 
-This integrates Argo with MinIO for artifact storage, creating:
+This integrates Argo with S3-compatible storage for artifact storage, creating:
 - Credentials secret
 - Artifact repository configuration
 - Test workflow with artifact storage
@@ -142,7 +142,7 @@ The following variables are used:
 | `admin_username` | Admin username | `tkadmin` |
 | `auth_realm_username` | Realm username for SSO | `thinkube` |
 | `argo_namespace` | Kubernetes namespace | `argo` |
-| `minio_api_hostname` | MinIO S3 API hostname | `s3.thinkube.com` |
+| `seaweedfs_s3_hostname` | S3 API hostname | `s3.thinkube.com` |
 | `kubeconfig` | Kubernetes config path | `/var/snap/microk8s/current/credentials/client.config` |
 | `kubectl_bin` | Path to kubectl binary | `/snap/bin/microk8s.kubectl` |
 | `helm_bin` | Path to helm binary | `/snap/bin/microk8s.helm3` |
@@ -153,7 +153,7 @@ These environment variables are required:
 
 | Variable | Description |
 |----------|-------------|
-| `ADMIN_PASSWORD` | Admin password for Keycloak and MinIO |
+| `ADMIN_PASSWORD` | Admin password for Keycloak and S3 storage |
 
 ## Troubleshooting
 
@@ -164,10 +164,11 @@ These environment variables are required:
    ./scripts/run_ssh_command.sh tkc "microk8s.kubectl get secret -n argo argo-server-sso -o yaml"
    ```
 
-2. **Artifact Storage Issues**: Check MinIO connectivity
+2. **Artifact Storage Issues**: Check S3 storage connectivity
    ```bash
-   ./scripts/run_ssh_command.sh tkc "mc ls minio/argo-artifacts"
+   ./scripts/run_ssh_command.sh tkc "mc ls s3/argo-artifacts"
    ```
+   Note: 's3' is the mc client alias for the S3 endpoint
 
 3. **Pod Startup Issues**: Check events and logs
    ```bash

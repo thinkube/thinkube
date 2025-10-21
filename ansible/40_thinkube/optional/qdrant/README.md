@@ -219,7 +219,7 @@ await client.createCollection('my_collection', {
 ## Related Components
 
 - **JupyterHub** - For AI model development
-- **MinIO** (CORE-007) - For model and data storage
+- **SeaweedFS** - For model and data storage (S3-compatible)
 - **Argo Workflows** (CORE-010) - For ML pipeline orchestration
 - **Harbor** (CORE-005) - For ML container images
 

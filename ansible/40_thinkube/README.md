@@ -11,7 +11,6 @@ This directory contains the component-based deployment structure for the Thinkub
 │   ├── keycloak/                 # SSO and authentication
 │   ├── postgresql/               # Database services
 │   ├── harbor/                   # Container registry
-│   ├── minio/                    # Object storage
 │   ├── argo-workflows/           # Workflow automation
 │   ├── argocd/                   # GitOps deployment
 │   ├── devpi/                    # Python package repository
@@ -20,7 +19,6 @@ This directory contains the component-based deployment structure for the Thinkub
 │   └── thinkube-dashboard/       # Main dashboard
 └── optional/                      # AWX-deployed components
     ├── prometheus/               # Metrics collection
-    ├── grafana/                  # Metrics visualization
     ├── opensearch/               # Log aggregation
     ├── jupyterhub/               # Data science notebooks
     ├── code-server/              # VS Code in browser

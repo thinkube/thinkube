@@ -1,6 +1,6 @@
 # SeaweedFS Deployment
 
-SeaweedFS is a distributed file storage system with S3-compatible API, deployed as a MinIO alternative.
+SeaweedFS is a distributed file storage system with S3-compatible API for object storage.
 
 ## Overview
 

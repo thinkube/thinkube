@@ -236,7 +236,7 @@ Create visualizations in OpenSearch Dashboards:
 - **Argo Workflows**: Index workflow execution logs
 - **Harbor**: Track container image usage
 - **Gitea**: Analyze code repository activity
-- **MinIO**: Index object storage metadata
+- **SeaweedFS**: Index object storage metadata
 
 ### 7. **Implement Security Policies**
 - Set up fine-grained access control
