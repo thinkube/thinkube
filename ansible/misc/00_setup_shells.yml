@@ -1,0 +1,122 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Clean Thinkube Shell Configuration Playbook with modular structure
+- name: Configure Thinkube shell environments
+  hosts: baremetal
+  become: no
+  vars:
+    user_home: "{{ ansible_env.HOME }}"
+    # Thinkube shared functions directories
+    thinkube_system_dir: "{{ user_home }}/.thinkube_shared_shell"
+    thinkube_system_functions_dir: "{{ thinkube_system_dir }}/functions"
+    thinkube_system_docs_dir: "{{ thinkube_system_dir }}/docs"
+    thinkube_system_aliases_dir: "{{ thinkube_system_dir }}/aliases"
+    # User custom functions directory
+    thinkube_user_dir: "{{ user_home }}/.user_shared_shell"
+    thinkube_user_functions_dir: "{{ thinkube_user_dir }}/functions"
+    thinkube_user_aliases_dir: "{{ thinkube_user_dir }}/aliases"
+    # Configuration directories
+    starship_config_dir: "{{ user_home }}/.config"
+    fish_config_dir: "{{ user_home }}/.config/fish"
+    fisher_plugins:
+      - edc/bass
+      - PatrickF1/fzf.fish
+      - franciscolourenco/done
+      - jorgebucaran/autopair.fish
+    required_packages:
+      - git
+      - curl
+      - zsh
+      - fish
+      - nano
+      - jq
+    # Common aliases for all shells - single definition, multiple renderers
+    common_aliases:
+      - { name: 'll', command: 'ls -la', description: 'List files with details' }
+      - { name: 'la', command: 'ls -A', description: 'List all files' }
+      - { name: 'l', command: 'ls -CF', description: 'List files in columns' }
+      - { name: '..', command: 'cd ..', description: 'Go up one directory' }
+      - { name: '...', command: 'cd ../..', description: 'Go up two directories' }
+      # Git shortcuts
+      - { name: 'g', command: 'git', description: 'Shortcut for git' }
+      - { name: 'gco', command: 'git checkout', description: 'Git checkout' }
+      - { name: 'gst', command: 'git status', description: 'Git status' }
+      - { name: 'gd', command: 'git diff', description: 'Git diff' }
+      - { name: 'gb', command: 'git branch', description: 'Git branch' }
+      # Kubernetes
+      - { name: 'k', command: 'kubectl', description: 'Shortcut for kubectl' }
+      - { name: 'kc', command: 'kubectl', description: 'Alternative kubectl shortcut' }
+      - { name: 'mk', command: 'microk8s kubectl', description: 'MicroK8s kubectl' }
+      - { name: 'kx', command: 'kubectx', description: 'Shortcut for kubectx (if installed)' }
+      - { name: 'kn', command: 'kubens', description: 'Shortcut for kubens (if installed)' }
+      # Ansible
+      - { name: 'ans', command: 'ansible', description: 'Shortcut for ansible' }
+      - { name: 'ansp', command: 'ansible-playbook', description: 'Shortcut for ansible-playbook' }
+      - { name: 'ansl', command: 'ansible-lint', description: 'Shortcut for ansible-lint' }
+      # Other tools
+      - { name: 'tf', command: 'terraform', description: 'Shortcut for terraform' }
+      - { name: 'dk', command: 'docker', description: 'Shortcut for docker' }
+      # SSH with no host checking (development only)
+      - { name: 'sshdev', command: 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null', description: 'SSH with no host checking (development only)' }
+      # Thinkube specific
+      - { name: 'runplay', command: '{{ user_home }}/thinkube/scripts/run_ansible.sh', description: 'Run ansible playbook with proper settings' }
+
+  tasks:
+    # Include modular components
+    - name: Basic setup - Install packages and create directories
+      include_tasks: tasks/00_core_shell_setup.yml
+      tags: [setup, packages]
+      
+    - name: Starship setup - Install and configure Starship prompt
+      include_tasks: tasks/01_starship_setup.yml
+      tags: [starship]
+      
+    # Set default if starship task was skipped
+    - name: Set default starship availability
+      set_fact:
+        starship_available: false
+      when: starship_available is not defined
+      tags: [starship]
+      
+    - name: Functions system - Create and configure shared functions
+      include_tasks: tasks/02_functions_system.yml
+      tags: [functions]
+      
+    - name: Aliases system - Create and configure shared aliases
+      include_tasks: tasks/03_aliases_system.yml
+      tags: [aliases]
+      
+    - name: Fish plugins - Install and configure Fish shell plugins
+      include_tasks: tasks/04_fish_plugins.yml
+      when: skip_fish_plugins is not defined or not skip_fish_plugins
+      tags: [fish, plugins]
+      
+    - name: Shell configuration - Configure shells to load our functions and aliases
+      include_tasks: tasks/05_shell_config.yml
+      tags: [config]
+    
+    # ===== COMPLETION MESSAGE =====
+    - name: Display successful completion message
+      debug:
+        msg: |
+          Thinkube Shell Configuration completed successfully!
+          
+          Key features installed:
+          - Custom Starship prompt with colors inspired by Tokyo Night palette
+          - Dual shared function directories:
+              * System: {{ thinkube_system_dir }}
+              * User: {{ thinkube_user_dir }}
+          - Individual function files (one function per file)
+          - Function documentation (view with show_function_docs)
+          - Dynamic shared aliases system:
+              * Common JSON-based alias definitions
+              * Automatic generation for Bash/Zsh aliases
+              * Automatic generation for Fish abbreviations 
+              * User-extensible via {{ thinkube_user_aliases_dir }} directory
+              * Reload with load_aliases command
+          
+          To use the new functions and aliases, restart your shell or source your config file.
+          Once loaded, use the 'aliases' command to see all available shortcuts.
+      tags: [always]

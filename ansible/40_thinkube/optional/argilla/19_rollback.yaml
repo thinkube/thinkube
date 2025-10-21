@@ -1,0 +1,111 @@
+---
+# ansible/40_thinkube/optional/argilla/19_rollback.yaml
+# Description:
+#   Rollback/uninstall playbook for Argilla
+#   Removes all Argilla resources from the cluster
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/argilla/19_rollback.yaml
+#
+# 🤖 [AI-generated]
+
+- name: Rollback Argilla deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    argilla_namespace: argilla
+    keycloak_url: "https://auth.{{ domain_name }}"
+    keycloak_realm: "thinkube"
+    argilla_client_id: "argilla"
+
+  tasks:
+    - name: Verify kubeconfig is defined
+      ansible.builtin.assert:
+        that:
+          - kubeconfig is defined
+        fail_msg: "kubeconfig is not defined"
+
+    - name: Check if Argilla namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ argilla_namespace }}"
+      register: namespace_check
+
+    - name: Delete Argilla namespace (this will delete all resources in the namespace)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ argilla_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: absent
+        wait: true
+        wait_timeout: 300
+      when: namespace_check.resources | length > 0
+
+    - name: Remove Argilla from Keycloak
+      when:
+        - domain_name is defined
+        - admin_username is defined
+        - admin_password is defined
+      block:
+        - name: Get Keycloak admin token
+          ansible.builtin.uri:
+            url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+            method: POST
+            body_format: form-urlencoded
+            body:
+              client_id: admin-cli
+              username: "{{ admin_username }}"
+              password: "{{ admin_password }}"
+              grant_type: password
+            validate_certs: true
+          register: keycloak_token
+          failed_when: false
+
+        - name: Get Argilla client from Keycloak
+          ansible.builtin.uri:
+            url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ argilla_client_id }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+            validate_certs: true
+          register: argilla_client
+          when: keycloak_token is succeeded
+          failed_when: false
+
+        - name: Delete Argilla client from Keycloak
+          ansible.builtin.uri:
+            url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ argilla_client.json[0].id }}"
+            method: DELETE
+            headers:
+              Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+            validate_certs: true
+            status_code: [204, 404]
+          when:
+            - keycloak_token is succeeded
+            - argilla_client is succeeded
+            - argilla_client.json | length > 0
+          failed_when: false
+
+    - name: Verify namespace is deleted
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ argilla_namespace }}"
+      register: final_check
+      failed_when: final_check.resources | length > 0
+
+    - name: Display rollback status
+      ansible.builtin.debug:
+        msg:
+          - "Argilla has been successfully removed from the cluster"
+          - "All resources in the {{ argilla_namespace }} namespace have been deleted"
+          - "Keycloak client configuration has been removed"

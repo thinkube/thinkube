@@ -1,0 +1,40 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Debug Keycloak Authentication
+  hosts: microk8s_control_plane
+  gather_facts: false
+  
+  vars:
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+  tasks:
+    - name: Show environment info
+      ansible.builtin.debug:
+        msg: |
+          Username: {{ admin_username }}
+          URL: {{ keycloak_url }}
+          Environment ADMIN_PASSWORD is set: {{ (lookup('env', 'ADMIN_PASSWORD') != '') | ternary('yes', 'no') }}
+          
+    - name: Check pod environment variables
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: keycloak
+        pod: "{{ pod_name }}"
+        command: env
+      register: pod_env
+      vars:
+        pod_name: "{{ lookup('kubernetes.core.k8s', api_version='v1', kind='Pod', namespace='keycloak', label_selector='app=keycloak').metadata.name }}"
+      ignore_errors: true
+      
+    - name: Test with curl directly
+      ansible.builtin.shell: |
+        curl -k -X POST "{{ keycloak_url }}/realms/master/protocol/openid-connect/token" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          -d "grant_type=password&client_id=admin-cli&username={{ admin_username }}&password={{ admin_password }}"
+      register: curl_result
+      
+    - name: Show curl result
+      ansible.builtin.debug:
+        var: curl_result.stdout

@@ -1,0 +1,105 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/opensearch/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for OpenSearch by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - OpenSearch must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/opensearch/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Configure OpenSearch service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    opensearch_namespace: opensearch
+
+  tasks:
+    - name: Get admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: opensearch
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "opensearch"
+          data:
+            service.yaml: |
+              service:
+                name: opensearch
+                display_name: "OpenSearch Dashboards"
+                description: "Search and analytics dashboard"
+                type: optional
+                category: storage
+                icon: /icons/tk_search.svg
+                
+                endpoints:
+                  - name: web
+                    type: http
+                    url: "https://osd.{{ domain_name }}/auth/openid/captureUrlFragment"
+                    health_url: "https://osd.{{ domain_name }}/api/status"
+                    description: "Dashboard interface"
+                    primary: true
+                    
+                dependencies: []
+                  
+                scaling:
+                  resource_type: statefulset
+                  resource_name: opensearch-cluster-master
+                  namespace: opensearch
+                  min_replicas: 1
+                  can_disable: true
+
+                environment_variables:
+                  - name: OPENSEARCH_URL
+                    value: "https://opensearch.{{ domain_name }}"
+                  - name: OPENSEARCH_HOST
+                    value: "opensearch.{{ domain_name }}"
+                  - name: OPENSEARCH_PORT
+                    value: "443"
+                  - name: OPENSEARCH_USER
+                    value: "admin"
+                  - name: OPENSEARCH_PASSWORD
+                    value: "{{ admin_password }}"
+                  - name: OPENSEARCH_DASHBOARDS_URL
+                    value: "https://osd.{{ domain_name }}"
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: opensearch
+      register: configmap_info
+      
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for OpenSearch"
+      when: configmap_info.resources | length > 0
+
+    - name: Update code-server environment variables
+      include_role:
+        name: code_server_env_update

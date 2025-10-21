@@ -1,0 +1,292 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/postgresql/18_test.yaml
+# Description:
+#   Test PostgreSQL deployment functionality
+#
+# Requirements:
+#   - PostgreSQL must be deployed using 10_deploy.yaml
+#   - PostgreSQL client installed on control node
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/postgresql/18_test.yaml
+#
+# Variables from inventory:
+#   - admin_username: PostgreSQL admin user
+#   - admin_password: PostgreSQL admin password
+#   - postgres_hostname: Hostname for PostgreSQL access
+#   - kubectl_bin: Path to kubectl binary
+
+- name: Test PostgreSQL deployment
+  hosts: microk8s_control_plane  # Use microk8s_control_plane (NOT k8s-control-node or gato-p)
+  gather_facts: true
+  vars:
+    postgres_release_name: "postgresql-official"
+    postgres_database: "mydatabase"
+    postgres_tcp_port: 5432
+    postgres_tls_secret_name: "{{ postgres_namespace }}-tls-secret"
+    
+    # User authentication using standard approach
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  pre_tasks:
+    - name: Verify admin password available
+      ansible.builtin.assert:
+        that: admin_password != ''
+        fail_msg: "ADMIN_PASSWORD environment variable must be set"
+        success_msg: "Admin password loaded from environment"
+    
+    - name: Check for required variables
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined or item | length == 0
+      with_items:
+        - admin_username
+        - postgres_hostname
+        - kubectl_bin
+
+  tasks:
+    ###########################################################################
+    # Task 1) INSTALL PostgreSQL client
+    ###########################################################################
+    - name: Install PostgreSQL client if not present
+      ansible.builtin.apt:
+        name: postgresql-client
+        state: present
+        update_cache: true
+      become: true
+
+    ###########################################################################
+    # Task 2) VERIFY PostgreSQL pod and service status
+    ###########################################################################
+    - name: Verify PostgreSQL pod status
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get pods -n {{ postgres_namespace }} -l app=postgres-official -o jsonpath='{.items[0].status.phase}'
+      register: postgres_pod_status
+      changed_when: false
+      
+    - name: Display PostgreSQL pod status
+      ansible.builtin.debug:
+        msg: "PostgreSQL pod status: {{ postgres_pod_status.stdout }}"
+      failed_when: postgres_pod_status.stdout != 'Running'
+
+    - name: Wait for PostgreSQL Service endpoints
+      ansible.builtin.shell: |
+        attempt=1
+        max_attempts=30
+        until {{ kubectl_bin }} get endpoints -n {{ postgres_namespace }} {{ postgres_release_name }} \
+          | grep -v "not ready" || [ $attempt -eq $max_attempts ]; do
+          sleep 2
+          attempt=$((attempt + 1))
+        done
+      become: true
+      register: wait_for_service
+      failed_when: wait_for_service.rc != 0
+
+    ###########################################################################
+    # Task 3) TEST in-cluster connection using ephemeral Pod
+    ###########################################################################
+    - name: Delete existing psql-test Pod if exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pod psql-test -n {{ postgres_namespace }} --force --grace-period=0 2>/dev/null || true
+      become: true
+      changed_when: false
+
+    - name: Create ephemeral psql-test Pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run psql-test \
+          --image=quay.io/sclorg/postgresql-16-c9s:latest \
+          --restart=Never \
+          --namespace {{ postgres_namespace }} \
+          --command -- \
+            sh -c "sleep 5 && PGPASSWORD='{{ admin_password }}' psql -h {{ postgres_release_name }} -U {{ admin_username }} -d {{ postgres_database }} -c 'SELECT version();' || echo 'Connection failed'"
+      become: true
+      register: ephemeral_pod
+
+    - name: Wait for ephemeral psql-test Pod to complete
+      ansible.builtin.shell: |
+        attempt=1
+        max_attempts=20
+        while [ $attempt -le $max_attempts ]; do
+          status=$({{ kubectl_bin }} get pod psql-test -n {{ postgres_namespace }} -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+          if [ "$status" = "Succeeded" ] || [ "$status" = "Failed" ] || [ "$status" = "NotFound" ]; then
+            exit 0
+          fi
+          sleep 1
+          attempt=$((attempt+1))
+        done
+        exit 1
+      become: true
+      register: wait_for_pod
+      failed_when: wait_for_pod.rc != 0
+
+    - name: Get logs from ephemeral psql-test Pod
+      ansible.builtin.shell: "{{ kubectl_bin }} logs psql-test -n {{ postgres_namespace }}"
+      become: true
+      register: psql_test_logs
+      ignore_errors: true
+
+    - name: Display in-cluster psql test logs
+      ansible.builtin.debug:
+        var: psql_test_logs.stdout_lines
+      failed_when: "'PostgreSQL' not in psql_test_logs.stdout"
+
+    - name: Delete ephemeral psql-test Pod
+      ansible.builtin.shell: "{{ kubectl_bin }} delete pod psql-test -n {{ postgres_namespace }}"
+      become: true
+      ignore_errors: true
+
+    ###########################################################################
+    # Task 4) TEST external connection via Ingress
+    ###########################################################################
+    - name: Verify PostgreSQL port is accessible via netcat
+      ansible.builtin.shell: |
+        nc -zv {{ postgres_hostname }} {{ postgres_tcp_port }} -w 5
+      become: true
+      register: nc_test
+      failed_when: nc_test.rc != 0
+
+    - name: Display netcat test results
+      ansible.builtin.debug:
+        var: nc_test.stdout_lines
+        
+    - name: Test PostgreSQL connection through NGINX Ingress (without SSL)
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ admin_password }}" \
+        psql -h "{{ postgres_hostname }}" \
+        -p {{ postgres_tcp_port }} \
+        -U "{{ admin_username }}" \
+        -d "{{ postgres_database }}" \
+        -v ON_ERROR_STOP=1 \
+        -c "SELECT version();"
+      become: true
+      register: postgres_test
+      failed_when: postgres_test.rc != 0
+
+    - name: Display PostgreSQL connection test results
+      ansible.builtin.debug:
+        var: postgres_test.stdout_lines
+      failed_when: "'PostgreSQL' not in postgres_test.stdout"
+
+    ###########################################################################
+    # Task 5) TEST admin privileges
+    ###########################################################################
+    - name: Test database creation privileges
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ admin_password }}" \
+        psql -h "{{ postgres_hostname }}" \
+        -p {{ postgres_tcp_port }} \
+        -U "{{ admin_username }}" \
+        -d "{{ postgres_database }}" \
+        -v ON_ERROR_STOP=1 \
+        -c "CREATE DATABASE test_privileges_db;"
+      become: true
+      register: create_test_db
+      failed_when: create_test_db.rc != 0
+      
+    - name: Drop test database
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ admin_password }}" \
+        psql -h "{{ postgres_hostname }}" \
+        -p {{ postgres_tcp_port }} \
+        -U "{{ admin_username }}" \
+        -d "{{ postgres_database }}" \
+        -v ON_ERROR_STOP=1 \
+        -c "DROP DATABASE test_privileges_db;"
+      become: true
+      register: drop_test_db
+      failed_when: drop_test_db.rc != 0
+      
+    - name: Display admin privileges test results
+      ansible.builtin.debug:
+        msg: "✅ Admin privileges verified - user can create and drop databases"
+
+    ###########################################################################
+    # Task 6) TEST data persistence
+    ###########################################################################
+    - name: Create test table to verify persistence
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ admin_password }}" \
+        psql -h "{{ postgres_hostname }}" \
+        -p {{ postgres_tcp_port }} \
+        -U "{{ admin_username }}" \
+        -d "{{ postgres_database }}" \
+        -v ON_ERROR_STOP=1 \
+        -c "CREATE TABLE IF NOT EXISTS persistence_test(id SERIAL PRIMARY KEY, test_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);"
+      become: true
+      register: create_table
+      failed_when: create_table.rc != 0
+
+    - name: Insert data into test table
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ admin_password }}" \
+        psql -h "{{ postgres_hostname }}" \
+        -p {{ postgres_tcp_port }} \
+        -U "{{ admin_username }}" \
+        -d "{{ postgres_database }}" \
+        -v ON_ERROR_STOP=1 \
+        -c "INSERT INTO persistence_test(id) VALUES (DEFAULT) RETURNING id, test_date;"
+      become: true
+      register: insert_data
+      failed_when: insert_data.rc != 0
+
+    - name: Display inserted data
+      ansible.builtin.debug:
+        var: insert_data.stdout_lines
+
+    - name: Restart PostgreSQL pod to test persistence
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pod -n {{ postgres_namespace }} -l app=postgres-official
+      become: true
+      register: restart_pod
+      changed_when: restart_pod.rc == 0
+
+    - name: Wait for PostgreSQL pod to be ready again
+      ansible.builtin.shell: |
+        attempt=1
+        max_attempts=30
+        until {{ kubectl_bin }} get pods -n {{ postgres_namespace }} -l app=postgres-official \
+          | grep "Running" || [ $attempt -eq $max_attempts ]; do
+          sleep 2
+          attempt=$((attempt + 1))
+        done
+      become: true
+      register: wait_for_pg
+      failed_when: wait_for_pg.rc != 0
+
+    - name: Wait additional time for Pod to initialize
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Verify data still exists after pod restart
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ admin_password }}" \
+        psql -h "{{ postgres_hostname }}" \
+        -p {{ postgres_tcp_port }} \
+        -U "{{ admin_username }}" \
+        -d "{{ postgres_database }}" \
+        -v ON_ERROR_STOP=1 \
+        -c "SELECT * FROM persistence_test ORDER BY id DESC LIMIT 5;"
+      become: true
+      register: verify_data
+      failed_when: verify_data.rc != 0
+
+    - name: Display persistence test results
+      ansible.builtin.debug:
+        var: verify_data.stdout_lines
+      failed_when: "'(0 rows)' in verify_data.stdout"
+
+    ###########################################################################
+    # Task 6) OVERALL test summary
+    ###########################################################################
+    - name: Display successful test summary
+      ansible.builtin.debug:
+        msg: |
+          ✅ PostgreSQL TEST SUCCESSFUL:
+          - Pod is running
+          - In-cluster connectivity works
+          - External connectivity via Ingress works
+          - Data persistence verified (survived pod restart)

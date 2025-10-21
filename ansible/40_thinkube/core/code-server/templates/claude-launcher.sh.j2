@@ -1,0 +1,85 @@
+#!/bin/bash
+
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Thinkube Claude Code Launcher
+# Reads configuration from .thinkube/claude-config if present
+
+# Ensure npm global bin is in PATH
+export PATH=/home/thinkube/.npm-global/bin:$PATH
+
+# Function to find .thinkube directory in current or parent directories
+find_thinkube_config() {
+    local dir="$1"
+    while [ "$dir" != "/" ]; do
+        if [ -d "$dir/.thinkube" ]; then
+            echo "$dir/.thinkube"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+# Get the directory to launch from
+LAUNCH_DIR="${1:-$(pwd)}"
+cd "$LAUNCH_DIR" || exit 1
+
+# Find .thinkube configuration
+CONFIG_DIR=$(find_thinkube_config "$LAUNCH_DIR")
+CLAUDE_ARGS=""
+
+if [ -n "$CONFIG_DIR" ]; then
+    # Read additional directories from config
+    if [ -f "$CONFIG_DIR/claude-config" ]; then
+        echo "Loading Thinkube Claude configuration from $CONFIG_DIR/claude-config"
+        
+        # Read additional directories
+        while IFS= read -r line; do
+            # Skip comments and empty lines
+            [[ "$line" =~ ^#.*$ ]] && continue
+            [[ -z "$line" ]] && continue
+            
+            # Handle add-dir entries
+            if [[ "$line" =~ ^add-dir:(.*)$ ]]; then
+                DIR_PATH="${BASH_REMATCH[1]}"
+                # Trim whitespace
+                DIR_PATH=$(echo "$DIR_PATH" | xargs)
+                # Expand ~ to home directory
+                DIR_PATH="${DIR_PATH/#\~/$HOME}"
+                # Make absolute if relative
+                if [[ ! "$DIR_PATH" = /* ]]; then
+                    DIR_PATH="$(dirname "$CONFIG_DIR")/$DIR_PATH"
+                fi
+                # Add if directory exists
+                if [ -d "$DIR_PATH" ]; then
+                    CLAUDE_ARGS="$CLAUDE_ARGS --add-dir \"$DIR_PATH\""
+                    echo "  Adding directory: $DIR_PATH"
+                else
+                    echo "  Warning: Directory not found: $DIR_PATH"
+                fi
+            fi
+        done < "$CONFIG_DIR/claude-config"
+    fi
+    
+    # Check for project-specific environment variables
+    if [ -f "$CONFIG_DIR/claude-env" ]; then
+        echo "Loading environment from $CONFIG_DIR/claude-env"
+        source "$CONFIG_DIR/claude-env"
+    fi
+fi
+
+# Check for continue flag
+if [ "$2" = "--continue" ]; then
+    CLAUDE_ARGS="$CLAUDE_ARGS --continue"
+fi
+
+# Launch Claude with configuration
+echo "Launching Claude Code in: $LAUNCH_DIR"
+if [ -n "$CLAUDE_ARGS" ]; then
+    echo "With arguments: $CLAUDE_ARGS"
+    eval "claude $CLAUDE_ARGS"
+else
+    claude
+fi

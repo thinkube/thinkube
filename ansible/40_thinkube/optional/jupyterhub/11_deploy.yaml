@@ -1,0 +1,351 @@
+---
+# ansible/40_thinkube/optional/jupyterhub/10_deploy.yaml
+# Description:
+#   Deploys JupyterHub with dynamic image discovery from thinkube-control
+#   Fast deployment (2 minutes) - no image building
+#
+# Requirements:
+#   - Harbor registry must be accessible
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the installation
+#   - harbor_registry: Harbor registry URL
+#   - admin_username: Administrator username
+#   - jupyterhub_client_secret: OAuth client secret for Keycloak
+#   - keycloak_realm: Keycloak realm name
+#
+# Dependencies:
+#   - CORE-002 (Harbor) must be complete
+#   - CORE-003 (Keycloak) must be complete
+#   - CORE (JuiceFS) must be complete for RWX storage
+#
+# 🤖 AI-assisted
+
+- name: Deploy JupyterHub with Dynamic Image Discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    jupyterhub_namespace: jupyterhub
+    jupyterhub_version: "4.2.0"
+    kubeconfig: /var/snap/microk8s/current/credentials/client.config
+    helm_bin: /snap/bin/microk8s.helm3
+    helm_repo_name: jupyterhub
+    helm_repo_url: https://hub.jupyter.org/helm-chart/
+
+  tasks:
+    # Step 1: Read the OIDC secret created by Keycloak configuration
+    - name: Get JupyterHub OIDC secret from Kubernetes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ jupyterhub_namespace }}"
+        name: jupyterhub-oidc-secret
+      register: oidc_secret
+      failed_when: oidc_secret.resources | length == 0
+
+    - name: Set client secret fact
+      ansible.builtin.set_fact:
+        jupyterhub_client_secret: "{{ oidc_secret.resources[0].data.client_secret | b64decode }}"
+
+    # Step 2: Create namespace
+    - name: Create JupyterHub namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ jupyterhub_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    # Step 3: Create JuiceFS RWX PVCs for JupyterHub storage
+    - name: Create JuiceFS RWX PVC for notebooks
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: jupyterhub-notebooks-pvc
+            namespace: "{{ jupyterhub_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            storageClassName: juicefs-rwx
+            resources:
+              requests:
+                storage: 100Gi
+
+    # Note: JuiceFS provides true multi-node RWX storage
+    # Examples repository can now be shared across all GPU nodes reliably
+
+    - name: Create JuiceFS RWX PVC for datasets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: jupyterhub-datasets-pvc
+            namespace: "{{ jupyterhub_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            storageClassName: juicefs-rwx
+            resources:
+              requests:
+                storage: 500Gi
+
+    - name: Create JuiceFS RWX PVC for models
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: jupyterhub-models-pvc
+            namespace: "{{ jupyterhub_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            storageClassName: juicefs-rwx
+            resources:
+              requests:
+                storage: 200Gi
+
+    # Step 4: Get wildcard certificate from default namespace
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: thinkube-com-tls
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to JupyterHub namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: jupyterhub-tls-secret
+            namespace: "{{ jupyterhub_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    # Step 5: Create service discovery resources
+    - name: Create service discovery script ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: jupyter-service-discovery-script
+            namespace: "{{ jupyterhub_namespace }}"
+          data:
+            service-discovery-init.sh: |
+              {{ lookup('file', playbook_dir + '/templates/service-discovery-init.sh') }}
+
+    - name: Create ServiceAccount for service discovery
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: jupyter-service-discovery
+            namespace: "{{ jupyterhub_namespace }}"
+
+    - name: Create ClusterRole for ConfigMap and Secret reading
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: jupyter-configmap-reader
+          rules:
+            - apiGroups: [""]
+              resources: ["configmaps", "secrets"]
+              verbs: ["get", "list"]
+
+    - name: Create ClusterRoleBinding for service discovery
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: jupyter-service-discovery-binding
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: jupyter-configmap-reader
+          subjects:
+            - kind: ServiceAccount
+              name: jupyter-service-discovery
+              namespace: "{{ jupyterhub_namespace }}"
+
+    # Step 5.5: Examples are now cloned by init container in each pod
+    # No separate clone job needed - this ensures reliable multi-node operation
+
+    # Step 6: Verify images are available in thinkube-control
+    # Images are already synced on thinkube-control startup from ConfigMaps
+    - name: Check if Jupyter images are available
+      ansible.builtin.uri:
+        url: "https://control.{{ domain_name }}/api/v1/images/jupyter"
+        method: GET
+        timeout: 10
+        validate_certs: yes
+      register: jupyter_images_check
+      failed_when: false
+
+    - name: Display available Jupyter images
+      ansible.builtin.debug:
+        msg: "Found {{ jupyter_images_check.json | length }} Jupyter images available"
+      when: jupyter_images_check.status == 200
+
+    # Step 7: Add JupyterHub Helm repository (if not already added)
+    - name: Check if JupyterHub Helm repository is already added
+      ansible.builtin.command: "{{ helm_bin }} repo list"
+      register: helm_repo_list
+      changed_when: false
+      failed_when: false
+
+    - name: Add JupyterHub Helm repository
+      ansible.builtin.command: "{{ helm_bin }} repo add {{ helm_repo_name }} {{ helm_repo_url }}"
+      when: helm_repo_name not in helm_repo_list.stdout
+      changed_when: true
+
+    - name: Update Helm repositories (only if repo was just added)
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+      when: helm_repo_name not in helm_repo_list.stdout
+      changed_when: false
+
+    # Step 8: Create values file from template
+    - name: Create temporary directory for JupyterHub configuration
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: jupyterhub
+      register: temp_dir
+
+    - name: Template JupyterHub values file
+      ansible.builtin.template:
+        src: jupyterhub-values.yaml.j2
+        dest: "{{ temp_dir.path }}/values.yaml"
+        mode: '0644'
+
+    # Step 8: Deploy JupyterHub using Helm
+    - name: Deploy JupyterHub
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        name: jupyterhub
+        chart_ref: "{{ helm_repo_name }}/jupyterhub"
+        release_namespace: "{{ jupyterhub_namespace }}"
+        create_namespace: false
+        kubeconfig: "{{ kubeconfig }}"
+        values_files:
+          - "{{ temp_dir.path }}/values.yaml"
+        wait: true
+        wait_timeout: 10m
+        state: present
+        chart_version: "{{ jupyterhub_version }}"
+
+    # Step 9: Create Ingress for JupyterHub
+    - name: Create JupyterHub Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: jupyterhub-ingress
+            namespace: "{{ jupyterhub_namespace }}"
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+              nginx.ingress.kubernetes.io/proxy-body-size: "0"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+              nginx.ingress.kubernetes.io/websocket-services: proxy-public
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - "jupyter.{{ domain_name }}"
+                secretName: jupyterhub-tls-secret
+            rules:
+              - host: "jupyter.{{ domain_name }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: proxy-public
+                          port:
+                            number: 80
+
+    # Step 10: Wait for JupyterHub to be ready
+    - name: Wait for JupyterHub hub pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ jupyterhub_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=jupyterhub
+          - component=hub
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+
+    - name: Wait for JupyterHub proxy pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ jupyterhub_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=jupyterhub
+          - component=proxy
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+
+    # Step 11: Clean up temporary directory
+    - name: Clean up temporary directory
+      ansible.builtin.file:
+        path: "{{ temp_dir.path }}"
+        state: absent
+
+    # Step 12: Display access information
+    - name: Display JupyterHub access information
+      ansible.builtin.debug:
+        msg:
+          - "JupyterHub has been deployed successfully!"
+          - "Access URL: https://jupyter.{{ domain_name }}"
+          - "Authentication: Keycloak (username: {{ admin_username }})"
+          - "Images will be discovered dynamically from thinkube-control"
+          - "Deployment completed in < 2 minutes (no image building)"

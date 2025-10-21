@@ -1,0 +1,104 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 39_rollback_gpu_reservation_08.yaml - Partially rollback GPU reservation for PCI 08:00.0
+#
+# Purpose:
+#   Updates VFIO configuration to only reserve the GPU at 01:00.0 for passthrough
+#   Frees the GPU at 08:00.0 for use by the host system directly
+#
+# Run with: 
+#   ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/39_rollback_gpu_reservation_08.yaml
+#   Or with helper script:
+#   ./scripts/run_ansible.sh ansible/00_initial_setup/39_rollback_gpu_reservation_08.yaml -l bcn1
+
+- name: Partially Rollback GPU Reservation for 08:00.0
+  hosts: bcn1
+  gather_facts: true
+  become: true
+  
+  tasks:
+    - name: Display rollback information
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          🔄 Rolling Back GPU Reservation for 08:00.0 ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          This playbook will update the VFIO configuration to only reserve
+          the GPU at PCI slot 01:00.0 for VM passthrough, while freeing
+          the GPU at PCI slot 08:00.0 for use by the host system directly.
+          
+          This is necessary because the GPU at 08:00.0 is in IOMMU Group 16,
+          which also contains essential system devices like network controllers,
+          storage controllers, and USB controllers that cannot be passed through.
+          
+          ═════════════════════════════════════════════════════════
+    
+    # Phase 1: Check current VFIO configuration
+    - name: Check current VFIO configuration
+      ansible.builtin.command: cat /etc/modprobe.d/vfio.conf
+      register: current_vfio
+      changed_when: false
+    
+    - name: Display current VFIO configuration
+      ansible.builtin.debug:
+        msg: |
+          Current VFIO configuration:
+          {{ current_vfio.stdout }}
+    
+    # Phase 2: Get information about the NVIDIA GPUs
+    - name: Get information about NVIDIA GPUs
+      ansible.builtin.shell: |
+        lspci -nnk | grep -A3 "VGA.*NVIDIA" | grep -B1 "01:00.0\|01:00.1"
+      register: nvidia_gpu_info
+      changed_when: false
+    
+    - name: Display NVIDIA GPU information
+      ansible.builtin.debug:
+        msg: |
+          NVIDIA GPU at 01:00.0 (for passthrough):
+          {{ nvidia_gpu_info.stdout }}
+    
+    # Phase 3: Update VFIO configuration for 01:00.0 only
+    - name: Update VFIO configuration to only include 01:00.0 GPU
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/vfio.conf
+        content: |
+          # Only reserve the GPU at 01:00.0 and its audio controller for passthrough
+          options vfio-pci ids=10de:2204,10de:1aef
+        mode: '0644'
+      register: vfio_updated
+    
+    # Phase 4: Update initramfs if any changes were made
+    - name: Update initramfs
+      ansible.builtin.command: update-initramfs -u
+      when: vfio_updated.changed
+    
+    # Phase 5: Display completion message
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          ✅ Partial GPU Reservation Rollback Complete ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          The system has been configured to:
+          - Keep GPU at 01:00.0 reserved for VM passthrough
+          - Free GPU at 08:00.0 for use by the host system directly
+          
+          IMPORTANT: This configuration update only modifies which devices
+          are bound to the VFIO driver. It does not change the IOMMU groups,
+          which are determined by the hardware and BIOS.
+          
+          ⚠️ IMPORTANT: A system reboot is required for changes to take effect.
+          
+          NEXT STEPS:
+          1. Reboot the system: sudo reboot
+          2. After reboot, verify that 01:00.0 uses vfio-pci and 08:00.0 uses nvidia driver
+          3. Continue with LXD setup playbooks
+          
+          ═════════════════════════════════════════════════════════

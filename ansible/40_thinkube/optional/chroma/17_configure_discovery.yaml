@@ -1,0 +1,119 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/chroma/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for Chroma by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - Chroma must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/chroma/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Configure Chroma service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    chroma_namespace: "chroma"
+    chroma_hostname: "chroma.{{ domain_name }}"
+
+  tasks:
+    - name: Get Chroma auth token from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: chroma-auth
+        namespace: "{{ chroma_namespace }}"
+      register: chroma_secret
+
+    - name: Set Chroma auth token fact
+      ansible.builtin.set_fact:
+        chroma_auth_token: "{{ chroma_secret.resources[0].data['auth-token'] | b64decode }}"
+
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: "{{ chroma_namespace }}"
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "chroma"
+          data:
+            service.yaml: |
+              service:
+                name: chroma
+                display_name: "Chroma"
+                description: "Open-source embedding database for AI applications"
+                type: optional
+                category: ai
+                icon: /icons/tk_vector.svg
+
+                endpoints:
+                  - name: api
+                    type: http
+                    url: "https://{{ chroma_hostname }}"
+                    health_url: "https://{{ chroma_hostname }}/api/v2/heartbeat"
+                    description: "REST API endpoint"
+                    primary: true
+
+                dependencies: []
+
+                scaling:
+                  resource_type: statefulset
+                  resource_name: chroma
+                  namespace: "{{ chroma_namespace }}"
+                  min_replicas: 1
+                  can_disable: true
+
+                metadata:
+                  authentication: token
+                  persistence: true
+                  license: "Apache-2.0"
+
+                environment_variables:
+                  - name: CHROMA_API_URL
+                    value: "https://{{ chroma_hostname }}"
+                  - name: CHROMA_AUTH_TOKEN
+                    value: "{{ chroma_auth_token }}"
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ chroma_namespace }}"
+        name: thinkube-service-config
+      register: configmap_check
+
+    - name: Display service discovery status
+      ansible.builtin.debug:
+        msg: |
+          Service discovery configured for Chroma
+
+          Service registered with:
+          - Name: chroma
+          - Category: ai
+          - Primary endpoint: https://{{ chroma_hostname }}
+          - Health endpoint: https://{{ chroma_hostname }}/api/v1/heartbeat
+    - name: Update code-server environment variables
+      include_role:
+        name: code_server_env_update

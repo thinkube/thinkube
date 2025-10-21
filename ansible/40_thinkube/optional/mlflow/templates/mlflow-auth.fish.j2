@@ -1,0 +1,47 @@
+#!/usr/bin/env fish
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# MLflow Authentication Helper (Fish shell version)
+# Gets a token from Keycloak and sets MLFLOW_TRACKING_TOKEN
+# Usage: source ~/mlflow-auth.fish
+
+if test -z "$MLFLOW_AUTH_USERNAME"; or test -z "$MLFLOW_AUTH_PASSWORD"; or test -z "$MLFLOW_KEYCLOAK_TOKEN_URL"
+    echo "Error: MLflow authentication variables not set. Please run:"
+    echo "  ./scripts/run_ansible.sh ansible/40_thinkube/optional/mlflow/17_configure_discovery.yaml"
+    echo "  ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/15_configure_environment.yaml"
+    return 1
+end
+
+# Debug: Print variables (remove after debugging)
+echo "DEBUG: MLFLOW_KEYCLOAK_TOKEN_URL=$MLFLOW_KEYCLOAK_TOKEN_URL"
+echo "DEBUG: MLFLOW_KEYCLOAK_CLIENT_ID=$MLFLOW_KEYCLOAK_CLIENT_ID"
+echo "DEBUG: MLFLOW_AUTH_USERNAME=$MLFLOW_AUTH_USERNAME"
+echo "DEBUG: About to curl..."
+
+# Get token from Keycloak using Resource Owner Password Credentials flow
+set TEMP_TOKEN_FILE (mktemp)
+curl -s -k --max-time 10 -X POST "$MLFLOW_KEYCLOAK_TOKEN_URL" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=password" \
+    -d "client_id=$MLFLOW_KEYCLOAK_CLIENT_ID" \
+    -d "client_secret=$MLFLOW_CLIENT_SECRET" \
+    -d "username=$MLFLOW_AUTH_USERNAME" \
+    -d "password=$MLFLOW_AUTH_PASSWORD" > $TEMP_TOKEN_FILE
+
+echo "DEBUG: curl completed, exit code: $status"
+
+# Extract access token
+set -gx MLFLOW_TRACKING_TOKEN (python3 -c 'import json, sys; data = json.load(open(sys.argv[1])); print(data.get("access_token", ""))' $TEMP_TOKEN_FILE)
+
+if test -z "$MLFLOW_TRACKING_TOKEN"
+    echo "Error: Failed to parse token from Keycloak response"
+    cat $TEMP_TOKEN_FILE
+    rm -f $TEMP_TOKEN_FILE
+    return 1
+end
+
+set expires_in (python3 -c 'import json, sys; data = json.load(open(sys.argv[1])); print(data.get("expires_in", "unknown"))' $TEMP_TOKEN_FILE)
+rm -f $TEMP_TOKEN_FILE
+
+echo "MLflow authentication successful. Token expires in $expires_in seconds."

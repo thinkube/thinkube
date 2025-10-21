@@ -1,0 +1,145 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/code-server/16_refresh_config.yaml
+# Description:
+#   Quick refresh of code-server configuration without full rollback/redeploy
+#   Use this during development to apply configuration changes
+#
+# Requirements:
+#   - code-server must be deployed and running
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/16_refresh_config.yaml
+#
+# What this does:
+#   1. Clears all shell configuration (functions, aliases, rc files)
+#   2. Clears VS Code workspace state (last folder, window position, etc.)
+#   3. Re-runs shell configuration (14_configure_shell.yaml)
+#   4. Restarts code-server pod to apply changes
+#
+# What this KEEPS:
+#   - Kubernetes deployment (no redeploy needed)
+#   - Extensions (if working)
+#   - User data in workspace directories
+#   - npm/python packages (unless you want to clear them too)
+#
+# 🤖 [AI-generated]
+
+- name: Refresh code-server configuration
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    code_server_namespace: "code-server"
+    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
+
+  tasks:
+    - name: Get code-server pod name
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        kind: Pod
+        label_selectors:
+          - app=code-server
+      register: codeserver_pods
+      failed_when: codeserver_pods.resources | length == 0
+
+    - name: Set code-server pod name
+      ansible.builtin.set_fact:
+        codeserver_pod: "{{ codeserver_pods.resources[0].metadata.name }}"
+
+    ###################################################################
+    # 1) Clear shell configuration in the running pod
+    ###################################################################
+    - name: Clear shell configuration in running pod
+      ansible.builtin.shell: |
+        microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+          bash -c "
+            rm -rf /home/thinkube/.thinkube_shared_shell/
+            rm -rf /home/thinkube/.user_shared_shell/
+            rm -f /home/thinkube/.bashrc
+            rm -f /home/thinkube/.zshrc
+            rm -rf /home/thinkube/.config/fish/config.fish
+            rm -rf /home/thinkube/.config/fish/functions/
+            rm -rf /home/thinkube/.config/fish/conf.d/
+            echo '✅ Cleared shell configuration in container'
+          "
+      register: clear_container
+      failed_when: false
+
+    - name: Display container cleanup result
+      ansible.builtin.debug:
+        var: clear_container.stdout_lines
+
+    ###################################################################
+    # 2) Clear persistent shell configuration on host
+    ###################################################################
+    - name: Clear persistent shell configuration
+      ansible.builtin.shell: |
+        rm -rf /home/{{ system_username }}/shared-code/.thinkube_shared_shell/
+        rm -rf /home/{{ system_username }}/shared-code/.user_shared_shell/
+        rm -f /home/{{ system_username }}/shared-code/.bashrc
+        rm -f /home/{{ system_username }}/shared-code/.zshrc
+        rm -rf /home/{{ system_username }}/shared-code/.config/fish/config.fish
+        rm -rf /home/{{ system_username }}/shared-code/.config/fish/functions/
+        rm -rf /home/{{ system_username }}/shared-code/.config/fish/conf.d/
+        echo "✅ Cleared persistent shell configuration"
+      register: clear_persistent
+      failed_when: false
+
+    - name: Display persistent cleanup result
+      ansible.builtin.debug:
+        var: clear_persistent.stdout_lines
+
+    ###################################################################
+    # 3) Clear VS Code workspace state (last folder, etc.)
+    ###################################################################
+    - name: Clear VS Code workspace state
+      ansible.builtin.shell: |
+        rm -rf /home/{{ system_username }}/shared-code/.local/share/code-server/Machine/
+        rm -rf /home/{{ system_username }}/shared-code/.local/share/code-server/machineid
+        rm -rf /home/{{ system_username }}/shared-code/.local/share/code-server/globalStorage/
+        rm -rf /home/{{ system_username }}/shared-code/.local/share/code-server/workspaceStorage/
+        rm -rf /home/{{ system_username }}/shared-code/.local/share/code-server/state.vscdb*
+        rm -rf /home/{{ system_username }}/shared-code/.local/share/code-server/Backups/
+        echo "✅ Cleared VS Code workspace state"
+      register: clear_vscode
+      failed_when: false
+
+    - name: Display VS Code cleanup result
+      ansible.builtin.debug:
+        var: clear_vscode.stdout_lines
+
+    ###################################################################
+    # 4) Restart pod to apply changes (do this BEFORE reconfiguring)
+    ###################################################################
+    - name: Restart code-server pod
+      ansible.builtin.shell: |
+        microk8s.kubectl delete pod {{ codeserver_pod }} -n {{ code_server_namespace }}
+      register: pod_restart
+
+    - name: Wait for new pod to be ready
+      ansible.builtin.shell: |
+        microk8s.kubectl wait --for=condition=Ready \
+          pod -l app=code-server \
+          -n {{ code_server_namespace }} \
+          --timeout=300s
+      register: pod_ready
+
+    - name: Display restart completion
+      ansible.builtin.debug:
+        msg:
+          - "✅ Configuration cleanup and pod restart completed"
+          - "-----------------------------------"
+          - "Cleared shell configuration (container + persistent)"
+          - "Cleared VS Code workspace state"
+          - "Restarted pod"
+          - "-----------------------------------"
+          - ""
+          - "🔄 Now run shell configuration:"
+          - "   ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/14_configure_shell.yaml"
+          - ""
+          - "💡 TIP: This is much faster than full rollback + redeploy"

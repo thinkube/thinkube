@@ -1,0 +1,116 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/10_baremetal_infra/10-3_restart_servers_ordered.yaml
+# Description:
+#   Orchestrated restart of all baremetal servers after network bridge configuration
+#   Restarts remote servers first, then the local management server
+#
+# Requirements:
+#   - Network bridge configuration must be applied (10-2 completed)
+#   - SSH connectivity to all servers
+#   - Elevated permissions for restart
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/10_baremetal_infra/10-3_restart_servers_ordered.yaml
+#
+# Variables from inventory:
+#   - ansible_connection: Identifies local vs remote servers
+#
+# 🤖 AI-assisted
+
+# PLAY 1: Restart remote servers first
+- name: Restart remote baremetal servers
+  hosts: baremetal:!management
+  gather_facts: true
+  become: true
+  serial: 1  # Restart one at a time to maintain some availability
+  
+  tasks:
+    - name: Display restart notification
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════════════
+          🔄 Restarting Remote Server: {{ inventory_hostname }}
+          ═══════════════════════════════════════════════════════════════════
+          This server will restart to apply network bridge configuration
+          
+    - name: Schedule system restart in 10 seconds
+      ansible.builtin.command: |
+        shutdown -r +0 "Applying network bridge configuration - restarting now"
+      async: 1
+      poll: 0
+      ignore_errors: true
+      
+    - name: Wait for server to go down
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        state: stopped
+        delay: 10
+        timeout: 60
+      delegate_to: localhost
+      
+    - name: Wait for server to come back online
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        state: started
+        delay: 30
+        timeout: 300
+      delegate_to: localhost
+      
+    - name: Wait for SSH to be fully ready
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 300
+
+    - name: Verify server is back online
+      ansible.builtin.ping:
+      register: ping_result
+      
+    - name: Display server status
+      ansible.builtin.debug:
+        msg: "✓ {{ inventory_hostname }} is back online and ready"
+
+# PLAY 2: Notify about local server restart
+- name: Prepare for local server restart
+  hosts: management
+  gather_facts: false
+  
+  tasks:
+    - name: Check if all remote servers are online
+      ansible.builtin.ping:
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['baremetal'] | difference(groups['management']) }}"
+      
+    - name: Display local restart notice
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════════════
+          ✓ All Remote Servers Successfully Restarted
+          ═══════════════════════════════════════════════════════════════════
+          
+          The management server ({{ inventory_hostname }}) needs to restart next.
+          
+          IMPORTANT: Save your work and close the Thinkube Installer.
+          
+          This server will restart in 30 seconds.
+          After restart, reopen the Thinkube Installer to continue.
+          
+          Your deployment progress is automatically saved.
+          ═══════════════════════════════════════════════════════════════════
+          
+    - name: Wait 30 seconds before restarting local server
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Preparing to restart management server..."
+        
+    - name: Restart local management server
+      ansible.builtin.command: |
+        shutdown -r now "Applying network bridge configuration"
+      become: true
+      async: 1
+      poll: 0

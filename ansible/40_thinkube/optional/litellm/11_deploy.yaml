@@ -1,0 +1,480 @@
+---
+# ansible/40_thinkube/optional/litellm/10_deploy.yaml
+# Description:
+#   Deploy LiteLLM proxy server on Kubernetes
+#   Provides unified API for multiple LLM providers with cost tracking and load balancing
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - Harbor registry must be available
+#   - PostgreSQL must be deployed (for usage tracking and team management)
+#   - SeaweedFS must be deployed (for S3-compatible response caching)
+#   - ADMIN_PASSWORD environment variable must be set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/litellm/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#   - harbor_registry: Harbor registry URL
+#   - admin_username: Admin username
+#
+# 🤖 [AI-generated]
+
+- name: Deploy LiteLLM on Kubernetes
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    litellm_namespace: litellm
+    litellm_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/litellm:latest"
+    litellm_hostname: "litellm.{{ domain_name }}"
+    # Get admin password from environment like other optional components
+    admin_password: "{{ lookup('env','ADMIN_PASSWORD') }}"
+
+  tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+          - harbor_registry is defined
+          - admin_username is defined
+          - lookup('env','ADMIN_PASSWORD') != ""
+        fail_msg: "Required variables are not defined. Please check your inventory or environment."
+
+    - name: Create LiteLLM namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ litellm_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Generate LiteLLM master key
+      ansible.builtin.set_fact:
+        litellm_master_key: "sk-{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Get Keycloak admin token to retrieve client secret
+      ansible.builtin.uri:
+        url: "https://auth.{{ domain_name }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: password
+        validate_certs: true
+      register: keycloak_token
+
+    - name: Get LiteLLM client details from Keycloak
+      ansible.builtin.uri:
+        url: "https://auth.{{ domain_name }}/admin/realms/{{ keycloak_realm }}/clients?clientId=litellm"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+      register: litellm_client
+
+    - name: Get client secret from Keycloak
+      ansible.builtin.uri:
+        url: "https://auth.{{ domain_name }}/admin/realms/{{ keycloak_realm }}/clients/{{ litellm_client.json[0].id }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+      register: client_secret_response
+      when: litellm_client.json | length > 0
+
+    - name: Set client secret from Keycloak
+      ansible.builtin.set_fact:
+        litellm_client_secret: "{{ client_secret_response.json.value }}"
+      when: client_secret_response.json.value is defined
+
+
+    - name: Check PostgreSQL service exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: postgres
+        name: postgresql-official
+      register: postgres_service
+      failed_when: postgres_service.resources | length == 0
+
+    - name: Get SeaweedFS S3 service info
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: seaweedfs
+        name: seaweedfs-s3
+      register: seaweedfs_service
+      failed_when: seaweedfs_service.resources | length == 0
+
+    - name: Create LiteLLM secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: litellm-secrets
+            namespace: "{{ litellm_namespace }}"
+          type: Opaque
+          stringData:
+            LITELLM_MASTER_KEY: "{{ litellm_master_key }}"
+            LITELLM_SALT_KEY: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+            ADMIN_USERNAME: "{{ admin_username }}"
+            ADMIN_PASSWORD: "{{ admin_password }}"
+            DATABASE_URL: "postgresql://{{ admin_username }}:{{ admin_password }}@postgresql-official.postgres.svc.cluster.local:5432/litellm"
+            CLIENT_SECRET: "{{ litellm_client_secret }}"
+            # SeaweedFS S3 credentials (using admin for now, should create specific user later)
+            S3_BUCKET_NAME: "litellm-cache"
+            S3_REGION_NAME: "us-east-1"
+            S3_ENDPOINT_URL: "http://seaweedfs-s3.seaweedfs.svc.cluster.local:8333"
+            S3_AWS_ACCESS_KEY_ID: "{{ admin_username }}"
+            S3_AWS_SECRET_ACCESS_KEY: "{{ admin_password }}"
+
+    - name: Create LiteLLM ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: litellm-config
+            namespace: "{{ litellm_namespace }}"
+          data:
+            config.yaml: |
+              database_url: os.environ/DATABASE_URL
+
+              general_settings:
+                master_key: os.environ/LITELLM_MASTER_KEY
+                salt_key: os.environ/LITELLM_SALT_KEY
+                proxy_batch_write_at: 60
+                disable_spend_logs: false
+                ui_access_mode: "all"
+                database_connection_pool_limit: 10
+                allow_requests_on_db_unavailable: true
+
+              # Caching configuration
+              litellm_settings:
+                cache: true
+                cache_params:
+                  type: s3
+                  s3_bucket_name: os.environ/S3_BUCKET_NAME
+                  s3_region_name: os.environ/S3_REGION_NAME
+                  s3_endpoint_url: os.environ/S3_ENDPOINT_URL
+                  s3_aws_access_key_id: os.environ/S3_AWS_ACCESS_KEY_ID
+                  s3_aws_secret_access_key: os.environ/S3_AWS_SECRET_ACCESS_KEY
+                  supported_call_types:
+                    - completion
+                    - acompletion
+                    - embedding
+                    - aembedding
+                  ttl: 3600  # Cache for 1 hour by default
+
+              model_list:
+                # Users will configure their own models via the UI
+                # This is just a placeholder
+                - model_name: "test-model"
+                  litellm_params:
+                    model: "openai/gpt-3.5-turbo"
+                    api_key: "os.environ/OPENAI_API_KEY"  # Will be set via UI
+
+    - name: Create PersistentVolumeClaim for LiteLLM data
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: litellm-data-pvc
+            namespace: "{{ litellm_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 5Gi
+
+    - name: Deploy LiteLLM
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: litellm
+            namespace: "{{ litellm_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: litellm
+            template:
+              metadata:
+                labels:
+                  app: litellm
+              spec:
+                containers:
+                  - name: litellm
+                    image: "{{ litellm_image }}"
+                    command:
+                      - "litellm"
+                      - "--port"
+                      - "4000"
+                      - "--config"
+                      - "/app/config.yaml"
+                    ports:
+                      - containerPort: 4000
+                        name: http
+                    env:
+                      - name: LITELLM_MASTER_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: LITELLM_MASTER_KEY
+                      - name: LITELLM_SALT_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: LITELLM_SALT_KEY
+                      - name: UI_USERNAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: ADMIN_USERNAME
+                      - name: UI_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: ADMIN_PASSWORD
+                      - name: STORE_MODEL_IN_DB
+                        value: "True"
+                      - name: PROXY_BASE_URL
+                        value: "https://{{ litellm_hostname }}"
+                      - name: ALLOWED_IPS
+                        value: ""
+                      - name: DROP_PARAMS
+                        value: "False"
+                      - name: LITELLM_MODE
+                        value: "PRODUCTION"
+                      - name: DATABASE_URL
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: DATABASE_URL
+                      - name: GENERIC_CLIENT_ID
+                        value: "litellm"
+                      - name: GENERIC_CLIENT_SECRET
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: CLIENT_SECRET
+                      - name: GENERIC_AUTHORIZATION_ENDPOINT
+                        value: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/auth"
+                      - name: GENERIC_TOKEN_ENDPOINT
+                        value: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
+                      - name: GENERIC_USERINFO_ENDPOINT
+                        value: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/userinfo"
+                      - name: GENERIC_SCOPE
+                        value: "openid profile email roles"
+                      - name: PROXY_ADMIN_ID
+                        value: "{{ auth_realm_username }}"
+                      - name: LITELLM_PROXY_ADMIN_ROLE
+                        value: "AI_ADMIN"
+                      - name: GENERIC_USER_ROLE_ATTRIBUTE
+                        value: "realm_access.roles"
+                      - name: GENERIC_USER_ID_ATTRIBUTE
+                        value: "preferred_username"
+                      - name: GENERIC_USER_EMAIL_ATTRIBUTE
+                        value: "email"
+                      - name: S3_BUCKET_NAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: S3_BUCKET_NAME
+                      - name: S3_REGION_NAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: S3_REGION_NAME
+                      - name: S3_ENDPOINT_URL
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: S3_ENDPOINT_URL
+                      - name: S3_AWS_ACCESS_KEY_ID
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: S3_AWS_ACCESS_KEY_ID
+                      - name: S3_AWS_SECRET_ACCESS_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: litellm-secrets
+                            key: S3_AWS_SECRET_ACCESS_KEY
+                    volumeMounts:
+                      - name: config
+                        mountPath: /app/config.yaml
+                        subPath: config.yaml
+                      - name: data
+                        mountPath: /app/data
+                    livenessProbe:
+                      httpGet:
+                        path: /health/liveliness
+                        port: http
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /health/readiness
+                        port: http
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                    resources:
+                      requests:
+                        memory: "256Mi"
+                        cpu: "100m"
+                      limits:
+                        memory: "1Gi"
+                        cpu: "500m"
+                volumes:
+                  - name: config
+                    configMap:
+                      name: litellm-config
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: litellm-data-pvc
+                initContainers:
+                  - name: wait-for-postgres
+                    image: busybox:1.35
+                    command: ['sh', '-c', 'until nc -z postgresql-official.postgres.svc.cluster.local 5432; do echo waiting for postgres; sleep 2; done;']
+                  - name: wait-for-seaweedfs
+                    image: busybox:1.35
+                    command: ['sh', '-c', 'until nc -z seaweedfs-s3.seaweedfs.svc.cluster.local 8333; do echo waiting for seaweedfs; sleep 2; done;']
+                  - name: init-db
+                    image: "{{ harbor_registry }}/{{ library_project | default('library') }}/postgres:16-alpine"
+                    env:
+                      - name: PGPASSWORD
+                        value: "{{ admin_password }}"
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        echo "Creating LiteLLM database if it doesn't exist..."
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'litellm'" | grep -q 1 || psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "CREATE DATABASE litellm"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE litellm TO {{ admin_username }}"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "ALTER DATABASE litellm OWNER TO {{ admin_username }}"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d litellm -c "GRANT ALL ON SCHEMA public TO {{ admin_username }}"
+                        echo "Database initialization complete."
+
+    - name: Create LiteLLM Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: litellm
+            namespace: "{{ litellm_namespace }}"
+          spec:
+            selector:
+              app: litellm
+            ports:
+              - port: 80
+                targetPort: 4000
+                name: http
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: thinkube-com-tls
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to LiteLLM namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ litellm_namespace }}-tls-secret"
+            namespace: "{{ litellm_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Create LiteLLM Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: litellm
+            namespace: "{{ litellm_namespace }}"
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+              nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+              nginx.ingress.kubernetes.io/proxy-connect-timeout: "600"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - "{{ litellm_hostname }}"
+                secretName: "{{ litellm_namespace }}-tls-secret"
+            rules:
+              - host: "{{ litellm_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: litellm
+                          port:
+                            number: 80
+
+    - name: Wait for LiteLLM deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ litellm_namespace }}"
+        name: litellm
+      register: deployment_status
+      until:
+        - deployment_status.resources is defined
+        - deployment_status.resources | length > 0
+        - deployment_status.resources[0].status.replicas is defined
+        - deployment_status.resources[0].status.readyReplicas is defined
+        - deployment_status.resources[0].status.replicas == deployment_status.resources[0].status.readyReplicas
+      retries: 30
+      delay: 10
+
+    - name: Display deployment status
+      ansible.builtin.debug:
+        msg:
+          - "LiteLLM has been deployed successfully!"
+          - "Access URL: https://{{ litellm_hostname }}"
+          - "Master key stored in secret: litellm-secrets"

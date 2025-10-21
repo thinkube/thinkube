@@ -1,0 +1,279 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/superset/18_test.yaml
+# Description:
+#   Test Apache Superset deployment
+#
+# This playbook verifies:
+#   1. Namespace exists
+#   2. Deployment is ready
+#   3. Pods are running
+#   4. Service is accessible
+#   5. Ingress is configured
+#   6. Database connection works
+#   7. Valkey cache connection works
+#   8. Web UI is accessible
+#
+# Requirements:
+#   - Superset must be deployed (11_deploy.yaml)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/superset/18_test.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - domain_name: Base domain
+#   - admin_username: Superset admin username
+#   - admin_password: Superset admin password
+#
+# 🤖 AI-assisted
+
+- name: Test Apache Superset deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    superset_namespace: "superset"
+    superset_app_name: "superset"
+    superset_hostname: "superset.{{ domain_name }}"
+    superset_url: "https://{{ superset_hostname }}"
+    valkey_service: "valkey.valkey.svc.cluster.local"
+    valkey_port: 6379
+
+  tasks:
+    ###########################################################################
+    # Test 1: Namespace
+    ###########################################################################
+    - name: Test 1 - Check if Superset namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Namespace
+        name: "{{ superset_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Test 1 - PASS
+      ansible.builtin.debug:
+        msg: "✓ Namespace '{{ superset_namespace }}' exists"
+
+    ###########################################################################
+    # Test 2: Deployment
+    ###########################################################################
+    - name: Test 2 - Check if Superset deployment exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ superset_namespace }}"
+        kind: Deployment
+        name: "{{ superset_app_name }}"
+      register: deployment_check
+      failed_when: deployment_check.resources | length == 0
+
+    - name: Test 2 - Verify deployment is ready
+      ansible.builtin.assert:
+        that:
+          - deployment_check.resources[0].status.readyReplicas is defined
+          - deployment_check.resources[0].status.readyReplicas > 0
+        fail_msg: "Deployment is not ready"
+
+    - name: Test 2 - PASS
+      ansible.builtin.debug:
+        msg: "✓ Deployment '{{ superset_app_name }}' is ready ({{ deployment_check.resources[0].status.readyReplicas }} replicas)"
+
+    ###########################################################################
+    # Test 3: Pods
+    ###########################################################################
+    - name: Test 3 - Check if Superset pods are running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ superset_namespace }}"
+        kind: Pod
+        label_selectors:
+          - "app={{ superset_app_name }}"
+      register: pod_check
+      failed_when: pod_check.resources | length == 0
+
+    - name: Test 3 - Verify all pods are running
+      ansible.builtin.assert:
+        that:
+          - item.status.phase == 'Running'
+          - item.status.containerStatuses | selectattr('name', 'equalto', 'superset') | first | json_query('ready') == true
+        fail_msg: "Pod {{ item.metadata.name }} is not running or not ready"
+      loop: "{{ pod_check.resources }}"
+
+    - name: Test 3 - PASS
+      ansible.builtin.debug:
+        msg: "✓ All {{ pod_check.resources | length }} Superset pod(s) are running and ready"
+
+    ###########################################################################
+    # Test 4: Service
+    ###########################################################################
+    - name: Test 4 - Check if Superset service exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ superset_namespace }}"
+        kind: Service
+        name: "{{ superset_app_name }}"
+      register: service_check
+      failed_when: service_check.resources | length == 0
+
+    - name: Test 4 - Verify service has endpoints
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ superset_namespace }}"
+        kind: Endpoints
+        name: "{{ superset_app_name }}"
+      register: endpoints_check
+      failed_when: >
+        endpoints_check.resources | length == 0 or
+        endpoints_check.resources[0].subsets is not defined or
+        endpoints_check.resources[0].subsets | length == 0
+
+    - name: Test 4 - PASS
+      ansible.builtin.debug:
+        msg: "✓ Service '{{ superset_app_name }}' exists and has active endpoints"
+
+    ###########################################################################
+    # Test 5: Ingress
+    ###########################################################################
+    - name: Test 5 - Check if Superset ingress exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ superset_namespace }}"
+        kind: Ingress
+        name: "{{ superset_app_name }}"
+      register: ingress_check
+      failed_when: ingress_check.resources | length == 0
+
+    - name: Test 5 - Verify ingress has correct hostname
+      ansible.builtin.assert:
+        that:
+          - ingress_check.resources[0].spec.rules[0].host == superset_hostname
+        fail_msg: "Ingress hostname mismatch"
+
+    - name: Test 5 - PASS
+      ansible.builtin.debug:
+        msg: "✓ Ingress configured for '{{ superset_hostname }}'"
+
+    ###########################################################################
+    # Test 6: Configuration Secret
+    ###########################################################################
+    - name: Test 6 - Check if Superset configuration secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ superset_namespace }}"
+        kind: Secret
+        name: superset-config
+      register: config_secret_check
+      failed_when: config_secret_check.resources | length == 0
+
+    - name: Test 6 - Verify configuration has superset_config.py
+      ansible.builtin.assert:
+        that:
+          - config_secret_check.resources[0].data['superset_config.py'] is defined
+        fail_msg: "Configuration secret missing superset_config.py"
+
+    - name: Test 6 - PASS
+      ansible.builtin.debug:
+        msg: "✓ Superset configuration secret exists"
+
+    ###########################################################################
+    # Test 7: Valkey connection
+    ###########################################################################
+    - name: Test 7 - Get Superset pod name for exec
+      ansible.builtin.set_fact:
+        test_pod_name: "{{ pod_check.resources[0].metadata.name }}"
+
+    - name: Test 7 - Test Valkey connection from Superset pod
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ superset_namespace }}"
+        pod: "{{ test_pod_name }}"
+        container: superset
+        command: >
+          python3 -c "
+          import redis;
+          r = redis.Redis(host='{{ valkey_service }}', port={{ valkey_port }}, db=1);
+          r.ping();
+          print('Valkey connection successful')
+          "
+      register: valkey_test
+      failed_when: "'Valkey connection successful' not in valkey_test.stdout"
+
+    - name: Test 7 - PASS
+      ansible.builtin.debug:
+        msg: "✓ Valkey cache connection working"
+
+    ###########################################################################
+    # Test 8: Web UI accessibility
+    ###########################################################################
+    - name: Test 8 - Check if Superset web UI is accessible
+      ansible.builtin.uri:
+        url: "{{ superset_url }}/health"
+        method: GET
+        validate_certs: true
+        status_code: 200
+      register: health_check
+
+    - name: Test 8 - PASS
+      ansible.builtin.debug:
+        msg: "✓ Superset web UI is accessible at {{ superset_url }}"
+
+    ###########################################################################
+    # Test 9: Login functionality
+    ###########################################################################
+    - name: Test 9 - Test login to Superset
+      ansible.builtin.uri:
+        url: "{{ superset_url }}/api/v1/security/login"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          provider: "db"
+          refresh: true
+        validate_certs: true
+        status_code: 200
+      register: login_test
+
+    - name: Test 9 - Verify access token received
+      ansible.builtin.assert:
+        that:
+          - login_test.json.access_token is defined
+        fail_msg: "Login did not return access token"
+
+    - name: Test 9 - PASS
+      ansible.builtin.debug:
+        msg: "✓ Login functionality working"
+
+    ###########################################################################
+    # Test Summary
+    ###########################################################################
+    - name: All tests passed
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════════════"
+          - "All Superset tests PASSED ✓"
+          - "════════════════════════════════════════════════════════"
+          - ""
+          - "Superset deployment is healthy and functional"
+          - "URL: {{ superset_url }}"
+          - "Username: {{ admin_username }}"
+          - ""
+          - "Test results:"
+          - "  ✓ Namespace exists"
+          - "  ✓ Deployment ready"
+          - "  ✓ Pods running"
+          - "  ✓ Service accessible"
+          - "  ✓ Ingress configured"
+          - "  ✓ Configuration secret exists"
+          - "  ✓ Valkey cache connection working"
+          - "  ✓ Web UI accessible"
+          - "  ✓ Login functionality working"
+          - ""
+          - "Next steps:"
+          - "  - Configure Keycloak SSO (12_configure_keycloak.yaml)"
+          - "  - Add data sources (13_configure_datasources.yaml)"
+          - "  - Create dashboards in the UI"

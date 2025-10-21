@@ -1,0 +1,330 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/prometheus/11_deploy.yaml
+# Description:
+#   Deploy Prometheus Operator with kube-prometheus stack including all recording rules
+#
+# This playbook follows the official kube-prometheus quickstart:
+#   1. Downloads kube-prometheus release with pre-built manifests
+#   2. Applies setup manifests (namespace, CRDs)
+#   3. Waits for CRDs to be established
+#   4. Applies remaining manifests (Prometheus, Grafana, exporters, recording rules)
+#
+# Requirements:
+#   - MicroK8s must be running
+#   - Internet access to download release
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/prometheus/11_deploy.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#
+# Reference:
+#   https://github.com/prometheus-operator/kube-prometheus/blob/v0.14.0/README.md#quickstart
+#
+# 🤖 AI-assisted
+
+- name: Deploy Prometheus Operator with kube-prometheus
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    kube_prometheus_version: "0.14.0"
+    kube_prometheus_url: "https://github.com/prometheus-operator/kube-prometheus/archive/refs/tags/v{{ kube_prometheus_version }}.tar.gz"
+    work_dir: "/tmp/kube-prometheus-deploy"
+    manifests_dir: "{{ work_dir }}/kube-prometheus-{{ kube_prometheus_version }}/manifests"
+
+  tasks:
+    ###################################################################
+    # 1) Download kube-prometheus release
+    ###################################################################
+    - name: Clean work directory
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: absent
+
+    - name: Create work directory
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Download kube-prometheus release
+      ansible.builtin.get_url:
+        url: "{{ kube_prometheus_url }}"
+        dest: "{{ work_dir }}/kube-prometheus.tar.gz"
+        mode: '0644'
+
+    - name: Extract kube-prometheus release
+      ansible.builtin.unarchive:
+        src: "{{ work_dir }}/kube-prometheus.tar.gz"
+        dest: "{{ work_dir }}"
+        remote_src: true
+
+    ###################################################################
+    # 2) Apply setup manifests (namespace and CRDs)
+    ###################################################################
+    - name: Apply setup manifests (namespace and CRDs)
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} apply --server-side -f {{ manifests_dir }}/setup
+      register: setup_result
+      changed_when: "'created' in setup_result.stdout or 'configured' in setup_result.stdout"
+
+    - name: Display setup result
+      ansible.builtin.debug:
+        msg: "{{ setup_result.stdout_lines }}"
+
+    ###################################################################
+    # 4) Wait for CRDs to be established
+    ###################################################################
+    - name: Wait for CustomResourceDefinitions to be established
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} wait \
+          --for condition=Established \
+          --all CustomResourceDefinition \
+          --namespace=prometheus \
+          --timeout=300s
+      register: crd_wait
+      changed_when: false
+
+    - name: Display CRD wait result
+      ansible.builtin.debug:
+        msg: "✅ All CRDs established"
+
+    ###################################################################
+    # 5) Apply remaining manifests
+    ###################################################################
+    - name: Patch Prometheus manifest to add cluster label
+      ansible.builtin.shell: |
+        cd {{ manifests_dir }}
+        # Add cluster external label to prometheus-prometheus.yaml
+        if grep -q "^  externalLabels:$" prometheus-prometheus.yaml 2>/dev/null; then
+          sed -i '/^  externalLabels:$/a\    cluster: ""' prometheus-prometheus.yaml
+        else
+          sed -i '/^spec:$/a\  externalLabels:\n    cluster: ""' prometheus-prometheus.yaml
+        fi
+      register: patch_result
+      changed_when: true
+
+    - name: Apply kube-prometheus manifests
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} apply -f {{ manifests_dir }}/
+      register: manifests_result
+      changed_when: "'created' in manifests_result.stdout or 'configured' in manifests_result.stdout"
+
+    - name: Display manifests result
+      ansible.builtin.debug:
+        msg: "{{ manifests_result.stdout_lines | length }} resources applied"
+
+    ###################################################################
+    # 6) Wait for Prometheus Operator to be ready
+    ###################################################################
+    - name: Wait for Prometheus Operator deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Deployment
+        namespace: monitoring
+        name: prometheus-operator
+      register: operator_status
+      until: operator_status.resources[0].status.availableReplicas | default(0) >= 1
+      retries: 30
+      delay: 10
+
+    - name: Display Prometheus Operator status
+      ansible.builtin.debug:
+        msg: "✅ Prometheus Operator: {{ operator_status.resources[0].status.availableReplicas }}/{{ operator_status.resources[0].spec.replicas }} replicas ready"
+
+    ###################################################################
+    # 7) Wait for Prometheus StatefulSet to be ready
+    ###################################################################
+    - name: Wait for Prometheus StatefulSet
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: StatefulSet
+        namespace: monitoring
+        name: prometheus-k8s
+      register: prometheus_status
+      until: prometheus_status.resources[0].status.readyReplicas | default(0) >= 1
+      retries: 30
+      delay: 10
+
+    - name: Display Prometheus status
+      ansible.builtin.debug:
+        msg: "✅ Prometheus: {{ prometheus_status.resources[0].status.readyReplicas }}/{{ prometheus_status.resources[0].spec.replicas }} replicas ready"
+
+    ###################################################################
+    # 8) Verify recording rules are deployed
+    ###################################################################
+    - name: List deployed PrometheusRules
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} get prometheusrule -n monitoring
+      register: prometheus_rules
+      changed_when: false
+
+    - name: Display deployed PrometheusRules
+      ansible.builtin.debug:
+        msg: "{{ prometheus_rules.stdout_lines }}"
+
+    - name: Verify kubernetes-mixin recording rules exist
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} get prometheusrule -n monitoring -o yaml | grep -c "node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"
+      register: recording_rules_check
+      changed_when: false
+      failed_when: recording_rules_check.rc > 1
+
+    - name: Display recording rules verification
+      ansible.builtin.debug:
+        msg: "✅ kubernetes-mixin recording rules found: {{ recording_rules_check.stdout }} occurrences"
+
+    ###################################################################
+    # 9) Configure network policy for external access
+    ###################################################################
+    - name: Patch Prometheus network policy to allow Perses namespace
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} patch networkpolicy prometheus-k8s -n monitoring --type=json -p='[
+          {
+            "op": "add",
+            "path": "/spec/ingress/-",
+            "value": {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "perses"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 9090,
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          }
+        ]'
+      register: netpol_patch
+      changed_when: "'patched' in netpol_patch.stdout"
+
+    - name: Display network policy update
+      ansible.builtin.debug:
+        msg: "✅ Prometheus network policy updated to allow Perses namespace access"
+
+    ###################################################################
+    # 10) Configure ServiceMonitors for external exporters
+    ###################################################################
+    - name: Create ServiceMonitor for NVIDIA DCGM Exporter
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: monitoring.coreos.com/v1
+          kind: ServiceMonitor
+          metadata:
+            name: nvidia-dcgm-exporter
+            namespace: monitoring
+            labels:
+              app.kubernetes.io/name: nvidia-dcgm-exporter
+          spec:
+            selector:
+              matchLabels:
+                app: nvidia-dcgm-exporter
+            namespaceSelector:
+              matchNames:
+                - gpu-operator
+            endpoints:
+              - port: gpu-metrics
+                interval: 30s
+
+    - name: Create ServiceMonitor for NGINX Ingress Controller
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: monitoring.coreos.com/v1
+          kind: ServiceMonitor
+          metadata:
+            name: nginx-ingress-controller
+            namespace: monitoring
+            labels:
+              app.kubernetes.io/name: nginx-ingress-controller
+          spec:
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: ingress-nginx
+                app.kubernetes.io/component: controller
+            namespaceSelector:
+              matchNames:
+                - ingress
+            endpoints:
+              - port: metrics
+                interval: 30s
+
+    - name: Display ServiceMonitor creation
+      ansible.builtin.debug:
+        msg: |
+          ✅ ServiceMonitors created:
+          • nvidia-dcgm-exporter (gpu-operator namespace)
+          • nginx-ingress-controller (ingress namespace)
+
+    ###################################################################
+    # 11) Cleanup
+    ###################################################################
+    - name: Remove work directory
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: absent
+
+    ###################################################################
+    # 11) Summary
+    ###################################################################
+    - name: Deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Prometheus Operator Deployed with kube-prometheus
+          ════════════════════════════════════════════════════════
+
+          📦 DEPLOYED COMPONENTS:
+          ─────────────────────────
+          • Prometheus Operator
+          • Prometheus (with recording rules)
+          • Alertmanager
+          • Grafana
+          • kube-state-metrics
+          • node-exporter
+          • blackbox-exporter
+          • prometheus-adapter
+
+          📊 RECORDING RULES:
+          ─────────────────────────
+          • kubernetes-mixin recording rules: ✅ DEPLOYED
+          • Required for Perses community dashboards
+
+          🔧 NAMESPACE:
+          ─────────────────────────
+          • Deployed to: monitoring
+
+          🔧 ACCESS (Port-forward):
+          ─────────────────────────
+          • Prometheus: kubectl port-forward -n monitoring svc/prometheus-k8s 9090:9090
+          • Alertmanager: kubectl port-forward -n monitoring svc/alertmanager-main 9093:9093
+          • Grafana: kubectl port-forward -n monitoring svc/grafana 3000:3000
+
+          📋 NEXT STEPS:
+          ─────────────────────────
+          1. Import Perses dashboards using percli
+          2. Convert and import Grafana dashboards
+          ════════════════════════════════════════════════════════

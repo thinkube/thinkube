@@ -1,0 +1,180 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/12_deploy_dev.yaml
+# Description:
+#   Development deployment helper for thinkube-control
+#   Processes templates with Copier, deploys WorkflowTemplate, and pushes to Gitea
+#
+# Requirements:
+#   - Initial deployment (12_deploy.yaml) must have been run at least once
+#   - All infrastructure components must already exist
+#   - Environment variable: ADMIN_PASSWORD
+#   - Copier installed in virtualenv
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/12_deploy_dev.yaml
+#
+#
+# What this does:
+#   1. Processes thinkube-control-temp with Copier
+#   2. Deploys WorkflowTemplate to Kubernetes
+#   3. Pushes to Gitea
+#   4. Webhook triggers build automatically
+#   5. ArgoCD deploys automatically
+#
+# Variables from inventory:
+#   - domain_name: Domain for Kubernetes services
+#   - admin_username: Admin username for service access
+#   - kubeconfig: Path to kubeconfig file
+#   - system_username: System user on remote host
+#   - github_org: GitHub organization
+#   - github_token: GitHub token
+#
+# 🤖 [AI-assisted]
+
+- name: Development Deployment Helper for thinkube-control
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    # Namespace configuration
+    k8s_namespace: "thinkube-control"
+    
+    # GitOps configuration
+    gitea_org: "thinkube-deployments"
+    
+    # Template processing
+    template_url: "git@github.com:thinkube/thinkube-control.git"
+    template_path: "{{ playbook_dir }}/../../../thinkube-control-temp"
+    
+    # Paths
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    local_repo_path: "{{ shared_code_path }}/thinkube-control"
+    app_name: "thinkube-control"
+    gitea_repo_name: "{{ app_name }}"
+    
+    # ArgoCD settings (when not using kubectl)
+    argocd_namespace: "argocd"
+    
+    # Get master node name for template processing
+    master_node_name: "{{ inventory_hostname }}"
+    master_node_ip: "{{ hostvars[inventory_hostname]['ansible_host'] }}"
+    
+    # Container registry
+    container_registry: "registry.{{ domain_name }}"
+
+  pre_tasks:
+    - name: Set GitHub variables from environment if not in inventory
+      ansible.builtin.set_fact:
+        github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+      when: github_token is not defined or github_token == ""
+
+    - name: Verify required variables
+      ansible.builtin.fail:
+        msg: "{{ item }} is not defined. Please set it in inventory."
+      when: vars[item] is not defined or vars[item] == ""
+      loop:
+        - domain_name
+        - kubeconfig
+        - system_username
+        - admin_username
+        - github_token
+        - github_org
+
+    - name: Check if thinkube-control namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ k8s_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Set admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    - name: Display development deployment info
+      ansible.builtin.debug:
+        msg: |
+          🚀 Development Deployment Helper
+          ==============================
+          This will:
+          1. Process template with Copier
+          2. Push to Gitea
+          3. Trigger webhook → build → deploy
+          
+          Prerequisites:
+          - Initial deployment completed
+          - All infrastructure exists
+          ==============================
+
+  tasks:
+    - name: Create update script from template
+      ansible.builtin.template:
+        src: update_from_template.sh.j2
+        dest: /tmp/update_from_template_{{ app_name }}.sh
+        mode: '0755'
+    
+    - name: Update from template with Copier
+      ansible.builtin.command: /tmp/update_from_template_{{ app_name }}.sh
+      register: copier_result
+      
+    - name: Clean up temporary script
+      ansible.builtin.file:
+        path: /tmp/update_from_template_{{ app_name }}.sh
+        state: absent
+      
+    - name: Show update results
+      ansible.builtin.debug:
+        var: copier_result.stdout_lines
+      when: copier_result is defined
+
+    - name: Get Gitea token and push
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: gitea
+        name: gitea-admin-token
+      register: gitea_token_secret
+
+    - name: Deploy CI/CD WorkflowTemplate for webhook triggers
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        src: "{{ local_repo_path }}/k8s/build-workflow.yaml"
+      register: workflow_deploy_result
+
+    - name: Push to Gitea
+      ansible.builtin.shell: |
+        cd {{ local_repo_path }}
+        git remote set-url gitea https://gitea_admin:{{ gitea_token_secret.resources[0].data.token | b64decode }}@git.{{ domain_name }}/{{ gitea_org }}/{{ gitea_repo_name }}.git || \
+        git remote add gitea https://gitea_admin:{{ gitea_token_secret.resources[0].data.token | b64decode }}@git.{{ domain_name }}/{{ gitea_org }}/{{ gitea_repo_name }}.git
+        git push gitea main --force
+      register: push_result
+      failed_when: push_result.rc != 0
+
+    - name: Show push results
+      ansible.builtin.debug:
+        msg: |
+          Push exit code: {{ push_result.rc }}
+          Push stdout: {{ push_result.stdout }}
+          Push stderr: {{ push_result.stderr }}
+      when: push_result is defined
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: |
+          ✅ Development deployment completed:
+          - Copier templates processed
+          - WorkflowTemplate deployed to Kubernetes
+          - Code pushed to Gitea - webhook will trigger build
+          
+          Monitor: https://control.{{ domain_name }}/cicd
+          
+          To configure Claude Code MCP integration, run:
+          ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/13_configure_code_server.yaml

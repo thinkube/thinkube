@@ -1,0 +1,1039 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/code-server/15_configure_environment.yaml
+# Description:
+#   Configure code-server environment after deployment using kubectl exec
+#   This runs IN the actual container, so all changes persist
+#
+# Requirements:
+#   - code-server must be deployed (10_deploy.yaml)
+#   - Pod must be running and ready
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/15_configure_environment.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Configure code-server environment
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    code_server_namespace: "code-server"
+    kubectl_bin: "microk8s.kubectl"
+    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    code_source_path: "{{ shared_code_path }}"
+
+  tasks:
+    - name: Get code-server pod name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
+          -l app=code-server \
+          -o jsonpath='{.items[0].metadata.name}'
+      register: pod_name
+      failed_when: pod_name.stdout == ""
+      
+    - name: Wait for pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        name: "{{ pod_name.stdout }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+
+    # NOTE: Node.js 20.x and code symlink are now installed in the Docker image
+    # No need to install them here
+
+    - name: Get Argo Workflows service account token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: argo
+        name: argo-workflows-server-sa-token
+      register: argo_sa_secret
+      failed_when: argo_sa_secret.resources | length == 0
+
+    - name: Set Argo token fact
+      ansible.builtin.set_fact:
+        argo_service_account_token: "{{ argo_sa_secret.resources[0].data.token | b64decode }}"
+      no_log: true
+
+    - name: Create .env file in shared-code for Ansible execution
+      ansible.builtin.copy:
+        dest: "{{ shared_code_path }}/.env"
+        content: |
+          # Ansible credentials for playbook execution from code-server
+          # Created by 15_configure_environment.yaml
+          ANSIBLE_BECOME_PASSWORD={{ lookup('env', 'ANSIBLE_BECOME_PASSWORD') }}
+          ADMIN_PASSWORD={{ lookup('env', 'ADMIN_PASSWORD') }}
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      become: true
+      no_log: true
+
+    ###################################################################
+    # Create environment setup scripts (cross-shell compatible)
+    # NOTE: Stored in ~/.thinkube_shared_shell (same location as aliases/functions from playbook 14)
+    # Contains ONLY environment variables - aliases managed by playbook 14's JSON system
+    ###################################################################
+    - name: Create Bash/Zsh environment setup script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'mkdir -p /home/thinkube/.thinkube_shared_shell && cat > /home/thinkube/.thinkube_shared_shell/env_setup.sh << "EOF"
+        #!/bin/bash
+        # Thinkube Environment Variables (Bash/Zsh compatible)
+        # Created by 15_configure_environment.yaml
+        # NOTE: Aliases are managed by the JSON system in playbook 14
+        # NOTE: Service endpoints (Argo, DevPI, ArgoCD, etc.) come from ~/.config/thinkube/service-env.sh
+
+        # Kubernetes
+        export KUBECONFIG=/home/thinkube/.kube/config
+
+        # Argo Workflows - Service account token (secret, not in ConfigMaps)
+        export ARGO_TOKEN={{ argo_service_account_token }}
+
+        # Ansible
+        export ANSIBLE_CONFIG=/home/thinkube/.ansible.cfg
+
+        # Python virtualenv
+        if [ -f /home/thinkube/.venv/bin/activate ]; then
+            source /home/thinkube/.venv/bin/activate
+        fi
+
+        # npm global packages
+        export PATH="/home/thinkube/.npm-global/bin:$PATH"
+        EOF
+        chmod +x /home/thinkube/.thinkube_shared_shell/env_setup.sh
+        echo "✅ Bash/Zsh environment setup created"'
+
+    - name: Create Fish environment setup script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.thinkube_shared_shell/env_setup.fish << "EOF"
+        # Thinkube Environment Variables (Fish compatible)
+        # Created by 15_configure_environment.yaml
+        # NOTE: Aliases are managed by the JSON system in playbook 14
+        # NOTE: Service endpoints (Argo, DevPI, ArgoCD, etc.) come from ~/.config/thinkube/service-env.sh
+
+        # Kubernetes
+        set -gx KUBECONFIG /home/thinkube/.kube/config
+
+        # Argo Workflows - Service account token (secret, not in ConfigMaps)
+        set -gx ARGO_TOKEN {{ argo_service_account_token }}
+
+        # Ansible
+        set -gx ANSIBLE_CONFIG /home/thinkube/.ansible.cfg
+
+        # Python virtualenv
+        if test -f /home/thinkube/.venv/bin/activate.fish
+            source /home/thinkube/.venv/bin/activate.fish
+        end
+
+        # npm global packages
+        set -gx PATH /home/thinkube/.npm-global/bin $PATH
+        EOF
+        chmod +x /home/thinkube/.thinkube_shared_shell/env_setup.fish
+        echo "✅ Fish environment setup created"'
+
+    ###################################################################
+    # Append environment sourcing to existing shell configs
+    # NOTE: Shell configs are created by playbook 14 (14_configure_shell.yaml)
+    # We only add environment variable sourcing, not overwriting anything
+    ###################################################################
+    - name: Check if Bash has environment sourcing
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          grep -q "THINKUBE ENV SETUP" /home/thinkube/.bashrc
+      register: bash_env_configured
+      failed_when: false
+      changed_when: false
+
+    - name: Append environment sourcing to Bash config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat >> /home/thinkube/.bashrc << "EOF"
+
+        # BEGIN THINKUBE ENV SETUP
+        # Source Thinkube environment variables
+        if [ -f ~/.thinkube_shared_shell/env_setup.sh ]; then
+            source ~/.thinkube_shared_shell/env_setup.sh
+        fi
+
+        # Source service environment variables from deployed services
+        if [ -f ~/.config/thinkube/service-env.sh ]; then
+            source ~/.config/thinkube/service-env.sh
+        fi
+        # END THINKUBE ENV SETUP
+        EOF'
+      when: bash_env_configured.rc != 0
+
+    - name: Check if Zsh has environment sourcing
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          grep -q "THINKUBE ENV SETUP" /home/thinkube/.zshrc
+      register: zsh_env_configured
+      failed_when: false
+      changed_when: false
+
+    - name: Append environment sourcing to Zsh config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat >> /home/thinkube/.zshrc << "EOF"
+
+        # BEGIN THINKUBE ENV SETUP
+        # Source Thinkube environment variables
+        if [ -f ~/.thinkube_shared_shell/env_setup.sh ]; then
+            source ~/.thinkube_shared_shell/env_setup.sh
+        fi
+
+        # Source service environment variables from deployed services
+        if [ -f ~/.config/thinkube/service-env.sh ]; then
+            source ~/.config/thinkube/service-env.sh
+        fi
+        # END THINKUBE ENV SETUP
+        EOF'
+      when: zsh_env_configured.rc != 0
+
+    - name: Check if Fish has environment sourcing
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          grep -q "THINKUBE ENV SETUP" /home/thinkube/.config/fish/config.fish
+      register: fish_env_configured
+      failed_when: false
+      changed_when: false
+
+    - name: Append environment sourcing to Fish config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat >> /home/thinkube/.config/fish/config.fish << "EOF"
+
+        # BEGIN THINKUBE ENV SETUP
+        # Source Thinkube environment variables
+        if test -f ~/.thinkube_shared_shell/env_setup.fish
+            source ~/.thinkube_shared_shell/env_setup.fish
+        end
+
+        # Source service environment variables from deployed services
+        if test -f ~/.config/thinkube/service-env.sh
+            bass source ~/.config/thinkube/service-env.sh
+        end
+        # END THINKUBE ENV SETUP
+        EOF'
+      when: fish_env_configured.rc != 0
+
+    ###################################################################
+    # Create .bash_profile and .profile to source .bashrc
+    # NOTE: Bash login shells read .bash_profile, not .bashrc
+    # Code-server terminals start as login shells
+    ###################################################################
+    - name: Create .bash_profile to source .bashrc
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.bash_profile << "EOF"
+        # Source .bashrc for login shells
+        if [ -f ~/.bashrc ]; then
+            source ~/.bashrc
+        fi
+        EOF'
+
+    - name: Create .profile to source .bashrc
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.profile << "EOF"
+        # Source .bashrc for login shells
+        if [ -f ~/.bashrc ]; then
+            source ~/.bashrc
+        fi
+        EOF'
+
+    - name: Configure npm for global installations
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            mkdir -p /home/thinkube/.npm-global
+            npm config set prefix '/home/thinkube/.npm-global'
+          "
+
+    - name: Install Claude Code
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -l -c "npm install -g @anthropic-ai/claude-code"
+          
+    - name: Create claude wrapper script content
+      ansible.builtin.set_fact:
+        claude_wrapper_content: |
+          #!/bin/bash
+          # Wrapper script for Claude Code to ensure PATH is set correctly
+          export PATH="/home/thinkube/.npm-global/bin:$PATH"
+          exec /home/thinkube/.npm-global/bin/claude "$@"
+          
+    - name: Copy claude wrapper script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /tmp/claude-wrapper.sh << "EOF"
+          {{ claude_wrapper_content }}
+          EOF'
+          
+    - name: Install claude wrapper script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "sudo mv /tmp/claude-wrapper.sh /usr/local/bin/claude && sudo chmod +x /usr/local/bin/claude"
+
+    # Create Python virtualenv at /home/thinkube/.venv to match ansible controller environment
+    # This ensures inventory Python interpreter paths work for both environments
+    - name: Create Python virtualenv
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "python3 -m venv /home/thinkube/.venv"
+
+    - name: Install Python platform tools and service SDKs
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "source /home/thinkube/.venv/bin/activate && \
+            pip3 install --no-cache-dir \
+            --extra-index-url https://pypi.org/simple \
+            ansible \
+            ansible-core \
+            copier \
+            kubernetes \
+            ansible-lint \
+            mlflow \
+            opensearch-py \
+            weaviate-client \
+            langfuse \
+            argilla \
+            clickhouse-connect \
+            devpi-client \
+            cvat-cli \
+            requests \
+            psycopg2-binary \
+            boto3 \
+            redis \
+            qdrant-client \
+            nats-py \
+            chromadb \
+            && echo '✅ Python packages installed'"
+
+    - name: Install uv (fast Python package manager)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "curl -LsSf https://astral.sh/uv/install.sh | sh && echo '✅ uv installed'"
+
+    - name: Configure pip to use DevPi
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/.config/pip && \
+            cat > /home/thinkube/.config/pip/pip.conf << 'EOF'
+        [global]
+        index-url = https://{{ devpi_api_hostname }}/root/{{ devpi_index_name }}/+simple/
+        trusted-host = {{ devpi_api_hostname | regex_replace('^https?://', '') }}
+        EOF
+        echo '✅ pip configured to use DevPi'"
+
+    - name: Configure uv to use DevPi
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/.config/uv && \
+            cat > /home/thinkube/.config/uv/uv.toml << 'EOF'
+        [pip]
+        index-url = \"https://{{ devpi_api_hostname }}/root/{{ devpi_index_name }}/+simple/\"
+        trusted-host = [\"{{ devpi_api_hostname | regex_replace('^https?://', '') }}\"]
+        EOF
+        echo '✅ uv configured to use DevPi'"
+
+    - name: Remove legacy pip.conf if it exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "rm -f /home/thinkube/.pip/pip.conf && echo '✅ Legacy pip.conf removed'"
+
+    - name: Create Ansible configuration content
+      ansible.builtin.set_fact:
+        ansible_cfg_content: |
+          [defaults]
+          host_key_checking = False
+          inventory = /home/thinkube/.ansible/inventory/inventory.yaml
+          remote_user = {{ system_username }}
+          private_key_file = /host-ssh/thinkube_cluster_key
+          interpreter_python = auto_silent
+          roles_path = /home/thinkube/thinkube-platform/thinkube/ansible/roles
+
+          [ssh_connection]
+          ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no
+          
+    - name: Create temporary Ansible configuration file
+      ansible.builtin.copy:
+        content: "{{ ansible_cfg_content }}"
+        dest: /tmp/ansible-cfg-{{ ansible_date_time.epoch }}
+        mode: '0644'
+      register: temp_ansible_cfg
+
+    - name: Copy Ansible configuration to pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ temp_ansible_cfg.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.ansible.cfg
+
+    - name: Clean up temporary Ansible config
+      ansible.builtin.file:
+        path: "{{ temp_ansible_cfg.dest }}"
+        state: absent
+
+    - name: Check if inventory already exists in pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          test -f /home/thinkube/.ansible/inventory/inventory.yaml && echo "exists" || echo "missing"
+      register: inventory_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create inventory directory on host if inventory missing
+      ansible.builtin.file:
+        path: "{{ shared_code_path }}/.ansible/inventory"
+        state: directory
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        mode: '0755'
+      become: true
+      when: inventory_check.stdout == "missing"
+
+    - name: Copy entire inventory directory to shared location if missing
+      ansible.builtin.copy:
+        src: "{{ ansible_env.HOME }}/thinkube/inventory/"
+        dest: "{{ shared_code_path }}/.ansible/inventory/"
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        mode: '0644'
+        directory_mode: '0755'
+      become: true
+      when: inventory_check.stdout == "missing"
+
+    # Update Python interpreters in inventory using a Python script
+    - name: Create Python script to update inventory
+      ansible.builtin.copy:
+        dest: /tmp/update_inventory_interpreters.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import yaml
+          import sys
+
+          def update_inventory(inventory_path, system_username):
+              # Load inventory
+              with open(inventory_path, 'r') as f:
+                  inventory = yaml.safe_load(f)
+
+              # Remove global Python interpreter
+              if 'all' in inventory and 'vars' in inventory['all']:
+                  inventory['all']['vars'].pop('ansible_python_interpreter', None)
+
+              # Add Python interpreter for baremetal group
+              if 'all' in inventory and 'children' in inventory['all']:
+                  if 'baremetal' in inventory['all']['children']:
+                      if inventory['all']['children']['baremetal'] is None:
+                          inventory['all']['children']['baremetal'] = {}
+                      if 'vars' not in inventory['all']['children']['baremetal']:
+                          inventory['all']['children']['baremetal']['vars'] = {}
+                      inventory['all']['children']['baremetal']['vars']['ansible_python_interpreter'] = f'/home/{system_username}/.venv/bin/python3'
+
+              # Add Python interpreter for controller host
+              if 'all' in inventory and 'children' in inventory['all']:
+                  if 'management' in inventory['all']['children']:
+                      if 'hosts' in inventory['all']['children']['management']:
+                          if 'controller' in inventory['all']['children']['management']['hosts']:
+                              if inventory['all']['children']['management']['hosts']['controller'] is None:
+                                  inventory['all']['children']['management']['hosts']['controller'] = {}
+                              inventory['all']['children']['management']['hosts']['controller']['ansible_python_interpreter'] = '/usr/bin/python3'
+
+              # Write updated inventory
+              with open(inventory_path, 'w') as f:
+                  yaml.dump(inventory, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+          if __name__ == '__main__':
+              if len(sys.argv) != 3:
+                  print("Usage: update_inventory_interpreters.py <inventory_path> <system_username>")
+                  sys.exit(1)
+
+              update_inventory(sys.argv[1], sys.argv[2])
+              print("Inventory updated successfully")
+      when: inventory_check.stdout == "missing"
+
+    - name: Run Python script to update inventory
+      ansible.builtin.command:
+        cmd: python3 /tmp/update_inventory_interpreters.py "{{ shared_code_path }}/.ansible/inventory/inventory.yaml" "{{ system_username }}"
+      changed_when: true
+      when: inventory_check.stdout == "missing"
+
+    - name: Remove temporary Python script
+      ansible.builtin.file:
+        path: /tmp/update_inventory_interpreters.py
+        state: absent
+      when: inventory_check.stdout == "missing"
+
+    - name: Create thinkube-platform directory structure
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/thinkube-platform"
+
+    - name: Fetch repository metadata from thinkube-metadata
+      ansible.builtin.uri:
+        url: "https://raw.githubusercontent.com/thinkube/thinkube-metadata/main/repositories.json"
+        return_content: yes
+      register: repo_metadata
+      failed_when: repo_metadata.status != 200
+
+    - name: Parse repository list for development cloning
+      ansible.builtin.set_fact:
+        repos_to_clone: "{{ (repo_metadata.content | from_json).repositories | selectattr('clone_for_development', 'equalto', true) | map(attribute='full_name') | list }}"
+      failed_when: repos_to_clone | length == 0
+
+    - name: Clone platform repositories
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            set -e
+            echo '===== Cloning platform repositories ====='
+
+            # Check if SSH key exists
+            if [ -f /home/thinkube/.ssh/github_ed25519 ]; then
+              echo 'GitHub SSH key found at /home/thinkube/.ssh/github_ed25519'
+              chmod 600 /home/thinkube/.ssh/github_ed25519
+
+              # Repository list fetched from thinkube-metadata
+              REPOS=(
+                {% for repo in repos_to_clone %}
+                '{{ repo }}'
+                {% endfor %}
+              )
+
+              echo \"Cloning {{ repos_to_clone | length }} repositories from metadata...\"
+
+              # Clone or update each repository
+              for repo in \"\${REPOS[@]}\"; do
+                repo_name=\$(basename \$repo)
+                if [ ! -d \"/home/thinkube/thinkube-platform/\$repo_name\" ]; then
+                  echo \"Cloning \$repo...\"
+                  GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
+                    git clone \"git@github.com:\$repo.git\" \"/home/thinkube/thinkube-platform/\$repo_name\"
+                else
+                  echo \"\$repo_name already exists, pulling latest changes...\"
+                  cd \"/home/thinkube/thinkube-platform/\$repo_name\"
+                  # Reset any local changes to avoid merge conflicts
+                  git reset --hard HEAD
+                  # Fetch and force update to latest from origin
+                  echo \"Fetching latest from origin for \$repo_name...\"
+                  if GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' git fetch origin 2>&1; then
+                    echo \"Resetting to origin/main for \$repo_name...\"
+                    git reset --hard origin/main
+                  else
+                    echo \"ERROR: Failed to fetch from origin for \$repo_name\"
+                    exit 1
+                  fi
+                fi
+              done
+            else
+              echo 'ERROR: No SSH key found at /home/thinkube/.ssh/github_ed25519'
+              echo 'Please ensure GitHub SSH key is properly configured'
+              exit 1
+            fi
+          "
+      register: clone_result
+
+    - name: Display repository cloning output
+      ansible.builtin.debug:
+        var: clone_result.stdout_lines
+
+    - name: Create symlink for tk_ansible command inside container
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "sudo ln -sf /home/thinkube/thinkube-platform/thinkube/scripts/tk_ansible /usr/local/bin/tk_ansible"
+
+    - name: Create symlink for tk_ssh command inside container
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "sudo ln -sf /home/thinkube/thinkube-platform/thinkube/scripts/tk_ssh /usr/local/bin/tk_ssh"
+
+    - name: Build hostAliases list for cluster nodes
+      ansible.builtin.set_fact:
+        cluster_host_aliases: "{{ cluster_host_aliases | default([]) + [{'ip': hostvars[item]['ansible_host'], 'hostnames': [item]}] }}"
+      loop: "{{ groups['baremetal'] }}"
+      when: hostvars[item]['ansible_host'] is defined
+
+    - name: Patch code-server deployment with hostAliases
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: patched
+        kind: Deployment
+        namespace: "{{ code_server_namespace }}"
+        name: code-server
+        definition:
+          spec:
+            template:
+              spec:
+                hostAliases: "{{ cluster_host_aliases }}"
+
+    # Create symlinks for GitHub SSH keys on control plane
+    # This allows git config to work both in pod and when SSHing to control plane
+    - name: Check if GitHub SSH key exists and is a file (not symlink)
+      ansible.builtin.stat:
+        path: "/home/{{ system_username }}/.ssh/{{ item }}"
+      loop:
+        - github_ed25519
+        - github_ed25519.pub
+      register: github_key_stat
+
+    - name: Remove existing GitHub SSH keys if they are files (not symlinks)
+      ansible.builtin.file:
+        path: "/home/{{ system_username }}/.ssh/{{ item.item }}"
+        state: absent
+      loop: "{{ github_key_stat.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists and not item.stat.islnk
+      become: true
+
+    - name: Create symlinks for GitHub SSH keys
+      ansible.builtin.file:
+        src: "/home/{{ system_username }}/shared-code/.ssh/{{ item }}"
+        dest: "/home/{{ system_username }}/.ssh/{{ item }}"
+        state: link
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      loop:
+        - github_ed25519
+        - github_ed25519.pub
+      become: true
+
+    - name: Configure git SSH for all cloned repositories
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            set -e
+            echo '===== Configuring git SSH for cloned repositories ====='
+            for repo_dir in /home/thinkube/thinkube-platform/*; do
+              if [ -d \"\$repo_dir/.git\" ]; then
+                repo_name=\$(basename \$repo_dir)
+                echo \"Configuring git SSH for \$repo_name...\"
+                cd \"\$repo_dir\"
+                git config core.sshCommand 'ssh -F /home/thinkube/.ssh/config -i /home/thinkube/.ssh/github_ed25519'
+                echo \"  ✓ SSH configured for \$repo_name\"
+              fi
+            done
+            echo '✅ Git SSH configuration complete for all repositories'
+          "
+
+    ###################################################################
+    # Configure CLI Tools for Development
+    ###################################################################
+
+    - name: Configure kubectl (copy kubeconfig from MicroK8s)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ kubeconfig }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/kubeconfig
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            mkdir -p /home/thinkube/.kube
+            # Modify kubeconfig to use in-cluster API server address
+            sed 's|https://127.0.0.1:16443|https://kubernetes.default.svc.cluster.local:443|g' /tmp/kubeconfig > /home/thinkube/.kube/config
+            chmod 600 /home/thinkube/.kube/config
+            rm /tmp/kubeconfig
+            echo '✅ kubectl configured'
+          "
+
+    - name: Configure GitHub CLI (gh auth)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            echo '{{ github_token }}' | gh auth login --with-token
+            gh auth status
+            echo '✅ GitHub CLI authenticated'
+          "
+      no_log: true
+      when: github_token is defined and github_token | length > 0
+
+    - name: Get ArgoCD token from .env
+      ansible.builtin.shell: grep ARGOCD_DEPLOYMENT_SECRET {{ ansible_env.HOME }}/.env | cut -d= -f2 | tr -d '"'
+      register: argocd_token_result
+      changed_when: false
+      no_log: true
+
+    - name: Create ArgoCD config from template
+      ansible.builtin.template:
+        src: templates/argocd_config.j2
+        dest: /tmp/argocd-config
+        mode: '0600'
+      vars:
+        argocd_deployment_token: "{{ argocd_token_result.stdout }}"
+      no_log: true
+
+    - name: Copy ArgoCD config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- mkdir -p /home/thinkube/.config/argocd
+        {{ kubectl_bin }} cp /tmp/argocd-config {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.config/argocd/config
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- chmod 600 /home/thinkube/.config/argocd/config
+        rm -f /tmp/argocd-config
+        echo '✅ ArgoCD CLI configured'
+      no_log: true
+
+    - name: Create Argo Workflows config from template
+      ansible.builtin.template:
+        src: templates/argo_config.j2
+        dest: /tmp/argo-config
+        mode: '0600'
+      vars:
+        argo_grpc_domain: "grpc-argo.{{ domain_name }}"
+      no_log: true
+
+    - name: Copy Argo config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- mkdir -p /home/thinkube/.config/argo
+        {{ kubectl_bin }} cp /tmp/argo-config {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.config/argo/config
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- chmod 600 /home/thinkube/.config/argo/config
+        rm -f /tmp/argo-config
+        echo '✅ Argo Workflows CLI configured'
+      no_log: true
+
+    - name: Get Gitea admin token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: gitea
+        name: gitea-admin-token
+      register: gitea_token_secret
+      failed_when: gitea_token_secret.resources | length == 0
+
+    - name: Configure Tea (Gitea CLI)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            tea login add \
+              --name {{ gitea_hostname }} \
+              --url https://{{ gitea_hostname }} \
+              --token '{{ gitea_token_secret.resources[0].data.token | b64decode }}' \
+              --insecure
+            echo '✅ Tea (Gitea CLI) configured'
+          "
+      no_log: true
+
+    - name: Read Harbor robot token from .env
+      ansible.builtin.shell: grep HARBOR_ROBOT_TOKEN {{ ansible_env.HOME }}/.env | cut -d= -f2 | tr -d '"'
+      register: harbor_token_result
+      changed_when: false
+      no_log: true
+
+    - name: Create Harbor auth base64 string
+      ansible.builtin.shell: echo -n 'robot${{ harbor_robot_name }}:{{ harbor_token_result.stdout }}' | base64 -w0
+      register: harbor_auth_result
+      changed_when: false
+      no_log: true
+
+    - name: Create Docker config from template
+      ansible.builtin.template:
+        src: templates/docker-config.json.j2
+        dest: /tmp/docker-config.json
+        mode: '0600'
+      vars:
+        harbor_auth_b64: "{{ harbor_auth_result.stdout }}"
+      no_log: true
+
+    - name: Copy Docker config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- mkdir -p /home/thinkube/.docker
+        {{ kubectl_bin }} cp /tmp/docker-config.json {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.docker/config.json
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- chmod 600 /home/thinkube/.docker/config.json
+        rm -f /tmp/docker-config.json
+        echo '✅ Harbor/Docker credentials configured'
+      no_log: true
+
+    - name: Configure git user settings
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            git config --global user.name '{{ github_org }}'
+            git config --global user.email '{{ admin_email }}'
+            echo '✅ Git user settings configured'
+          "
+
+    - name: Configure service environment variables from deployed services
+      include_role:
+        name: code_server_env_update
+
+    - name: Create CLI tools test script from template
+      ansible.builtin.template:
+        src: templates/test-cli-tools.sh.j2
+        dest: /tmp/test-cli-tools-{{ ansible_date_time.epoch }}.sh
+        mode: '0755'
+      register: test_script
+
+    - name: Copy test script to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ test_script.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/test-cli-tools.sh \
+          -c code-server
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          chmod +x /home/thinkube/test-cli-tools.sh
+
+    - name: Clean up temporary test script
+      ansible.builtin.file:
+        path: "{{ test_script.dest }}"
+        state: absent
+
+    - name: Create Fish CLI tools test script from template
+      ansible.builtin.template:
+        src: templates/test-cli-tools.fish.j2
+        dest: /tmp/test-cli-tools-{{ ansible_date_time.epoch }}.fish
+        mode: '0755'
+      register: test_script_fish
+
+    - name: Copy Fish test script to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ test_script_fish.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/test-cli-tools.fish \
+          -c code-server
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          chmod +x /home/thinkube/test-cli-tools.fish
+
+    - name: Clean up temporary Fish test script
+      ansible.builtin.file:
+        path: "{{ test_script_fish.dest }}"
+        state: absent
+
+    - name: Create VS Code workspace settings content
+      ansible.builtin.set_fact:
+        vscode_workspace_settings: |
+          {
+            "files.exclude": {
+              "**/.cache": true,
+              "**/.config": true,
+              "**/.local": true,
+              "**/.npm": true,
+              "**/.npm-global": true,
+              "**/.vscode-server": true,
+              "**/.ansible": true,
+              "**/.venv": true,
+              "**/.ansible.cfg": true,
+              "**/.ssh": true,
+              "**/.gitconfig": true,
+              "**/.npmrc": true,
+              "**/.profile": true,
+              "**/.bashrc": true,
+              "**/.bash_history": true,
+              "**/.claude.json": true,
+              "**/claude.json": true,
+              "**/ansible/.ansible": true,
+              "**/tmp": true,
+              "**/node_modules": true,
+              "**/create-gitea-repo.sh": true,
+              "**/setup-gitea-workflow.sh": true,
+              "**/.git": false,
+              "**/.gitignore": false
+            },
+            "explorer.excludeGitIgnore": false,
+            "search.exclude": {
+              "**/.cache": true,
+              "**/.config": true,
+              "**/.local": true,
+              "**/.npm": true,
+              "**/.npm-global": true,
+              "**/.vscode-server": true,
+              "**/.venv": true,
+              "**/node_modules": true,
+              "**/tmp": true,
+              "**/.bash_history": true
+            }
+          }
+          
+    - name: Create .vscode directory
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/.vscode"
+          
+    - name: Copy VS Code workspace settings
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.vscode/settings.json << "EOF"
+          {{ vscode_workspace_settings }}
+          EOF'
+          
+    - name: Ensure VS Code extensions directory exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          mkdir -p /home/thinkube/.local/share/code-server/extensions
+
+    - name: Build and install thinkube-ai-integration extension
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c '
+          if [ -d "/home/thinkube/thinkube-platform/thinkube-ai-integration" ]; then
+            echo "Building thinkube-ai-integration extension..."
+            cd /home/thinkube/thinkube-platform/thinkube-ai-integration
+            git pull || echo "Could not pull latest changes"
+            npm install --production=false
+            npm run compile
+            rm -rf /home/thinkube/.local/share/code-server/extensions/thinkube.thinkube-ai-integration-*
+            ln -sf /home/thinkube/thinkube-platform/thinkube-ai-integration /home/thinkube/.local/share/code-server/extensions/thinkube-ai-integration
+            echo "✅ thinkube-ai-integration extension installed"
+          else
+            echo "❌ thinkube-ai-integration repository not found"
+          fi
+          '
+      register: ai_integration_install
+
+    - name: Display thinkube-ai-integration installation output
+      ansible.builtin.debug:
+        var: ai_integration_install.stdout_lines
+
+    - name: Build and install thinkube-cicd-monitor extension
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c '
+          if [ -d "/home/thinkube/thinkube-platform/thinkube-cicd-monitor" ]; then
+            echo "Building thinkube-cicd-monitor extension..."
+            cd /home/thinkube/thinkube-platform/thinkube-cicd-monitor
+            git pull || echo "Could not pull latest changes"
+            npm install --production=false
+            npm run compile
+            rm -rf /home/thinkube/.local/share/code-server/extensions/thinkube.thinkube-cicd-monitor-*
+            ln -sf /home/thinkube/thinkube-platform/thinkube-cicd-monitor /home/thinkube/.local/share/code-server/extensions/thinkube-cicd-monitor
+            echo "✅ thinkube-cicd-monitor extension installed"
+          else
+            echo "❌ thinkube-cicd-monitor repository not found"
+          fi
+          '
+      register: cicd_monitor_install
+
+    - name: Display thinkube-cicd-monitor installation output
+      ansible.builtin.debug:
+        var: cicd_monitor_install.stdout_lines
+
+    - name: Install thinkube-theme extension
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c '
+          echo "Installing thinkube-theme..."
+          THEME_REPO="/tmp/thinkube-theme"
+          rm -rf "$THEME_REPO"
+          if git clone https://github.com/thinkube/thinkube-theme.git "$THEME_REPO" 2>/dev/null; then
+            rm -rf /home/thinkube/.local/share/code-server/extensions/thinkube-theme
+            cp -r "$THEME_REPO" /home/thinkube/.local/share/code-server/extensions/thinkube-theme
+            rm -rf "$THEME_REPO"
+            echo "✅ thinkube-theme extension installed"
+          else
+            echo "❌ Could not clone thinkube-theme from GitHub"
+          fi
+          '
+      register: theme_install
+
+    - name: Display thinkube-theme installation output
+      ansible.builtin.debug:
+        var: theme_install.stdout_lines
+      
+    - name: Create temporary settings file from template
+      ansible.builtin.template:
+        src: templates/vscode-settings.json.j2
+        dest: /tmp/vscode-settings-{{ ansible_date_time.epoch }}.json
+        mode: '0644'
+      register: temp_settings_file
+
+    - name: Ensure VS Code user settings directory exists on host with correct permissions
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/.local/share/code-server/User"
+        state: directory
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        mode: '0755'
+      become: true
+
+    - name: Check if existing settings file exists on host
+      ansible.builtin.stat:
+        path: "{{ code_source_path }}/.local/share/code-server/User/settings.json"
+      register: existing_settings_file
+
+    - name: Read existing settings if present
+      ansible.builtin.slurp:
+        src: "{{ code_source_path }}/.local/share/code-server/User/settings.json"
+      register: existing_settings
+      when: existing_settings_file.stat.exists
+
+    - name: Parse existing settings
+      ansible.builtin.set_fact:
+        existing_vscode_settings: "{{ existing_settings.content | b64decode | from_json }}"
+      when: existing_settings_file.stat.exists
+
+    - name: Read template settings file
+      ansible.builtin.slurp:
+        src: "{{ temp_settings_file.dest }}"
+      register: template_settings_content
+
+    - name: Parse template settings
+      ansible.builtin.set_fact:
+        template_vscode_settings: "{{ template_settings_content.content | b64decode | from_json }}"
+
+    - name: Merge template with existing settings (preserving custom configs like apiToken)
+      ansible.builtin.set_fact:
+        merged_vscode_settings: "{{ existing_vscode_settings | default({}) | combine(template_vscode_settings, recursive=True) }}"
+
+    - name: Write merged settings to temporary file
+      ansible.builtin.copy:
+        content: "{{ merged_vscode_settings | to_nice_json(indent=4) }}"
+        dest: /tmp/vscode-settings-merged-{{ ansible_date_time.epoch }}.json
+        mode: '0644'
+      register: merged_settings_file
+
+    - name: Copy merged settings file to pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ merged_settings_file.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.local/share/code-server/User/settings.json \
+          -c code-server
+      register: extension_config
+
+    - name: Clean up temporary template file
+      ansible.builtin.file:
+        path: "{{ temp_settings_file.dest }}"
+        state: absent
+
+    - name: Clean up temporary merged file
+      ansible.builtin.file:
+        path: "{{ merged_settings_file.dest }}"
+        state: absent
+      
+    - name: Display extension configuration output
+      ansible.builtin.debug:
+        var: extension_config.stdout_lines
+      when: extension_config is defined
+
+    - name: Display setup summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ Code-server environment configured successfully"
+          - "✅ Cross-shell environment (Bash, Zsh, Fish) configured"
+          - "✅ Node.js and npm installed"
+          - "✅ Claude Code installed and available"
+          - "✅ Python and Ansible installed"
+          - "✅ Repository cloned (if SSH key available)"
+          - "✅ VS Code extensions installed (if repositories available)"
+          - "✅ VS Code workspace configured with clean file explorer"
+          - "✅ Nerd Fonts injected (Fira Code, JetBrains Mono)"
+          - ""
+          - "The 'claude' command should now work in any new terminal session"
+          - ""
+          - "Extensions installed:"
+          - "  - thinkube-ai-integration (via symlink from platform repo)"
+          - "  - thinkube-cicd-monitor (via symlink from platform repo)"
+          - "  - Hooks are configured for Ansible playbook review"
+          - ""
+          - "Test CLI tools:"
+          - "  - Bash: ./test-cli-tools.sh"
+          - "  - Fish: fish test-cli-tools.fish"
+          - ""
+          - "💡 Reload browser to see Nerd Font icons in terminal"

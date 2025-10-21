@@ -1,0 +1,87 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/keycloak/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for Keycloak by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - Keycloak must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/keycloak/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Configure Keycloak service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  tasks:
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: keycloak
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "core"
+              thinkube.io/service-name: "keycloak"
+          data:
+            service.yaml: |
+              service:
+                name: keycloak
+                display_name: "Keycloak"
+                description: "Identity and access management platform"
+                type: core
+                category: security
+                icon: /icons/tk_dashboard.svg
+                
+                endpoints:
+                  - name: web
+                    type: http
+                    url: "https://auth.{{ domain_name }}"
+                    health_url: "https://auth.{{ domain_name }}/realms/master"
+                    description: "Admin console and authentication UI"
+                    primary: true
+                    
+                  - name: api
+                    type: http
+                    url: "https://auth.{{ domain_name }}"
+                    health_url: "https://auth.{{ domain_name }}/realms/master/.well-known/openid-configuration"
+                    description: "OpenID Connect API endpoint"
+                    
+                dependencies:
+                  - postgresql
+                  
+                scaling:
+                  resource_type: deployment
+                  resource_name: keycloak
+                  namespace: keycloak
+                  min_replicas: 1
+                  can_disable: false
+                  
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: keycloak
+      register: configmap_info
+      
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for Keycloak"
+      when: configmap_info.resources | length > 0

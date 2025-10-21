@@ -1,0 +1,336 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/valkey/10_deploy.yaml
+# Description:
+#   Deploy Valkey (Redis-compatible) for infrastructure use in Kubernetes with external access
+#
+# This playbook:
+#   1. Creates valkey namespace
+#   2. Creates persistent storage for Valkey data
+#   3. Deploys Valkey 8.1 with persistence enabled
+#   4. Creates ClusterIP and headless services
+#   5. Configures external access via TCP passthrough (port 6379)
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - NGINX Ingress Controller with TCP passthrough support
+#   - Wildcard TLS certificate in default namespace
+#   - Valkey custom image must be available in Harbor (built by Harbor base images playbook)
+#   - HARBOR_ROBOT_TOKEN environment variable in ~/.env file
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/valkey/10_deploy.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Harbor registry domain
+#   - kubeconfig: Path to kubeconfig file
+#   - domain_name: Base domain (e.g., thinkube.com)
+#   - ingress_namespace: Namespace for ingress controller
+#   - primary_ingress_service: Ingress controller service name
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 AI-assisted
+
+- name: Deploy Valkey (Redis-compatible)
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    valkey_namespace: "valkey"
+    valkey_deployment_name: "valkey"
+    valkey_service_name: "valkey"
+    valkey_headless_service_name: "valkey-headless"
+    valkey_image: "{{ harbor_registry }}/library/valkey:8.1.0"
+    valkey_port: 6379
+    valkey_storage_class: "microk8s-hostpath"
+    valkey_persistence_size: "5Gi"
+    valkey_hostname: "valkey.{{ domain_name }}"
+    valkey_tls_secret_name: "{{ valkey_namespace }}-tls-secret"
+    ingress_tcp_configmap_name: "primary-ingress-ingress-nginx-tcp"
+
+  tasks:
+    - name: Load Harbor robot token from .env file
+      ansible.builtin.shell: |
+        if [ -f "{{ ansible_env.HOME }}/.env" ]; then
+          source {{ ansible_env.HOME }}/.env
+          echo $HARBOR_ROBOT_TOKEN
+        else
+          echo ""
+        fi
+      args:
+        executable: /bin/bash
+      register: robot_token_result
+      changed_when: false
+
+    - name: Set Harbor credentials facts
+      ansible.builtin.set_fact:
+        harbor_robot_user: "robot${{ harbor_robot_name }}"
+        harbor_robot_token: "{{ robot_token_result.stdout.strip() }}"
+
+    - name: Verify Harbor robot token is available
+      ansible.builtin.fail:
+        msg: "HARBOR_ROBOT_TOKEN not found in {{ ansible_env.HOME }}/.env. Please ensure Harbor is configured."
+      when: harbor_robot_token == ""
+
+    - name: Create namespace for Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ valkey_namespace }}"
+        kind: Namespace
+        state: present
+
+    - name: Create Harbor registry pull secret in Valkey namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: harbor-registry-secret
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: "{{ {'auths': {harbor_registry: {'username': harbor_robot_user, 'password': harbor_robot_token, 'auth': (harbor_robot_user + ':' + harbor_robot_token) | b64encode}}} | to_json | b64encode }}"
+
+    - name: Create PVC for Valkey data
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: valkey-data
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: "{{ valkey_storage_class }}"
+            resources:
+              requests:
+                storage: "{{ valkey_persistence_size }}"
+
+    - name: Deploy Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ valkey_deployment_name }}"
+            labels:
+              app: "{{ valkey_deployment_name }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: "{{ valkey_deployment_name }}"
+            template:
+              metadata:
+                labels:
+                  app: "{{ valkey_deployment_name }}"
+              spec:
+                imagePullSecrets:
+                - name: harbor-registry-secret
+                containers:
+                - name: valkey
+                  image: "{{ valkey_image }}"
+                  imagePullPolicy: Always
+                  command: ["valkey-server"]
+                  args:
+                    - "--save"
+                    - "900 1"
+                    - "--appendonly"
+                    - "yes"
+                    - "--protected-mode"
+                    - "no"
+                  ports:
+                  - containerPort: "{{ valkey_port }}"
+                    name: valkey
+                  resources:
+                    limits:
+                      memory: "256Mi"
+                      cpu: "200m"
+                    requests:
+                      memory: "128Mi"
+                      cpu: "100m"
+                  volumeMounts:
+                    - name: data
+                      mountPath: /data
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: valkey-data
+
+    - name: Create ClusterIP service for Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ valkey_service_name }}"
+            labels:
+              app: "{{ valkey_deployment_name }}"
+          spec:
+            type: ClusterIP
+            selector:
+              app: "{{ valkey_deployment_name }}"
+            ports:
+              - name: valkey
+                port: "{{ valkey_port }}"
+                targetPort: "{{ valkey_port }}"
+
+    - name: Create headless service for Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ valkey_headless_service_name }}"
+            labels:
+              app: "{{ valkey_deployment_name }}"
+          spec:
+            clusterIP: None
+            selector:
+              app: "{{ valkey_deployment_name }}"
+            ports:
+              - name: valkey
+                port: "{{ valkey_port }}"
+                targetPort: "{{ valkey_port }}"
+
+    ###########################################################################
+    # Configure external access via Ingress
+    ###########################################################################
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Valkey namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ valkey_tls_secret_name }}"
+            namespace: "{{ valkey_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Configure NGINX Ingress TCP passthrough for Valkey
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch configmap {{ ingress_tcp_configmap_name }} \
+          -n {{ ingress_namespace }} \
+          --type=merge \
+          -p='{"data":{"{{ valkey_port }}":"{{ valkey_namespace }}/{{ valkey_service_name }}:{{ valkey_port }}"}}'
+      become: true
+      register: tcp_passthrough
+      changed_when: "'configured' in tcp_passthrough.stdout or tcp_passthrough.rc == 0"
+
+    - name: Restart NGINX Ingress controller to pick up TCP config changes
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout restart deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }}
+      become: true
+      register: rollout_restart
+
+    - name: Wait for Ingress controller to restart
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }} --timeout=60s
+      become: true
+      register: rollout_status
+      failed_when: rollout_status.rc != 0
+
+    - name: Check if Valkey port is already exposed in Ingress deployment
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.template.spec.containers[0].ports[*].containerPort}' | grep -q "{{ valkey_port }}"
+      become: true
+      register: port_check
+      changed_when: false
+      failed_when: false
+
+    - name: Patch NGINX Ingress controller deployment to expose Valkey port
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} \
+          --type=json \
+          -p='[
+            {
+              "op": "add",
+              "path": "/spec/template/spec/containers/0/ports/-",
+              "value": {
+                "name": "valkey-{{ valkey_port }}",
+                "containerPort": {{ valkey_port }},
+                "hostPort": {{ valkey_port }},
+                "protocol": "TCP"
+              }
+            }
+          ]'
+      become: true
+      register: patch_deploy
+      changed_when: "'patched' in patch_deploy.stdout or patch_deploy.rc == 0"
+      when: port_check.rc != 0
+
+    - name: Check if Valkey port is already exposed in Ingress service
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get service -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.ports[*].port}' | grep -q "{{ valkey_port }}"
+      become: true
+      register: service_port_check
+      changed_when: false
+      failed_when: false
+
+    - name: Patch NGINX Ingress controller service to expose Valkey port
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch service -n {{ ingress_namespace }} {{ primary_ingress_service }} \
+          --type=json \
+          -p='[
+            {
+              "op": "add",
+              "path": "/spec/ports/-",
+              "value": {
+                "name": "valkey-{{ valkey_port }}",
+                "port": {{ valkey_port }},
+                "targetPort": {{ valkey_port }},
+                "protocol": "TCP"
+              }
+            }
+          ]'
+      become: true
+      register: patch_service
+      changed_when: "'patched' in patch_service.stdout or patch_service.rc == 0"
+      when: service_port_check.rc != 0
+
+    - name: Wait for changes to propagate
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Final Valkey info
+      ansible.builtin.debug:
+        msg:
+          - "Valkey (Redis-compatible) deployed successfully."
+          - "Namespace: {{ valkey_namespace }}"
+          - "Image: {{ valkey_image }}"
+          - "External URL: {{ valkey_hostname }}:{{ valkey_port }}"
+          - "Service: {{ valkey_service_name }}.{{ valkey_namespace }}.svc.cluster.local:{{ valkey_port }}"
+          - "Headless service: {{ valkey_headless_service_name }}.{{ valkey_namespace }}.svc.cluster.local:{{ valkey_port }}"
+          - "Persistence: {{ valkey_persistence_size }} on {{ valkey_storage_class }}"
+          - "Features: AOF persistence enabled, save snapshots every 900s if 1+ key changed"
+          - "TCP passthrough configured on port {{ valkey_port }}"

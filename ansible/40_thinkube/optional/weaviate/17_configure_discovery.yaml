@@ -1,0 +1,164 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/weaviate/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for Weaviate by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - Weaviate must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/weaviate/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Configure Weaviate service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    weaviate_namespace: "weaviate"
+    weaviate_hostname: "weaviate.{{ domain_name }}"
+    code_server_namespace: "code-server"
+    kubectl_bin: "microk8s.kubectl"
+
+  tasks:
+    - name: Get Weaviate API key from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ weaviate_namespace }}"
+        name: weaviate-auth
+      register: weaviate_secret
+      failed_when: weaviate_secret.resources | length == 0
+
+    - name: Set Weaviate API key fact
+      ansible.builtin.set_fact:
+        weaviate_api_key: "{{ weaviate_secret.resources[0].data['api-key'] | b64decode }}"
+      no_log: true
+
+    - name: Get code-server pod name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
+          -l app=code-server \
+          -o jsonpath='{.items[0].metadata.name}'
+      register: pod_name
+      failed_when: pod_name.stdout == ""
+
+    - name: Create Weaviate config file from template
+      ansible.builtin.template:
+        src: templates/weaviate-config.json.j2
+        dest: /tmp/weaviate-config.json
+        mode: '0600'
+      no_log: true
+
+    - name: Copy Weaviate config file to code-server
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          mkdir -p /home/thinkube/.weaviate
+        {{ kubectl_bin }} cp /tmp/weaviate-config.json \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.weaviate/config.json
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          chmod 600 /home/thinkube/.weaviate/config.json
+      changed_when: true
+      no_log: true
+
+    - name: Remove temporary Weaviate config file
+      ansible.builtin.file:
+        path: /tmp/weaviate-config.json
+        state: absent
+
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: "{{ weaviate_namespace }}"
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "weaviate"
+          data:
+            service.yaml: |
+              service:
+                name: weaviate
+                display_name: "Weaviate"
+                description: "Vector database for AI applications"
+                type: optional
+                category: ai
+                icon: /icons/tk_vector.svg
+
+                endpoints:
+                  - name: api
+                    type: http
+                    url: "https://{{ weaviate_hostname }}"
+                    health_url: "https://{{ weaviate_hostname }}/v1/.well-known/ready"
+                    description: "REST API endpoint"
+                    primary: true
+                  - name: grpc
+                    type: grpc
+                    url: "weaviate-grpc.{{ domain_name }}:50051"
+                    description: "gRPC endpoint (high performance)"
+                  - name: graphql
+                    type: http
+                    url: "https://{{ weaviate_hostname }}/v1/graphql"
+                    description: "GraphQL endpoint"
+
+                dependencies: []
+
+                scaling:
+                  resource_type: statefulset
+                  resource_name: weaviate
+                  namespace: "{{ weaviate_namespace }}"
+                  min_replicas: 1
+                  can_disable: true
+
+                metadata:
+                  authentication: api_key
+                  persistence: true
+                  license: "BSD-3-Clause"
+
+                environment_variables:
+                  - name: WEAVIATE_URL
+                    value: "https://{{ weaviate_hostname }}"
+                  - name: WEAVIATE_GRPC_URL
+                    value: "weaviate-grpc.{{ domain_name }}:50051"
+                  - name: WEAVIATE_API_KEY
+                    value: "{{ weaviate_api_key }}"
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ weaviate_namespace }}"
+        name: thinkube-service-config
+      register: configmap_check
+
+    - name: Display service discovery status
+      ansible.builtin.debug:
+        msg: |
+          Service discovery configured for Weaviate
+
+          Service registered with:
+          - Name: weaviate
+          - Category: ai
+          - Primary endpoint: https://{{ weaviate_hostname }}
+          - GraphQL endpoint: https://{{ weaviate_hostname }}/v1/graphql
+    - name: Update code-server environment variables
+      include_role:
+        name: code_server_env_update

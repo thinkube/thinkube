@@ -1,0 +1,154 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/prometheus/19_rollback.yaml
+# Description:
+#   Rollback Prometheus Operator deployment
+#
+# This playbook:
+#   1. Deletes all kube-prometheus components
+#   2. Deletes Prometheus Operator and CRDs
+#   3. Deletes prometheus namespace
+#   4. Cleans up PVCs
+#
+# Requirements:
+#   - Prometheus Operator must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/prometheus/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Rollback Prometheus Operator
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    prometheus_namespace: "monitoring"
+    work_dir: "/tmp/kube-prometheus-deploy"
+
+  tasks:
+    ###################################################################
+    # 1) Delete kube-prometheus components (if manifests exist)
+    ###################################################################
+    - name: Check if work directory exists
+      ansible.builtin.stat:
+        path: "{{ work_dir }}/kube-prometheus-0.14.0/manifests"
+      register: manifests_dir
+
+    - name: Delete kube-prometheus components
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        cd {{ work_dir }}/kube-prometheus-0.14.0/manifests
+        {{ kubectl_bin }} delete -f . --ignore-not-found=true
+      when: manifests_dir.stat.exists
+      register: components_delete
+      changed_when: "'deleted' in components_delete.stdout"
+      failed_when: false
+
+    - name: Delete Prometheus Operator setup (CRDs)
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        cd {{ work_dir }}/kube-prometheus-0.14.0/manifests
+        {{ kubectl_bin }} delete -f setup/ --ignore-not-found=true
+      when: manifests_dir.stat.exists
+      register: setup_delete
+      changed_when: "'deleted' in setup_delete.stdout"
+      failed_when: false
+
+    ###################################################################
+    # 2) Delete PVCs first to avoid namespace getting stuck
+    ###################################################################
+    - name: Delete all PVCs in monitoring namespace
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} delete pvc --all -n {{ prometheus_namespace }} --ignore-not-found=true --timeout=30s
+      register: pvc_delete
+      changed_when: "'deleted' in pvc_delete.stdout"
+      failed_when: false
+
+    - name: Delete all StatefulSets to release PVCs
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} delete sts --all -n {{ prometheus_namespace }} --ignore-not-found=true --timeout=30s
+      register: sts_delete
+      changed_when: "'deleted' in sts_delete.stdout"
+      failed_when: false
+
+    ###################################################################
+    # 3) Delete namespace and all resources
+    ###################################################################
+    - name: Delete prometheus namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: Namespace
+        name: "{{ prometheus_namespace }}"
+      register: namespace_delete
+
+    - name: Wait for namespace to be deleted
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Namespace
+        name: "{{ prometheus_namespace }}"
+      register: namespace_check
+      until: namespace_check.resources | length == 0
+      retries: 18
+      delay: 5
+      failed_when: false
+
+    ###################################################################
+    # 4) Force cleanup if namespace is stuck
+    ###################################################################
+    - name: Check if namespace still exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Namespace
+        name: "{{ prometheus_namespace }}"
+      register: final_check
+
+    - name: Force remove namespace finalizers if stuck
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} get ns {{ prometheus_namespace }} -o json | jq '.spec.finalizers = []' | {{ kubectl_bin }} replace --raw "/api/v1/namespaces/{{ prometheus_namespace }}/finalize" -f -
+      when: final_check.resources | length > 0
+      failed_when: false
+      changed_when: true
+
+    ###################################################################
+    # 5) Clean up work directory
+    ###################################################################
+    - name: Remove work directory
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: absent
+
+    ###################################################################
+    # 6) Summary
+    ###################################################################
+    - name: Rollback summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Prometheus Operator Rollback Complete
+          ════════════════════════════════════════════════════════
+
+          🗑️ REMOVED:
+          ─────────────────────────
+          • kube-prometheus components
+          • Prometheus Operator
+          • CRDs (Custom Resource Definitions)
+          • Namespace: {{ prometheus_namespace }}
+          • All PVCs and data
+          • Work directory
+
+          ⚠️ NOTE:
+          ─────────────────────────
+          All Prometheus data and metrics have been deleted.
+          Recording rules and configurations are removed.
+          ════════════════════════════════════════════════════════

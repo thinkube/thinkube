@@ -1,0 +1,315 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/knative/19_rollback.yaml
+# Description:
+#   Cleanup script for Knative installations
+#   Completely removes Knative from the cluster
+#
+# Requirements:
+#   - MicroK8s with kubectl installed
+#   - Knative components installed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/knative/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to kubeconfig file
+#
+# Dependencies:
+#   - None (this is a cleanup playbook)
+#
+# 🤖 [AI-assisted]
+
+- name: Cleanup Knative installation
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    knative_namespaces:
+      - knative-serving
+      - knative-eventing
+      - kourier-system
+      - kn
+    timeout: 240  # Long timeout for deletion operations
+
+  tasks:
+    - name: Display cleanup warning
+      ansible.builtin.debug:
+        msg: |
+          WARNING: This will completely remove Knative from your cluster.
+          All Knative services, configs, and resources will be deleted.
+          
+          Starting cleanup process...
+
+    - name: Delete all Knative services
+      ansible.builtin.shell: |
+        set -e
+        # Try to find and delete all Knative services across namespaces
+        for NS in $({{ kubectl_bin }} get namespaces -o jsonpath='{.items[*].metadata.name}'); do
+          echo "Checking namespace $NS for Knative services..."
+          if {{ kubectl_bin }} get ksvc -n $NS 2>/dev/null | grep -q .; then
+            echo "Found Knative services in $NS, deleting..."
+            {{ kubectl_bin }} delete ksvc --all -n $NS --timeout=60s
+          fi
+        done
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: delete_services
+
+    - name: Display services deletion result
+      ansible.builtin.debug:
+        msg: "{{ delete_services.stdout_lines }}"
+
+    - name: Remove Knative webhooks
+      ansible.builtin.shell: |
+        set -e
+        # Delete webhooks that might block operations (may not exist)
+        {{ kubectl_bin }} delete mutatingwebhookconfiguration --all --ignore-not-found=true
+        {{ kubectl_bin }} delete validatingwebhookconfiguration --all --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: webhooks_deletion
+
+    - name: Remove Knative Custom Resource Definitions
+      ansible.builtin.shell: |
+        set -e
+        # Delete all Knative CRDs to clean up completely
+        {{ kubectl_bin }} delete crd -l knative.dev/crd-install=true --ignore-not-found=true
+        {{ kubectl_bin }} delete crd -l serving.knative.dev/release --ignore-not-found=true
+        {{ kubectl_bin }} delete crd -l duck.knative.dev/addressable=true --ignore-not-found=true
+        {{ kubectl_bin }} delete crd -l eventing.knative.dev/release --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: crds_deletion
+
+    - name: Remove Knative ClusterRoles and ClusterRoleBindings
+      ansible.builtin.shell: |
+        set -e
+        # Delete all Knative cluster-wide RBAC resources
+        {{ kubectl_bin }} get clusterrole -o name | grep knative | xargs -r {{ kubectl_bin }} delete --ignore-not-found=true
+        {{ kubectl_bin }} get clusterrolebinding -o name | grep knative | xargs -r {{ kubectl_bin }} delete --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: cluster_rbac_deletion
+
+    - name: Clean up ingress rules
+      ansible.builtin.shell: |
+        set -e
+        # Delete any Knative-related ingresses
+        {{ kubectl_bin }} delete ingress -l knative.dev/route=true --all-namespaces --ignore-not-found=true
+        {{ kubectl_bin }} delete ingress -l serving.knative.dev/route=true --all-namespaces --ignore-not-found=true
+        # Delete specific ingresses in kourier-system if they exist
+        {{ kubectl_bin }} delete ingress knative-wildcard-ingress -n kourier-system --ignore-not-found=true
+        {{ kubectl_bin }} delete ingress knative-direct-ingress -n kourier-system --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: ingress_cleanup
+
+    - name: Delete HorizontalPodAutoscalers blocking deployment deletion
+      ansible.builtin.shell: |
+        set -e
+        for NS in knative-serving knative-eventing kourier-system; do
+          echo "Deleting HPAs in $NS..."
+          {{ kubectl_bin }} delete hpa --all -n $NS --ignore-not-found=true || true
+        done
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: hpa_cleanup
+
+    - name: Delete PodDisruptionBudgets blocking pod eviction
+      ansible.builtin.shell: |
+        set -e
+        for NS in knative-serving knative-eventing kourier-system; do
+          echo "Deleting PDBs in $NS..."
+          {{ kubectl_bin }} delete pdb --all -n $NS --ignore-not-found=true || true
+        done
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: pdb_cleanup
+
+    - name: Delete coordination leases
+      ansible.builtin.shell: |
+        set -e
+        for NS in knative-serving knative-eventing kourier-system; do
+          echo "Deleting leases in $NS..."
+          {{ kubectl_bin }} delete lease --all -n $NS --ignore-not-found=true || true
+        done
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: lease_cleanup
+
+    - name: Delete all deployments in Knative namespaces
+      ansible.builtin.shell: |
+        set -e
+        # Delete all deployments to trigger pod deletion
+        for NS in knative-serving knative-eventing kourier-system; do
+          if {{ kubectl_bin }} get namespace $NS &>/dev/null; then
+            echo "Deleting deployments in $NS..."
+            {{ kubectl_bin }} delete deployment --all -n $NS --timeout=60s --ignore-not-found=true
+          fi
+        done
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: deployment_cleanup
+
+    - name: Delete all services in Knative namespaces
+      ansible.builtin.shell: |
+        set -e
+        # Delete all services
+        for NS in knative-serving knative-eventing kourier-system; do
+          if {{ kubectl_bin }} get pods -n $NS --no-headers 2>/dev/null | grep -q .; then
+            echo "Deleting services in $NS..."
+            {{ kubectl_bin }} delete service --all -n $NS --timeout=60s --ignore-not-found=true
+          fi
+        done
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: service_cleanup
+
+    - name: Force delete all stuck pods in Knative namespaces
+      ansible.builtin.shell: |
+        set -e
+        for NS in knative-serving knative-eventing kourier-system; do
+          echo "Force deleting pods in $NS..."
+          PODS=$({{ kubectl_bin }} get pods -n $NS --no-headers 2>/dev/null | awk '{print $1}' || true)
+          if [ -n "$PODS" ]; then
+            for POD in $PODS; do
+              echo "Force deleting pod $POD in $NS..."
+              {{ kubectl_bin }} delete pod $POD -n $NS --force --grace-period=0 --ignore-not-found=true || true
+            done
+          fi
+        done
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: force_delete_pods
+
+    - name: Delete ALL remaining resources in Knative namespaces
+      ansible.builtin.shell: |
+        set -e
+        for NS in knative-serving knative-eventing kourier-system; do
+          if {{ kubectl_bin }} get namespace $NS 2>/dev/null; then
+            echo "Force deleting all resources in $NS..."
+            {{ kubectl_bin }} delete all,cm,secret,sa,role,rolebinding,pdb,hpa,lease --all -n $NS --force --grace-period=0 --ignore-not-found=true || true
+          fi
+        done
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      register: force_delete_all_resources
+
+    - name: Delete Knative namespaces (force)
+      ansible.builtin.shell: |
+        set -e
+        # Check if namespace exists first
+        if ! {{ kubectl_bin }} get namespace {{ item }} &>/dev/null; then
+          echo "Namespace {{ item }} already deleted"
+          exit 0
+        fi
+
+        # Delete the namespace non-blocking
+        {{ kubectl_bin }} delete namespace {{ item }} --wait=false &
+
+        # Give it a few seconds
+        sleep 3
+
+        # Remove finalizers from namespace to force deletion
+        if {{ kubectl_bin }} get namespace {{ item }} &>/dev/null; then
+          echo "Removing finalizers from namespace {{ item }}..."
+          {{ kubectl_bin }} get namespace {{ item }} -o json | tr -d "\n" | sed "s/\"finalizers\": \[[^]]\+\]/\"finalizers\": []/" | {{ kubectl_bin }} replace --raw "/api/v1/namespaces/{{ item }}/finalize" -f - || true
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ knative_namespaces }}"
+      register: namespace_deletion
+      changed_when: true
+
+    - name: Wait for namespaces to be deleted
+      ansible.builtin.shell: |
+        set -e
+        for i in $(seq 1 10); do
+          echo "Attempt $i to verify deletion of namespace {{ item }}..."
+          if ! {{ kubectl_bin }} get namespace {{ item }} &>/dev/null; then
+            echo "Namespace {{ item }} has been successfully deleted!"
+            exit 0
+          fi
+          echo "Namespace {{ item }} still exists. Waiting..."
+          sleep 5
+        done
+        echo "ERROR: Namespace {{ item }} could not be deleted after 50 seconds"
+        exit 1
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ knative_namespaces }}"
+      changed_when: false
+      register: namespace_check
+
+    - name: Verify removal of all Knative components
+      ansible.builtin.shell: |
+        FAILED=0
+        echo "=== VERIFICATION RESULTS ==="
+        echo "Checking for any remaining Knative CRDs..."
+        REMAINING_CRDS=$({{ kubectl_bin }} get crd -o name 2>/dev/null | grep -i knative || true)
+        if [ -n "$REMAINING_CRDS" ]; then
+          echo "ERROR: Some Knative CRDs still exist:"
+          echo "$REMAINING_CRDS"
+          FAILED=1
+        else
+          echo "✅ All Knative CRDs have been removed"
+        fi
+        echo "Checking for any remaining Knative namespaces..."
+        for NS in {{ knative_namespaces | join(' ') }}; do
+          if {{ kubectl_bin }} get namespace $NS 2>/dev/null; then
+            echo "ERROR: Namespace $NS still exists"
+            FAILED=1
+          else
+            echo "✅ Namespace $NS has been removed"
+          fi
+        done
+        echo "Checking for any remaining Kourier components..."
+        KOURIER_SVC=$({{ kubectl_bin }} get svc -A 2>/dev/null | grep -i kourier || true)
+        if [ -n "$KOURIER_SVC" ]; then
+          echo "ERROR: Some Kourier services still exist:"
+          echo "$KOURIER_SVC"
+          FAILED=1
+        else
+          echo "✅ All Kourier services have been removed"
+        fi
+        if [ $FAILED -eq 1 ]; then
+          echo ""
+          echo "=== ROLLBACK FAILED ==="
+          echo "Some Knative components could not be removed."
+          echo "Please check the errors above and clean up manually."
+          exit 1
+        fi
+        echo ""
+        echo "=== ROLLBACK SUCCESSFUL ==="
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: verification
+      changed_when: false
+
+    - name: Display cleanup results
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          KNATIVE CLEANUP COMPLETE
+          ==========================================
+
+          {{ verification.stdout_lines | join('\n') }}
+
+          You can now reinstall Knative using:
+          ./scripts/run_ansible.sh ansible/40_thinkube/optional/knative/10_deploy.yaml

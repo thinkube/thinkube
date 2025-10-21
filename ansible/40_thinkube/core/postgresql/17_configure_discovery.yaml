@@ -1,0 +1,105 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/postgresql/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for PostgreSQL by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - PostgreSQL must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/postgresql/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Configure PostgreSQL service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    postgres_database: "mydatabase"
+    # admin_password from environment variable or .env file
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    - name: Verify admin credentials are available
+      ansible.builtin.assert:
+        that:
+          - admin_username is defined and admin_username | length > 0
+          - admin_password is defined and admin_password | length > 0
+        fail_msg: "admin_username must be defined in inventory and ADMIN_PASSWORD or ANSIBLE_BECOME_PASSWORD must be set"
+        success_msg: "Admin credentials loaded successfully"
+
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: postgres
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "core"
+              thinkube.io/service-name: "postgresql"
+          data:
+            service.yaml: |
+              service:
+                name: postgresql
+                display_name: "PostgreSQL"
+                description: "Relational database management system"
+                type: core
+                category: storage
+                icon: /icons/tk_data.svg
+                
+                endpoints:
+                  - name: database
+                    type: postgres
+                    url: "postgresql://postgresql-official.postgres.svc.cluster.local:5432"
+                    health_url: "postgresql://postgresql-official.postgres.svc.cluster.local:5432/postgres"
+                    description: "PostgreSQL database service"
+                    primary: true
+                    
+                dependencies: []
+                  
+                scaling:
+                  resource_type: statefulset
+                  resource_name: postgresql-official
+                  namespace: postgres
+                  min_replicas: 1
+                  can_disable: false
+
+                environment_variables:
+                  - name: POSTGRES_HOST
+                    value: "postgres.{{ domain_name }}"
+                  - name: POSTGRES_PORT
+                    value: "5432"
+                  - name: POSTGRES_USER
+                    value: "{{ admin_username }}"
+                  - name: POSTGRES_PASSWORD
+                    value: "{{ admin_password }}"
+                  - name: POSTGRES_DB
+                    value: "{{ postgres_database }}"
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: postgres
+      register: configmap_info
+      
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for PostgreSQL"
+      when: configmap_info.resources | length > 0

@@ -1,0 +1,334 @@
+---
+# ansible/40_thinkube/optional/argilla/11_deploy.yaml
+# Description:
+#   Deploy Argilla data annotation platform on Kubernetes
+#   Uses OpenSearch backend and native Keycloak OIDC authentication
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - Harbor registry must be available
+#   - OpenSearch must be deployed
+#   - Keycloak must be deployed and configured (10_configure_keycloak.yaml)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/argilla/11_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#   - harbor_registry: Harbor registry URL
+#   - admin_username: Admin username
+#   - admin_password: Admin password
+#
+# 🤖 [AI-generated]
+
+- name: Deploy Argilla on Kubernetes
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    argilla_namespace: argilla
+    argilla_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/argilla:latest"
+    argilla_hostname: "argilla.{{ domain_name }}"
+
+    # Get admin password from environment
+    admin_password: "{{ lookup('env','ADMIN_PASSWORD') }}"
+
+    # Keycloak settings for OIDC integration
+    keycloak_url: "https://auth.{{ domain_name }}"
+    keycloak_oidc_endpoint: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+
+  tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+          - harbor_registry is defined
+          - admin_username is defined
+          - admin_password is defined
+        fail_msg: "Required variables are not defined. Please check your inventory."
+
+    - name: Create Argilla namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ argilla_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Generate random API key for Argilla
+      ansible.builtin.set_fact:
+        argilla_api_key: "argilla.apikey.{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Create Argilla secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: argilla-secrets
+            namespace: "{{ argilla_namespace }}"
+          type: Opaque
+          stringData:
+            ARGILLA_API_KEY: "{{ argilla_api_key }}"
+            DEFAULT_USER_ENABLED: "true"
+            DEFAULT_USER_USERNAME: "{{ admin_username }}"
+            DEFAULT_USER_PASSWORD: "{{ admin_password }}"
+            DEFAULT_USER_API_KEY: "{{ argilla_api_key }}"
+
+    - name: Get OpenSearch service info
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: opensearch
+        name: opensearch-cluster-master
+      register: opensearch_service
+      failed_when: opensearch_service.resources | length == 0
+
+    - name: Deploy Argilla
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: argilla
+            namespace: "{{ argilla_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: argilla
+            template:
+              metadata:
+                labels:
+                  app: argilla
+              spec:
+                containers:
+                  - name: argilla
+                    image: "{{ argilla_image }}"
+                    ports:
+                      - containerPort: 6900
+                        name: http
+                    env:
+                      - name: ARGILLA_SEARCH_ENGINE
+                        value: "opensearch"
+                      - name: ARGILLA_ELASTICSEARCH
+                        value: "https://admin:{{ admin_password }}@opensearch-cluster-master.opensearch.svc.cluster.local:9200"
+                      - name: ARGILLA_ELASTICSEARCH_SSL_VERIFY
+                        value: "False"
+                      - name: ARGILLA_REDIS_URL
+                        value: "redis://valkey.valkey.svc.cluster.local:6379/0"
+                      - name: ARGILLA_HOME_PATH
+                        value: "/var/lib/argilla"
+                      - name: USERNAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: argilla-secrets
+                            key: DEFAULT_USER_USERNAME
+                      - name: PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: argilla-secrets
+                            key: DEFAULT_USER_PASSWORD
+                      - name: API_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: argilla-secrets
+                            key: DEFAULT_USER_API_KEY
+                      - name: SOCIAL_AUTH_KEYCLOAK_OIDC_ENDPOINT
+                        value: "{{ keycloak_oidc_endpoint }}"
+                      - name: ARGILLA_AUTH_OAUTH_CFG
+                        value: "/app/.oauth.yml"
+                    volumeMounts:
+                      - name: oauth-config
+                        mountPath: /app/.oauth.yml
+                        subPath: .oauth.yml
+                        readOnly: true
+                    livenessProbe:
+                      httpGet:
+                        path: /api/status
+                        port: http
+                      initialDelaySeconds: 60
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /api/status
+                        port: http
+                      initialDelaySeconds: 30
+                      periodSeconds: 5
+                    resources:
+                      requests:
+                        memory: "512Mi"
+                        cpu: "250m"
+                      limits:
+                        memory: "2Gi"
+                        cpu: "1"
+                volumes:
+                  - name: oauth-config
+                    configMap:
+                      name: argilla-oauth-config
+                initContainers:
+                  - name: wait-for-opensearch
+                    image: "{{ harbor_registry }}/{{ library_project | default('library') }}/busybox:latest"
+                    command: ['sh', '-c', 'until nc -z opensearch-cluster-master.opensearch.svc.cluster.local 9200; do echo waiting for opensearch; sleep 2; done;']
+
+    - name: Create Argilla Service (internal only)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: argilla
+            namespace: "{{ argilla_namespace }}"
+          spec:
+            selector:
+              app: argilla
+            ports:
+              - port: 6900
+                targetPort: 6900
+                name: http
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: thinkube-com-tls
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Argilla namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ argilla_namespace }}-tls-secret"
+            namespace: "{{ argilla_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Get Argilla OAuth secret from Kubernetes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ argilla_namespace }}"
+        name: argilla-oauth-secret
+      register: oauth_secret
+      failed_when: oauth_secret.resources | length == 0
+
+    - name: Decode OAuth client credentials
+      ansible.builtin.set_fact:
+        argilla_client_id: "{{ oauth_secret.resources[0].data.client_id | b64decode }}"
+        argilla_client_secret: "{{ oauth_secret.resources[0].data.client_secret | b64decode }}"
+
+    - name: Create .oauth.yml ConfigMap for Argilla
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: argilla-oauth-config
+            namespace: "{{ argilla_namespace }}"
+          data:
+            .oauth.yml: |
+              providers:
+                - name: keycloak
+                  client_id: "{{ argilla_client_id }}"
+                  client_secret: "{{ argilla_client_secret }}"
+
+    - name: Create Argilla Dashboard Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: argilla-dashboard
+            namespace: "{{ argilla_namespace }}"
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+              nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - "{{ argilla_hostname }}"
+                secretName: "{{ argilla_namespace }}-tls-secret"
+            rules:
+              - host: "{{ argilla_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: argilla
+                          port:
+                            number: 6900
+
+    - name: Wait for Argilla deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ argilla_namespace }}"
+        name: argilla
+      register: deployment_status
+      until:
+        - deployment_status.resources is defined
+        - deployment_status.resources | length > 0
+        - deployment_status.resources[0].status.replicas is defined
+        - deployment_status.resources[0].status.readyReplicas is defined
+        - deployment_status.resources[0].status.replicas == deployment_status.resources[0].status.readyReplicas
+      retries: 30
+      delay: 10
+
+    - name: Create Argilla config from template
+      ansible.builtin.template:
+        src: templates/argilla-config.yaml.j2
+        dest: /tmp/argilla-config.yaml
+        mode: '0600'
+      no_log: true
+
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy Argilla config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.argilla
+        {{ kubectl_bin }} cp /tmp/argilla-config.yaml code-server/{{ code_server_pod.stdout }}:/home/thinkube/.argilla/config.yaml
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.argilla/config.yaml
+        rm -f /tmp/argilla-config.yaml
+        echo '✅ Argilla CLI configured in code-server'
+      no_log: true
+
+    - name: Display access information
+      ansible.builtin.debug:
+        msg:
+          - "Argilla has been deployed successfully!"
+          - "Access URL: https://{{ argilla_hostname }}"
+          - "Default admin user: {{ admin_username }}"
+          - "Default admin password: {{ admin_password }}"
+          - "API Key: {{ argilla_api_key }}"
+          - "Note: SSO is configured via Keycloak OAuth2 proxy"

@@ -1,0 +1,91 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/knative/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for Knative by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - Knative must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/knative/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Configure Knative service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  tasks:
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: knative-serving
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "knative"
+          data:
+            service.yaml: |
+              service:
+                name: knative
+                display_name: "Knative"
+                description: "Serverless container platform"
+                type: optional
+                category: devops
+                icon: /icons/tk_devops.svg
+                
+                endpoints:
+                  - name: controller
+                    type: internal
+                    url: "http://controller.knative-serving.svc.cluster.local:9090"
+                    health_url: "http://controller.knative-serving.svc.cluster.local:9090/metrics"
+                    description: "Knative controller metrics"
+                    primary: true
+
+                  - name: webhook
+                    type: internal
+                    url: "http://webhook.knative-serving.svc.cluster.local:9090"
+                    health_url: "http://webhook.knative-serving.svc.cluster.local:9090/metrics"
+                    description: "Knative webhook service"
+                    primary: false
+                    
+                dependencies: []
+                  
+                scaling:
+                  resource_type: deployment
+                  resource_name: controller
+                  namespace: knative-serving
+                  min_replicas: 1
+                  can_disable: true
+                  
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: knative-serving
+      register: configmap_info
+      
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for Knative"
+      when: configmap_info.resources | length > 0
+
+    - name: Update code-server environment variables
+      include_role:
+        name: code_server_env_update

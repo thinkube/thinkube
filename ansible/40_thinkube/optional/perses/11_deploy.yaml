@@ -1,0 +1,232 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/perses/11_deploy.yaml
+# Description:
+#   Deploy Perses observability visualization platform using official Helm chart
+#
+# This playbook:
+#   1. Creates perses namespace
+#   2. Copies wildcard TLS certificate
+#   3. Retrieves Keycloak client secret
+#   4. Processes Helm values template with Thinkube-specific configuration
+#   5. Deploys Perses using Helm chart with OIDC authentication
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - Keycloak deployed and configured (run 10_configure_keycloak.yaml first)
+#   - Wildcard TLS certificate in default namespace
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/perses/11_deploy.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - domain_name: Base domain (e.g., thinkube.com)
+#   - admin_username: Admin user
+#   - keycloak_url: Keycloak URL
+#   - keycloak_realm: Keycloak realm name
+#   - primary_ingress_class: Ingress controller class name
+#
+# 🤖 AI-assisted
+
+- name: Deploy Perses
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    perses_namespace: "perses"
+    perses_app_name: "perses"
+    perses_hostname: "perses.{{ domain_name }}"
+    perses_tls_secret_name: "perses-tls-secret"
+    perses_release_name: "perses"
+    perses_chart_repo: "https://perses.github.io/helm-charts"
+    perses_chart_version: "0.17.1"  # Deploys Perses app v0.52.0
+
+    # Keycloak configuration
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    keycloak_validate_certs: false
+    perses_client_id: "perses"
+
+  tasks:
+    - name: Create namespace for Perses
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ perses_namespace }}"
+        kind: Namespace
+        state: present
+
+    ###########################################################################
+    # TLS certificate
+    ###########################################################################
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Perses namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ perses_tls_secret_name }}"
+            namespace: "{{ perses_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###########################################################################
+    # Get Keycloak client secret
+    ###########################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ keycloak_admin_username }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: keycloak_token
+
+    - name: Get Perses client UUID
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ perses_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: perses_client_response
+
+    - name: Get Perses client secret
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ perses_client_response.json[0].id }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: client_secret_response
+
+    - name: Set client secret fact
+      ansible.builtin.set_fact:
+        keycloak_client_secret: "{{ client_secret_response.json.value }}"
+
+    ###########################################################################
+    # Helm deployment
+    ###########################################################################
+    - name: Create temp directory for Helm values
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: perses-helm
+      register: temp_helm_dir
+
+    - name: Template Helm values file
+      ansible.builtin.template:
+        src: values-thinkube.yaml
+        dest: "{{ temp_helm_dir.path }}/values.yaml"
+        mode: '0644'
+
+    - name: Add Perses Helm repo
+      ansible.builtin.shell: |
+        microk8s helm3 repo add perses {{ perses_chart_repo }}
+        microk8s helm3 repo update
+      become: true
+
+    - name: Deploy Perses with Helm
+      ansible.builtin.shell: |
+        microk8s helm3 upgrade --install {{ perses_release_name }} perses/perses \
+          --namespace {{ perses_namespace }} \
+          {% if perses_chart_version %}--version {{ perses_chart_version }} {% endif %}\
+          --values {{ temp_helm_dir.path }}/values.yaml \
+          --wait \
+          --timeout 10m
+      become: true
+      register: helm_deploy
+
+    - name: Clean up temp directory
+      ansible.builtin.file:
+        path: "{{ temp_helm_dir.path }}"
+        state: absent
+
+    - name: Wait for Perses pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ perses_namespace }}"
+        kind: Pod
+        label_selectors:
+          - "app.kubernetes.io/name=perses"
+      register: perses_pods
+      until: >
+        perses_pods.resources | length > 0 and
+        perses_pods.resources[0].status.phase == 'Running' and
+        (perses_pods.resources[0].status.containerStatuses | selectattr('name', 'equalto', 'perses') | first).ready == true
+      retries: 30
+      delay: 10
+
+    ###########################################################################
+    # Create native admin user
+    ###########################################################################
+    - name: Get admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    - name: Create native admin user in Perses
+      ansible.builtin.uri:
+        url: "https://{{ perses_hostname }}/api/v1/users"
+        method: POST
+        body_format: json
+        body:
+          kind: "User"
+          metadata:
+            name: "{{ admin_username }}"
+          spec:
+            firstName: "Admin"
+            lastName: "User"
+            nativeProvider:
+              password: "{{ admin_password }}"
+        validate_certs: true
+        status_code: [200, 201, 409]
+      register: create_user_result
+      failed_when: false
+
+    - name: Display user creation result
+      ansible.builtin.debug:
+        msg: "{{ '✅ Native admin user created' if create_user_result.status in [200, 201] else '⚠️ User already exists or creation failed' }}"
+
+    - name: Deployment complete
+      ansible.builtin.debug:
+        msg:
+          - "Perses deployed successfully using Helm!"
+          - "URL: https://{{ perses_hostname }}"
+          - "Authentication: Keycloak SSO"
+          - "Realm: {{ keycloak_realm }}"
+          - "Client ID: {{ perses_client_id }}"
+          - ""
+          - "Supported datasources:"
+          - "  - Prometheus (native PromQL support)"
+          - "  - Tempo (distributed tracing)"
+          - "  - Loki (log aggregation)"
+          - "  - Pyroscope (continuous profiling)"
+          - ""
+          - "Next steps:"
+          - "1. Access Perses at https://{{ perses_hostname }}"
+          - "2. Login with Keycloak SSO"
+          - "3. Configure Prometheus datasource"
+          - "4. Migrate Grafana dashboards using 'percli migrate'"

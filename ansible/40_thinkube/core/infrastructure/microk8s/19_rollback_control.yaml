@@ -1,0 +1,121 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Rollback MicroK8s Control Node Installation
+# Description:
+#   Removes MicroK8s and all related configurations
+#   - Removes MicroK8s snap
+#   - Cleans up kubectl/helm wrappers
+#   - Removes aliases from Thinkube system
+#   - Removes user from microk8s group
+#   - Cleans up configuration directories
+#
+# WARNING: This will completely remove MicroK8s and all Kubernetes resources!
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/microk8s/19_rollback_control.yaml
+
+- name: Rollback MicroK8s Control Node Installation
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+
+    # Paths to clean up
+    kube_config_dir: "{{ user_home }}/.kube"
+    local_bin_dir: "{{ user_home }}/.local/bin"
+    thinkube_alias_dir: "{{ user_home }}/.thinkube_shared_shell/aliases"
+    kubectl_aliases_file: "{{ thinkube_alias_dir }}/kubectl_aliases.json"
+    helm_aliases_file: "{{ thinkube_alias_dir }}/helm_aliases.json"
+
+  tasks:
+    - name: Check if MicroK8s is installed
+      ansible.builtin.command: "snap list microk8s"
+      register: microk8s_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop MicroK8s if running
+      ansible.builtin.command: microk8s stop
+      become: true
+      when: microk8s_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Get current groups for user
+      ansible.builtin.command: "id -nG {{ user }}"
+      register: current_groups
+      changed_when: false
+      become: true
+
+    - name: Remove microk8s from user groups
+      ansible.builtin.user:
+        name: "{{ user }}"
+        groups: "{{ (current_groups.stdout.split() | reject('equalto', 'microk8s')) | join(',') }}"
+        append: false
+        state: present
+      become: true
+      when: "'microk8s' in current_groups.stdout"
+      failed_when: false
+
+    - name: Remove MicroK8s snap
+      ansible.builtin.command: snap remove microk8s
+      register: snap_remove
+      changed_when: snap_remove.rc == 0
+      become: true
+      when: microk8s_check.rc == 0
+
+    - name: Remove kubectl wrapper script
+      ansible.builtin.file:
+        path: "{{ local_bin_dir }}/kubectl"
+        state: absent
+
+    - name: Remove helm wrapper script
+      ansible.builtin.file:
+        path: "{{ local_bin_dir }}/helm"
+        state: absent
+
+    - name: Remove kubectl aliases file
+      ansible.builtin.file:
+        path: "{{ kubectl_aliases_file }}"
+        state: absent
+
+    - name: Remove helm aliases file
+      ansible.builtin.file:
+        path: "{{ helm_aliases_file }}"
+        state: absent
+
+    - name: Remove .kube directory
+      ansible.builtin.file:
+        path: "{{ kube_config_dir }}"
+        state: absent
+
+    - name: Run alias regeneration to remove k8s aliases
+      ansible.builtin.command: "{{ ansible_env.HOME }}/.thinkube_shared_shell/scripts/regenerate_aliases.sh"
+      changed_when: true
+      failed_when: false
+
+    - name: Clean up MicroK8s data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      become: true
+      loop:
+        - /var/snap/microk8s
+        - /var/lib/microk8s
+      failed_when: false
+
+    - name: Display rollback status
+      ansible.builtin.debug:
+        msg:
+          - "MicroK8s rollback completed"
+          - "Removed components:"
+          - "- MicroK8s snap package"
+          - "- kubectl/helm wrappers"
+          - "- Kubernetes aliases"
+          - "- Configuration directories"
+          - ""
+          - "NOTE: User may need to log out and back in to refresh group membership"

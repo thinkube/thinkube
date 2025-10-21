@@ -1,0 +1,97 @@
+---
+# ansible/40_thinkube/optional/jupyterhub/12_configure_examples_sync.yaml
+# Description:
+#   Configure automatic sync of Jupyter examples repository
+#   Creates CronJob for daily updates and manual trigger capability
+#
+# Requirements:
+#   - JupyterHub deployed with examples PVC
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/12_configure_examples_sync.yaml
+#
+#   Manual sync trigger:
+#   kubectl create job --from=cronjob/thinkube-ai-examples-sync manual-sync -n jupyterhub
+#
+# Variables from inventory:
+#   None required
+#
+# Dependencies:
+#   - JupyterHub must be deployed (11_deploy.yaml)
+#
+# 🤖 AI-assisted
+
+- name: Configure Jupyter Examples Auto-Sync
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    jupyterhub_namespace: jupyterhub
+    kubeconfig: /var/snap/microk8s/current/credentials/client.config
+
+  tasks:
+    - name: Create CronJob for examples repository sync
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: thinkube-ai-examples-sync
+            namespace: "{{ jupyterhub_namespace }}"
+          spec:
+            # Run daily at 2 AM
+            schedule: "0 2 * * *"
+            successfulJobsHistoryLimit: 3
+            failedJobsHistoryLimit: 3
+            jobTemplate:
+              spec:
+                ttlSecondsAfterFinished: 86400  # 24 hours
+                template:
+                  spec:
+                    restartPolicy: Never
+                    containers:
+                      - name: git-sync
+                        image: alpine/git:latest
+                        command:
+                          - sh
+                          - -c
+                          - |
+                            set -e
+
+                            if [ ! -d /examples/thinkube-ai-examples/.git ]; then
+                              echo "ERROR: Examples repository not initialized"
+                              echo "Run initial deployment first: 11_deploy.yaml"
+                              exit 1
+                            fi
+
+                            cd /examples/thinkube-ai-examples
+
+                            echo "Pulling latest examples from GitHub..."
+                            git fetch origin main
+                            git reset --hard origin/main
+
+                            echo "Examples repository synced successfully"
+                            echo "Last update: $(date)"
+                        volumeMounts:
+                          - name: examples
+                            mountPath: /examples
+                    volumes:
+                      - name: examples
+                        persistentVolumeClaim:
+                          claimName: jupyterhub-examples-pvc
+
+    - name: Display sync job information
+      ansible.builtin.debug:
+        msg:
+          - "Jupyter examples sync CronJob configured successfully!"
+          - "Schedule: Daily at 2 AM"
+          - ""
+          - "Manual sync:"
+          - "  kubectl create job --from=cronjob/thinkube-ai-examples-sync manual-sync -n jupyterhub"
+          - ""
+          - "Check sync status:"
+          - "  kubectl get cronjobs -n jupyterhub"
+          - "  kubectl get jobs -n jupyterhub"

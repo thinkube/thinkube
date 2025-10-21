@@ -1,0 +1,145 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Rollback cert-manager installation
+#
+# This playbook removes cert-manager and all associated resources,
+# reverting to manual certificate management if needed.
+#
+# WARNING: This will delete all certificates managed by cert-manager!
+# Make sure to have backups or alternative certificate management before running.
+#
+# Prerequisites:
+#   - Cert-manager currently installed
+#   - Alternative certificate management ready (if needed)
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/cert-manager/19_rollback.yaml
+
+- name: Rollback cert-manager installation
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    cert_manager_namespace: "cert-manager"
+
+  tasks:
+
+    - name: Check if cert-manager namespace exists
+      ansible.builtin.command: microk8s kubectl get namespace {{ cert_manager_namespace }} --no-headers --ignore-not-found
+      register: namespace_exists
+      changed_when: false
+      become: true
+      failed_when: false
+
+    - name: Use kubectl to list all certificates
+      ansible.builtin.shell: |
+        microk8s kubectl get certificates --all-namespaces -o json | jq -c '.items[] | {name: .metadata.name, namespace: .metadata.namespace}'
+      register: all_certificates_raw
+      become: true
+      when: namespace_exists.stdout != ""
+      failed_when: false
+      
+    - name: Parse certificates JSON
+      ansible.builtin.set_fact:
+        all_certificates: "{{ all_certificates_raw.stdout_lines | map('from_json') | list }}"
+      when: 
+        - namespace_exists.stdout != ""
+        - all_certificates_raw.stdout is defined and all_certificates_raw.stdout | length > 0
+
+    - name: Display certificates that will be deleted
+      ansible.builtin.debug:
+        msg:
+          - "Namespace: {{ item.namespace }}"
+          - "Certificate: {{ item.name }}"
+      loop: "{{ all_certificates }}"
+      loop_control:
+        label: "{{ item.namespace }}/{{ item.name }}"
+      when: all_certificates is defined
+
+    - name: Delete all certificates
+      ansible.builtin.shell: |
+        microk8s kubectl delete certificate {{ item.name }} -n {{ item.namespace }}
+      become: true
+      loop: "{{ all_certificates }}"
+      loop_control:
+        label: "{{ item.namespace }}/{{ item.name }}"
+      when: 
+        - all_certificates is defined
+        - all_certificates | length > 0
+      failed_when: false
+
+    - name: Delete all challenges
+      ansible.builtin.shell: |
+        if microk8s kubectl get crd challenges.acme.cert-manager.io >/dev/null 2>&1; then
+          echo "Deleting all challenges..."
+          microk8s kubectl delete challenges --all --all-namespaces
+        else
+          echo "No challenge CRD found, skipping"
+        fi
+      become: true
+      failed_when: false
+
+    - name: Delete ClusterIssuers
+      ansible.builtin.shell: |
+        microk8s kubectl delete clusterissuer {{ item }}
+      become: true
+      loop:
+        - letsencrypt-prod
+        - letsencrypt-staging
+      failed_when: false
+
+    - name: Delete Cloudflare API token secret
+      ansible.builtin.shell: |
+        microk8s kubectl delete secret cloudflare-api-token -n {{ cert_manager_namespace }}
+      become: true
+      failed_when: false
+
+    - name: Uninstall cert-manager Helm chart
+      ansible.builtin.shell: |
+        microk8s helm3 uninstall cert-manager -n {{ cert_manager_namespace }} || true
+      become: true
+      when: namespace_exists.stdout != ""
+      register: uninstall_result
+
+    - name: Wait for namespace deletion
+      ansible.builtin.shell: |
+        microk8s kubectl get namespace {{ cert_manager_namespace }} --no-headers --ignore-not-found
+      become: true
+      register: namespace_check
+      until: namespace_check.stdout == ""
+      retries: 30
+      delay: 10
+      failed_when: false
+
+    - name: Force delete namespace if stuck
+      ansible.builtin.shell: |
+        microk8s kubectl delete namespace {{ cert_manager_namespace }} --force --grace-period=0
+      become: true
+      when: namespace_check.stdout != ""
+      failed_when: false
+
+    - name: Clean up any remaining certificate secrets
+      ansible.builtin.shell: |
+        microk8s kubectl delete secret {{ domain_name.replace('.', '-') }}-tls -n default
+      become: true
+      failed_when: false
+
+    - name: Delete cert-manager CRDs
+      ansible.builtin.shell: |
+        for crd in certificaterequests.cert-manager.io certificates.cert-manager.io challenges.acme.cert-manager.io clusterissuers.cert-manager.io issuers.cert-manager.io orders.acme.cert-manager.io; do
+          microk8s kubectl delete crd $crd || true
+        done
+      become: true
+      failed_when: false
+
+    - name: Display rollback summary
+      ansible.builtin.debug:
+        msg:
+          - "Cert-manager rollback completed"
+          - "Certificates deleted: {{ (all_certificates | default([])) | length }}"
+          - "Cert-manager uninstalled: {{ 'SUCCESS' if uninstall_result.changed | default(false) else 'Not installed' }}"
+          - ""
+          - "WARNING: SSL certificates are no longer managed automatically"
+          - "You may need to implement alternative certificate management"

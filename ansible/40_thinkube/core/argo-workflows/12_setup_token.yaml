@@ -1,0 +1,155 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/argo-workflows/12_setup_token.yaml
+# Description:
+#   Install Argo CLI, create ServiceAccount token, and verify connectivity using gRPC domain
+#
+# Requirements:
+#   - MicroK8s Kubernetes cluster
+#   - Argo Workflows deployment (run 11_deploy.yaml first)
+#   - Properly configured gRPC domain with TLS
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/argo-workflows/12_setup_token.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain name for all services
+#   - kubectl_bin: Path to kubectl binary
+#
+# Dependencies:
+#   - CORE-001: MicroK8s Control Node
+#   - CORE-008: Argo Workflows (11_deploy.yaml)
+
+- name: Install Argo CLI + Ensure SA token + Verify with gRPC domain
+  hosts: microk8s_control_plane
+  gather_facts: false
+  become: true
+
+  vars:
+    # CLI install settings
+    argo_version: "v3.6.2"
+    temp_dir: "/tmp"
+
+    # K8s + Argo ServiceAccount token settings
+    argo_namespace: "argo"
+    argo_server_sa: "argo-workflows-server"
+    argo_sa_secret_name: "argo-workflows-server-sa-token"
+
+    # gRPC settings
+    argo_grpc_domain: "grpc-argo.{{ domain_name }}"
+    argo_server_port: 443
+
+    # If self-signed or untrusted cert
+    argo_cli_insecure_skip_verify: false
+
+  tasks:
+    ########################################################################
+    # (A) INSTALL ARGO CLI (LINUX AMD64)
+    ########################################################################
+    - name: Download Argo CLI binary (linux-amd64)
+      ansible.builtin.get_url:
+        url: "https://github.com/argoproj/argo-workflows/releases/download/{{ argo_version }}/argo-linux-amd64.gz"
+        dest: "{{ temp_dir }}/argo-linux-amd64.gz"
+        mode: '0644'
+      failed_when: false
+
+    - name: Decompress Argo binary
+      ansible.builtin.command: gunzip -f "{{ temp_dir }}/argo-linux-amd64.gz"
+      args:
+        creates: "{{ temp_dir }}/argo-linux-amd64"
+      failed_when: false
+
+    - name: Move Argo binary to /usr/local/bin
+      ansible.builtin.copy:
+        src: "{{ temp_dir }}/argo-linux-amd64"
+        dest: "/usr/local/bin/argo"
+        mode: '0755'
+        remote_src: true
+      failed_when: false
+
+    - name: Verify Argo CLI installation
+      ansible.builtin.command: argo version
+      register: argo_version_output
+      changed_when: false
+      failed_when: argo_version_output.rc != 0
+
+    - name: Show Argo version
+      ansible.builtin.debug:
+        var: argo_version_output.stdout_lines
+
+    ########################################################################
+    # (B) CREATE/UPDATE SA TOKEN SECRET (FOR K8s 1.24+)
+    ########################################################################
+    - name: Create or update SA token secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ argo_sa_secret_name }}"
+            namespace: "{{ argo_namespace }}"
+            annotations:
+              kubernetes.io/service-account.name: "{{ argo_server_sa }}"
+          type: kubernetes.io/service-account-token
+
+    ########################################################################
+    # (C) WAIT FOR TOKEN
+    ########################################################################
+    - name: Wait for token to be populated in the secret
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          token=$({{ kubectl_bin }} -n {{ argo_namespace }} get secret {{ argo_sa_secret_name }} \
+                  -o jsonpath='{.data.token}' | tr -d '\n')
+          if [ -n "$token" ]; then
+            echo "$token"
+            exit 0
+          fi
+          sleep 2
+        done
+        exit 1
+      register: token_b64
+      changed_when: false
+      failed_when: token_b64.rc != 0
+
+    ########################################################################
+    # (D) DECODE THE TOKEN
+    ########################################################################
+    - name: Decode the token
+      ansible.builtin.set_fact:
+        argo_sa_token: "{{ token_b64.stdout | b64decode | regex_replace('\\n$', '') }}"
+
+    - name: Show the token
+      ansible.builtin.debug:
+        msg: "Argo SA token: {{ argo_sa_token }}"
+
+    ########################################################################
+    # (E) VERIFY ARGO CLI (GRPC DOMAIN)
+    ########################################################################
+    - name: Build 'argo list' command
+      ansible.builtin.set_fact:
+        argo_list_cmd: >-
+          argo list
+          -n {{ argo_namespace }}
+          -s {{ argo_grpc_domain }}:{{ argo_server_port }}
+          -e
+          {% if argo_cli_insecure_skip_verify %}-k{% endif %}
+          --token "{{ argo_sa_token }}"
+
+    - name: Attempt 'argo list' with SA token
+      ansible.builtin.shell: |
+        set -eu
+        echo "Listing workflows in '{{ argo_namespace }}' with token via gRPC domain..."
+        export KUBECONFIG={{ kubeconfig }}
+        {{ argo_list_cmd }}
+      register: argo_cli_test
+      changed_when: false
+      failed_when: argo_cli_test.rc != 0
+
+    - name: Display result (truncated)
+      ansible.builtin.debug:
+        msg: "Argo CLI result: {{ argo_cli_test.stdout | default('') | truncate(300) }}"

@@ -1,0 +1,224 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/cert-manager/letsencrypt/22_sync_certificates.yaml
+# Description:
+#   Manually trigger certificate synchronization across all namespaces
+#   Use this when you need immediate certificate propagation
+#
+# Requirements:
+#   - cert-manager must be deployed
+#   - Certificate sync CronJob must exist
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/cert-manager/letsencrypt/22_sync_certificates.yaml
+#
+# Variables from inventory:
+#   - domain_name: The domain for certificates
+#
+# 🤖 [AI-assisted]
+
+- name: Manually Trigger Certificate Synchronization
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    cert_manager_namespace: cert-manager
+    show_diff: "{{ show_certificate_diff | default(false) }}"
+    
+  tasks:
+    - name: Check if cert-sync CronJob exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: batch/v1
+        kind: CronJob
+        name: cert-sync
+        namespace: "{{ cert_manager_namespace }}"
+      register: cronjob_check
+      failed_when: cronjob_check.resources | length == 0
+
+    - name: Get current certificate information
+      ansible.builtin.shell: |
+        CERT_NAME="{{ domain_name.replace('.', '-') }}-tls"
+        
+        echo "════════════════════════════════════════════════════════"
+        echo "Current Certificate Information"
+        echo "════════════════════════════════════════════════════════"
+        
+        # Get certificate details
+        CERT_DATA=$(microk8s kubectl get secret $CERT_NAME -n default -o jsonpath='{.data.tls\.crt}' | base64 -d)
+        
+        echo "Issuer: $(echo "$CERT_DATA" | openssl x509 -issuer -noout)"
+        echo "Subject: $(echo "$CERT_DATA" | openssl x509 -subject -noout)"
+        echo "Not Before: $(echo "$CERT_DATA" | openssl x509 -startdate -noout)"
+        echo "Not After: $(echo "$CERT_DATA" | openssl x509 -enddate -noout)"
+        echo ""
+        
+        # Calculate days until expiry
+        EXPIRY_DATE=$(echo "$CERT_DATA" | openssl x509 -enddate -noout | cut -d= -f2)
+        EXPIRY_EPOCH=$(date -d "$EXPIRY_DATE" +%s)
+        CURRENT_EPOCH=$(date +%s)
+        DAYS_UNTIL_EXPIRY=$(( (EXPIRY_EPOCH - CURRENT_EPOCH) / 86400 ))
+        
+        echo "Days until expiry: $DAYS_UNTIL_EXPIRY"
+        
+        # Get certificate fingerprint for comparison
+        FINGERPRINT=$(echo "$CERT_DATA" | openssl x509 -fingerprint -noout)
+        echo "Fingerprint: $FINGERPRINT"
+      register: cert_info
+      become: true
+
+    - name: Display certificate information
+      ansible.builtin.debug:
+        var: cert_info.stdout_lines
+
+    - name: Create manual sync job
+      ansible.builtin.shell: |
+        JOB_NAME="cert-sync-manual-{{ ansible_date_time.epoch }}"
+        
+        echo "Creating manual sync job: $JOB_NAME"
+        microk8s kubectl create job \
+          --from=cronjob/cert-sync \
+          "$JOB_NAME" \
+          -n {{ cert_manager_namespace }}
+        
+        echo "Job created successfully"
+      register: create_job
+      become: true
+
+    - name: Wait for sync job to start
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: batch/v1
+        kind: Job
+        name: "cert-sync-manual-{{ ansible_date_time.epoch }}"
+        namespace: "{{ cert_manager_namespace }}"
+      register: job_status
+      until: job_status.resources[0].status.active is defined or job_status.resources[0].status.succeeded is defined
+      retries: 30
+      delay: 2
+
+    - name: Stream sync job logs
+      ansible.builtin.shell: |
+        JOB_NAME="cert-sync-manual-{{ ansible_date_time.epoch }}"
+        POD_NAME=$(microk8s kubectl get pods -n {{ cert_manager_namespace }} -l job-name=$JOB_NAME -o jsonpath='{.items[0].metadata.name}')
+        
+        if [ -z "$POD_NAME" ]; then
+          echo "Waiting for pod to be created..."
+          sleep 5
+          POD_NAME=$(microk8s kubectl get pods -n {{ cert_manager_namespace }} -l job-name=$JOB_NAME -o jsonpath='{.items[0].metadata.name}')
+        fi
+        
+        echo "Streaming logs from pod: $POD_NAME"
+        echo "════════════════════════════════════════════════════════"
+        
+        # Stream logs with timeout
+        timeout 300 microk8s kubectl logs -f $POD_NAME -n {{ cert_manager_namespace }} || true
+      register: job_logs
+      become: true
+
+    - name: Check job completion status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: batch/v1
+        kind: Job
+        name: "cert-sync-manual-{{ ansible_date_time.epoch }}"
+        namespace: "{{ cert_manager_namespace }}"
+      register: final_job_status
+
+    - name: Verify certificate propagation
+      when: show_diff
+      ansible.builtin.shell: |
+        CERT_NAME="{{ domain_name.replace('.', '-') }}-tls"
+        
+        echo "════════════════════════════════════════════════════════"
+        echo "Verifying Certificate Propagation"
+        echo "════════════════════════════════════════════════════════"
+        
+        # Get the source certificate fingerprint
+        SOURCE_FINGERPRINT=$(microk8s kubectl get secret $CERT_NAME -n default -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -fingerprint -noout)
+        
+        echo "Source certificate fingerprint:"
+        echo "$SOURCE_FINGERPRINT"
+        echo ""
+        
+        # Check certificates in other namespaces
+        NAMESPACES=$(microk8s kubectl get secrets --all-namespaces -o json | \
+          jq -r '.items[] | select(.type == "kubernetes.io/tls") | .metadata.namespace' | \
+          sort -u | grep -v "^default$" | head -10)
+        
+        echo "Checking certificates in namespaces:"
+        for NS in $NAMESPACES; do
+          if microk8s kubectl get secret -n "$NS" -o name | grep -q "tls-secret"; then
+            TARGET_FINGERPRINT=$(microk8s kubectl get secret -n "$NS" -o name | \
+              grep "tls-secret" | head -1 | \
+              xargs -I {} microk8s kubectl get {} -n "$NS" -o jsonpath='{.data.tls\.crt}' | \
+              base64 -d | openssl x509 -fingerprint -noout 2>/dev/null || echo "ERROR")
+            
+            if [ "$TARGET_FINGERPRINT" == "$SOURCE_FINGERPRINT" ]; then
+              echo "✅ $NS: Certificate matches source"
+            else
+              echo "❌ $NS: Certificate differs from source"
+            fi
+          else
+            echo "⚪ $NS: No TLS secret found"
+          fi
+        done
+      register: verify_propagation
+      become: true
+
+    - name: Display verification results
+      when: show_diff
+      ansible.builtin.debug:
+        var: verify_propagation.stdout_lines
+
+    - name: Clean up completed sync jobs
+      ansible.builtin.shell: |
+        echo "Cleaning up old sync jobs..."
+        
+        # Get all completed cert-sync jobs older than 1 hour
+        OLD_JOBS=$(microk8s kubectl get jobs -n {{ cert_manager_namespace }} -o json | \
+          jq -r '.items[] | 
+            select(.metadata.name | startswith("cert-sync-")) | 
+            select(.status.succeeded == 1) | 
+            select(.status.completionTime) |
+            select((now - (.status.completionTime | fromdateiso8601)) > 3600) |
+            .metadata.name')
+        
+        if [ -n "$OLD_JOBS" ]; then
+          echo "Deleting old jobs:"
+          for JOB in $OLD_JOBS; do
+            echo "  - $JOB"
+            microk8s kubectl delete job $JOB -n {{ cert_manager_namespace }}
+          done
+        else
+          echo "No old jobs to clean up"
+        fi
+      register: cleanup_jobs
+      become: true
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Manual Certificate Sync Complete
+          ════════════════════════════════════════════════════════
+          
+          Job Status: {{ 'Succeeded' if final_job_status.resources[0].status.succeeded else 'Failed' }}
+          Job Name: cert-sync-manual-{{ ansible_date_time.epoch }}
+          
+          {% if final_job_status.resources[0].status.succeeded %}
+          The certificate has been synchronized to all namespaces.
+          Services will automatically pick up the new certificate.
+          {% else %}
+          ⚠️  The sync job failed. Check the logs above for details.
+          {% endif %}
+          
+          Next automatic sync: Within the next hour
+          
+          To see detailed differences, run with:
+            -e show_certificate_diff=true
+          ════════════════════════════════════════════════════════

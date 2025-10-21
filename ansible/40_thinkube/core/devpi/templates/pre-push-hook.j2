@@ -1,0 +1,48 @@
+#!/bin/bash
+
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Git pre-push hook to record the commit being pushed
+# This works with the repository monitor service to trigger builds after push completes
+
+# Log file for debugging
+LOG_FILE="/home/coder/.hooks-logs/pre-push.log"
+mkdir -p "/home/coder/.hooks-logs"
+echo "$(date): Pre-push hook triggered" > "$LOG_FILE"
+
+# When pre-push hook runs, it receives stdin lines in the format:
+# <local ref> <local sha1> <remote ref> <remote sha1>
+# Read the first line to get the local ref and SHA
+read local_ref local_sha remote_ref remote_sha
+
+# Get the commit SHA being pushed
+echo "Local SHA: $local_sha" >> "$LOG_FILE"
+
+# Create a unique timestamp
+TIMESTAMP=$(date +%Y%m%dT%H%M%S)
+
+# Create a file in the pending commits directory
+# This directory should be monitored by the repository monitor service
+PENDING_DIR="/home/coder/.pending-commits"
+mkdir -p "$PENDING_DIR"
+
+# Create a file containing the commit SHA and project info
+cat > "$PENDING_DIR/$TIMESTAMP-{{ app_name }}-$local_sha.commit" << EOF
+{
+  "project_id": "{{ app_name }}",
+  "repo_url": "{{ github_repo_url }}",
+  "commit_sha": "$local_sha",
+  "timestamp": "$TIMESTAMP",
+  "namespace": "argo",
+  "image_repo": "{{ image_repo }}",
+  "docker_secret": "{{ docker_config_secret_name }}",
+  "service_account": "{{ kaniko_sa_name }}"
+}
+EOF
+
+echo "Created pending commit file at $PENDING_DIR/$TIMESTAMP-{{ app_name }}-$local_sha.commit" >> "$LOG_FILE"
+echo "✅ Push recorded. Build will start once push completes."
+
+# Always allow the push to proceed
+exit 0

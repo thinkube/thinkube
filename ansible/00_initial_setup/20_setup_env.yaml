@@ -1,0 +1,154 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 20_setup_env.yaml - Set up environment variables from inventory
+#
+# Purpose:
+#   Creates environment variables file from inventory settings,
+#   preserving any existing variables not set by inventory.
+#
+# Requirements:
+#   - SSH keys must be configured correctly
+#   - Inventory file must contain required variables
+#
+# Variables:
+#   Required (from inventory):
+#     - domain_name: Primary domain for services
+#     - network_cidr: IP range for the network
+#     - network_gateway: Default gateway for LAN
+#     - admin_username: Administrative username
+#   Optional:
+#     - zerotier_network_id: ZeroTier network identifier
+#
+# Run with: 
+#   ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/20_setup_env.yaml
+#   Or with helper script:
+#   ./scripts/run_ansible.sh ansible/00_initial_setup/20_setup_env.yaml
+
+- name: Setup Environment Variables from Inventory
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined and domain_name | length > 0
+          - network_cidr is defined and network_cidr | length > 0
+          - network_gateway is defined and network_gateway | length > 0
+          - admin_username is defined and admin_username | length > 0
+        fail_msg: |
+          ERROR: Missing Required Variables
+          
+          DETAILS:
+          - The following variables must be defined in inventory:
+            - domain_name: {% if domain_name is defined and domain_name | length > 0 %}✓{% else %}✗ missing{% endif %}
+            - network_cidr: {% if network_cidr is defined and network_cidr | length > 0 %}✓{% else %}✗ missing{% endif %}
+            - network_gateway: {% if network_gateway is defined and network_gateway | length > 0 %}✓{% else %}✗ missing{% endif %}
+            - admin_username: {% if admin_username is defined and admin_username | length > 0 %}✓{% else %}✗ missing{% endif %}
+          
+          REQUIRED ACTION:
+          - Add missing variables to your inventory file at inventory/inventory.yaml
+          - Or define them in inventory/group_vars/all.yml
+          
+          REFERENCE: See docs/architecture/VARIABLE_HANDLING.md
+    - name: Ensure .env file directory exists
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}"
+        state: directory
+        mode: '0700'
+
+    - name: Create .env file if it doesn't exist
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/.env"
+        state: touch
+        mode: '0600'
+        modification_time: preserve
+        access_time: preserve
+      register: touch_result
+
+    - name: Backup existing .env file
+      ansible.builtin.copy:
+        src: "{{ lookup('env', 'HOME') }}/.env"
+        dest: "{{ lookup('env', 'HOME') }}/.env.bak-{{ ansible_date_time.date }}"
+        mode: '0600'
+        remote_src: yes
+      when: not touch_result.changed
+
+    # Update environment variables one by one using lineinfile
+    # This ensures we don't destroy existing variables not managed by Ansible
+    
+    - name: Update network configuration variables
+      ansible.builtin.lineinfile:
+        path: "{{ lookup('env', 'HOME') }}/.env"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        state: present
+      loop:
+        - { key: "DOMAIN_NAME", value: "{{ domain_name }}" }
+        - { key: "NETWORK_CIDR", value: "{{ network_cidr }}" }
+        - { key: "NETWORK_GATEWAY", value: "{{ network_gateway }}" }
+        - { key: "ADMIN_USERNAME", value: "{{ admin_username }}" }
+
+    - name: Update ZeroTier Network ID if defined
+      ansible.builtin.lineinfile:
+        path: "{{ lookup('env', 'HOME') }}/.env"
+        regexp: "^ZEROTIER_NETWORK_ID="
+        line: "ZEROTIER_NETWORK_ID={{ zerotier_network_id }}"
+        state: present
+      when: zerotier_network_id is defined and zerotier_network_id | length > 0
+    
+    # Update server IP variables
+    - name: Update server IP variables
+      ansible.builtin.lineinfile:
+        path: "{{ lookup('env', 'HOME') }}/.env"
+        regexp: "^{{ item | upper }}_IP="
+        line: "{{ item | upper }}_IP={{ hostvars[item]['ansible_host'] }}"
+        state: present
+      loop: "{{ groups['baremetal'] }}"
+      when: hostvars[item]['ansible_host'] is defined
+      
+    - name: Display environment setup message
+      ansible.builtin.debug:
+        msg: "Environment variables have been set up in ~/.env"
+        
+    - name: Remind to source the environment file
+      ansible.builtin.debug:
+        msg: "Remember to run 'source ~/.env' to load these variables in your current shell"
+        
+    # No need to clean up temporary files as we're no longer using any
+
+    - name: Create symbolic link to .env file in project root
+      ansible.builtin.file:
+        src: "{{ lookup('env', 'HOME') }}/.env"
+        dest: "{{ playbook_dir }}/../../.env"
+        state: link
+        force: yes
+
+    - name: Check if executable script exists for environment sourcing
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../scripts/setup_env_link.sh"
+      register: setup_script
+
+    - name: Display successful setup message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          ✓ Environment Setup Complete
+          ═════════════════════════════════════════════════════════
+          
+          Environment variables have been successfully set up.
+          
+          DETAILS:
+            ✓ Created ~/.env file with required variables
+            ✓ Created symbolic link in project root
+            ✓ Preserved existing custom variables
+          
+          NEXT STEPS:
+            1. Source the environment file: source ~/.env
+            2. Verify variables are loaded: echo $DOMAIN_NAME
+          
+          ═════════════════════════════════════════════════════════

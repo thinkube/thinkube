@@ -1,0 +1,112 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/perses/18_test.yaml
+# Description:
+#   Test Perses deployment and verify all components are working
+#
+# Tests performed:
+#   1. Namespace exists
+#   2. Perses pod is running and ready
+#   3. Service is accessible
+#   4. Ingress is configured
+#   5. HTTPS endpoint is accessible
+#   6. OIDC authentication redirects correctly
+#
+# Requirements:
+#   - Perses must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/perses/18_test.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - domain_name: Base domain for the cluster
+#
+# 🤖 AI-assisted
+
+- name: Test Perses deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    perses_namespace: "perses"
+    perses_hostname: "perses.{{ domain_name }}"
+
+  tasks:
+    - name: Test - Perses namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Namespace
+        name: "{{ perses_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Test - Perses pod is running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ perses_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=perses"
+      register: pod_check
+      failed_when: >
+        pod_check.resources | length == 0 or
+        pod_check.resources[0].status.phase != 'Running'
+
+    - name: Test - Perses service exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        namespace: "{{ perses_namespace }}"
+        name: perses
+      register: service_check
+      failed_when: service_check.resources | length == 0
+
+    - name: Test - Perses ingress exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Ingress
+        namespace: "{{ perses_namespace }}"
+        name: perses
+      register: ingress_check
+      failed_when: ingress_check.resources | length == 0
+
+    - name: Test - HTTPS endpoint is accessible
+      ansible.builtin.uri:
+        url: "https://{{ perses_hostname }}"
+        method: GET
+        validate_certs: true
+        status_code: [200, 301, 302, 307, 308]
+        follow_redirects: none
+      register: https_check
+      retries: 5
+      delay: 10
+      until: https_check.status in [200, 301, 302, 307, 308]
+
+    - name: Test - Service discovery ConfigMap exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: ConfigMap
+        namespace: "{{ perses_namespace }}"
+        name: thinkube-service-config
+      register: configmap_check
+      failed_when: configmap_check.resources | length == 0
+
+    - name: All tests passed
+      ansible.builtin.debug:
+        msg:
+          - "✓ All Perses tests passed!"
+          - ""
+          - "Deployment status:"
+          - "  Namespace: {{ perses_namespace }} - OK"
+          - "  Pod status: {{ pod_check.resources[0].status.phase }} - OK"
+          - "  Service: perses - OK"
+          - "  Ingress: configured - OK"
+          - "  HTTPS endpoint: {{ https_check.status }} - OK"
+          - "  Service discovery: registered - OK"
+          - ""
+          - "Access Perses at: https://{{ perses_hostname }}"
+          - "Authentication: Keycloak SSO"

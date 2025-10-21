@@ -1,0 +1,248 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/weaviate/18_test.yaml
+# Description:
+#   Test Weaviate deployment and functionality
+#   This playbook verifies that Weaviate is properly deployed and operational
+#
+# Requirements:
+#   - Weaviate must be deployed
+#   - ADMIN_PASSWORD environment variable must be set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/weaviate/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Test Weaviate deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    weaviate_namespace: "weaviate"
+    weaviate_hostname: "weaviate.{{ domain_name }}"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    test_results: []
+
+  tasks:
+    - name: Check if Weaviate namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ weaviate_namespace }}"
+      register: namespace_check
+
+    - name: Record namespace test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Namespace exists', 'passed': namespace_check.resources | length > 0}] }}"
+
+    - name: Check Weaviate StatefulSet status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ weaviate_namespace }}"
+        name: weaviate
+      register: statefulset_check
+
+    - name: Record StatefulSet test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'StatefulSet exists', 'passed': statefulset_check.resources | length > 0}] }}"
+
+    - name: Check if Weaviate pods are running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ weaviate_namespace }}"
+        label_selectors:
+          - app=weaviate
+      register: pod_check
+
+    - name: Record pod status test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Pods running', 'passed': pod_check.resources | length > 0 and pod_check.resources[0].status.phase == 'Running'}] }}"
+
+    - name: Check Weaviate service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ weaviate_namespace }}"
+        name: weaviate
+      register: service_check
+
+    - name: Record service test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Service exists', 'passed': service_check.resources | length > 0}] }}"
+
+    - name: Check Weaviate Ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ weaviate_namespace }}"
+        name: weaviate-ingress
+      register: ingress_check
+
+    - name: Record ingress test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Ingress configured', 'passed': ingress_check.resources | length > 0}] }}"
+
+    - name: Test Weaviate health endpoint
+      ansible.builtin.uri:
+        url: "https://{{ weaviate_hostname }}/v1/.well-known/ready"
+        method: GET
+        validate_certs: false
+        status_code: [200]
+      register: health_check
+      ignore_errors: true
+
+    - name: Record health check result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Health endpoint accessible', 'passed': health_check.status is defined and health_check.status == 200}] }}"
+
+    - name: Test Weaviate API with authentication
+      ansible.builtin.uri:
+        url: "https://{{ weaviate_hostname }}/v1/schema"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ admin_password }}"
+        validate_certs: false
+        status_code: [200]
+      register: api_check
+      ignore_errors: true
+
+    - name: Record API authentication test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'API authentication working', 'passed': api_check.status is defined and api_check.status == 200}] }}"
+
+    - name: Create test schema
+      ansible.builtin.uri:
+        url: "https://{{ weaviate_hostname }}/v1/schema"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ admin_password }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          class: "TestArticle"
+          description: "Test article class for validation"
+          properties:
+            - name: "title"
+              dataType: ["text"]
+              description: "Title of the article"
+            - name: "content"
+              dataType: ["text"]
+              description: "Content of the article"
+            - name: "wordCount"
+              dataType: ["int"]
+              description: "Word count of the article"
+        validate_certs: false
+        status_code: [200]
+      register: schema_create
+      ignore_errors: true
+
+    - name: Record schema creation test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Schema creation', 'passed': schema_create.status is defined and schema_create.status == 200}] }}"
+
+    - name: Create test object
+      ansible.builtin.uri:
+        url: "https://{{ weaviate_hostname }}/v1/objects"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ admin_password }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          class: "TestArticle"
+          properties:
+            title: "Test Article"
+            content: "This is a test article to verify Weaviate functionality"
+            wordCount: 10
+        validate_certs: false
+        status_code: [200]
+      register: object_create
+      ignore_errors: true
+      when: schema_create.status is defined and schema_create.status == 200
+
+    - name: Record object creation test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Object creation', 'passed': object_create.status is defined and object_create.status == 200}] }}"
+      when: schema_create.status is defined and schema_create.status == 200
+
+    - name: Query test object
+      ansible.builtin.uri:
+        url: "https://{{ weaviate_hostname }}/v1/graphql"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ admin_password }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          query: |
+            {
+              Get {
+                TestArticle {
+                  title
+                  content
+                  wordCount
+                }
+              }
+            }
+        validate_certs: false
+        status_code: [200]
+      register: graphql_query
+      ignore_errors: true
+      when: object_create is defined and object_create.status is defined and object_create.status == 200
+
+    - name: Record GraphQL query test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'GraphQL query', 'passed': graphql_query.status is defined and graphql_query.status == 200}] }}"
+      when: object_create is defined and object_create.status is defined and object_create.status == 200
+
+    - name: Clean up test schema
+      ansible.builtin.uri:
+        url: "https://{{ weaviate_hostname }}/v1/schema/TestArticle"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ admin_password }}"
+        validate_certs: false
+        status_code: [200, 404]
+      ignore_errors: true
+      when: schema_create.status is defined and schema_create.status == 200
+
+    - name: Display test results summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          Weaviate Test Results Summary
+          ========================================
+          {% for result in test_results %}
+          {{ '✓' if result.passed else '✗' }} {{ result.test }}
+          {% endfor %}
+
+          Total: {{ test_results | selectattr('passed', 'equalto', true) | list | length }}/{{ test_results | length }} tests passed
+
+          {% if test_results | selectattr('passed', 'equalto', false) | list | length > 0 %}
+          FAILED TESTS:
+          {% for result in test_results | selectattr('passed', 'equalto', false) | list %}
+          - {{ result.test }}
+          {% endfor %}
+          {% else %}
+          All tests passed successfully!
+          {% endif %}
+
+    - name: Fail if any test failed
+      ansible.builtin.fail:
+        msg: "Some tests failed. Please check the results above."
+      when: test_results | selectattr('passed', 'equalto', false) | list | length > 0

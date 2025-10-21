@@ -1,0 +1,84 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/jupyterhub/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for Thinkube AI Lab by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - JupyterHub must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Configure Thinkube AI Lab service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  tasks:
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: jupyterhub
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "jupyterhub"
+          data:
+            service.yaml: |
+              service:
+                name: jupyterhub
+                display_name: "Thinkube AI Lab"
+                description: "AI-powered notebook environment for ML, agents, and data science"
+                type: optional
+                category: ai
+                icon: /icons/tk_ai.svg
+                
+                endpoints:
+                  - name: web
+                    type: http
+                    url: "https://jupyter.{{ domain_name }}/hub/oauth_login?next="
+                    health_url: "https://jupyter.{{ domain_name }}/hub/api"
+                    description: "Web interface"
+                    primary: true
+                    
+                dependencies: []
+                  
+                scaling:
+                  resource_type: deployment
+                  resource_name: hub
+                  namespace: jupyterhub
+                  min_replicas: 1
+                  can_disable: true
+                  
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: jupyterhub
+      register: configmap_info
+      
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for Thinkube AI Lab"
+      when: configmap_info.resources | length > 0
+
+    - name: Update code-server environment variables
+      include_role:
+        name: code_server_env_update

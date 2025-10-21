@@ -1,0 +1,193 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/gpu_operator/18_test.yaml
+# Description:
+#   Tests NVIDIA GPU Operator deployment and functionality on all GPU nodes
+#   Verifies that all components are running and GPUs are available to the cluster
+#   Runs a CUDA test job on each GPU-equipped node to validate functionality
+#
+# Requirements:
+#   - MicroK8s cluster with GPU-equipped nodes
+#   - GPU Operator must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/gpu_operator/18_test.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to Kubernetes configuration file
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to Helm binary
+#
+# 🤖 [AI-assisted]
+
+- name: Test NVIDIA GPU Operator
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  pre_tasks:
+    - name: Verify required variables exist
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined
+      loop:
+        - kubeconfig
+        - kubectl_bin
+        - helm_bin
+  
+  vars:
+    gpu_operator_namespace: gpu-operator
+    cuda_test_namespace: default
+    cuda_test_manifest_base: /tmp/cuda-test
+    cuda_test_pod_template: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: cuda-test-{NODE_NAME}
+        namespace: {{ cuda_test_namespace }}
+      spec:
+        restartPolicy: OnFailure
+        nodeName: {NODE_NAME}
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          fsGroup: 1000
+        containers:
+        - name: cuda-vectoradd
+          image: "nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda11.7.1-ubuntu20.04"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+            requests:
+              nvidia.com/gpu: 1
+
+  tasks:
+    - name: Check that GPU Operator namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Namespace
+        name: "{{ gpu_operator_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check if GPU Operator is installed via Helm
+      ansible.builtin.command: "{{ helm_bin }} status gpu-operator -n {{ gpu_operator_namespace }}"
+      register: helm_status
+      changed_when: false
+      failed_when: helm_status.rc != 0
+
+    - name: Verify GPU operator pods are running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ gpu_operator_namespace }}"
+      register: operator_pods
+
+    - name: Count running pods by component
+      ansible.builtin.set_fact:
+        running_components: >-
+          {{ operator_pods.resources | 
+             selectattr('status.phase', 'equalto', 'Running') | 
+             list | length }}
+
+    - name: Check if critical components are running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ gpu_operator_namespace }}"
+        label_selectors:
+          - "app in (nvidia-device-plugin-daemonset,nvidia-container-toolkit-daemonset)"
+        field_selectors:
+          - status.phase=Running
+      register: critical_pods
+      failed_when: critical_pods.resources | length < 2
+
+    # Identify all GPU nodes in the cluster
+    - name: Get nodes with GPU resources
+      ansible.builtin.shell: >
+        {{ kubectl_bin }} get nodes -o=custom-columns=NAME:.metadata.name,GPU:.status.capacity.'nvidia\.com/gpu' --no-headers | 
+        grep -v '<none>' | awk '{print $1}'
+      register: gpu_nodes_result
+      changed_when: false
+      
+    - name: Set GPU nodes fact
+      ansible.builtin.set_fact:
+        gpu_nodes: "{{ gpu_nodes_result.stdout_lines }}"
+
+    - name: Display GPU nodes
+      ansible.builtin.debug:
+        var: gpu_nodes
+        
+    - name: Verify that at least one GPU node was found
+      ansible.builtin.assert:
+        that: gpu_nodes | length > 0
+        fail_msg: "No GPU nodes found in the cluster"
+        success_msg: "Found {{ gpu_nodes | length }} GPU node(s)"
+
+    # Run CUDA tests on each GPU node
+    - name: Initialize test results dictionary
+      ansible.builtin.set_fact:
+        node_test_results: {}
+        
+    - name: Create CUDA test manifest for GPU node
+      ansible.builtin.copy:
+        content: "{{ cuda_test_pod_template | replace('{NODE_NAME}', item) }}"
+        dest: "{{ cuda_test_manifest_base }}-{{ item }}.yaml"
+        mode: '0600'
+      loop: "{{ gpu_nodes }}"
+      loop_control:
+        label: "Preparing test for node {{ item }}"
+        
+    - name: Deploy CUDA test pod on GPU node
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        src: "{{ cuda_test_manifest_base }}-{{ item }}.yaml"
+      loop: "{{ gpu_nodes }}"
+      loop_control:
+        label: "Deploying test pod on node {{ item }}"
+        
+    # Process each node individually to avoid loop register issues
+    - name: Process CUDA test for each GPU node
+      include_tasks: tasks/test_node.yaml
+      loop: "{{ gpu_nodes }}"
+      loop_control:
+        loop_var: "current_node"
+        label: "Testing node {{ current_node }}"
+        
+    - name: Clean up CUDA test pods
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: Pod
+        name: "cuda-test-{{ item }}"
+        namespace: "{{ cuda_test_namespace }}"
+      loop: "{{ gpu_nodes }}"
+      loop_control:
+        label: "Cleaning up test pod on node {{ item }}"
+        
+    - name: Remove temporary manifests
+      ansible.builtin.file:
+        path: "{{ cuda_test_manifest_base }}-{{ item }}.yaml"
+        state: absent
+      loop: "{{ gpu_nodes }}"
+      loop_control:
+        label: "Removing manifest for node {{ item }}"
+
+    - name: Display test results summary
+      ansible.builtin.debug:
+        msg:
+          - "===== GPU OPERATOR TEST SUMMARY ====="
+          - "✅ GPU Operator Namespace: {{ 'Created' if namespace_check.resources | length > 0 else 'Missing' }}"
+          - "✅ GPU Operator Components Running: {{ running_components }} pods"
+          - "✅ Critical Components (device plugin, toolkit): {{ 'Running' if critical_pods.resources | length >= 2 else 'Some missing' }}"
+          - "✅ GPU Nodes: {{ gpu_nodes | length }} node(s) with GPUs"
+          - "✅ Node test results: {% for node, result in node_test_results.items() %} {{ node }}: {{ result }}{% if not loop.last %},{% endif %}{% endfor %}"
+          - "✅ Overall Status: {{ 'PASSED' if node_test_results.values() | select('equalto', 'Succeeded') | list | length == gpu_nodes | length else 'FAILED' }}"
+          - "=================================="

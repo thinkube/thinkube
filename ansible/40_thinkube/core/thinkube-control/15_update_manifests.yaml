@@ -1,0 +1,100 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/15_update_manifests.yaml  
+# Description:
+#   Update only Kubernetes manifests without syncing code
+#   Useful for testing deployment configuration changes
+#
+# Requirements:
+#   - thinkube-control must be deployed
+#   - kubectl configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/15_update_manifests.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Update Kubernetes Manifests for thinkube-control
+  hosts: microk8s_control_plane
+  gather_facts: false
+  
+  vars:
+    k8s_namespace: "thinkube-control"
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    local_repo_path: "{{ shared_code_path }}/thinkube-control"
+    local_source_path: "{{ playbook_dir }}/../../../thinkube-control-temp"
+
+  tasks:
+    - name: Sync k8s manifests directory
+      ansible.builtin.synchronize:
+        src: "{{ local_source_path }}/k8s/"
+        dest: "{{ local_repo_path }}/k8s/"
+        delete: yes
+        rsync_opts:
+          - "--chown={{ system_username }}:{{ system_username }}"
+
+    - name: Process Jinja2 templates in k8s directory
+      block:
+        - name: Get list of .j2 templates
+          ansible.builtin.find:
+            paths: "{{ local_repo_path }}/k8s"
+            patterns: "*.j2"
+          register: j2_templates
+
+        - name: Process each .j2 template
+          ansible.builtin.template:
+            src: "{{ item.path }}"
+            dest: "{{ item.path | regex_replace('\\.j2$', '') }}"
+            mode: '0644'
+          loop: "{{ j2_templates.files }}"
+          vars:
+            domain_name: "{{ domain_name }}"
+            control_host: "control.{{ domain_name }}"
+            admin_username: "{{ admin_username }}"
+            system_username: "{{ system_username }}"
+            project_name: "thinkube-control"
+            k8s_namespace: "{{ k8s_namespace }}"
+            container_registry: "registry.{{ domain_name }}"
+
+    - name: Apply updated manifests
+      ansible.builtin.shell: |
+        # Apply in dependency order
+        kubectl apply -f {{ local_repo_path }}/k8s/namespace.yaml || true
+        kubectl apply -f {{ local_repo_path }}/k8s/configmap-*.yaml || true
+        kubectl apply -f {{ local_repo_path }}/k8s/secret-*.yaml || true
+        kubectl apply -f {{ local_repo_path }}/k8s/deployment-*.yaml
+        kubectl apply -f {{ local_repo_path }}/k8s/service-*.yaml
+        kubectl apply -f {{ local_repo_path }}/k8s/ingress-*.yaml
+        
+        # Apply any remaining manifests
+        kubectl apply -f {{ local_repo_path }}/k8s/ --recursive
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: kubectl_output
+
+    - name: Show kubectl output
+      ansible.builtin.debug:
+        var: kubectl_output.stdout_lines
+
+    - name: Get deployment status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+      register: deployments
+
+    - name: Display manifest update results
+      ansible.builtin.debug:
+        msg: |
+          ✅ Manifest update completed!
+          
+          Deployments:
+          {% for dep in deployments.resources %}
+          - {{ dep.metadata.name }}: {{ dep.status.readyReplicas | default(0) }}/{{ dep.status.replicas | default(0) }} ready
+          {% endfor %}
+          
+          Note: Pods will use the existing container images unless you restart them.

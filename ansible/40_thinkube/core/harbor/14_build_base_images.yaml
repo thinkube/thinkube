@@ -1,0 +1,457 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/14_build_base_images.yaml
+# Description:
+#   Build and push optimized base images to Harbor library project
+#   These images contain common dependencies to speed up builds
+#
+# Requirements:
+#   - Harbor registry deployed and accessible
+#   - Podman installed on the MicroK8s control plane node
+#   - Harbor admin credentials
+#   - Base images mirrored to Harbor (13_mirror_public_images.yaml must run first)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/14_build_base_images.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Harbor registry hostname
+#   - admin_password: Admin password from environment
+#
+# Dependencies:
+#   - CORE-008: Harbor deployed
+#
+# 🤖 [AI-assisted]
+
+- name: Build and Push Base Images to Harbor
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    local_base_images_dir: "{{ playbook_dir }}/base-images"
+    base_images_dir: "/tmp/harbor-base-images"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+  tasks:
+    - name: Install podman (ensure it's available)
+      ansible.builtin.apt:
+        name: podman
+        state: present
+        update_cache: yes
+      become: true
+      when: ansible_os_family == "Debian"
+
+
+    - name: Ensure library project exists in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects"
+        method: POST
+        headers:
+          Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
+        body_format: json
+        body:
+          project_name: "library"
+          public: true
+          metadata:
+            public: "true"
+        validate_certs: true
+        status_code: [201, 409]
+      register: library_project
+
+    - name: Ensure thinkube project exists in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects"
+        method: POST
+        headers:
+          Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
+        body_format: json
+        body:
+          project_name: "thinkube"
+          public: true
+          metadata:
+            public: "true"
+        validate_certs: true
+        status_code: [201, 409]
+      register: thinkube_project
+
+    - name: Create build context directory
+      ansible.builtin.file:
+        path: "{{ base_images_dir }}"
+        state: directory
+        mode: '0755'
+      
+    - name: Create temp directory for templated Containerfiles
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: harbor-containerfiles
+      register: temp_containerfiles_dir
+
+    - name: Template Python base Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/python-base.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/python-base.Containerfile"
+    
+    - name: Build Python base image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/python-base:3.12-slim \
+                     -t {{ harbor_registry }}/library/python-base:latest \
+                     -f {{ temp_containerfiles_dir.path }}/python-base.Containerfile \
+                     {{ base_images_dir }}
+      register: python_build
+      changed_when: true
+      
+    - name: Template Node.js 18 base Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/node-base.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/node-base.Containerfile"
+    
+    - name: Build Node.js 18 base image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/node-base:18-alpine \
+                     -f {{ temp_containerfiles_dir.path }}/node-base.Containerfile \
+                     {{ base_images_dir }}
+      register: node18_build
+      changed_when: true
+      
+    - name: Template Node.js 22 base Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/node-base-22.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/node-base-22.Containerfile"
+    
+    - name: Build Node.js 22 base image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/node-base:22-alpine \
+                     -t {{ harbor_registry }}/library/node-base:latest \
+                     -f {{ temp_containerfiles_dir.path }}/node-base-22.Containerfile \
+                     {{ base_images_dir }}
+      register: node22_build
+      changed_when: true
+      
+    - name: Template test-runner Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/test-runner.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/test-runner.Containerfile"
+    
+    - name: Build test-runner image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/test-runner:latest \
+                     -f {{ temp_containerfiles_dir.path }}/test-runner.Containerfile \
+                     {{ base_images_dir }}
+      register: test_runner_build
+      changed_when: true
+      
+    - name: Template ci-utils Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/ci-utils.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/ci-utils.Containerfile"
+    
+    - name: Build ci-utils image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/ci-utils:latest \
+                     -t {{ harbor_registry }}/library/ci-utils:alpine \
+                     -f {{ temp_containerfiles_dir.path }}/ci-utils.Containerfile \
+                     {{ base_images_dir }}
+      register: ci_utils_build
+      changed_when: true
+
+    - name: Template tk-service-discovery Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/tk-service-discovery.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/tk-service-discovery.Containerfile"
+
+    - name: Build tk-service-discovery image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/tk-service-discovery:latest \
+                     -f {{ temp_containerfiles_dir.path }}/tk-service-discovery.Containerfile \
+                     {{ base_images_dir }}
+      register: tk_service_discovery_build
+      changed_when: true
+
+    - name: Login to Harbor
+      ansible.builtin.shell: |
+        echo {{ admin_password }} | podman login {{ harbor_registry }} -u admin --password-stdin --tls-verify=true
+      changed_when: false
+      no_log: true
+      
+    - name: Push Python base images
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/python-base:{{ item }}
+      loop:
+        - "3.12-slim"
+        - "latest"
+      register: python_push
+      changed_when: python_push.rc == 0
+      failed_when: python_push.rc != 0
+      retries: 2
+      delay: 10
+      
+    - name: Push Node.js base images
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/node-base:{{ item }}
+      loop:
+        - "18-alpine"
+        - "22-alpine"
+        - "latest"
+      register: node_push
+      changed_when: node_push.rc == 0
+      failed_when: node_push.rc != 0
+      retries: 2
+      delay: 10
+      
+    - name: Push test-runner image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/test-runner:latest
+      register: test_runner_push
+      changed_when: test_runner_push.rc == 0
+      failed_when: test_runner_push.rc != 0
+      retries: 2
+      delay: 10
+      
+    - name: Push ci-utils images
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/ci-utils:{{ item }}
+      loop:
+        - "latest"
+        - "alpine"
+      register: ci_utils_push
+      changed_when: ci_utils_push.rc == 0
+      failed_when: ci_utils_push.rc != 0
+      retries: 2
+      delay: 10
+
+    - name: Push tk-service-discovery image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/tk-service-discovery:latest
+      register: tk_service_discovery_push
+      changed_when: tk_service_discovery_push.rc == 0
+      failed_when: tk_service_discovery_push.rc != 0
+      retries: 2
+      delay: 10
+
+    - name: Template AI inference base Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/ai-inference-base.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/ai-inference-base.Containerfile"
+    
+    - name: Build AI inference base image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/ai-inference-base:12.4-ubuntu24.04 \
+                     -t {{ harbor_registry }}/library/ai-inference-base:latest \
+                     -f {{ temp_containerfiles_dir.path }}/ai-inference-base.Containerfile \
+                     {{ base_images_dir }}
+      register: ai_inference_build
+      changed_when: true
+      
+    - name: Push AI inference base images
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/ai-inference-base:{{ item }}
+      loop:
+        - "12.4-ubuntu24.04"
+        - "latest"
+      register: ai_inference_push
+      changed_when: ai_inference_push.rc == 0
+      failed_when: ai_inference_push.rc != 0
+      retries: 2
+      delay: 10
+
+    - name: Template MLflow Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/mlflow.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/mlflow.Containerfile"
+
+    - name: Build MLflow custom image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/mlflow-custom:latest \
+                     -f {{ temp_containerfiles_dir.path }}/mlflow.Containerfile \
+                     {{ base_images_dir }}
+      register: mlflow_build
+      changed_when: true
+
+    - name: Push MLflow custom image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/mlflow-custom:latest
+      register: mlflow_push
+      changed_when: mlflow_push.rc == 0
+      failed_when: mlflow_push.rc != 0
+      retries: 2
+      delay: 10
+
+    # Build Valkey from custom Dockerfile
+    - name: Template Valkey Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/valkey.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/valkey.Containerfile"
+
+    - name: Copy Valkey entrypoint script
+      ansible.builtin.copy:
+        src: "{{ local_base_images_dir }}/docker-entrypoint.sh"
+        dest: "{{ base_images_dir }}/docker-entrypoint.sh"
+        mode: '0755'
+
+    - name: Build Valkey image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/valkey:8.1.0 \
+                     -t {{ harbor_registry }}/library/valkey:latest \
+                     -f {{ temp_containerfiles_dir.path }}/valkey.Containerfile \
+                     {{ base_images_dir }}
+      register: valkey_build
+      changed_when: true
+
+    - name: Push Valkey images
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/valkey:{{ item }}
+      loop:
+        - "8.1.0"
+        - "latest"
+      register: valkey_push
+      changed_when: valkey_push.rc == 0
+      failed_when: valkey_push.rc != 0
+      retries: 2
+      delay: 10
+
+    # Build tk-package-version from GitHub repository
+    - name: Clone tk-package-version repository
+      ansible.builtin.git:
+        repo: "https://github.com/thinkube/tk-package-version.git"
+        dest: "{{ base_images_dir }}/tk-package-version"
+        version: main
+        force: yes
+
+    - name: Build tk-package-version image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/tk-package-version:latest \
+                     {{ base_images_dir }}/tk-package-version
+      register: tk_package_version_build
+      changed_when: true
+
+    - name: Push tk-package-version image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/tk-package-version:latest
+      register: tk_package_version_push
+      changed_when: tk_package_version_push.rc == 0
+      failed_when: tk_package_version_push.rc != 0
+      retries: 2
+      delay: 10
+
+    - name: Clean up temp dockerfiles directory
+      ansible.builtin.file:
+        path: "{{ temp_containerfiles_dir.path }}"
+        state: absent
+      when: temp_containerfiles_dir.path is defined
+
+    - name: Create manifest for custom built images
+      include_role:
+        name: container_deployment/image_manifest
+      vars:
+        manifest_images:
+          - destination: "{{ harbor_registry }}/library/python-base:3.12-slim"
+            source: "custom-build"
+            description: "Python 3.12 base with FastAPI, SQLAlchemy, and testing tools"
+            metadata:
+              base_image: "python:3.12-slim"
+              packages: "fastapi sqlalchemy pytest"
+          - destination: "{{ harbor_registry }}/library/python-base:latest"
+            source: "custom-build"
+            description: "Python base latest (3.12-slim)"
+          - destination: "{{ harbor_registry }}/library/node-base:18-alpine"
+            source: "custom-build"
+            description: "Node.js 18 Alpine with common development dependencies"
+            metadata:
+              base_image: "node:18-alpine"
+          - destination: "{{ harbor_registry }}/library/node-base:22-alpine"
+            source: "custom-build"
+            description: "Node.js 22 LTS Alpine with common development dependencies"
+            metadata:
+              base_image: "node:22-alpine"
+          - destination: "{{ harbor_registry }}/library/node-base:latest"
+            source: "custom-build"
+            description: "Node.js base latest (22-alpine)"
+          - destination: "{{ harbor_registry }}/library/test-runner:latest"
+            source: "custom-build"
+            description: "Test runner with pytest, jest, and testing utilities"
+          - destination: "{{ harbor_registry }}/library/ci-utils:latest"
+            source: "custom-build"
+            description: "CI/CD utilities image with curl, jq, git, and common tools"
+          - destination: "{{ harbor_registry }}/library/ci-utils:alpine"
+            source: "custom-build"
+            description: "CI/CD utilities Alpine variant"
+          - destination: "{{ harbor_registry }}/library/tk-service-discovery:latest"
+            source: "custom-build"
+            description: "Service discovery init container with kubectl, jq, and yq"
+            metadata:
+              base_image: "alpine:3.19"
+              tools: "kubectl jq yq bash"
+          - destination: "{{ harbor_registry }}/library/ai-inference-base:12.4-ubuntu24.04"
+            source: "custom-build"
+            description: "AI inference base with CUDA 12.4 and PyTorch"
+            metadata:
+              base_image: "nvidia/cuda:12.4.0-runtime-ubuntu24.04"
+              ml_frameworks: "pytorch tensorflow"
+          - destination: "{{ harbor_registry }}/library/ai-inference-base:latest"
+            source: "custom-build"
+            description: "AI inference base latest (CUDA 12.4)"
+          - destination: "{{ harbor_registry }}/library/mlflow-custom:latest"
+            source: "custom-build"
+            description: "MLflow with OIDC auth, PostgreSQL and S3 support"
+            metadata:
+              base_image: "python:3.12-slim"
+              packages: "mlflow mlflow-oidc-auth psycopg2-binary boto3 PyJWT"
+          - destination: "{{ harbor_registry }}/library/valkey:8.1.0"
+            source: "github.com/valkey-io/valkey-container"
+            description: "Valkey 8.1.0 Alpine - Redis OSS alternative"
+            metadata:
+              base_image: "alpine"
+              version: "8.1.0"
+          - destination: "{{ harbor_registry }}/library/valkey:latest"
+            source: "github.com/valkey-io/valkey-container"
+            description: "Valkey latest - Redis OSS alternative"
+          - destination: "{{ harbor_registry }}/library/tk-package-version:latest"
+            source: "github.com/thinkube/tk-package-version"
+            description: "MCP server for checking package versions across multiple registries"
+            metadata:
+              language: "rust"
+              type: "mcp-server"
+        manifest_category: "system"
+        manifest_source: "built"
+        manifest_namespace: "registry"
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Base Images Built and Pushed Successfully
+          ════════════════════════════════════════════════════════
+          
+          Python base: {{ harbor_registry }}/library/python-base:3.12-slim
+          Node.js 18 base: {{ harbor_registry }}/library/node-base:18-alpine
+          Node.js 22 base: {{ harbor_registry }}/library/node-base:22-alpine
+          Test runner: {{ harbor_registry }}/library/test-runner:latest
+          CI utils: {{ harbor_registry }}/library/ci-utils:latest
+          Service discovery: {{ harbor_registry }}/library/tk-service-discovery:latest
+          AI inference: {{ harbor_registry }}/library/ai-inference-base:latest
+          MLflow custom: {{ harbor_registry }}/library/mlflow-custom:latest
+          Valkey: {{ harbor_registry }}/library/valkey:8.1.0
+          tk-package-version: {{ harbor_registry }}/library/tk-package-version:latest
+
+          These images contain common dependencies and will speed up:
+          - Test execution (dependencies pre-installed)
+          - Build times (less to download/install)
+          - Overall CI/CD pipeline performance
+          - CI/CD operations (curl, jq, etc pre-installed)
+          
+          Run this playbook periodically to update base dependencies.
+          ════════════════════════════════════════════════════════

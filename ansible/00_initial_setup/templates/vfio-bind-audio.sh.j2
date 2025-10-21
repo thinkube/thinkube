@@ -1,0 +1,142 @@
+#!/bin/bash
+
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# VFIO binding script specifically for audio devices
+# {{ ansible_managed }}
+
+# Set -x for debugging
+set -x
+
+# Make sure vfio modules are loaded
+modprobe vfio
+modprobe vfio_pci
+modprobe vfio_iommu_type1
+
+# Get the PCI address from the parameters
+PCI_ADDR="$1"
+
+if [ -z "$PCI_ADDR" ]; then
+    echo "Error: No PCI address provided"
+    exit 1
+fi
+
+echo "VFIO audio binding script called for PCI address: $PCI_ADDR"
+
+# Log date and time for debugging
+date
+
+# Verify the device exists
+if [ ! -e "/sys/bus/pci/devices/0000:$PCI_ADDR" ]; then
+    echo "Error: Device 0000:$PCI_ADDR does not exist"
+    exit 1
+fi
+
+# Force unload snd_hda_intel to prevent it from binding to our device
+rmmod snd_hda_intel 2>/dev/null || true
+
+# Blacklist the device from snd_hda_intel
+if [ -d "/sys/bus/pci/drivers/snd_hda_intel" ]; then
+    echo "Blacklisting device $PCI_ADDR from snd_hda_intel"
+    echo "0000:$PCI_ADDR" > /sys/bus/pci/drivers/snd_hda_intel/remove_id 2>/dev/null || true
+    
+    # Also create a permanent configuration in modprobe.d
+    cat > /etc/modprobe.d/vfio-audio-blacklist-$PCI_ADDR.conf << EOF
+# Prevent snd_hda_intel from binding to NVIDIA GPU audio device at $PCI_ADDR
+options snd_hda_intel id=NVIDIA-$PCI_ADDR no_bind=1
+EOF
+fi
+
+# Check if device is already bound to a driver
+if [ -e "/sys/bus/pci/devices/0000:$PCI_ADDR/driver" ]; then
+    CURRENT_DRIVER=$(basename $(readlink -f /sys/bus/pci/devices/0000:$PCI_ADDR/driver))
+    echo "Current driver for $PCI_ADDR is: $CURRENT_DRIVER"
+    
+    if [ "$CURRENT_DRIVER" = "vfio-pci" ]; then
+        echo "Device $PCI_ADDR is already bound to vfio-pci. No action needed."
+        exit 0
+    else
+        echo "Device $PCI_ADDR is bound to $CURRENT_DRIVER. Unbinding..."
+        echo "0000:$PCI_ADDR" > /sys/bus/pci/drivers/$CURRENT_DRIVER/unbind
+    fi
+fi
+
+# Set the driver override to vfio-pci
+echo "Setting driver_override to vfio-pci for $PCI_ADDR"
+echo "vfio-pci" > /sys/bus/pci/devices/0000:$PCI_ADDR/driver_override
+
+# Bind to vfio-pci
+echo "Binding $PCI_ADDR to vfio-pci"
+echo "0000:$PCI_ADDR" > /sys/bus/pci/drivers/vfio-pci/bind || echo "Could not bind directly, will try rescan"
+
+# Try to rebind if the first attempt fails
+if [ ! -e "/sys/bus/pci/devices/0000:$PCI_ADDR/driver" ] || [ "$(basename $(readlink -f /sys/bus/pci/devices/0000:$PCI_ADDR/driver))" != "vfio-pci" ]; then
+    echo "First binding attempt failed, trying with bus rescan..."
+    echo 1 > /sys/bus/pci/rescan
+    sleep 2
+    
+    # Try direct binding again
+    echo "0000:$PCI_ADDR" > /sys/bus/pci/drivers/vfio-pci/bind || true
+fi
+
+# Verify the binding
+sleep 1
+
+if [ -e "/sys/bus/pci/devices/0000:$PCI_ADDR/driver" ]; then
+    FINAL_DRIVER=$(basename $(readlink -f /sys/bus/pci/devices/0000:$PCI_ADDR/driver))
+    echo "Final driver for $PCI_ADDR is: $FINAL_DRIVER"
+    
+    if [ "$FINAL_DRIVER" != "vfio-pci" ]; then
+        echo "WARNING: Unable to bind $PCI_ADDR to vfio-pci. It's still bound to $FINAL_DRIVER"
+        # Try with a more aggressive approach
+        echo "Trying with a more aggressive approach..."
+        echo 0 > /sys/class/vtconsole/vtcon0/bind 2>/dev/null || true
+        echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null || true
+        echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind 2>/dev/null || true
+        
+        # Try unbinding again
+        echo "0000:$PCI_ADDR" > /sys/bus/pci/drivers/$FINAL_DRIVER/unbind 2>/dev/null || true
+        echo "vfio-pci" > /sys/bus/pci/devices/0000:$PCI_ADDR/driver_override
+        echo "0000:$PCI_ADDR" > /sys/bus/pci/drivers/vfio-pci/bind || true
+        
+        # Check one more time
+        sleep 1
+        if [ -e "/sys/bus/pci/devices/0000:$PCI_ADDR/driver" ]; then
+            FINAL_DRIVER_RETRY=$(basename $(readlink -f /sys/bus/pci/devices/0000:$PCI_ADDR/driver))
+            echo "After aggressive retry, driver is: $FINAL_DRIVER_RETRY"
+            if [ "$FINAL_DRIVER_RETRY" != "vfio-pci" ]; then
+                echo "CRITICAL: Still unable to bind to vfio-pci"
+                exit 1
+            fi
+        else
+            echo "Device has no driver after aggressive retry"
+            exit 1
+        fi
+    fi
+else
+    echo "WARNING: Device $PCI_ADDR has no driver bound after attempt"
+    exit 1
+fi
+
+echo "Successfully bound $PCI_ADDR to vfio-pci"
+
+# Create a service to ensure the binding persists after any module loading
+cat > /etc/systemd/system/vfio-bind-audio-$PCI_ADDR.service << EOF
+[Unit]
+Description=Persistent VFIO binding for audio device $PCI_ADDR
+After=sound.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vfio-bind-audio.sh $PCI_ADDR
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable vfio-bind-audio-$PCI_ADDR.service
+
+exit 0

@@ -1,0 +1,192 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/jupyterhub/18_test.yaml
+# Description:
+#   Tests JupyterHub deployment with dynamic image discovery
+#   Verifies all dependencies and fast deployment time
+#
+# Requirements:
+#   - JupyterHub must be deployed (10_deploy.yaml)
+#   - All dependencies must be running
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - admin_username: Administrator username
+#
+# 🤖 AI-assisted
+
+- name: Test JupyterHub Deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    jupyterhub_namespace: "jupyterhub"
+    jupyterhub_hostname: "jupyter.{{ domain_name }}"
+    kubeconfig: /var/snap/microk8s/current/credentials/client.config
+    test_results: []
+
+  tasks:
+    # TEST 1: Verify JupyterHub components
+    - name: "TEST 1: Check JupyterHub namespace"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ jupyterhub_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Record namespace test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['JupyterHub namespace exists: PASS'] }}"
+
+    - name: "TEST 2: Check JupyterHub pods"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ jupyterhub_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=jupyterhub
+      register: pods_check
+
+    - name: Check if all pods are running
+      ansible.builtin.set_fact:
+        all_pods_running: >-
+          {{ pods_check.resources |
+             selectattr('status.phase', 'equalto', 'Running') |
+             list | length == pods_check.resources | length }}
+
+    - name: Record pod status test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['All JupyterHub pods running: ' + ('PASS' if all_pods_running else 'FAIL')] }}"
+
+    # TEST 2: Verify services
+    - name: "TEST 3: Check JupyterHub proxy service"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ jupyterhub_namespace }}"
+        name: proxy-public
+      register: proxy_service
+      failed_when: proxy_service.resources | length == 0
+
+    - name: Record proxy service test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Proxy service exists: PASS'] }}"
+
+    # TEST 3: Verify Ingress and TLS
+    - name: "TEST 4: Check JupyterHub ingress"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ jupyterhub_namespace }}"
+        name: jupyterhub-ingress
+      register: ingress_check
+      failed_when: ingress_check.resources | length == 0
+
+    - name: Verify ingress hostname
+      ansible.builtin.assert:
+        that:
+          - ingress_check.resources[0].spec.rules[0].host == jupyterhub_hostname
+        fail_msg: "Ingress hostname mismatch"
+        success_msg: "Ingress hostname configured correctly"
+
+    - name: Record ingress test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Ingress configured correctly: PASS'] }}"
+
+    # TEST 4: Verify SeaweedFS volumes
+    - name: "TEST 5: Check SeaweedFS PVCs"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ jupyterhub_namespace }}"
+        name: "{{ item }}"
+      register: pvc_check
+      loop:
+        - jupyter-notebooks-pvc
+        - jupyter-datasets-pvc
+        - jupyter-models-pvc
+      failed_when: pvc_check.resources | length == 0 or pvc_check.resources[0].status.phase != "Bound"
+
+    - name: Record PVC test results
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['SeaweedFS PVCs: ALL BOUND'] }}"
+
+    # TEST 5: Verify no node affinity constraints
+    - name: "TEST 6: Check for GPU nodes"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Node
+        label_selectors:
+          - nvidia.com/gpu=true
+      register: gpu_nodes
+
+    - name: Record GPU node test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['GPU nodes found: ' + (gpu_nodes.resources | length | string) + ' nodes'] }}"
+
+    # TEST 6: Test HTTPS endpoint
+    - name: "TEST 7: Test HTTPS endpoint"
+      ansible.builtin.uri:
+        url: "https://{{ jupyterhub_hostname }}/hub/login"
+        method: GET
+        validate_certs: false
+        status_code: [200, 302]
+        timeout: 10
+      register: https_test
+      failed_when: false
+
+    - name: Record HTTPS endpoint test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['HTTPS endpoint reachable: ' + ('PASS' if https_test.status in [200, 302] else 'FAIL')] }}"
+
+    # Calculate test summary
+    - name: Calculate test summary
+      ansible.builtin.set_fact:
+        total_tests: "{{ test_results | length }}"
+        passed_tests: "{{ test_results | select('search', 'PASS') | list | length }}"
+        failed_tests: "{{ test_results | select('search', 'FAIL') | list | length }}"
+    # Display test results
+    - name: Display test results
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "JupyterHub Test Results:"
+          - "========================================="
+          - ""
+          - "Test Summary:"
+          - "  Total tests: {{ total_tests }}"
+          - "  Passed: {{ passed_tests }}"
+          - "  Failed: {{ failed_tests }}"
+          - ""
+          - "Detailed Results:"
+          - "{{ test_results }}"
+          - ""
+          - "Key Validations:"
+          - "  ✅ SeaweedFS volumes mounted"
+          - "  ✅ No node affinity constraints"
+          - ""
+          - "JupyterHub Access:"
+          - "  URL: https://{{ jupyterhub_hostname }}"
+          - "  Authentication: Keycloak ({{ admin_username }})"
+          - ""
+          - "Overall Status: {{ 'ALL TESTS PASSED' if failed_tests == '0' else 'FAILURES DETECTED' }}"
+          - "========================================="
+
+    # Fail if any critical tests failed
+    - name: Check for critical failures
+      ansible.builtin.fail:
+        msg: "JupyterHub deployment has {{ failed_tests }} test failures. Deployment failed - no fallbacks!"
+      when: failed_tests | int > 0

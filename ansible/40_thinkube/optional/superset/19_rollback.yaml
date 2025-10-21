@@ -1,0 +1,129 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/superset/19_rollback.yaml
+# Description:
+#   Rollback Apache Superset deployment
+#
+# This playbook:
+#   1. Removes Superset deployment, service, and ingress
+#   2. Removes Keycloak client
+#   3. Removes database and user from PostgreSQL
+#   4. Removes namespace
+#
+# Requirements:
+#   - Superset must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/superset/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - domain_name: Base domain
+#   - admin_username: Keycloak admin username
+#   - admin_password: Admin password
+#   - keycloak_realm: Keycloak realm name
+#
+# 🤖 AI-assisted
+
+- name: Rollback Apache Superset
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    superset_namespace: "superset"
+    superset_db_name: "superset"
+    superset_db_user: "superset"
+    keycloak_url: "https://keycloak.{{ domain_name }}"
+    keycloak_client_id: "superset"
+
+  tasks:
+    ###########################################################################
+    # Remove Kubernetes resources
+    ###########################################################################
+    - name: Remove Superset namespace (this removes all resources)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ superset_namespace }}"
+        kind: Namespace
+        state: absent
+        wait: true
+        wait_timeout: 300
+
+    ###########################################################################
+    # Remove Keycloak client
+    ###########################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: "password"
+          client_id: "admin-cli"
+        validate_certs: true
+      register: keycloak_token_response
+      ignore_errors: true
+
+    - name: Set Keycloak access token
+      ansible.builtin.set_fact:
+        keycloak_access_token: "{{ keycloak_token_response.json.access_token }}"
+      when: keycloak_token_response is succeeded
+
+    - name: Get Superset client ID from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ keycloak_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_access_token }}"
+        validate_certs: true
+      register: existing_client
+      when: keycloak_token_response is succeeded
+      ignore_errors: true
+
+    - name: Delete Superset client from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ existing_client.json[0].id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_access_token }}"
+        validate_certs: true
+        status_code: [204, 404]
+      when:
+        - keycloak_token_response is succeeded
+        - existing_client is succeeded
+        - existing_client.json | length > 0
+      ignore_errors: true
+
+    ###########################################################################
+    # Remove database
+    ###########################################################################
+    - name: Remove Superset database and user from PostgreSQL
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        command: >
+          psql -U {{ admin_username }} -c "
+          DROP DATABASE IF EXISTS {{ superset_db_name }};
+          DROP USER IF EXISTS {{ superset_db_user }};
+          "
+      register: db_cleanup
+      changed_when: "'DROP' in db_cleanup.stdout"
+      ignore_errors: true
+
+    - name: Rollback complete
+      ansible.builtin.debug:
+        msg:
+          - "Apache Superset rollback complete"
+          - ""
+          - "Removed:"
+          - "  - Superset namespace and all resources"
+          - "  - Keycloak client (if configured)"
+          - "  - PostgreSQL database and user"
+          - ""
+          - "Note: Valkey deployment was not removed (shared resource)"

@@ -1,0 +1,310 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/nats/10_deploy.yaml
+# Description:
+#   Deploy NATS messaging system with JetStream and external access
+#   Configures HTTP monitoring (port 8222) and client TCP (port 4222) access
+#
+# Requirements:
+#   - MicroK8s must be installed
+#   - NGINX Ingress Controller with TCP passthrough support
+#   - Wildcard TLS certificate in default namespace
+#   - Helm must be installed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/nats/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - nats_namespace: Namespace for NATS
+#   - kubeconfig: Path to kubeconfig file
+#   - helm_bin: Path to Helm binary
+#   - harbor_registry: Harbor registry URL
+#   - library_project: Harbor library project name
+#   - ingress_namespace: Namespace for ingress controller
+#   - primary_ingress_service: Ingress controller service name
+#   - primary_ingress_class: Ingress class name
+#   - kubectl_bin: Path to kubectl binary
+#
+# Dependencies:
+#   - CORE-001: MicroK8s must be installed
+#   - CORE-002: Helm must be installed
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy NATS with JetStream
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Common settings
+    k8s_namespace: "nats"
+
+    # TLS settings
+    tls_secret_name: "nats-tls-secret"
+
+    # External access configuration
+    nats_hostname: "nats.{{ domain_name }}"
+    nats_client_port: 4222
+    nats_monitoring_port: 8222
+    ingress_tcp_configmap_name: "primary-ingress-ingress-nginx-tcp"
+
+  tasks:
+    ###########################################################################
+    # Step 1: Create Namespace and TLS Secret
+    ###########################################################################
+    - name: Ensure NATS namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ k8s_namespace }}"
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to NATS namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ tls_secret_name }}"
+            namespace: "{{ k8s_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###########################################################################
+    # Step 2: Deploy NATS with Helm
+    ###########################################################################
+    - name: Add NATS Helm repository
+      kubernetes.core.helm_repository:
+        binary_path: "{{ helm_bin }}"
+        name: nats
+        repo_url: "https://nats-io.github.io/k8s/helm/charts/"
+        state: present
+
+    - name: Update Helm repos for NATS
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+      changed_when: false
+
+    - name: Deploy NATS with JetStream
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        kubeconfig: "{{ kubeconfig }}"
+        name: "nats"
+        chart_ref: "nats/nats"
+        release_namespace: "{{ k8s_namespace }}"
+        create_namespace: false
+        reset_values: true
+        force: true
+        update_repo_cache: true
+        values:
+          nats:
+            image:
+              repository: "{{ harbor_registry }}/{{ library_project | default('library') }}/nats"
+              tag: "2.12.0-alpine"
+              pullPolicy: IfNotPresent
+
+            # JetStream configuration
+            jetstream:
+              enabled: true
+              fileStore:
+                pvc:
+                  enabled: true
+                  storageClassName: ""
+                  size: 10Gi
+
+            # Single replica for homelab
+            cluster:
+              enabled: false
+              replicas: 1
+
+            # Resource limits (homelab-appropriate)
+            resources:
+              requests:
+                cpu: "500m"
+                memory: "512Mi"
+              limits:
+                cpu: "1"
+                memory: "2Gi"
+
+            # Service configuration (internal only)
+            service:
+              enabled: true
+              type: ClusterIP
+              ports:
+                client: 4222
+                cluster: 6222
+                monitor: 8222
+
+            # Monitoring endpoint
+            natsBox:
+              enabled: true
+              image:
+                repository: "{{ harbor_registry }}/{{ library_project | default('library') }}/nats-box"
+                tag: "0.18.1"
+
+    ###########################################################################
+    # Step 3: Wait for NATS to be ready
+    ###########################################################################
+    - name: Wait for NATS pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ k8s_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/component=nats"
+      register: nats_pods
+      until: >
+        nats_pods.resources | length == 1 and
+        nats_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length == 1
+      retries: 30
+      delay: 10
+
+    ###########################################################################
+    # Step 4: Configure external access via Ingress
+    ###########################################################################
+    - name: Create HTTP Ingress for NATS monitoring
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: nats-monitoring-ingress
+            namespace: "{{ k8s_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ nats_hostname }}"
+                secretName: "{{ tls_secret_name }}"
+            rules:
+              - host: "{{ nats_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: nats
+                          port:
+                            number: "{{ nats_monitoring_port }}"
+
+    - name: Configure NGINX Ingress TCP passthrough for NATS client port
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch configmap {{ ingress_tcp_configmap_name }} \
+          -n {{ ingress_namespace }} \
+          --type=merge \
+          -p='{"data":{"{{ nats_client_port }}":"{{ k8s_namespace }}/nats:{{ nats_client_port }}"}}'
+      become: true
+      register: tcp_passthrough
+      changed_when: "'configured' in tcp_passthrough.stdout or tcp_passthrough.rc == 0"
+
+    - name: Restart NGINX Ingress controller to pick up TCP config changes
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout restart deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }}
+      become: true
+      register: rollout_restart
+
+    - name: Wait for Ingress controller to restart
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }} --timeout=60s
+      become: true
+      register: rollout_status
+      failed_when: rollout_status.rc != 0
+
+    - name: Check if NATS client port is already exposed in Ingress deployment
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.template.spec.containers[0].ports[*].containerPort}' | grep -q "{{ nats_client_port }}"
+      become: true
+      register: port_check
+      changed_when: false
+      failed_when: false
+
+    - name: Patch NGINX Ingress controller deployment to expose NATS client port
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} \
+          --type=json \
+          -p='[
+            {
+              "op": "add",
+              "path": "/spec/template/spec/containers/0/ports/-",
+              "value": {
+                "name": "nats-{{ nats_client_port }}",
+                "containerPort": {{ nats_client_port }},
+                "hostPort": {{ nats_client_port }},
+                "protocol": "TCP"
+              }
+            }
+          ]'
+      become: true
+      register: patch_deploy
+      changed_when: "'patched' in patch_deploy.stdout or patch_deploy.rc == 0"
+      when: port_check.rc != 0
+
+    - name: Check if NATS client port is already exposed in Ingress service
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get service -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.ports[*].port}' | grep -q "{{ nats_client_port }}"
+      become: true
+      register: service_port_check
+      changed_when: false
+      failed_when: false
+
+    - name: Patch NGINX Ingress controller service to expose NATS client port
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch service -n {{ ingress_namespace }} {{ primary_ingress_service }} \
+          --type=json \
+          -p='[
+            {
+              "op": "add",
+              "path": "/spec/ports/-",
+              "value": {
+                "name": "nats-{{ nats_client_port }}",
+                "port": {{ nats_client_port }},
+                "targetPort": {{ nats_client_port }},
+                "protocol": "TCP"
+              }
+            }
+          ]'
+      become: true
+      register: patch_service
+      changed_when: "'patched' in patch_service.stdout or patch_service.rc == 0"
+      when: service_port_check.rc != 0
+
+    - name: Wait for changes to propagate
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Display deployment results
+      ansible.builtin.debug:
+        msg:
+          - "NATS deployment complete!"
+          - "Namespace: {{ k8s_namespace }}"
+          - "External monitoring URL: https://{{ nats_hostname }}"
+          - "External client TCP: {{ nats_hostname }}:{{ nats_client_port }}"
+          - "Service: nats.{{ k8s_namespace }}.svc.cluster.local:{{ nats_client_port }}"
+          - "Single replica (homelab)"
+          - "JetStream: Enabled with persistent storage"
+        verbosity: 0

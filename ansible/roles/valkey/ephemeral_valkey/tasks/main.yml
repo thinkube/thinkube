@@ -1,0 +1,122 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# roles/valkey/ephemeral_valkey/tasks/main.yml
+---
+# Description: Deploy ephemeral Valkey (Redis-compatible, BSD licensed)
+# 
+# This role deploys Valkey without any persistence mechanisms, making it suitable
+# for ephemeral session storage, temporary caching, and other non-critical data.
+# Valkey is a Redis-compatible fork with BSD 3-clause license.
+#
+# Variables:
+#   - valkey_namespace: Kubernetes namespace to deploy Valkey to (required)
+#   - valkey_kubeconfig: Path to kubeconfig (optional, defaults to kubeconfig var)
+#   - valkey_deployment_name: Name of Valkey deployment (default: ephemeral-valkey)
+#   - valkey_service_name: Name of Valkey service (default: ephemeral-valkey)
+#   - valkey_image: Valkey image to use (default: valkey:7.2-alpine)
+#   - valkey_port: Valkey port (default: 6379)
+#   - valkey_registry: Container registry prefix (optional)
+
+- name: Validate required variables
+  ansible.builtin.assert:
+    that:
+      - valkey_namespace is defined
+    fail_msg: "valkey_namespace must be defined"
+
+- name: Set full image path
+  ansible.builtin.set_fact:
+    valkey_full_image: "{{ valkey_registry ~ '/' if valkey_registry is defined else '' }}{{ valkey_image }}"
+
+- name: Deploy ephemeral Valkey (Deployment)
+  kubernetes.core.k8s:
+    kubeconfig: "{{ valkey_kubeconfig | default(kubeconfig) | default(omit) }}"
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: "{{ valkey_deployment_name }}"
+        namespace: "{{ valkey_namespace }}"
+        labels:
+          app: "{{ valkey_deployment_name }}"
+          component: valkey
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: "{{ valkey_deployment_name }}"
+        template:
+          metadata:
+            labels:
+              app: "{{ valkey_deployment_name }}"
+              component: valkey
+          spec:
+            containers:
+            - name: valkey
+              image: "{{ valkey_full_image }}"
+              # ephemeral usage: no snapshots, no appendonly
+              command: ["valkey-server", "--save", "", "--appendonly", "no"]
+              ports:
+              - containerPort: "{{ valkey_port }}"
+                name: valkey
+              resources:
+                requests:
+                  cpu: "{{ valkey_cpu_request }}"
+                  memory: "{{ valkey_memory_request }}"
+                limits:
+                  cpu: "{{ valkey_cpu_limit }}"
+                  memory: "{{ valkey_memory_limit }}"
+              livenessProbe:
+                tcpSocket:
+                  port: valkey
+                initialDelaySeconds: 30
+                periodSeconds: 10
+              readinessProbe:
+                exec:
+                  command:
+                  - sh
+                  - -c
+                  - "valkey-cli ping"
+                initialDelaySeconds: 5
+                periodSeconds: 5
+
+- name: Deploy ephemeral Valkey (Service)
+  kubernetes.core.k8s:
+    kubeconfig: "{{ valkey_kubeconfig | default(kubeconfig) | default(omit) }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: "{{ valkey_service_name }}"
+        namespace: "{{ valkey_namespace }}"
+        labels:
+          app: "{{ valkey_deployment_name }}"
+          component: valkey
+      spec:
+        type: ClusterIP
+        selector:
+          app: "{{ valkey_deployment_name }}"
+        ports:
+          - name: valkey
+            port: "{{ valkey_port }}"
+            targetPort: "{{ valkey_port }}"
+
+- name: Wait for Valkey deployment to be ready
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ valkey_kubeconfig | default(kubeconfig) | default(omit) }}"
+    api_version: apps/v1
+    kind: Deployment
+    name: "{{ valkey_deployment_name }}"
+    namespace: "{{ valkey_namespace }}"
+    wait: true
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 300
+  register: valkey_deployment
+
+- name: Debug Valkey deployment info
+  ansible.builtin.debug:
+    msg: "Deployed ephemeral Valkey service '{{ valkey_service_name }}' in namespace '{{ valkey_namespace }}'"

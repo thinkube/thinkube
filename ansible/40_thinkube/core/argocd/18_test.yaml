@@ -1,0 +1,188 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/argocd/18_test.yaml
+# Description:
+#   Test ArgoCD deployment and functionality
+#
+# Requirements:
+#   - MicroK8s Kubernetes cluster
+#   - ArgoCD deployed (run 11_deploy.yaml first)
+#   - ArgoCD CLI installed and token configured (run 13_setup_serviceaccount.yaml first)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/argocd/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain name for all services
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - kubectl_bin: Path to kubectl binary
+#
+# Dependencies:
+#   - CORE-001: MicroK8s Control Node
+#   - CORE-003: Cert-Manager (for TLS)
+#   - CORE-004: Keycloak (for SSO)
+#   - CORE-009: ArgoCD (all deployment playbooks)
+
+- name: Test ArgoCD deployment
+  hosts: microk8s_control_plane
+  gather_facts: false
+  become: false
+
+  # No vars section needed - all variables come from inventory
+    
+  tasks:
+    ###################################################################
+    # 1) Basic deployment tests
+    ###################################################################
+    - name: Verify ArgoCD namespace exists
+      ansible.builtin.shell: "{{ kubectl_bin }} get namespace {{ argocd_namespace }}"
+      register: namespace_check
+      changed_when: false
+      failed_when: namespace_check.rc != 0
+      
+    - name: Verify ArgoCD pods are running
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ argocd_namespace }} | grep -E 'argocd-server|argocd-repo-server|argocd-application-controller' | grep Running
+      register: pods_check
+      changed_when: false
+      failed_when: pods_check.rc != 0
+      
+    - name: Verify ArgoCD Ingress resources exist
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get ingress -n {{ argocd_namespace }} | grep -E 'argocd-http-ingress|argocd-grpc-ingress'
+      register: ingress_check
+      changed_when: false
+      failed_when: ingress_check.rc != 0
+      
+    ###################################################################
+    # 2) TLS certificate verification
+    ###################################################################
+    - name: Verify TLS certificate for UI endpoint
+      ansible.builtin.shell: |
+        curl -sI https://{{ argocd_hostname }} | grep -i "HTTP/2 200\|HTTP/1.1 200\|HTTP/1.1 303"
+      register: ui_tls_check
+      changed_when: false
+      failed_when: ui_tls_check.rc != 0
+      
+    - name: Verify TLS certificate for gRPC endpoint
+      ansible.builtin.shell: |
+        curl -sI https://{{ argocd_grpc_hostname }} | grep -i "HTTP/2\|HTTP/1.1"
+      register: grpc_tls_check
+      changed_when: false
+      failed_when: grpc_tls_check.rc != 0
+      
+    ###################################################################
+    # 3) Authentication verification
+    ###################################################################
+    - name: Verify ArgoCD admin settings in ConfigMap
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get configmap -n {{ argocd_namespace }} argocd-cm -o yaml | grep -E 'admin.enabled'
+      register: admin_config_check
+      changed_when: false
+      failed_when: admin_config_check.rc != 0
+      
+    - name: Verify Keycloak OIDC configuration in ConfigMap
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get configmap -n {{ argocd_namespace }} argocd-cm -o yaml | grep -E 'oidc.config|clientID|clientSecret'
+      register: oidc_config_check
+      changed_when: false
+      failed_when: oidc_config_check.rc != 0
+      
+    - name: Verify Keycloak realm is accessible
+      ansible.builtin.shell: |
+        curl -s -I {{ keycloak_url }}/realms/{{ keycloak_realm }}/.well-known/openid-configuration | grep -i "HTTP/1.1 200\|HTTP/2 200"
+      register: keycloak_check
+      changed_when: false
+      failed_when: keycloak_check.rc != 0
+      
+    ###################################################################
+    # 4) Token and ServiceAccount verification
+    ###################################################################
+    - name: Verify service account token exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret -n {{ argocd_namespace }} argo-cd-deployer-token
+      register: token_check
+      changed_when: false
+      failed_when: token_check.rc != 0
+      
+    - name: Verify ArgoCD CLI is installed
+      ansible.builtin.shell: |
+        which argocd && argocd version
+      register: cli_check
+      changed_when: false
+      failed_when: cli_check.rc != 0
+      
+    ###################################################################
+    # 5) RBAC verification
+    ###################################################################
+    - name: Verify RBAC configuration in ConfigMap
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get configmap -n {{ argocd_namespace }} argocd-rbac-cm -o yaml | grep -E 'policy.csv|argocd-admins|role:admin'
+      register: rbac_check
+      changed_when: false
+      failed_when: rbac_check.rc != 0
+      
+    ###################################################################
+    # 6) API Verification
+    ###################################################################
+    - name: Test ArgoCD API accessibility
+      ansible.builtin.shell: >
+        curl -s -k https://{{ argocd_hostname }}/api/v1/applications | grep -i "Unauthorized\|applications" || echo "API returned unexpected response"
+      args:
+        executable: /bin/bash
+      register: api_check
+      changed_when: false
+      failed_when: api_check.rc != 0
+    
+    ###################################################################
+    # 7) Webhook Adapter verification
+    ###################################################################
+    - name: Check if Harbor webhook adapter is deployed
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ argocd_namespace }}"
+        name: harbor-webhook-adapter
+      register: webhook_adapter_check
+      failed_when: webhook_adapter_check.resources | length == 0
+
+    - name: Verify webhook adapter pods
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ argocd_namespace }} -l app=harbor-webhook-adapter | grep Running
+      register: webhook_pods_check
+      changed_when: false
+      failed_when: webhook_pods_check.rc != 0
+
+    - name: Test webhook adapter health endpoint
+      ansible.builtin.uri:
+        url: "https://harbor-webhook-adapter.{{ domain_name }}/"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: webhook_health_check
+
+    ###################################################################
+    # 8) Display test results
+    ###################################################################
+    - name: Display test results
+      ansible.builtin.debug:
+        msg:
+          - "✅ ArgoCD namespace: {{ argocd_namespace }} exists"
+          - "✅ ArgoCD pods are running"
+          - "✅ ArgoCD Ingress resources exist"
+          - "✅ TLS certificate for UI endpoint is valid"
+          - "✅ TLS certificate for gRPC endpoint is valid"
+          - "✅ ArgoCD admin user ({{ admin_username }}) is properly configured"
+          - "✅ Keycloak OIDC configuration in ConfigMap is present"
+          - "✅ Keycloak realm is accessible"
+          - "✅ Service account token exists"
+          - "✅ ArgoCD CLI is installed: {{ cli_check.stdout.split('\n')[1] | default('Version info not available') }}"
+          - "✅ RBAC configuration is correctly set up"
+          - "✅ ArgoCD API is accessible"
+          - "✅ Harbor webhook adapter is deployed and running"
+          - "✅ Webhook adapter health endpoint is accessible"

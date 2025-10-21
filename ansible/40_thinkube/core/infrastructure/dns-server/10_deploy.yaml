@@ -1,0 +1,394 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/dns-server/10_deploy.yaml
+# Description:
+#   Deploy BIND9 DNS server for network-wide DNS resolution
+#   Handles domain resolution for *.thinkube.com and forwards external queries
+#   Separate from Kubernetes CoreDNS which handles cluster.local
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - MetalLB must be enabled for LoadBalancer services
+#   - DNS external IP must be configured on control plane node
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/dns-server/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for all services
+#   - dns_external_ip_octet: Last octet for DNS external IP
+#   - primary_ingress_ip_octet: Last octet for primary ingress
+#   - secondary_ingress_ip_octet: Last octet for secondary ingress
+#
+# Dependencies:
+#   - Networking and ZeroTier must be configured
+#   - IPs must be assigned to control plane node
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy BIND9 DNS Server for Network DNS
+  hosts: microk8s_control_plane
+  gather_facts: true
+  become: true
+  
+  vars:
+    dns_namespace: "dns-system"
+    # Determine subnet prefix based on network mode
+    subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    dns_external_ip: "{{ subnet_prefix }}{{ dns_external_ip_octet }}"
+    primary_ingress_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
+    secondary_ingress_ip: "{{ subnet_prefix }}{{ secondary_ingress_ip_octet }}"
+    kubeconfig: /var/snap/microk8s/current/credentials/client.config
+    kubectl_bin: microk8s kubectl
+    control_plane_hostname: "{{ inventory_hostname }}"
+    
+  pre_tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - dns_external_ip_octet is defined
+          - primary_ingress_ip_octet is defined
+          - secondary_ingress_ip_octet is defined
+          - network_mode is defined
+        fail_msg: "Required inventory variables are not defined"
+        
+  tasks:
+    - name: Create DNS namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ dns_namespace }}"
+            labels:
+              name: "{{ dns_namespace }}"
+              
+    # Create BIND9 configuration files
+    - name: Create BIND9 named.conf configuration
+      ansible.builtin.set_fact:
+        named_conf: |
+          options {
+              directory "/var/cache/bind";
+              
+              // Forwarders for external DNS resolution
+              forwarders {
+                  8.8.8.8;
+                  8.8.4.4;
+              };
+              
+              // DNS Security
+              dnssec-validation no;
+              
+              // Allow queries from any source
+              allow-query { any; };
+              
+              // Enable recursion for all clients
+              recursion yes;
+              allow-recursion { any; };
+              
+              // Listen on all interfaces
+              listen-on { any; };
+              listen-on-v6 { any; };
+              
+              // Hide version
+              version "DNS Server";
+          };
+          
+          // Include zone configurations
+          include "/etc/bind/zones.conf";
+          
+    - name: Create zones configuration
+      ansible.builtin.set_fact:
+        zones_conf: |
+          // Zone for {{ domain_name }}
+          zone "{{ domain_name }}" {
+              type master;
+              file "/etc/bind/zones/db.{{ domain_name }}";
+          };
+          
+          // Zone for kn.{{ domain_name }}
+          zone "kn.{{ domain_name }}" {
+              type master;
+              file "/etc/bind/zones/db.kn.{{ domain_name }}";
+          };
+          
+    - name: Create main domain zone file
+      ansible.builtin.set_fact:
+        zone_main: |
+          $TTL    604800
+          @       IN      SOA     ns1.{{ domain_name }}. admin.{{ domain_name }}. (
+                                  {{ ansible_date_time.epoch }}  ; Serial
+                                  604800          ; Refresh
+                                  86400           ; Retry
+                                  2419200         ; Expire
+                                  604800 )        ; Negative Cache TTL
+          ;
+          @       IN      NS      ns1.{{ domain_name }}.
+          ns1     IN      A       {{ dns_external_ip }}
+          
+          ; Wildcard for all subdomains
+          *       IN      A       {{ primary_ingress_ip }}
+          
+          ; Specific entries for infrastructure
+          dns     IN      A       {{ dns_external_ip }}
+          {{ control_plane_hostname }}  IN  A  {{ hostvars[control_plane_hostname]['zerotier_ip'] }}
+          {% for host in groups['microk8s_workers'] | default([]) %}
+          {{ host }}  IN  A  {{ hostvars[host]['zerotier_ip'] }}
+          {% endfor %}
+          
+    - name: Create Knative domain zone file
+      ansible.builtin.set_fact:
+        zone_kn: |
+          $TTL    604800
+          @       IN      SOA     ns1.kn.{{ domain_name }}. admin.{{ domain_name }}. (
+                                  {{ ansible_date_time.epoch }}  ; Serial
+                                  604800          ; Refresh
+                                  86400           ; Retry
+                                  2419200         ; Expire
+                                  604800 )        ; Negative Cache TTL
+          ;
+          @       IN      NS      ns1.{{ domain_name }}.
+          
+          ; Wildcard for all Knative services
+          *       IN      A       {{ secondary_ingress_ip }}
+          
+    # Create ConfigMaps for BIND9 configuration
+    - name: Create ConfigMap for BIND9 configuration
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: bind9-config
+            namespace: "{{ dns_namespace }}"
+          data:
+            named.conf: "{{ named_conf }}"
+            zones.conf: "{{ zones_conf }}"
+            
+    - name: Set zone file names
+      ansible.builtin.set_fact:
+        zone_file_main: "db.{{ domain_name }}"
+        zone_file_kn: "db.kn.{{ domain_name }}"
+        
+    - name: Create ConfigMap for zone files
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: bind9-zones
+            namespace: "{{ dns_namespace }}"
+          data: "{{ {zone_file_main: zone_main, zone_file_kn: zone_kn} }}"
+            
+    # Deploy BIND9 as a Deployment
+    - name: Deploy BIND9 DNS server
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: bind9
+            namespace: "{{ dns_namespace }}"
+            labels:
+              app: bind9
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: bind9
+            template:
+              metadata:
+                labels:
+                  app: bind9
+              spec:
+                # Pin to control plane node where IPs are configured
+                nodeSelector:
+                  kubernetes.io/hostname: "{{ control_plane_hostname }}"
+                containers:
+                - name: bind9
+                  image: internetsystemsconsortium/bind9:9.18
+                  ports:
+                  - containerPort: 53
+                    name: dns-tcp
+                    protocol: TCP
+                  - containerPort: 53
+                    name: dns-udp
+                    protocol: UDP
+                  volumeMounts:
+                  - name: bind9-config
+                    mountPath: /etc/bind/named.conf
+                    subPath: named.conf
+                  - name: bind9-config
+                    mountPath: /etc/bind/zones.conf
+                    subPath: zones.conf
+                  - name: bind9-zones
+                    mountPath: /etc/bind/zones
+                  - name: cache
+                    mountPath: /var/cache/bind
+                  resources:
+                    requests:
+                      memory: "256Mi"
+                      cpu: "100m"
+                    limits:
+                      memory: "512Mi"
+                      cpu: "500m"
+                  livenessProbe:
+                    exec:
+                      command:
+                      - /usr/bin/dig
+                      - "@127.0.0.1"
+                      - "+tcp"
+                      - "google.com"
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                  readinessProbe:
+                    exec:
+                      command:
+                      - /usr/bin/dig
+                      - "@127.0.0.1"
+                      - "+tcp"
+                      - "google.com"
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+                volumes:
+                - name: bind9-config
+                  configMap:
+                    name: bind9-config
+                - name: bind9-zones
+                  configMap:
+                    name: bind9-zones
+                - name: cache
+                  emptyDir: {}
+                  
+    # Create LoadBalancer service for external DNS access
+    - name: Create BIND9 LoadBalancer service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: bind9-external
+            namespace: "{{ dns_namespace }}"
+            labels:
+              app: bind9
+          spec:
+            type: LoadBalancer
+            loadBalancerIP: "{{ dns_external_ip }}"
+            selector:
+              app: bind9
+            ports:
+            - name: dns-udp
+              port: 53
+              targetPort: 53
+              protocol: UDP
+            - name: dns-tcp
+              port: 53
+              targetPort: 53
+              protocol: TCP
+              
+    # Also create a ClusterIP service for internal use
+    - name: Create BIND9 ClusterIP service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: bind9-internal
+            namespace: "{{ dns_namespace }}"
+            labels:
+              app: bind9
+          spec:
+            type: ClusterIP
+            selector:
+              app: bind9
+            ports:
+            - name: dns-udp
+              port: 53
+              targetPort: 53
+              protocol: UDP
+            - name: dns-tcp
+              port: 53
+              targetPort: 53
+              protocol: TCP
+              
+    - name: Wait for BIND9 deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: bind9
+        namespace: "{{ dns_namespace }}"
+      register: bind9_deployment
+      until: bind9_deployment.resources[0].status.readyReplicas | default(0) == 1
+      retries: 30
+      delay: 10
+      
+    - name: Wait for LoadBalancer IP to be assigned
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        name: bind9-external
+        namespace: "{{ dns_namespace }}"
+      register: lb_service
+      until: lb_service.resources[0].status.loadBalancer.ingress is defined
+      retries: 30
+      delay: 10
+      
+    - name: Get BIND9 pod for testing
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ dns_namespace }}"
+        label_selectors:
+          - app=bind9
+      register: bind9_pods
+      
+    - name: Test DNS resolution from BIND9 pod
+      ansible.builtin.command: >
+        {{ kubectl_bin }} exec -n {{ dns_namespace }} {{ bind9_pods.resources[0].metadata.name }}
+        -- dig @127.0.0.1 google.com +short
+      register: dns_test
+      changed_when: false
+      failed_when: dns_test.rc != 0 or dns_test.stdout == ""
+      
+    - name: Display DNS test result
+      ansible.builtin.debug:
+        msg: "DNS resolution test for google.com: {{ dns_test.stdout }}"
+        
+    - name: Display summary message
+      ansible.builtin.debug:
+        msg: |
+          BIND9 DNS Server has been successfully deployed!
+          
+          External DNS Service: {{ dns_external_ip }}:53
+          Internal Service: bind9-internal.{{ dns_namespace }}.svc.cluster.local
+          
+          Configured zones:
+          - {{ domain_name }} (wildcard → {{ primary_ingress_ip }})
+          - kn.{{ domain_name }} (wildcard → {{ secondary_ingress_ip }})
+          
+          External forwarding to: 8.8.8.8, 8.8.4.4
+          
+          To test DNS resolution:
+          dig @{{ dns_external_ip }} test.{{ domain_name }}
+          dig @{{ dns_external_ip }} google.com
+          
+          Next step: Update nodes to use this DNS server

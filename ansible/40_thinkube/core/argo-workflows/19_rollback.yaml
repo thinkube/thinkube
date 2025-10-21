@@ -1,0 +1,249 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/argo-workflows/19_rollback.yaml
+# Description:
+#   Rollback (uninstall) Argo Workflows and Argo Events deployment
+#
+# This playbook:
+#   1. Removes all Ingress resources
+#   2. Removes Argo Workflows and Argo Events Helm releases
+#   3. Deletes namespace and all associated resources
+#   4. Optionally removes the Argo CLI binary
+#
+# Requirements:
+#   - MicroK8s Kubernetes cluster
+#   - Helm binary available
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/argo-workflows/19_rollback.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain name for all services
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+#
+# Dependencies:
+#   - CORE-001: MicroK8s Control Node
+
+- name: Rollback (uninstall) Argo Workflows and Argo Events deployment
+  hosts: microk8s_control_plane
+  gather_facts: false
+  become: true
+
+  vars:
+    ###################################################################
+    # Rollback configuration
+    ###################################################################
+    argo_namespace: "argo"
+    argo_release_name: "argo-workflows"
+    argo_events_release_name: "argo-events"
+    argo_cli_path: "/usr/local/bin/argo"
+    remove_cli: false  # Set to true to remove the Argo CLI binary
+    force_deletion: true  # Set to false to prevent namespace force deletion
+    preserve_pvcs: false  # Set to true to preserve PVCs during rollback
+
+  tasks:
+    ###################################################################
+    # 1) Remove Ingress resources first
+    ###################################################################
+    - name: Remove Argo Ingress resources
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete ingress -n {{ argo_namespace }} --all --ignore-not-found=true
+      register: ingress_removal
+      changed_when: ingress_removal.rc == 0
+      failed_when: false
+
+    ###################################################################
+    # 2) Remove Argo Helm releases
+    ###################################################################
+    - name: Check if Argo Workflows Helm release exists
+      ansible.builtin.shell: |
+        {{ helm_bin }} list -n {{ argo_namespace }} | grep -q "^{{ argo_release_name }}" || echo "not found"
+      register: argo_helm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Uninstall Argo Workflows Helm release if it exists
+      ansible.builtin.shell: |
+        {{ helm_bin }} uninstall {{ argo_release_name }} -n {{ argo_namespace }}
+      when: "'not found' not in argo_helm_check.stdout"
+      register: argo_uninstall
+      changed_when: argo_uninstall.rc == 0
+      failed_when: false
+
+    - name: Check if Argo Events Helm release exists
+      ansible.builtin.shell: |
+        {{ helm_bin }} list -n {{ argo_namespace }} | grep -q "^{{ argo_events_release_name }}" || echo "not found"
+      register: events_helm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Uninstall Argo Events Helm release if it exists
+      ansible.builtin.shell: |
+        {{ helm_bin }} uninstall {{ argo_events_release_name }} -n {{ argo_namespace }}
+      when: "'not found' not in events_helm_check.stdout"
+      register: events_uninstall
+      changed_when: events_uninstall.rc == 0
+      failed_when: false
+
+    - name: Wait for Helm releases to be fully uninstalled
+      ansible.builtin.shell: |
+        {{ helm_bin }} list -n {{ argo_namespace }} | grep -E "{{ argo_release_name }}|{{ argo_events_release_name }}" || echo "All releases uninstalled"
+      register: helm_uninstall_check
+      until: "'All releases uninstalled' in helm_uninstall_check.stdout"
+      retries: 10
+      delay: 5
+      changed_when: false
+      failed_when: false
+
+    ###################################################################
+    # 3) Remove Custom Resources (workflows, events, etc)
+    ###################################################################
+    - name: Check if Workflow CRD exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get crd workflows.argoproj.io || echo "not found"
+      register: workflow_crd_check
+      changed_when: false
+      failed_when: false
+
+    - name: Remove all Workflow resources if CRD exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete workflows --all -n {{ argo_namespace }} --ignore-not-found=true
+      when: "'not found' not in workflow_crd_check.stdout"
+      register: workflow_removal
+      changed_when: workflow_removal.rc == 0
+      failed_when: false
+
+    - name: Check if EventSource CRD exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get crd eventsources.argoproj.io || echo "not found"
+      register: eventsource_crd_check
+      changed_when: false
+      failed_when: false
+
+    - name: Remove all EventSource resources if CRD exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete eventsources --all -n {{ argo_namespace }} --ignore-not-found=true
+      when: "'not found' not in eventsource_crd_check.stdout"
+      register: eventsource_removal
+      changed_when: eventsource_removal.rc == 0
+      failed_when: false
+
+    - name: Check if Sensor CRD exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get crd sensors.argoproj.io || echo "not found"
+      register: sensor_crd_check
+      changed_when: false
+      failed_when: false
+
+    - name: Remove all Sensor resources if CRD exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete sensors --all -n {{ argo_namespace }} --ignore-not-found=true
+      when: "'not found' not in sensor_crd_check.stdout"
+      register: sensor_removal
+      changed_when: sensor_removal.rc == 0
+      failed_when: false
+
+    - name: Check if EventBus CRD exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get crd eventbus.argoproj.io || echo "not found"
+      register: eventbus_crd_check
+      changed_when: false
+      failed_when: false
+
+    - name: Remove all EventBus resources if CRD exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete eventbus --all -n {{ argo_namespace }} --ignore-not-found=true
+      when: "'not found' not in eventbus_crd_check.stdout"
+      register: eventbus_removal
+      changed_when: eventbus_removal.rc == 0
+      failed_when: false
+
+    ###################################################################
+    # 4) Delete namespace (and all remaining resources)
+    ###################################################################
+    - name: Check if Argo namespace exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get namespace {{ argo_namespace }} || echo "not found"
+      register: namespace_check
+      changed_when: false
+      failed_when: false
+
+    - name: Delete namespace if it exists (normal deletion)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete namespace {{ argo_namespace }} --ignore-not-found=true
+      when: 
+        - "'not found' not in namespace_check.stdout"
+        - not force_deletion
+      register: namespace_delete
+      changed_when: namespace_delete.rc == 0
+      failed_when: false
+
+    - name: Force delete namespace if needed
+      ansible.builtin.shell: |
+        # Remove finalizers from any remaining resources
+        for resource in $({{ kubectl_bin }} api-resources --verbs=list --namespaced -o name); do
+          echo "Checking $resource..."
+          {{ kubectl_bin }} get $resource -n {{ argo_namespace }} -o json 2>/dev/null | \
+            jq -r '.items[] | select(.metadata.finalizers != null) | "\(.kind) \(.metadata.name)"' | \
+            while read kind name; do
+              echo "Removing finalizers from $kind/$name"
+              {{ kubectl_bin }} patch $kind/$name -n {{ argo_namespace }} -p '{"metadata":{"finalizers":[]}}' --type=merge || true
+            done
+        done
+        
+        # Force delete the namespace
+        {{ kubectl_bin }} delete namespace {{ argo_namespace }} --ignore-not-found=true --force --grace-period=0
+      when: 
+        - "'not found' not in namespace_check.stdout"
+        - force_deletion
+      register: force_delete
+      changed_when: force_delete.rc == 0
+      failed_when: false
+
+    - name: Wait for namespace to be fully deleted
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get namespace {{ argo_namespace }} || echo "namespace deleted"
+      register: namespace_check_after
+      until: "'namespace deleted' in namespace_check_after.stdout"
+      retries: 15
+      delay: 5
+      changed_when: false
+      failed_when: false
+      when: "'not found' not in namespace_check.stdout"
+
+    ###################################################################
+    # 5) Optionally remove Argo CLI
+    ###################################################################
+    - name: Check if Argo CLI exists
+      ansible.builtin.stat:
+        path: "{{ argo_cli_path }}"
+      register: argo_cli_check
+
+    - name: Remove Argo CLI binary if requested
+      ansible.builtin.file:
+        path: "{{ argo_cli_path }}"
+        state: absent
+      when: 
+        - remove_cli
+        - argo_cli_check.stat.exists
+      register: cli_removal
+      changed_when: cli_removal is changed
+
+    ###################################################################
+    # 6) Clean up Keycloak client (optional)
+    ###################################################################
+    - name: Display rollback completion message
+      ansible.builtin.debug:
+        msg:
+          - "✅ Argo Workflows rollback completed."
+          - "✅ Ingress resources removed: {{ ingress_removal.rc == 0 }}"
+          - "✅ Argo Workflows Helm release uninstalled: {{ 'not found' not in argo_helm_check.stdout and argo_uninstall.rc == 0 }}"
+          - "✅ Argo Events Helm release uninstalled: {{ 'not found' not in events_helm_check.stdout and events_uninstall.rc == 0 }}"
+          - "✅ Custom resources removed"
+          - "✅ Namespace deleted: {{ 'namespace deleted' in namespace_check_after.stdout | default('true') }}"
+          - "✅ Argo CLI removed: {{ remove_cli and cli_removal is changed }}"
+          - "NOTE: The Keycloak client was not removed. To remove it, use the Keycloak admin console or API."

@@ -1,0 +1,241 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/argo-workflows/13_setup_artifacts.yaml
+# Description:
+#   Configure Argo Workflows to use SeaweedFS S3 for artifact storage
+#
+# This playbook:
+#   1. Creates a Secret in the argo namespace with S3 credentials
+#   2. Creates/updates the artifact-repositories ConfigMap in the argo namespace
+#   3. Configures it to use the existing SeaweedFS S3 API
+#   4. Ensures the argo-artifacts bucket exists
+#   5. Optionally restarts the Argo controller to apply changes
+#   6. Creates a test workflow to verify configuration
+#
+# Requirements:
+#   - MicroK8s Kubernetes cluster
+#   - Argo Workflows deployed (run 11_deploy.yaml first)
+#   - SeaweedFS deployed with S3 API enabled
+#   - SeaweedFS S3 credentials configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/argo-workflows/13_setup_artifacts.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain name for all services
+#   - admin_username: Username for admin access
+#   - kubeconfig: Path to Kubernetes configuration
+#   - kubectl_bin: Path to kubectl binary
+#
+# Dependencies:
+#   - CORE-001: MicroK8s Control Node
+#   - SeaweedFS (for S3-compatible artifact storage)
+#   - CORE-008: Argo Workflows (11_deploy.yaml)
+
+- name: Configure Argo Workflows to use SeaweedFS S3 for Artifacts
+  hosts: microk8s_control_plane
+  gather_facts: true
+  become: true
+
+  vars:
+    ###################################################################
+    # Kubernetes configuration
+    ###################################################################
+    argo_namespace: "argo"
+    
+    ###################################################################
+    # SeaweedFS S3 connection details
+    ###################################################################
+    s3_endpoint_internal: "seaweedfs-filer.{{ seaweedfs_namespace }}.svc.cluster.local:8333"
+    s3_endpoint_external: "https://{{ seaweedfs_s3_hostname }}"
+    s3_bucket: "argo-artifacts"
+    
+    ###################################################################
+    # Argo configuration
+    ###################################################################
+    artifact_repo_name: "artifact-repositories"
+    artifact_repo_key: "default-v1"
+    argo_secret_name: "argo-artifacts-s3"
+
+  tasks:
+    ###################################################################
+    # 1) Verify SeaweedFS is deployed and get credentials
+    ###################################################################
+    - name: Check if SeaweedFS is deployed
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        name: seaweedfs-filer
+        namespace: "{{ seaweedfs_namespace }}"
+      register: seaweedfs_check
+      failed_when: 
+        - seaweedfs_check.resources | length == 0
+        - seaweedfs_check.resources[0].status.readyReplicas != seaweedfs_check.resources[0].spec.replicas
+
+    - name: Get S3 credentials from SeaweedFS config secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: seaweedfs-s3-config
+        namespace: "{{ seaweedfs_namespace }}"
+      register: seaweedfs_config
+      failed_when: seaweedfs_config.resources | length == 0
+
+    - name: Set S3 credentials from config
+      ansible.builtin.set_fact:
+        s3_access_key: "{{ seaweedfs_config.resources[0].data.access_key | b64decode }}"
+        s3_secret_key: "{{ seaweedfs_config.resources[0].data.secret_key | b64decode }}"
+
+    - name: Create Argo Artifacts S3 Secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ argo_secret_name }}"
+            namespace: "{{ argo_namespace }}"
+          type: Opaque
+          stringData:
+            accesskey: "{{ s3_access_key }}"
+            secretkey: "{{ s3_secret_key }}"
+
+    ###################################################################
+    # 2) Create/Update artifact-repositories ConfigMap
+    ###################################################################
+    - name: Prepare ConfigMap data with SeaweedFS S3 configuration
+      ansible.builtin.set_fact:
+        artifact_repo_config: |
+          archiveLogs: true
+          s3:
+            endpoint: {{ s3_endpoint_internal }}
+            bucket: {{ s3_bucket }}
+            insecure: true
+            disableSSL: true
+            s3ForcePathStyle: true
+            useSDKCreds: false
+            accessKeySecret:
+              name: {{ argo_secret_name }}
+              key: accesskey
+            secretKeySecret:
+              name: {{ argo_secret_name }}
+              key: secretkey
+
+    - name: Create Artifact Repositories ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ artifact_repo_name }}"
+            namespace: "{{ argo_namespace }}"
+          data:
+            "default-v1": "{{ artifact_repo_config }}"
+
+    ###################################################################
+    # 3) Create and verify bucket in SeaweedFS
+    ###################################################################
+    - name: Install s3cmd for bucket operations
+      ansible.builtin.package:
+        name: s3cmd
+        state: present
+      become: true
+
+    - name: Create s3cmd config file
+      ansible.builtin.copy:
+        content: |
+          [default]
+          access_key = {{ s3_access_key }}
+          secret_key = {{ s3_secret_key }}
+          host_base = {{ seaweedfs_s3_hostname }}
+          host_bucket = {{ seaweedfs_s3_hostname }}/%(bucket)s
+          use_https = True
+          check_ssl_certificate = False
+          signature_v2 = True
+          use_path_style = True
+        dest: /tmp/s3cmd-argo.cfg
+        mode: '0600'
+
+    - name: Create argo-artifacts bucket
+      ansible.builtin.shell: |
+        s3cmd -c /tmp/s3cmd-argo.cfg mb s3://{{ s3_bucket }} 2>&1 || true
+      register: bucket_creation
+
+    - name: Verify bucket with test upload
+      ansible.builtin.shell: |
+        echo "Argo test file $(date)" > /tmp/argo-test.txt
+        s3cmd -c /tmp/s3cmd-argo.cfg put /tmp/argo-test.txt s3://{{ s3_bucket }}/test.txt
+        s3cmd -c /tmp/s3cmd-argo.cfg get s3://{{ s3_bucket }}/test.txt /tmp/argo-test-verify.txt
+        diff /tmp/argo-test.txt /tmp/argo-test-verify.txt
+        s3cmd -c /tmp/s3cmd-argo.cfg del s3://{{ s3_bucket }}/test.txt
+      register: s3_test_result
+
+    - name: Clean up temp files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/s3cmd-argo.cfg
+        - /tmp/argo-test.txt
+        - /tmp/argo-test-verify.txt
+
+    ###################################################################
+    # 4) Restart Argo controller
+    ###################################################################
+    - name: Restart Argo Workflow Controller
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout restart deployment/argo-workflows-workflow-controller -n {{ argo_namespace }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: restart_result
+
+    ###################################################################
+    # 5) Create a test workflow to verify configuration
+    ###################################################################
+    - name: Create test workflow
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: Workflow
+          metadata:
+            generateName: artifact-test-
+            namespace: "{{ argo_namespace }}"
+          spec:
+            entrypoint: artifact-example
+            artifactRepositoryRef:
+              configMap: "{{ artifact_repo_name }}"
+              key: "{{ artifact_repo_key }}"
+            templates:
+            - name: artifact-example
+              container:
+                image: alpine:latest
+                command: [sh, -c]
+                args: ["echo 'SeaweedFS S3 test at time: $(date)' > /tmp/test.txt; echo 'File created successfully'"]
+              outputs:
+                artifacts:
+                - name: test-artifact
+                  path: /tmp/test.txt
+      register: test_workflow
+      failed_when: false
+    
+    ###################################################################
+    # 6) Output results
+    ###################################################################
+    - name: Display configuration results
+      ansible.builtin.debug:
+        msg:
+          - "Argo Workflow ConfigMap '{{ artifact_repo_name }}' configured in namespace '{{ argo_namespace }}'"
+          - "Using SeaweedFS S3 endpoint: {{ s3_endpoint_internal }}"
+          - "Using bucket: {{ s3_bucket }}"
+          - "Test workflow created: {{ test_workflow.result.metadata.name if test_workflow.result.metadata is defined else 'Failed to create' }}"
+          - "Check workflow status with: {{ kubectl_bin }} get workflow -n {{ argo_namespace }} {{ test_workflow.result.metadata.name if test_workflow.result.metadata is defined else '' }}"

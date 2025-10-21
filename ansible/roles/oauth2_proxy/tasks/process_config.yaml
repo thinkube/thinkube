@@ -1,0 +1,181 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# ============================================================================
+# OAUTH2 PROXY ROLE - CONFIGURATION PROCESSING
+# ============================================================================
+# File: roles/oauth2_proxy/tasks/process_config.yaml
+# Description: Processes OAuth2 Proxy configuration and prepares for deployment
+#   This file handles the preparation of all configuration parameters needed
+#   for the OAuth2 Proxy deployment. It performs the following operations:
+#   - Ensures the target namespace exists
+#   - Sets default values for missing parameters
+#   - Builds the Redis connection URL (if Redis session store is enabled)
+#   - Constructs all command-line arguments for the OAuth2 Proxy deployment
+#
+# Author: Infrastructure Team
+# Last Updated: 2025-03-06
+# ============================================================================
+
+---
+
+# ============================================================================
+# DEBUG INFORMATION
+# ============================================================================
+# Displays OAuth2 Proxy configuration settings for debugging purposes
+# This task is conditional and only runs when debugging is enabled
+- name: Debug OAuth2 Proxy settings
+  ansible.builtin.debug:
+    msg:
+      - "Namespace: {{ oauth2_proxy_namespace }}"
+      - "OAuth2 Proxy name: {{ oauth2_proxy_name }}"
+      - "Provider: {{ oauth2_proxy_provider }}"
+      - "OIDC Issuer URL: {{ oauth2_proxy_oidc_issuer_url }}"
+      - "Client ID: {{ oauth2_proxy_client_id }}"
+      - "Redirect URL: {{ oauth2_proxy_redirect_url | default('not set') }}"
+      - "Session store type: {{ oauth2_proxy_session_store_type }}"
+  when: oauth2_proxy_debug | bool
+
+# ============================================================================
+# NAMESPACE CREATION
+# ============================================================================
+# Ensures the target Kubernetes namespace exists
+# This task creates the namespace if it doesn't exist, which is required
+# before deploying any resources.
+- name: Ensure namespace exists
+  kubernetes.core.k8s:
+    kubeconfig: "{{ oauth2_proxy_kubeconfig | default(omit) }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ oauth2_proxy_namespace }}"
+
+# ============================================================================
+# DEFAULT VALUES
+# ============================================================================
+# Sets default values for missing parameters
+# This task sets the redirect URL if it's not provided but the ingress host is.
+# The redirect URL is required for OAuth2 authentication flow.
+- name: Set redirect URL if not provided
+  ansible.builtin.set_fact:
+    oauth2_proxy_redirect_url: "https://{{ oauth2_proxy_ingress_host }}/oauth2/callback"
+  when: 
+    - oauth2_proxy_redirect_url is not defined or oauth2_proxy_redirect_url | length == 0
+    - oauth2_proxy_ingress_host is defined and oauth2_proxy_ingress_host | length > 0
+
+# ============================================================================
+# REDIS CONFIGURATION
+# ============================================================================
+# Builds the Redis connection URL if Redis session store is enabled
+# This task constructs the Redis connection URL with the appropriate format,
+# including password if provided. The URL follows the format:
+# redis://[:password@]host:port
+- name: Compute Redis connection URL
+  ansible.builtin.set_fact:
+    oauth2_proxy_redis_connection_url: >-
+      redis://{% if oauth2_proxy_redis_password | length > 0 %}:{{ oauth2_proxy_redis_password }}@{% endif %}{{ oauth2_proxy_redis_service }}.{{ oauth2_proxy_namespace }}.svc.cluster.local:{{ oauth2_proxy_redis_port }}
+  when: oauth2_proxy_session_store_type == 'redis'
+
+# Displays the Redis connection URL for debugging purposes
+# This task is conditional and only runs when Redis is enabled and debugging is enabled
+- name: Debug Redis connection URL
+  ansible.builtin.debug:
+    msg: "Redis connection URL: {{ oauth2_proxy_redis_connection_url }}"
+  when: oauth2_proxy_session_store_type == 'redis' and oauth2_proxy_debug | bool
+
+# ============================================================================
+# COMMAND-LINE ARGUMENTS
+# ============================================================================
+# Builds the standard command-line arguments for OAuth2 Proxy
+# This task constructs the core set of arguments needed for OAuth2 Proxy
+# to function properly, including:
+# - Provider configuration (Keycloak OIDC)
+# - Client credentials
+# - Cookie settings
+# - Proxy behavior
+- name: Build OAuth2 Proxy standard args
+  ansible.builtin.set_fact:
+    oauth2_proxy_standard_args:
+      - "--provider={{ oauth2_proxy_provider }}"
+      - "--client-id={{ oauth2_proxy_client_id }}"
+      - "--client-secret={{ oauth2_proxy_client_secret }}"
+      - "--redirect-url={{ oauth2_proxy_redirect_url }}"
+      - "--oidc-issuer-url={{ oauth2_proxy_oidc_issuer_url }}"
+      - "--cookie-domain={{ oauth2_proxy_cookie_domain }}"
+      - "--cookie-secure={{ oauth2_proxy_cookie_secure | string | lower }}"
+      - "--cookie-samesite={{ oauth2_proxy_cookie_samesite }}"
+      - "--cookie-refresh={{ oauth2_proxy_cookie_refresh }}"
+      - "--reverse-proxy=true"
+      - "--set-xauthrequest=true"
+      - "--session-cookie-minimal={{ oauth2_proxy_session_cookie_minimal | string | lower }}"
+
+# Adds PKCE (Proof Key for Code Exchange) support if enabled
+# PKCE enhances security for the OAuth2 authorization code flow
+# This task is conditional and only runs when PKCE is enabled
+- name: Add PKCE support if enabled
+  ansible.builtin.set_fact:
+    oauth2_proxy_standard_args: >-
+      {{ oauth2_proxy_standard_args + [
+        '--code-challenge-method=' + oauth2_proxy_code_challenge_method
+      ] }}
+  when: oauth2_proxy_use_pkce | bool
+
+# Adds Redis session store arguments if Redis is enabled
+# Redis provides a more robust session store than cookies,
+# especially for large sessions or high traffic
+# This task is conditional and only runs when Redis is enabled
+- name: Add Redis session store args if enabled
+  ansible.builtin.set_fact:
+    oauth2_proxy_standard_args: >-
+      {{ oauth2_proxy_standard_args + [
+        '--session-store-type=' + oauth2_proxy_session_store_type,
+        '--redis-connection-url=' + oauth2_proxy_redis_connection_url,
+        '--redis-use-sentinel=' + (oauth2_proxy_redis_use_sentinel | string | lower),
+        '--redis-insecure-skip-tls-verify=' + (oauth2_proxy_redis_insecure_skip_tls_verify | string | lower)
+      ] }}
+  when: oauth2_proxy_session_store_type == 'redis'
+
+# Adds skip-auth-route arguments if routes are specified
+# This allows specific routes (e.g., /api/) to bypass OAuth2 authentication
+# Useful for programmatic API access with token-based auth
+# This task is conditional and only runs when skip auth routes are defined
+- name: Add skip-auth-route args if specified
+  ansible.builtin.set_fact:
+    oauth2_proxy_standard_args: >-
+      {{ oauth2_proxy_standard_args +
+         (oauth2_proxy_skip_auth_routes | map('regex_replace', '^(.*)$', '--skip-auth-route=\1') | list) }}
+  when: oauth2_proxy_skip_auth_routes is defined and oauth2_proxy_skip_auth_routes | length > 0
+
+# Adds skip-auth-regex arguments if specified (better for ingress setups)
+# Works more reliably than skip-auth-route with reverse proxies
+- name: Add skip-auth-regex args if specified
+  ansible.builtin.set_fact:
+    oauth2_proxy_standard_args: >-
+      {{ oauth2_proxy_standard_args +
+         (oauth2_proxy_skip_auth_regex | map('regex_replace', '^(.*)$', '--skip-auth-regex=\1') | list) }}
+  when: oauth2_proxy_skip_auth_regex is defined and oauth2_proxy_skip_auth_regex | length > 0
+
+# ============================================================================
+# FINAL ARGUMENTS
+# ============================================================================
+# Combines standard arguments with any extra arguments provided
+# This allows for customization of the OAuth2 Proxy configuration
+# beyond the standard settings
+- name: Combine standard args with extra args
+  ansible.builtin.set_fact:
+    oauth2_proxy_all_args: "{{ oauth2_proxy_standard_args + oauth2_proxy_extra_args }}"
+
+# Displays the final set of arguments for debugging purposes
+# This task is conditional and only runs when debugging is enabled
+- name: Debug final OAuth2 Proxy args
+  ansible.builtin.debug:
+    var: oauth2_proxy_all_args
+  when: oauth2_proxy_debug | bool
+
+# Always show skip-auth-routes if defined (for verification)
+- name: Display skip-auth-routes configuration
+  ansible.builtin.debug:
+    msg: "Skip auth routes configured: {{ oauth2_proxy_skip_auth_routes }}"
+  when: oauth2_proxy_skip_auth_routes is defined and oauth2_proxy_skip_auth_routes | length > 0

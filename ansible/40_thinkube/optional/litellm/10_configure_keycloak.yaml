@@ -1,0 +1,269 @@
+---
+# ansible/40_thinkube/optional/litellm/15_configure_keycloak.yaml
+# Description:
+#   Configure Keycloak OIDC authentication for LiteLLM
+#   Creates client and configures JWT authentication settings
+#
+# Requirements:
+#   - Keycloak must be deployed and accessible
+#   - LiteLLM must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/litellm/15_configure_keycloak.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - admin_username: Keycloak admin username
+#   - admin_password: Keycloak admin password
+#
+# 🤖 [AI-generated]
+
+- name: Configure Keycloak OIDC for LiteLLM
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    keycloak_url: "https://auth.{{ domain_name }}"
+    litellm_hostname: "litellm.{{ domain_name }}"
+    litellm_client_id: "litellm"
+    # Get admin password from environment like main deployment
+    admin_password: "{{ lookup('env','ADMIN_PASSWORD') }}"
+
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - admin_username is defined
+          - lookup('env','ADMIN_PASSWORD') != ""
+        fail_msg: "Required variables are not defined"
+
+    - name: Wait for Keycloak to be ready
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+        validate_certs: true
+        status_code: 200
+      register: keycloak_check
+      until: keycloak_check.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: password
+        validate_certs: true
+      register: keycloak_token
+
+    - name: Check if LiteLLM client exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ litellm_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+      register: existing_client
+
+    - name: Delete existing LiteLLM client if it exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ existing_client.json[0].id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+        status_code: [204]
+      when: existing_client.json | length > 0
+
+    - name: Create LiteLLM client in Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          clientId: "{{ litellm_client_id }}"
+          name: "LiteLLM Proxy"
+          description: "LiteLLM unified LLM API proxy with dashboard"
+          enabled: true
+          publicClient: false
+          standardFlowEnabled: true
+          implicitFlowEnabled: false
+          directAccessGrantsEnabled: true
+          serviceAccountsEnabled: false
+          protocol: openid-connect
+          bearerOnly: false
+          fullScopeAllowed: true
+          rootUrl: "https://{{ litellm_hostname }}"
+          baseUrl: "/"
+          redirectUris:
+            - "https://{{ litellm_hostname }}/sso/callback"
+            - "https://{{ litellm_hostname }}/*"
+          webOrigins:
+            - "https://{{ litellm_hostname }}"
+          attributes:
+            post.logout.redirect.uris: "https://{{ litellm_hostname }}"
+          defaultClientScopes:
+            - web-origins
+            - acr
+            - roles
+            - profile
+            - email
+          optionalClientScopes:
+            - address
+            - phone
+            - offline_access
+            - microprofile-jwt
+        validate_certs: true
+        status_code: [201]
+      register: client_creation
+
+    - name: Get LiteLLM client details
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ litellm_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+      register: litellm_client
+
+    - name: Create litellm_proxy_admin client scope
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/client-scopes"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "litellm_proxy_admin"
+          description: "Admin scope for LiteLLM proxy"
+          protocol: "openid-connect"
+          attributes:
+            include.in.token.scope: "true"
+            display.on.consent.screen: "true"
+            gui.order: "100"
+        validate_certs: true
+        status_code: [201, 409]
+      register: scope_creation
+
+    - name: Get all client scopes
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/client-scopes"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+      register: all_scopes
+
+    - name: Find litellm_proxy_admin scope ID
+      set_fact:
+        litellm_scope_id: "{{ item.id }}"
+      loop: "{{ all_scopes.json }}"
+      when: item.name == "litellm_proxy_admin"
+
+    - name: Add litellm_proxy_admin scope to client optional scopes
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ litellm_client.json[0].id }}/optional-client-scopes/{{ litellm_scope_id }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+        status_code: [204]
+      when: litellm_scope_id is defined
+
+    - name: Create or update LiteLLM admin role
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "AI_ADMIN"
+          description: "Administrator role for LiteLLM and AI services"
+          composite: false
+        validate_certs: true
+        status_code: [201, 409]
+
+    - name: Create or update LiteLLM user role
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "AI_USER"
+          description: "User role for LiteLLM and AI services"
+          composite: false
+        validate_certs: true
+        status_code: [201, 409]
+
+    - name: Get admin user details
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users?username={{ admin_username }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+      register: admin_user
+
+    - name: Get AI_ADMIN role details
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles/AI_ADMIN"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+      register: ai_admin_role
+
+    - name: Assign AI_ADMIN role to admin user
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/{{ admin_user.json[0].id }}/role-mappings/realm"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          - id: "{{ ai_admin_role.json.id }}"
+            name: "AI_ADMIN"
+        validate_certs: true
+        status_code: [204]
+      when: admin_user.json | length > 0
+
+    - name: Get client secret for LiteLLM
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ litellm_client.json[0].id }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: true
+      register: client_secret_response
+
+    - name: Store client secret in fact for deployment
+      ansible.builtin.set_fact:
+        litellm_client_secret: "{{ client_secret_response.json.value }}"
+      when: client_secret_response.json.value is defined
+
+    - name: Display OIDC configuration information
+      ansible.builtin.debug:
+        msg:
+          - "Keycloak OIDC configuration for LiteLLM completed!"
+          - "Client ID: {{ litellm_client_id }}"
+          - "Client secret has been retrieved and stored"
+          - "OIDC Discovery URL: {{ keycloak_url }}/realms/{{ keycloak_realm }}/.well-known/openid-configuration"
+          - "Admin scope: litellm_proxy_admin"
+          - "Admin role: AI_ADMIN"
+          - "User role: AI_USER"

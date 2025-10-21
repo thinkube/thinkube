@@ -1,0 +1,123 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/perses/19_rollback.yaml
+# Description:
+#   Rollback Perses deployment by removing all components
+#
+# This playbook:
+#   1. Uninstalls Perses Helm release
+#   2. Deletes perses namespace (including all resources)
+#   3. Removes Keycloak client
+#
+# Requirements:
+#   - Perses deployment exists
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/perses/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - keycloak_url: Keycloak URL
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username
+#
+# 🤖 AI-assisted
+
+- name: Rollback Perses deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    perses_namespace: "perses"
+    perses_release_name: "perses"
+    perses_client_id: "perses"
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    keycloak_validate_certs: false
+
+  tasks:
+    - name: Uninstall Perses Helm release
+      ansible.builtin.shell: |
+        microk8s helm3 uninstall {{ perses_release_name }} --namespace {{ perses_namespace }}
+      become: true
+      register: helm_uninstall
+      failed_when: false
+      changed_when: helm_uninstall.rc == 0
+
+    - name: Delete Perses namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ perses_namespace }}"
+        kind: Namespace
+        state: absent
+        wait: true
+        wait_timeout: 300
+
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ keycloak_admin_username }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: keycloak_token
+      failed_when: false
+
+    - name: Get Perses client UUID
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ perses_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: perses_client_response
+      when: keycloak_token is succeeded
+      failed_when: false
+
+    - name: Delete Perses Keycloak client
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ perses_client_response.json[0].id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: [204, 404]
+      when:
+        - keycloak_token is succeeded
+        - perses_client_response is succeeded
+        - perses_client_response.json | length > 0
+      failed_when: false
+
+    - name: Delete Perses realm roles
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles/{{ item }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: [204, 404]
+      loop:
+        - "perses-admin"
+        - "perses-user"
+      when: keycloak_token is succeeded
+      failed_when: false
+
+    - name: Rollback complete
+      ansible.builtin.debug:
+        msg:
+          - "Perses rollback completed"
+          - ""
+          - "Removed components:"
+          - "  - Helm release: {{ perses_release_name }}"
+          - "  - Namespace: {{ perses_namespace }}"
+          - "  - Keycloak client: {{ perses_client_id }}"
+          - "  - Keycloak roles: perses-admin, perses-user"

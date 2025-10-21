@@ -1,0 +1,253 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/13_configure_code_server.yaml
+# Description:
+#   Configure code-server with CI/CD monitoring token after thinkube-control deployment
+#   Also configures Claude Code MCP integration using the same token
+#
+# Requirements:
+#   - thinkube-control must be deployed (creates the CI/CD monitoring token)
+#   - code-server must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/11_configure_code_server.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Configure code-server with CI/CD monitoring token
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    thinkube_control_namespace: "thinkube-control"
+    code_server_namespace: "code-server"
+    
+  tasks:
+    - name: Check if thinkube-control namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ thinkube_control_namespace }}"
+      register: control_namespace
+      
+    - name: Check if code-server namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ code_server_namespace }}"
+      register: code_namespace
+      
+    - name: Verify both namespaces exist
+      ansible.builtin.assert:
+        that:
+          - control_namespace.resources | length > 0
+          - code_namespace.resources | length > 0
+        fail_msg: "Both thinkube-control and code-server must be deployed before running this configuration"
+        
+    - name: Get CI/CD monitoring token from thinkube-control namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ thinkube_control_namespace }}"
+        name: "cicd-monitoring-token"
+      register: monitoring_token_secret
+      failed_when: monitoring_token_secret.resources | length == 0
+      
+    - name: Extract token value
+      ansible.builtin.set_fact:
+        cicd_api_token: "{{ monitoring_token_secret.resources[0].data.token | b64decode }}"
+        
+    - name: Debug variables
+      ansible.builtin.debug:
+        msg:
+          - "domain_name: {{ domain_name }}"
+          - "cicd_api_token: {{ cicd_api_token }}"
+          - "code_server_namespace: {{ code_server_namespace }}"
+          
+    - name: Copy CI/CD monitoring token to code-server namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "cicd-monitoring-token"
+            namespace: "{{ code_server_namespace }}"
+          type: Opaque
+          stringData:
+            token: "{{ cicd_api_token }}"
+            
+    - name: Ensure VS Code settings directory exists
+      ansible.builtin.file:
+        path: "/home/{{ system_username }}/shared-code/.local/share/code-server/User"
+        state: directory
+        mode: '0755'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      become: true
+      
+    - name: Check if VS Code settings file exists
+      ansible.builtin.stat:
+        path: "/home/{{ system_username }}/shared-code/.local/share/code-server/User/settings.json"
+      register: settings_file
+      
+    - name: Read existing VS Code settings if file exists
+      ansible.builtin.slurp:
+        src: "/home/{{ system_username }}/shared-code/.local/share/code-server/User/settings.json"
+      register: existing_settings
+      when: settings_file.stat.exists
+      
+    - name: Verify settings file exists
+      ansible.builtin.assert:
+        that:
+          - settings_file.stat.exists
+        fail_msg: "VS Code settings file does not exist at /home/{{ system_username }}/shared-code/.local/share/code-server/User/settings.json - run 15_configure_environment.yaml first!"
+        
+    - name: Parse existing settings
+      ansible.builtin.set_fact:
+        vscode_settings: "{{ existing_settings.content | b64decode | from_json }}"
+        
+    - name: Update settings with CI/CD configuration
+      ansible.builtin.set_fact:
+        updated_settings: "{{ vscode_settings | combine({
+          'git.autofetch': true,
+          'git.enableSmartCommit': true,
+          'thinkube-cicd.apiUrl': 'https://control.' + domain_name,
+          'thinkube-cicd.showNotifications': true,
+          'thinkube-cicd.refreshInterval': 5000,
+          'thinkube-cicd.apiToken': cicd_api_token,
+          'terminal.integrated.env.linux': {
+            'PATH': '${env:PATH}:/home/coder/.npm-global/bin:/home/coder/.local/bin'
+          },
+          'terminal.integrated.inheritEnv': true
+        }) }}"
+        
+    - name: Write updated VS Code settings
+      ansible.builtin.copy:
+        content: "{{ updated_settings | to_nice_json(indent=4) }}"
+        dest: "/home/{{ system_username }}/shared-code/.local/share/code-server/User/settings.json"
+        mode: '0644'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      become: true
+              
+    - name: Restart code-server deployment to pick up new configuration
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: code-server
+            namespace: "{{ code_server_namespace }}"
+            annotations:
+              kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
+              
+    - name: Wait for code-server to be ready after restart
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ code_server_namespace }}"
+        name: code-server
+        wait: true
+        wait_condition:
+          type: Progressing
+          status: "True"
+        wait_timeout: 300
+        
+    - name: Display configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ CI/CD monitoring token successfully configured in code-server"
+          - "✅ VS Code settings updated with CI/CD extension configuration"
+          - "✅ code-server deployment restarted to apply changes"
+          - ""
+          - "The thinkube-cicd VS Code extension will now be able to monitor pipelines"
+
+    - name: Save token and domain for local configuration
+      ansible.builtin.set_fact:
+        mcp_token_to_share: "{{ cicd_api_token }}"
+        mcp_domain_to_share: "{{ domain_name }}"
+      delegate_to: localhost
+      delegate_facts: true
+
+# Second play to configure Claude Code MCP on the local ansible controller
+- name: Configure Claude Code MCP integration locally
+  hosts: localhost
+  gather_facts: true
+  
+  vars:
+    cicd_api_token: "{{ hostvars['localhost']['mcp_token_to_share'] }}"
+    # Use domain_name from shared facts
+    control_domain_name: "{{ hostvars['localhost']['mcp_domain_to_share'] }}"
+    
+  tasks:
+    - name: Check if MCP config exists in project root
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../../.mcp.json"
+      register: mcp_config_file
+
+    - name: Read existing MCP config from project root
+      ansible.builtin.slurp:
+        src: "{{ playbook_dir }}/../../../.mcp.json"
+      register: existing_mcp_config
+      when: mcp_config_file.stat.exists
+
+    - name: Parse existing MCP config
+      ansible.builtin.set_fact:
+        mcp_config: "{{ existing_mcp_config.content | b64decode | from_json }}"
+      when: mcp_config_file.stat.exists
+
+    - name: Initialize empty MCP config if not exists
+      ansible.builtin.set_fact:
+        mcp_config: {}
+      when: not mcp_config_file.stat.exists
+
+    - name: Update MCP config with thinkube-control server
+      ansible.builtin.set_fact:
+        mcp_config: "{{ mcp_config | combine({'mcpServers': 
+          (mcp_config.mcpServers | default({})) | combine({
+            'thinkube-control': {
+              'type': 'http',
+              'url': 'https://control.' + control_domain_name + '/api/mcp/mcp/',
+              'headers': {
+                'Authorization': 'Bearer ' + cicd_api_token
+              }
+            }
+          })
+        }, recursive=True) }}"
+
+    - name: Write updated MCP config to project root
+      ansible.builtin.copy:
+        content: "{{ mcp_config | to_nice_json }}"
+        dest: "{{ playbook_dir }}/../../../.mcp.json"
+        mode: '0644'
+
+    - name: Display MCP configuration info
+      ansible.builtin.debug:
+        msg: |
+          🤖 Claude Code MCP Configuration Complete!
+          
+          MCP Server: https://control.{{ control_domain_name }}/mcp
+          Using existing CI/CD monitoring token
+          
+          The MCP server has been configured in {{ playbook_dir }}/../../../.mcp.json
+          Restart Claude Code or run /mcp to see the available servers.
+          
+          Available MCP tools:
+          - list_templates()
+          - get_template_parameters(template_url)
+          - deploy_template(template_url, app_name, variables)
+          - get_deployment_status_by_id(deployment_id)
+          - get_deployment_logs_by_id(deployment_id)
+          - list_recent_deployments()
+          - cancel_deployment_by_id(deployment_id)

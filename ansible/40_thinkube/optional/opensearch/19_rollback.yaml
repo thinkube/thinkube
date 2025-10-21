@@ -1,0 +1,223 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/opensearch/19_rollback.yaml
+# Description:
+#   Rollback OpenSearch deployment including Keycloak client and all resources
+#
+# Requirements:
+#   - MicroK8s cluster with kubectl and helm
+#   - Keycloak admin access
+#   - ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/opensearch/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Administrator username
+#   - domain_name: Base domain name
+
+- name: Rollback OpenSearch deployment
+  hosts: microk8s_control_plane
+  gather_facts: false
+  vars:
+    namespace: opensearch
+    opensearch_client_id: "opensearch"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Check if namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ namespace }}"
+      register: namespace_check
+
+    - name: Uninstall OpenSearch Dashboards Helm release
+      ansible.builtin.command: >
+        {{ helm_bin }} uninstall gato-opensearch-dashboards
+        --namespace {{ namespace }}
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+      become: true
+
+    - name: Uninstall OpenSearch Helm release
+      ansible.builtin.command: >
+        {{ helm_bin }} uninstall gato-opensearch
+        --namespace {{ namespace }}
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+      become: true
+
+    - name: Remove Fluent Bit namespace resources before waiting
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.name }}"
+        namespace: "{{ namespace }}"
+      loop:
+        - { api_version: "apps/v1", kind: "DaemonSet", name: "fluent-bit" }
+        - { api_version: "v1", kind: "ConfigMap", name: "fluent-bit-config" }
+        - { api_version: "v1", kind: "ServiceAccount", name: "fluent-bit" }
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Wait for pods to terminate
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ namespace }}"
+      register: pods_check
+      until: pods_check.resources | length == 0
+      retries: 30
+      delay: 10
+      when: namespace_check.resources | length > 0
+
+    - name: Delete PVCs
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ namespace }}"
+        name: "{{ item }}"
+      loop:
+        - "opensearch-cluster-master-opensearch-cluster-master-0"
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ namespace }}"
+      when: namespace_check.resources | length > 0
+
+    - name: Clean up temporary files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/opensearch-values.yaml
+        - /tmp/osd-values.yaml
+        - /tmp/opensearch-security
+      become: true
+
+    # Keycloak cleanup
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: "password"
+        validate_certs: false
+      register: keycloak_token
+      when: admin_password != ""
+      no_log: true
+
+    - name: Get OpenSearch client ID
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ opensearch_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+      register: client_info
+      when: keycloak_token is defined and keycloak_token.json is defined
+
+    - name: Delete OpenSearch client from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ client_info.json[0].id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: [204]
+      when:
+        - client_info is defined
+        - client_info.json is defined
+        - client_info.json | length > 0
+
+    - name: Get opensearch-authorization scope
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/client-scopes"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+      register: scopes_info
+      when: keycloak_token is defined and keycloak_token.json is defined
+
+    - name: Find opensearch-authorization scope ID
+      ansible.builtin.set_fact:
+        opensearch_scope_id: "{{ item.id }}"
+      loop: "{{ scopes_info.json | default([]) }}"
+      when:
+        - scopes_info is defined
+        - item.name == "opensearch-authorization"
+
+    - name: Delete opensearch-authorization scope
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/client-scopes/{{ opensearch_scope_id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: [204]
+      when: opensearch_scope_id is defined
+
+    - name: Delete OpenSearch-related realm roles
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles/{{ item }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: [204, 404]
+      loop:
+        - opensearch_admin
+        - opensearch_editor
+        - opensearch_viewer
+      when: keycloak_token is defined and keycloak_token.json is defined
+      ignore_errors: true
+
+    - name: Remove Fluent Bit cluster resources
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.name }}"
+      loop:
+        - { api_version: "rbac.authorization.k8s.io/v1", kind: "ClusterRole", name: "fluent-bit-read" }
+        - { api_version: "rbac.authorization.k8s.io/v1", kind: "ClusterRoleBinding", name: "fluent-bit-read" }
+      ignore_errors: true
+
+    - name: Display rollback completion
+      ansible.builtin.debug:
+        msg:
+          - "OpenSearch rollback completed"
+          - "Namespace: {{ namespace }} - deleted"
+          - "Helm releases: gato-opensearch, gato-opensearch-dashboards - uninstalled"
+          - "Keycloak client and roles - removed"
+          - "Fluent Bit - removed if deployed"

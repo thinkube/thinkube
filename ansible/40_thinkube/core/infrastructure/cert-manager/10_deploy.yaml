@@ -1,0 +1,316 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/cert-manager/10_deploy.yaml
+# Description:
+#   Deploys cert-manager for automatic SSL certificate management via Let's Encrypt
+#   Sets up staging ClusterIssuer and requests initial staging certificates
+#
+# Requirements:
+#   - MicroK8s must be installed
+#   - CLOUDFLARE_TOKEN environment variable must be set
+#   - Domain must be managed by Cloudflare
+#
+# Usage:
+#   cd ~/thinkube
+#   export CLOUDFLARE_TOKEN='your-cloudflare-api-token'
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/cert-manager/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: The domain for which to request certificates
+#   - cert_manager_namespace: Namespace for cert-manager (default: cert-manager)
+#
+# Dependencies:
+#   - CORE-001 (MicroK8s Control Plane) must be complete
+#   - CORE-002 (MicroK8s Workers) should be complete
+
+- name: Deploy cert-manager
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    cert_manager_namespace: "cert-manager"
+    cert_manager_version: "v1.16.1"
+    cloudflare_token: "{{ lookup('env', 'CLOUDFLARE_TOKEN') }}"
+    kubeconfig: "{{ ansible_env.HOME }}/.kube/config"
+    
+  tasks:
+    - name: Verify Cloudflare API token is set
+      ansible.builtin.fail:
+        msg: "CLOUDFLARE_TOKEN environment variable is not set. Please set it before running this playbook."
+      when: cloudflare_token | length == 0
+      tags:
+        - always
+
+    - name: Create cert-manager namespace
+      ansible.builtin.command: microk8s kubectl create namespace {{ cert_manager_namespace }}
+      register: create_namespace
+      failed_when: 
+        - create_namespace.rc != 0 
+        - '"already exists" not in create_namespace.stderr'
+      changed_when: create_namespace.rc == 0
+      become: true
+      tags:
+        - namespace
+        
+    - name: Add cert-manager Helm repo
+      ansible.builtin.shell: |
+        microk8s helm3 repo add jetstack https://charts.jetstack.io
+        microk8s helm3 repo update
+      become: true
+      tags:
+        - helm
+
+    - name: Download cert-manager CRDs
+      ansible.builtin.get_url:
+        url: https://github.com/cert-manager/cert-manager/releases/download/{{ cert_manager_version }}/cert-manager.crds.yaml
+        dest: /home/{{ system_username }}/cert-manager-crds.yaml
+        mode: '0644'
+      tags:
+        - crds
+
+    - name: Install cert-manager CRDs
+      ansible.builtin.shell: |
+        microk8s kubectl apply -f /home/{{ system_username }}/cert-manager-crds.yaml
+      register: apply_crds
+      failed_when: apply_crds.rc != 0
+      become: true
+      tags:
+        - crds
+
+    - name: Verify cert-manager CRDs installation
+      ansible.builtin.shell: |
+        # Check that all required CRDs exist
+        for crd in certificaterequests.cert-manager.io certificates.cert-manager.io challenges.acme.cert-manager.io clusterissuers.cert-manager.io issuers.cert-manager.io orders.acme.cert-manager.io; do
+          if ! microk8s kubectl get crd $crd > /dev/null 2>&1; then
+            echo "CRD $crd is missing!"
+            exit 1
+          else
+            echo "CRD $crd is installed"
+          fi
+        done
+      register: verify_crds
+      failed_when: verify_crds.rc != 0
+      become: true
+      tags:
+        - crds
+
+    - name: Install cert-manager with Helm
+      ansible.builtin.shell: |
+        microk8s helm3 upgrade --install cert-manager jetstack/cert-manager \
+         --namespace {{ cert_manager_namespace }} \
+         --version {{ cert_manager_version }} \
+         --set installCRDs=false \
+         --set extraArgs="{--dns01-recursive-nameservers=8.8.8.8:53\\,1.1.1.1:53,--dns01-recursive-nameservers-only=true}"
+      become: true
+      tags:
+        - helm
+
+    - name: Wait for cert-manager deployments to exist
+      ansible.builtin.shell: |
+        microk8s kubectl get deployments -n {{ cert_manager_namespace }} cert-manager cert-manager-cainjector cert-manager-webhook -o name
+      register: deployments_exist
+      until: deployments_exist.rc == 0
+      retries: 30
+      delay: 10
+      become: true
+      tags:
+        - wait
+
+    - name: Patch cert-manager deployments to fix DNS resolution
+      ansible.builtin.shell: |
+        # Patch cert-manager deployment to fix DNS resolution issues
+        microk8s kubectl patch deployment cert-manager -n {{ cert_manager_namespace }} --type=json -p='[{"op":"add", "path":"/spec/template/spec/dnsConfig", "value":{"options":[{"name":"ndots","value":"1"}], "searches":[]}}]'
+        
+        # Patch cert-manager-cainjector deployment
+        microk8s kubectl patch deployment cert-manager-cainjector -n {{ cert_manager_namespace }} --type=json -p='[{"op":"add", "path":"/spec/template/spec/dnsConfig", "value":{"options":[{"name":"ndots","value":"1"}], "searches":[]}}]'
+        
+        # Patch cert-manager-webhook deployment
+        microk8s kubectl patch deployment cert-manager-webhook -n {{ cert_manager_namespace }} --type=json -p='[{"op":"add", "path":"/spec/template/spec/dnsConfig", "value":{"options":[{"name":"ndots","value":"1"}], "searches":[]}}]'
+      become: true
+      tags:
+        - config
+
+    - name: Patch cert-manager deployment to optimize DNS challenge behavior
+      ansible.builtin.shell: |
+        # Patch cert-manager controller with flags to make DNS validation faster
+        microk8s kubectl patch deployment cert-manager -n {{ cert_manager_namespace }} --type=json -p='[{"op":"add", "path":"/spec/template/spec/containers/0/args/-", "value":"--dns01-recursive-nameservers=8.8.8.8:53,1.1.1.1:53"},{"op":"add", "path":"/spec/template/spec/containers/0/args/-", "value":"--dns01-recursive-nameservers-only"}]'
+      become: true
+      tags:
+        - config
+
+    - name: Wait for cert-manager namespace
+      ansible.builtin.command: microk8s kubectl get namespace {{ cert_manager_namespace }}
+      register: get_namespace
+      until: get_namespace.rc == 0
+      retries: 30
+      delay: 2
+      become: true
+      tags:
+        - namespace
+
+    - name: Check cert-manager pods
+      ansible.builtin.shell: |
+        microk8s kubectl get pods -n {{ cert_manager_namespace }} --show-labels | grep -E 'cert-manager|cainjector|webhook'
+      register: cert_manager_pods
+      become: true
+      tags:
+        - wait
+
+    - name: Wait for cert-manager pods to be ready
+      ansible.builtin.shell: |
+        # Wait for pods one by one
+        for pod in $(microk8s kubectl get pods -n {{ cert_manager_namespace }} -o name); do
+          echo "Waiting for $pod..."
+          microk8s kubectl wait --for=condition=ready $pod -n {{ cert_manager_namespace }} --timeout=300s
+        done
+      become: true
+      tags:
+        - wait
+
+    - name: Create Cloudflare API token secret
+      ansible.builtin.shell: |
+        microk8s kubectl create secret generic cloudflare-api-token \
+         --from-literal=api-token={{ cloudflare_token }} \
+         --namespace={{ cert_manager_namespace }} \
+         --dry-run=client -o yaml | microk8s kubectl apply -f -
+      become: true
+      tags:
+        - config
+
+    - name: Create ClusterIssuer for Let's Encrypt production
+      ansible.builtin.copy:
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-prod
+          spec:
+            acme:
+              server: https://acme-v02.api.letsencrypt.org/directory
+              email: admin@{{ domain_name }}
+              privateKeySecretRef:
+                name: letsencrypt-prod
+              solvers:
+              - dns01:
+                  cloudflare:
+                    apiTokenSecretRef:
+                      name: cloudflare-api-token
+                      key: api-token
+        dest: /tmp/clusterissuer-prod.yaml
+      tags:
+        - config
+    
+    - name: Apply ClusterIssuer for production
+      ansible.builtin.command: microk8s kubectl apply -f /tmp/clusterissuer-prod.yaml
+      become: true
+      tags:
+        - config
+
+    - name: Create ClusterIssuer for Let's Encrypt staging
+      ansible.builtin.copy:
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-staging
+          spec:
+            acme:
+              server: https://acme-staging-v02.api.letsencrypt.org/directory
+              email: admin@{{ domain_name }}
+              privateKeySecretRef:
+                name: letsencrypt-staging
+              solvers:
+              - dns01:
+                  cloudflare:
+                    apiTokenSecretRef:
+                      name: cloudflare-api-token
+                      key: api-token
+        dest: /tmp/clusterissuer-staging.yaml
+      tags:
+        - config
+    
+    - name: Apply ClusterIssuer for staging
+      ansible.builtin.command: microk8s kubectl apply -f /tmp/clusterissuer-staging.yaml
+      become: true
+      tags:
+        - config
+
+    - name: Create self-signed ClusterIssuer
+      ansible.builtin.copy:
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: selfsigned-issuer
+          spec:
+            selfSigned: {}
+        dest: /tmp/clusterissuer-selfsigned.yaml
+      tags:
+        - config
+    
+    - name: Apply self-signed ClusterIssuer
+      ansible.builtin.command: microk8s kubectl apply -f /tmp/clusterissuer-selfsigned.yaml
+      become: true
+      tags:
+        - config
+
+    - name: Create staging wildcard certificate for default namespace
+      ansible.builtin.copy:
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: {{ domain_name.replace('.', '-') }}-tls
+            namespace: default
+            annotations:
+              cert-manager.io/issue-temporary-certificate: "true"
+              acme.cert-manager.io/dns01-check-interval: "10s"
+              acme.cert-manager.io/dns01-propagation-timeout: "180s"
+          spec:
+            secretName: {{ domain_name.replace('.', '-') }}-tls
+            issuerRef:
+              name: letsencrypt-staging
+              kind: ClusterIssuer
+            commonName: "*.{{ domain_name }}"
+            dnsNames:
+            - "*.{{ domain_name }}"
+            - "*.kn.{{ domain_name }}"
+            duration: 2160h  # 90 days
+            renewBefore: 720h  # 30 days
+        dest: /tmp/certificate-combined.yaml
+      tags:
+        - certificate
+
+    - name: Apply staging certificate
+      ansible.builtin.command: microk8s kubectl apply -f /tmp/certificate-combined.yaml
+      become: true
+      register: cert_result_wildcards
+      tags:
+        - certificate
+
+    - name: Create certificate monitoring script from template
+      ansible.builtin.template:
+        src: wait-for-certificate.sh.j2
+        dest: /tmp/wait-for-certificate.sh
+        mode: '0755'
+      tags:
+        - certificate
+
+    - name: Wait for staging certificate with proper monitoring
+      ansible.builtin.command: /tmp/wait-for-certificate.sh
+      register: cert_ready
+      become: true
+      tags:
+        - certificate
+
+    - name: Display cert-manager status
+      ansible.builtin.debug:
+        msg:
+          - "cert-manager deployed successfully"
+          - "ClusterIssuers created: letsencrypt-prod, letsencrypt-staging, selfsigned-issuer"
+          - "Staging wildcard certificate created in default namespace"
+          - "To check certificate status: kubectl describe certificate {{ domain_name.replace('.', '-') }}-tls -n default"
+      tags:
+        - always

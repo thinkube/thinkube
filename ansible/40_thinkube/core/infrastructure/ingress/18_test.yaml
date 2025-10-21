@@ -1,0 +1,184 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Test Ingress Controllers deployment
+#
+# This playbook tests that the ingress controllers are correctly deployed
+# and configured in the MicroK8s cluster.
+#
+# Requirements:
+#   - MicroK8s cluster running
+#   - Ingress controllers deployed (10_deploy.yaml)
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/ingress/18_test.yaml
+
+- name: Test Ingress Controllers
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    primary_namespace: "ingress"
+    secondary_namespace: "ingress-kn"
+    primary_class: "nginx"
+    secondary_class: "nginx-kn"
+    primary_ip: "{{ zerotier_subnet_prefix }}{{ primary_ingress_ip_octet }}"
+    secondary_ip: "{{ zerotier_subnet_prefix }}{{ secondary_ingress_ip_octet }}"
+
+  tasks:
+    - name: Verify MetalLB is enabled
+      ansible.builtin.command: microk8s status --wait-ready
+      become: true
+      register: microk8s_status
+      failed_when: "'metallb' not in microk8s_status.stdout"
+      tags:
+        - test
+
+    - name: Test - Primary ingress namespace exists
+      ansible.builtin.command: microk8s kubectl get namespace {{ primary_namespace }}
+      become: true
+      register: primary_ns_check
+      failed_when: primary_ns_check.rc != 0
+      tags:
+        - test
+
+    - name: Test - Secondary ingress namespace exists
+      ansible.builtin.command: microk8s kubectl get namespace {{ secondary_namespace }}
+      become: true
+      register: secondary_ns_check
+      failed_when: secondary_ns_check.rc != 0
+      tags:
+        - test
+
+    - name: Test - Primary ingress controller pods are running
+      ansible.builtin.command: >
+        microk8s kubectl get pods -n {{ primary_namespace }}
+        -l app.kubernetes.io/name=ingress-nginx
+        -o jsonpath='{.items[*].status.phase}'
+      become: true
+      register: primary_pods_status
+      failed_when: "'Running' not in primary_pods_status.stdout"
+      tags:
+        - test
+
+    - name: Test - Secondary ingress controller pods are running
+      ansible.builtin.command: >
+        microk8s kubectl get pods -n {{ secondary_namespace }}
+        -l app.kubernetes.io/name=ingress-nginx
+        -o jsonpath='{.items[*].status.phase}'
+      become: true
+      register: secondary_pods_status
+      failed_when: "'Running' not in secondary_pods_status.stdout"
+      tags:
+        - test
+
+    - name: Test - Primary ingress service has correct external IP
+      ansible.builtin.command: >
+        microk8s kubectl get service -n {{ primary_namespace }}
+        -l app.kubernetes.io/name=ingress-nginx
+        -o jsonpath='{.items[*].status.loadBalancer.ingress[0].ip}'
+      become: true
+      register: primary_service_ip
+      failed_when: primary_service_ip.stdout != primary_ip
+      tags:
+        - test
+
+    - name: Test - Secondary ingress service has correct external IP
+      ansible.builtin.command: >
+        microk8s kubectl get service -n {{ secondary_namespace }}
+        -l app.kubernetes.io/name=ingress-nginx
+        -o jsonpath='{.items[*].status.loadBalancer.ingress[0].ip}'
+      become: true
+      register: secondary_service_ip
+      failed_when: secondary_service_ip.stdout != secondary_ip
+      tags:
+        - test
+
+    - name: Test - Primary IngressClass exists and is default
+      ansible.builtin.command: >
+        microk8s kubectl get ingressclass {{ primary_class }}
+        -o jsonpath='{.metadata.annotations.ingressclass\.kubernetes\.io/is-default-class}'
+      become: true
+      register: primary_class_check
+      failed_when: primary_class_check.stdout != "true"
+      tags:
+        - test
+
+    - name: Test - Secondary IngressClass exists
+      ansible.builtin.command: microk8s kubectl get ingressclass {{ secondary_class }}
+      become: true
+      register: secondary_class_check
+      failed_when: secondary_class_check.rc != 0
+      tags:
+        - test
+        
+    - name: Test - Primary ingress controller has default SSL certificate configured
+      ansible.builtin.command: >
+        microk8s kubectl get deployment -n {{ primary_namespace }} 
+        -l app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.template.spec.containers[0].args}'
+      become: true
+      register: primary_args
+      vars:
+        cert_path_string: "--default-ssl-certificate={{ primary_namespace }}/{{ primary_namespace }}-tls-secret"
+      failed_when: cert_path_string not in primary_args.stdout
+      tags:
+        - test
+        
+    - name: Test - Secondary ingress controller has default SSL certificate configured
+      ansible.builtin.command: >
+        microk8s kubectl get deployment -n {{ secondary_namespace }} 
+        -l app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.template.spec.containers[0].args}'
+      become: true
+      register: secondary_args
+      vars:
+        cert_path_string: "--default-ssl-certificate={{ secondary_namespace }}/{{ secondary_namespace }}-tls-secret"
+      failed_when: cert_path_string not in secondary_args.stdout
+      tags:
+        - test
+
+    - name: Test - Primary ingress controller is responding to health checks
+      ansible.builtin.uri:
+        url: "http://{{ primary_ip }}/healthz"
+        method: GET
+        status_code: 200
+      delegate_to: localhost
+      tags:
+        - test
+
+    - name: Test - Secondary ingress controller is responding to health checks
+      ansible.builtin.uri:
+        url: "http://{{ secondary_ip }}/healthz"
+        method: GET
+        status_code: 200
+      delegate_to: localhost
+      tags:
+        - test
+
+    - name: Display ingress controllers test summary
+      ansible.builtin.debug:
+        msg:
+          - "==========================================="
+          - "Ingress Controllers Test Results"
+          - "==========================================="
+          - ""
+          - "Primary Ingress Controller ({{ primary_namespace }}):"
+          - "  ✓ Namespace exists"
+          - "  ✓ Pods running"
+          - "  ✓ Service IP: {{ primary_ip }}"
+          - "  ✓ IngressClass: {{ primary_class }} (default)"
+          - "  ✓ Default SSL certificate: {{ primary_namespace }}/{{ primary_namespace }}-tls-secret"
+          - "  ✓ Health check passed"
+          - ""
+          - "Secondary Ingress Controller ({{ secondary_namespace }}):"
+          - "  ✓ Namespace exists"
+          - "  ✓ Pods running"
+          - "  ✓ Service IP: {{ secondary_ip }}"
+          - "  ✓ IngressClass: {{ secondary_class }}"
+          - "  ✓ Default SSL certificate: {{ secondary_namespace }}/{{ secondary_namespace }}-tls-secret"
+          - "  ✓ Health check passed"
+          - ""
+          - "MetalLB: Enabled and configured"
+          - ""
+          - "==========================================="
+      tags:
+        - test

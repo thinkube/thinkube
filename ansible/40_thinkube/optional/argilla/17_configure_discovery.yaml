@@ -1,0 +1,130 @@
+---
+# ansible/40_thinkube/optional/argilla/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for Argilla
+#   Registers the service with metadata for thinkube-control
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - Argilla must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/argilla/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 [AI-generated]
+
+- name: Configure Argilla service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    argilla_namespace: argilla
+    argilla_hostname: "argilla.{{ domain_name }}"
+
+  tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+        fail_msg: "Required variables are not defined"
+
+    - name: Get Argilla API key from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ argilla_namespace }}"
+        name: argilla-secrets
+      register: argilla_secret
+      failed_when: argilla_secret.resources | length == 0
+
+    - name: Set Argilla API key fact
+      ansible.builtin.set_fact:
+        argilla_api_key: "{{ argilla_secret.resources[0].data['ARGILLA_API_KEY'] | b64decode }}"
+      no_log: true
+
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: "{{ argilla_namespace }}"
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "argilla"
+          data:
+            service.yaml: |
+              service:
+                name: argilla
+                display_name: "Argilla"
+                description: "Data annotation and curation platform for AI"
+                type: optional
+                category: ai
+                icon: /icons/tk_design.svg
+
+                endpoints:
+                  - name: dashboard
+                    type: http
+                    url: "https://{{ argilla_hostname }}"
+                    health_url: "https://{{ argilla_hostname }}/api/status"
+                    description: "Annotation dashboard"
+                    primary: true
+                  - name: api
+                    type: http
+                    url: "https://{{ argilla_hostname }}/api"
+                    description: "API endpoint"
+
+                dependencies:
+                  - opensearch
+                  - valkey
+
+                scaling:
+                  resource_type: deployment
+                  resource_name: argilla
+                  namespace: "{{ argilla_namespace }}"
+                  min_replicas: 1
+                  can_disable: true
+
+                metadata:
+                  authentication: jwt_oidc
+                  supports_oidc: true
+                  oidc_client_id: argilla
+                  features:
+                    - "Data annotation"
+                    - "Dataset curation"
+                    - "Active learning"
+                    - "Human feedback collection"
+
+                environment_variables:
+                  - name: ARGILLA_API_URL
+                    value: "https://{{ argilla_hostname }}"
+                  - name: ARGILLA_API_KEY
+                    value: "{{ argilla_api_key }}"
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: "{{ argilla_namespace }}"
+      register: configmap_info
+
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for Argilla"
+      when: configmap_info.resources | length > 0
+    - name: Update code-server environment variables
+      include_role:
+        name: code_server_env_update

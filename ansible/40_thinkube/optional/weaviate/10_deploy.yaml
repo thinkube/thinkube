@@ -1,0 +1,443 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/weaviate/10_deploy.yaml
+# Description:
+#   Deploy Weaviate vector database with API key authentication and gRPC support
+#   This playbook deploys Weaviate as a stateful service with persistence
+#   Configures both HTTP (port 8080) and gRPC (port 50051) access
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - NGINX Ingress Controller with gRPC support
+#   - Wildcard TLS certificate in default namespace
+#   - ADMIN_PASSWORD environment variable must be set
+#   - DNS must be configured for ingress
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/weaviate/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - admin_username: Admin username for authentication
+#   - primary_ingress_class: Ingress controller class name
+#   - kubeconfig: Path to kubeconfig file
+#   - harbor_registry: Harbor registry domain
+#   - kubectl_bin: Path to kubectl binary
+#
+# Dependencies:
+#   - MicroK8s cluster
+#   - Ingress controller with gRPC support
+#
+# 🤖 AI-assisted
+
+- name: Deploy Weaviate Vector Database
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    weaviate_namespace: "weaviate"
+    weaviate_hostname: "weaviate.{{ domain_name }}"
+    weaviate_grpc_hostname: "weaviate-grpc.{{ domain_name }}"
+    weaviate_capacity: "10Gi"
+    storage_class_name: "microk8s-hostpath"
+    weaviate_http_port: 8080
+    weaviate_grpc_port: 50051
+
+    # Admin credentials for API key authentication
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    # Weaviate image from Harbor registry (latest version)
+    weaviate_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/weaviate:latest"
+    library_project: "library"  # Harbor's default library project
+
+    # TLS secret name
+    weaviate_tls_secret_name: "weaviate-tls-secret"
+
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - admin_username is defined
+          - admin_password is defined and admin_password != ""
+          - primary_ingress_class is defined
+          - kubeconfig is defined
+        fail_msg: "Required variables are not defined. Check inventory configuration."
+
+    - name: Create Weaviate namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ weaviate_namespace }}"
+            labels:
+              name: "{{ weaviate_namespace }}"
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Weaviate namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ weaviate_tls_secret_name }}"
+            namespace: "{{ weaviate_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Create Weaviate authentication secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: weaviate-auth
+            namespace: "{{ weaviate_namespace }}"
+          type: Opaque
+          stringData:
+            api-key: "{{ admin_password }}"
+            admin-username: "{{ admin_username }}"
+
+    - name: Create PersistentVolumeClaim for Weaviate data
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: weaviate-data-pvc
+            namespace: "{{ weaviate_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            storageClassName: "{{ storage_class_name }}"
+            resources:
+              requests:
+                storage: "{{ weaviate_capacity }}"
+
+    - name: Create Weaviate ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: weaviate-config
+            namespace: "{{ weaviate_namespace }}"
+          data:
+            conf.yaml: |
+              authentication:
+                apikey:
+                  enabled: true
+                  allowed_keys:
+                    - "{{ admin_password }}"
+                  users:
+                    - "{{ admin_username }}"
+              authorization:
+                admin_list:
+                  enabled: true
+                  users:
+                    - "{{ admin_username }}"
+              query_defaults:
+                limit: 25
+              persistence:
+                data_path: "/var/lib/weaviate"
+
+    - name: Deploy Weaviate StatefulSet
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: weaviate
+            namespace: "{{ weaviate_namespace }}"
+            labels:
+              app: weaviate
+              thinkube.io/managed: "true"
+          spec:
+            serviceName: weaviate-headless
+            replicas: 1
+            selector:
+              matchLabels:
+                app: weaviate
+            template:
+              metadata:
+                labels:
+                  app: weaviate
+              spec:
+                containers:
+                  - name: weaviate
+                    image: "{{ weaviate_image }}"
+                    ports:
+                      - containerPort: "{{ weaviate_http_port }}"
+                        name: http
+                      - containerPort: "{{ weaviate_grpc_port }}"
+                        name: grpc
+                    env:
+                      - name: AUTHENTICATION_APIKEY_ENABLED
+                        value: "true"
+                      - name: AUTHENTICATION_APIKEY_ALLOWED_KEYS
+                        valueFrom:
+                          secretKeyRef:
+                            name: weaviate-auth
+                            key: api-key
+                      - name: AUTHENTICATION_APIKEY_USERS
+                        valueFrom:
+                          secretKeyRef:
+                            name: weaviate-auth
+                            key: admin-username
+                      - name: AUTHORIZATION_ADMINLIST_ENABLED
+                        value: "true"
+                      - name: AUTHORIZATION_ADMINLIST_USERS
+                        valueFrom:
+                          secretKeyRef:
+                            name: weaviate-auth
+                            key: admin-username
+                      - name: PERSISTENCE_DATA_PATH
+                        value: "/var/lib/weaviate"
+                      - name: DEFAULT_VECTORIZER_MODULE
+                        value: "none"
+                      - name: CLUSTER_HOSTNAME
+                        value: "weaviate"
+                      - name: ENABLE_MODULES
+                        value: ""
+                      - name: QUERY_DEFAULTS_LIMIT
+                        value: "25"
+                      - name: AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED
+                        value: "false"
+                      - name: LOG_LEVEL
+                        value: "info"
+                    volumeMounts:
+                      - name: weaviate-data
+                        mountPath: /var/lib/weaviate
+                    resources:
+                      requests:
+                        memory: "512Mi"
+                        cpu: "250m"
+                      limits:
+                        memory: "2Gi"
+                        cpu: "1"
+                    livenessProbe:
+                      httpGet:
+                        path: /v1/.well-known/live
+                        port: http
+                      initialDelaySeconds: 60
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /v1/.well-known/ready
+                        port: http
+                      initialDelaySeconds: 30
+                      periodSeconds: 5
+                volumes:
+                  - name: weaviate-data
+                    persistentVolumeClaim:
+                      claimName: weaviate-data-pvc
+
+    - name: Create Weaviate headless service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: weaviate-headless
+            namespace: "{{ weaviate_namespace }}"
+            labels:
+              app: weaviate
+          spec:
+            clusterIP: None
+            selector:
+              app: weaviate
+            ports:
+              - name: http
+                port: "{{ weaviate_http_port }}"
+                targetPort: "{{ weaviate_http_port }}"
+              - name: grpc
+                port: "{{ weaviate_grpc_port }}"
+                targetPort: "{{ weaviate_grpc_port }}"
+
+    - name: Create Weaviate service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: weaviate
+            namespace: "{{ weaviate_namespace }}"
+            labels:
+              app: weaviate
+              thinkube.io/managed: "true"
+          spec:
+            type: ClusterIP
+            selector:
+              app: weaviate
+            ports:
+              - name: http
+                port: 80
+                targetPort: "{{ weaviate_http_port }}"
+                protocol: TCP
+              - name: grpc
+                port: "{{ weaviate_grpc_port }}"
+                targetPort: "{{ weaviate_grpc_port }}"
+                protocol: TCP
+
+    - name: Create Weaviate HTTP Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: weaviate-http-ingress
+            namespace: "{{ weaviate_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ weaviate_hostname }}"
+                secretName: "{{ weaviate_tls_secret_name }}"
+            rules:
+              - host: "{{ weaviate_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: weaviate
+                          port:
+                            number: 80
+
+    - name: Create Weaviate gRPC Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: weaviate-grpc-ingress
+            namespace: "{{ weaviate_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ weaviate_grpc_hostname }}"
+                secretName: "{{ weaviate_tls_secret_name }}"
+            rules:
+              - host: "{{ weaviate_grpc_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: weaviate
+                          port:
+                            number: "{{ weaviate_grpc_port }}"
+
+    - name: Wait for Weaviate StatefulSet to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ weaviate_namespace }}"
+        name: weaviate
+      register: statefulset_status
+      until:
+        - statefulset_status.resources is defined
+        - statefulset_status.resources | length > 0
+        - statefulset_status.resources[0].status.readyReplicas is defined
+        - statefulset_status.resources[0].status.readyReplicas == 1
+      retries: 30
+      delay: 10
+
+    - name: Set Weaviate API key for template
+      ansible.builtin.set_fact:
+        weaviate_api_key: "{{ admin_password }}"
+      no_log: true
+
+    - name: Create Weaviate config from template
+      ansible.builtin.template:
+        src: templates/weaviate-config.json.j2
+        dest: /tmp/weaviate-config.json
+        mode: '0600'
+      no_log: true
+
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy Weaviate config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.weaviate
+        {{ kubectl_bin }} cp /tmp/weaviate-config.json code-server/{{ code_server_pod.stdout }}:/home/thinkube/.weaviate/config.json
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.weaviate/config.json
+        rm -f /tmp/weaviate-config.json
+        echo '✅ Weaviate CLI configured in code-server'
+      no_log: true
+
+    - name: Display deployment status
+      ansible.builtin.debug:
+        msg: |
+          Weaviate deployment completed successfully!
+
+          HTTP API endpoint: https://{{ weaviate_hostname }}
+          gRPC endpoint: https://{{ weaviate_grpc_hostname }}:{{ weaviate_grpc_port }}
+          Authentication: API key (use admin password)
+
+          Example HTTP usage with curl:
+          curl -H "Authorization: Bearer ${ADMIN_PASSWORD}" https://{{ weaviate_hostname }}/v1/schema
+
+          Example gRPC usage with Python:
+          import weaviate
+          client = weaviate.Client(
+              url="https://{{ weaviate_hostname }}",
+              grpc_host="{{ weaviate_grpc_hostname }}",
+              grpc_port={{ weaviate_grpc_port }},
+              auth_client_secret=weaviate.AuthApiKey(api_key="${ADMIN_PASSWORD}")
+          )
+
+          To check the status:
+          kubectl -n {{ weaviate_namespace }} get pods

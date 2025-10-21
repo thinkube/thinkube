@@ -1,0 +1,273 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/gitea/18_test.yaml
+# Description:
+#   Test Gitea deployment and verify all components are working
+#
+# Requirements:
+#   - Gitea must be deployed (10_deploy.yaml)
+#   - kubectl access to the cluster
+#   - Optional: Argo Events webhook configuration (16_configure_argo_events_webhook.yaml)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/gitea/18_test.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Test Gitea Deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    gitea_host: "{{ gitea_hostname }}"
+    test_timeout: 300
+
+  tasks:
+    ###################################################################
+    # 1) Check namespace and basic resources
+    ###################################################################
+    - name: Check if Gitea namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ gitea_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check Gitea deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ gitea_namespace }}"
+        name: gitea
+      register: deployment_check
+      failed_when: 
+        - deployment_check.resources | length == 0
+        - deployment_check.resources[0].status.readyReplicas != 1
+
+    - name: Check Gitea service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ gitea_namespace }}"
+        name: gitea
+      register: service_check
+      failed_when: service_check.resources | length == 0
+
+    - name: Check Gitea ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ gitea_namespace }}"
+        name: gitea
+      register: ingress_check
+      failed_when: 
+        - ingress_check.resources | length == 0
+        - gitea_host not in ingress_check.resources[0].spec.rules[0].host
+
+    ###################################################################
+    # 2) Check database and storage
+    ###################################################################
+    - name: Check database secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ gitea_namespace }}"
+        name: gitea-db-secret
+      register: db_secret_check
+      failed_when: db_secret_check.resources | length == 0
+
+    - name: Check PVC status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ gitea_namespace }}"
+        name: gitea-pvc
+      register: pvc_check
+      failed_when: 
+        - pvc_check.resources | length == 0
+        - pvc_check.resources[0].status.phase != "Bound"
+
+    - name: Test database connectivity
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "gitea-db-test-{{ ansible_date_time.epoch }}"
+            namespace: "{{ gitea_namespace }}"
+          spec:
+            ttlSecondsAfterFinished: 60
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: test-db
+                  image: postgres:14
+                  env:
+                  - name: PGPASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: gitea-db-secret
+                        key: password
+                  command:
+                  - psql
+                  - -h
+                  - postgresql-official.postgres.svc.cluster.local
+                  - -U
+                  - "{{ admin_username }}"
+                  - -d
+                  - gitea
+                  - -c
+                  - "SELECT version();"
+
+    - name: Wait for database test to complete
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ gitea_namespace }}"
+        name: "gitea-db-test-{{ ansible_date_time.epoch }}"
+      register: db_job_status
+      until: db_job_status.resources[0].status.succeeded is defined and db_job_status.resources[0].status.succeeded == 1
+      retries: 20
+      delay: 5
+
+    ###################################################################
+    # 3) Check Keycloak integration
+    ###################################################################
+    - name: Check OAuth secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ gitea_namespace }}"
+        name: gitea-oauth-secret
+      register: oauth_secret_check
+      failed_when: oauth_secret_check.resources | length == 0
+
+    - name: Test OAuth2 provider configuration
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ gitea_namespace }} deployment/gitea -- su git -c "gitea admin auth list" | grep -q "Keycloak"
+      register: oauth_test
+      failed_when: oauth_test.rc != 0
+
+    ###################################################################
+    # 4) Test Gitea accessibility and API
+    ###################################################################
+    - name: Test Gitea URL
+      ansible.builtin.uri:
+        url: "https://{{ gitea_host }}/user/login"
+        validate_certs: false
+        status_code: 200
+      register: gitea_url_test
+
+    - name: Check admin token exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ gitea_namespace }}"
+        name: gitea-admin-token
+      register: admin_token_check
+      failed_when: admin_token_check.resources | length == 0
+
+    - name: Decode admin token
+      ansible.builtin.set_fact:
+        gitea_admin_token: "{{ admin_token_check.resources[0].data.token | b64decode }}"
+
+    - name: Test Gitea API with admin token
+      ansible.builtin.uri:
+        url: "https://{{ gitea_host }}/api/v1/user"
+        headers:
+          Authorization: "token {{ gitea_admin_token }}"
+        validate_certs: false
+        status_code: 200
+      register: api_test
+
+    - name: Verify admin user
+      ansible.builtin.assert:
+        that:
+          - api_test.json.username == admin_username
+          - api_test.json.is_admin == true
+        fail_msg: "Admin user verification failed"
+
+    ###################################################################
+    # 5) Check organization setup
+    ###################################################################
+    - name: Check thinkube-deployments organization
+      ansible.builtin.uri:
+        url: "https://{{ gitea_host }}/api/v1/orgs/thinkube-deployments"
+        headers:
+          Authorization: "token {{ gitea_admin_token }}"
+        validate_certs: false
+        status_code: 200
+      register: org_check
+      failed_when: false
+
+    - name: List repositories in organization
+      ansible.builtin.uri:
+        url: "https://{{ gitea_host }}/api/v1/orgs/thinkube-deployments/repos"
+        headers:
+          Authorization: "token {{ gitea_admin_token }}"
+        validate_certs: false
+        status_code: 200
+      register: org_repos
+      when: org_check is not failed
+
+    ###################################################################
+    # 6) Summary report
+    ###################################################################
+    - name: Test summary
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Gitea Test Results
+          ════════════════════════════════════════════════════════
+          
+          Service URL: https://{{ gitea_host }}
+          Namespace: {{ gitea_namespace }}
+          
+          Gitea Core Status:
+          ✓ Deployment: Running ({{ deployment_check.resources[0].status.readyReplicas }}/{{ deployment_check.resources[0].status.replicas }})
+          ✓ Service: Active
+          ✓ Ingress: Configured
+          ✓ Storage: {{ pvc_check.resources[0].status.phase }}
+          ✓ Database: Connected
+          
+          Integration Status:
+          ✓ Keycloak OAuth: Configured
+          ✓ Admin API: Working
+          ✓ HTTPS Access: Verified
+          
+          Admin User:
+          - Username: {{ api_test.json.username }}
+          - Email: {{ api_test.json.email }}
+          - Admin: {{ api_test.json.is_admin }}
+          
+          Organization Status:
+          {% if org_check is not failed %}
+          ✓ thinkube-deployments: Active
+          {% if org_repos is defined %}
+          - Repositories: {{ org_repos.json | length }}
+          {% endif %}
+          {% else %}
+          ✗ thinkube-deployments: Not found
+          {% endif %}
+          
+          Note: Webhook configuration happens automatically when 
+          repositories are created via deployment playbooks.
+          
+          ════════════════════════════════════════════════════════

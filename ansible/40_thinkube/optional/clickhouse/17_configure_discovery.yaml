@@ -1,0 +1,136 @@
+---
+# ansible/40_thinkube/optional/clickhouse/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for ClickHouse
+#   Registers the service with metadata for thinkube-control
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - ClickHouse must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/clickhouse/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 [AI-generated]
+
+- name: Configure ClickHouse service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    clickhouse_namespace: clickhouse
+
+  tasks:
+    - name: Get admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+        fail_msg: "Required variables are not defined"
+
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: "{{ clickhouse_namespace }}"
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "clickhouse"
+          data:
+            service.yaml: |
+              service:
+                name: clickhouse
+                display_name: "ClickHouse"
+                description: "Analytics database for real-time data processing"
+                type: optional
+                category: data
+                icon: /icons/tk_data.svg
+
+                endpoints:
+                  - name: http
+                    type: http
+                    url: "https://clickhouse.{{ domain_name }}"
+                    health_url: "https://clickhouse.{{ domain_name }}/ping"
+                    description: "External HTTP interface (HTTPS)"
+                    primary: true
+
+                  - name: native
+                    type: tcp
+                    url: "clickhouse.{{ domain_name }}:9000"
+                    description: "External native TCP protocol (TCP passthrough)"
+                    primary: false
+
+                  - name: internal-http
+                    type: http
+                    url: "http://clickhouse-clickhouse.{{ clickhouse_namespace }}.svc.cluster.local:8123"
+                    health_url: "http://clickhouse-clickhouse.{{ clickhouse_namespace }}.svc.cluster.local:8123/ping"
+                    description: "Internal HTTP interface"
+                    internal: true
+
+                  - name: internal-native
+                    type: tcp
+                    url: "clickhouse-clickhouse.{{ clickhouse_namespace }}.svc.cluster.local:9000"
+                    description: "Internal native TCP protocol"
+                    internal: true
+
+                dependencies: []
+
+                scaling:
+                  resource_type: statefulset
+                  resource_name: chi-clickhouse-clickhouse-0-0
+                  namespace: "{{ clickhouse_namespace }}"
+                  min_replicas: 1
+                  can_disable: true
+
+                metadata:
+                  features:
+                    - "Real-time analytics"
+                    - "SQL interface"
+                    - "High performance OLAP"
+                    - "Columnar storage"
+
+                environment_variables:
+                  - name: CLICKHOUSE_HOST
+                    value: "clickhouse.{{ domain_name }}"
+                  - name: CLICKHOUSE_HTTP_PORT
+                    value: "443"
+                  - name: CLICKHOUSE_NATIVE_PORT
+                    value: "9000"
+                  - name: CLICKHOUSE_USER
+                    value: "default"
+                  - name: CLICKHOUSE_PASSWORD
+                    value: "{{ admin_password }}"
+                  - name: CLICKHOUSE_URL
+                    value: "https://clickhouse.{{ domain_name }}"
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: "{{ clickhouse_namespace }}"
+      register: configmap_info
+
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for ClickHouse"
+      when: configmap_info.resources | length > 0
+    - name: Update code-server environment variables
+      include_role:
+        name: code_server_env_update

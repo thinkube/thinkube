@@ -1,0 +1,156 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/valkey/19_rollback.yaml
+# Description:
+#   Rollback Valkey deployment including namespace and resources
+#
+# Requirements:
+#   - MicroK8s cluster with kubectl configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/valkey/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Rollback Valkey Deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    valkey_namespace: "valkey"
+
+  tasks:
+    - name: Check if Valkey namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ valkey_namespace }}"
+      register: namespace_check
+
+    - name: Delete Valkey deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ valkey_namespace }}"
+        name: valkey
+        state: absent
+        wait: true
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete Valkey ClusterIP service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ valkey_namespace }}"
+        name: valkey
+        state: absent
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete Valkey headless service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ valkey_namespace }}"
+        name: valkey-headless
+        state: absent
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete persistent volume claim
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ valkey_namespace }}"
+        name: valkey-data
+        state: absent
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete ConfigMaps
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ valkey_namespace }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - thinkube-service-config
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ valkey_namespace }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - harbor-registry-secret
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Force delete stuck pods if any
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pods --all -n {{ valkey_namespace }} --grace-period=0 --force || true
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete Valkey namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ valkey_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: absent
+        wait: true
+        wait_timeout: 60
+      when: namespace_check.resources | length > 0
+      register: namespace_delete
+      ignore_errors: true
+
+    - name: Force remove namespace finalizers if stuck
+      ansible.builtin.shell: |
+        NS_STATUS=$({{ kubectl_bin }} get namespace {{ valkey_namespace }} -o json 2>/dev/null | jq -r '.status.phase')
+        if [ "$NS_STATUS" = "Terminating" ]; then
+          echo "Namespace stuck in Terminating, removing finalizers..."
+          {{ kubectl_bin }} get namespace {{ valkey_namespace }} -o json | \
+            jq '.spec.finalizers = []' | \
+            {{ kubectl_bin }} replace --raw /api/v1/namespaces/{{ valkey_namespace }}/finalize -f -
+        fi
+      when:
+        - namespace_check.resources | length > 0
+        - namespace_delete is failed or namespace_delete.changed == false
+      ignore_errors: true
+
+    - name: Display cleanup status
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "Valkey Rollback Complete"
+          - "========================================="
+          - "Resources removed:"
+          - "  - Deployment: valkey"
+          - "  - Service: valkey"
+          - "  - Headless service: valkey-headless"
+          - "  - Namespace: {{ valkey_namespace }}"
+          - "  - PVC: valkey-data (data deleted)"
+          - "  - All secrets and ConfigMaps"
+          - ""
+          - "Note: Custom image remains in Harbor"
+          - "========================================="

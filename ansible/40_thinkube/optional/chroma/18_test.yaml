@@ -1,0 +1,247 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/chroma/18_test.yaml
+# Description:
+#   Test Chroma deployment and functionality
+#   This playbook verifies that Chroma is properly deployed and operational
+#
+# Requirements:
+#   - Chroma must be deployed
+#   - ADMIN_PASSWORD environment variable must be set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/chroma/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Test Chroma deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    chroma_namespace: "chroma"
+    chroma_hostname: "chroma.{{ domain_name }}"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    test_results: []
+
+  tasks:
+    - name: Check if Chroma namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ chroma_namespace }}"
+      register: namespace_check
+
+    - name: Record namespace test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Namespace exists', 'passed': namespace_check.resources | length > 0}] }}"
+
+    - name: Check Chroma StatefulSet status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ chroma_namespace }}"
+        name: chroma
+      register: statefulset_check
+
+    - name: Record StatefulSet test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'StatefulSet exists', 'passed': statefulset_check.resources | length > 0}] }}"
+
+    - name: Check if Chroma pods are running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ chroma_namespace }}"
+        label_selectors:
+          - app=chroma
+      register: pod_check
+
+    - name: Record pod status test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Pods running', 'passed': pod_check.resources | length > 0 and pod_check.resources[0].status.phase == 'Running'}] }}"
+
+    - name: Check Chroma service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ chroma_namespace }}"
+        name: chroma
+      register: service_check
+
+    - name: Record service test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Service exists', 'passed': service_check.resources | length > 0}] }}"
+
+    - name: Check Chroma Ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ chroma_namespace }}"
+        name: chroma-ingress
+      register: ingress_check
+
+    - name: Record ingress test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Ingress configured', 'passed': ingress_check.resources | length > 0}] }}"
+
+    - name: Test Chroma heartbeat endpoint
+      ansible.builtin.uri:
+        url: "https://{{ chroma_hostname }}/api/v1/heartbeat"
+        method: GET
+        validate_certs: false
+        status_code: [200]
+      register: heartbeat_check
+      ignore_errors: true
+
+    - name: Record heartbeat check result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Heartbeat endpoint accessible', 'passed': heartbeat_check.status is defined and heartbeat_check.status == 200}] }}"
+
+    - name: Test Chroma API with authentication - get collections
+      ansible.builtin.uri:
+        url: "https://{{ chroma_hostname }}/api/v1/collections"
+        method: GET
+        headers:
+          X-Chroma-Token: "{{ admin_password }}"
+        validate_certs: false
+        status_code: [200]
+      register: api_check
+      ignore_errors: true
+
+    - name: Record API authentication test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'API authentication working', 'passed': api_check.status is defined and api_check.status == 200}] }}"
+
+    - name: Create test collection
+      ansible.builtin.uri:
+        url: "https://{{ chroma_hostname }}/api/v1/collections"
+        method: POST
+        headers:
+          X-Chroma-Token: "{{ admin_password }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "test_collection"
+          metadata:
+            description: "Test collection for validation"
+        validate_certs: false
+        status_code: [200]
+      register: collection_create
+      ignore_errors: true
+
+    - name: Record collection creation test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Collection creation', 'passed': collection_create.status is defined and collection_create.status == 200}] }}"
+
+    - name: Add test embeddings to collection
+      ansible.builtin.uri:
+        url: "https://{{ chroma_hostname }}/api/v1/collections/test_collection/add"
+        method: POST
+        headers:
+          X-Chroma-Token: "{{ admin_password }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          ids: ["id1", "id2", "id3"]
+          embeddings: [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]]
+          metadatas: [{"type": "doc1"}, {"type": "doc2"}, {"type": "doc3"}]
+          documents: ["This is document 1", "This is document 2", "This is document 3"]
+        validate_certs: false
+        status_code: [200, 201]
+      register: embedding_add
+      ignore_errors: true
+      when: collection_create.status is defined and collection_create.status == 200
+
+    - name: Record embedding addition test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Embedding addition', 'passed': embedding_add.status is defined and (embedding_add.status == 200 or embedding_add.status == 201)}] }}"
+      when: collection_create.status is defined and collection_create.status == 200
+
+    - name: Query test embeddings
+      ansible.builtin.uri:
+        url: "https://{{ chroma_hostname }}/api/v1/collections/test_collection/query"
+        method: POST
+        headers:
+          X-Chroma-Token: "{{ admin_password }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          query_embeddings: [[0.1, 0.2, 0.3]]
+          n_results: 2
+        validate_certs: false
+        status_code: [200]
+      register: query_test
+      ignore_errors: true
+      when: embedding_add is defined and embedding_add.status is defined and (embedding_add.status == 200 or embedding_add.status == 201)
+
+    - name: Record query test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Embedding query', 'passed': query_test.status is defined and query_test.status == 200}] }}"
+      when: embedding_add is defined and embedding_add.status is defined and (embedding_add.status == 200 or embedding_add.status == 201)
+
+    - name: Get collection info
+      ansible.builtin.uri:
+        url: "https://{{ chroma_hostname }}/api/v1/collections/test_collection"
+        method: GET
+        headers:
+          X-Chroma-Token: "{{ admin_password }}"
+        validate_certs: false
+        status_code: [200]
+      register: collection_info
+      ignore_errors: true
+      when: collection_create.status is defined and collection_create.status == 200
+
+    - name: Record collection info test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + [{'test': 'Get collection info', 'passed': collection_info.status is defined and collection_info.status == 200}] }}"
+      when: collection_create.status is defined and collection_create.status == 200
+
+    - name: Clean up test collection
+      ansible.builtin.uri:
+        url: "https://{{ chroma_hostname }}/api/v1/collections/test_collection"
+        method: DELETE
+        headers:
+          X-Chroma-Token: "{{ admin_password }}"
+        validate_certs: false
+        status_code: [200, 404]
+      ignore_errors: true
+      when: collection_create.status is defined and collection_create.status == 200
+
+    - name: Display test results summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          Chroma Test Results Summary
+          ========================================
+          {% for result in test_results %}
+          {{ '✓' if result.passed else '✗' }} {{ result.test }}
+          {% endfor %}
+
+          Total: {{ test_results | selectattr('passed', 'equalto', true) | list | length }}/{{ test_results | length }} tests passed
+
+          {% if test_results | selectattr('passed', 'equalto', false) | list | length > 0 %}
+          FAILED TESTS:
+          {% for result in test_results | selectattr('passed', 'equalto', false) | list %}
+          - {{ result.test }}
+          {% endfor %}
+          {% else %}
+          All tests passed successfully!
+          {% endif %}
+
+    - name: Fail if any test failed
+      ansible.builtin.fail:
+        msg: "Some tests failed. Please check the results above."
+      when: test_results | selectattr('passed', 'equalto', false) | list | length > 0

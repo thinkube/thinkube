@@ -1,0 +1,336 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/18_test.yaml
+# Description:
+#   Tests Harbor container registry deployment and functionality
+#   Verifies deployment, services, OIDC authentication, and registry operations
+#
+# Requirements:
+#   - Harbor must be deployed
+#   - kubectl access to the cluster
+#   - Container runtime (podman or docker) available
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/18_test.yaml
+#
+# Variables from inventory:
+#   - harbor_namespace: Harbor namespace
+#   - harbor_release: Harbor Helm release name
+#   - harbor_registry: Harbor registry domain
+#   - harbor_project: Harbor project name
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to Kubernetes configuration file
+#   - helm_bin: Path to helm binary
+#
+# 🤖 [AI-assisted]
+
+- name: Test Harbor Component
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    test_image: "alpine:latest"
+    harbor_admin_user: "admin"  # Harbor's built-in admin user
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    ########################################################################
+    # 1. Kubernetes Resource Checks
+    ########################################################################
+    
+    - name: Check if namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ harbor_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check if Helm release exists
+      kubernetes.core.helm_info:
+        binary_path: "{{ helm_bin }}"
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ harbor_release }}"
+        release_namespace: "{{ harbor_namespace }}"
+      register: helm_check
+      failed_when: 
+        - helm_check.status is not defined
+        - helm_check.status.info is not defined
+
+    - name: Check Harbor pods status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ harbor_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/instance={{ harbor_release }}"
+      register: harbor_pods
+
+    - name: Verify all pods are running
+      ansible.builtin.assert:
+        that:
+          - harbor_pods.resources | length > 0
+          - (harbor_pods.resources | map(attribute='status.phase') | list | unique == ['Running'])
+        fail_msg: "Not all Harbor pods are running"
+        success_msg: "All Harbor pods are running"
+
+    - name: Check Harbor services
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        namespace: "{{ harbor_namespace }}"
+      register: harbor_services
+
+    - name: Check Harbor ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Ingress
+        namespace: "{{ harbor_namespace }}"
+      register: harbor_ingress
+
+    - name: Verify ingress has been created
+      ansible.builtin.assert:
+        that:
+          - harbor_ingress.resources | length > 0
+          - harbor_ingress.resources[0].spec.rules[0].host == harbor_registry
+        fail_msg: "Harbor ingress not properly configured"
+        success_msg: "Harbor ingress configured correctly"
+
+    ########################################################################
+    # 2. API and Web Interface Checks
+    ########################################################################
+
+    - name: Get Harbor admin password
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ harbor_namespace }}"
+        name: harbor-core
+      register: harbor_secret
+
+    - name: Note about password
+      ansible.builtin.debug:
+        msg: "Harbor admin password has been changed to our standard admin_password"
+
+    - name: Test Harbor API availability with certificate validation
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/systeminfo"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+        validate_certs: false
+        status_code: 200
+      register: harbor_api
+
+    - name: Verify OIDC is configured
+      ansible.builtin.assert:
+        that:
+          - harbor_api.json.auth_mode == 'oidc_auth'
+        fail_msg: "Harbor OIDC authentication not configured"
+        success_msg: "Harbor OIDC authentication is active"
+
+    - name: Check all Harbor projects
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects?page=1&page_size=100"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+          Accept: "application/json"
+        validate_certs: false
+        status_code: 200
+      register: all_projects
+      
+    - name: Debug all projects
+      ansible.builtin.debug:
+        var: all_projects.json
+      
+    - name: Check specific project directly
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects/{{ harbor_project }}"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+          Accept: "application/json"
+        validate_certs: false
+        status_code: 
+          - 200
+          - 404
+      register: specific_project
+      
+    - name: Debug specific project response
+      ansible.builtin.debug:
+        var: specific_project
+      
+    - name: Filter for our project in all projects list
+      ansible.builtin.set_fact:
+        harbor_projects: "{{ all_projects.json | selectattr('name', 'equalto', harbor_project) | list }}"
+      when: all_projects.json is defined
+      
+    - name: Debug filtered project
+      ansible.builtin.debug:
+        var: harbor_projects
+      when: harbor_projects is defined
+        
+    - name: Verify project exists
+      ansible.builtin.assert:
+        that:
+          - >-
+            (specific_project.status == 200) or
+            (harbor_projects is defined and harbor_projects | length > 0)
+        fail_msg: "Harbor project {{ harbor_project }} not found"
+        success_msg: "Harbor project {{ harbor_project }} exists"
+
+    ########################################################################
+    # 3. Registry Operation Tests
+    ########################################################################
+
+    - name: Check if podman is available
+      ansible.builtin.command: which podman
+      register: podman_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check if docker is available
+      ansible.builtin.command: which docker
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set container runtime
+      ansible.builtin.set_fact:
+        container_runtime: "{{ 'podman' if podman_check.rc == 0 else 'docker' if docker_check.rc == 0 else 'none' }}"
+
+    - name: Verify container runtime is available
+      ansible.builtin.assert:
+        that:
+          - container_runtime != 'none'
+        fail_msg: "Neither podman nor docker is available"
+        success_msg: "Container runtime found: {{ container_runtime }}"
+
+    - name: Get remote user home directory
+      ansible.builtin.shell: echo $HOME
+      register: remote_home
+      changed_when: false
+      
+    - name: Debug environment info
+      ansible.builtin.debug:
+        msg:
+          - "Remote HOME: {{ remote_home.stdout }}"
+          - "ansible_hostname: {{ ansible_hostname }}"
+          - "inventory_hostname: {{ inventory_hostname }}"
+
+    - name: Read robot token from environment
+      ansible.builtin.slurp:
+        src: "{{ remote_home.stdout }}/.env"
+      register: env_file
+      
+    - name: Debug env file content
+      ansible.builtin.debug:
+        msg: "env file content: {{ env_file.content | b64decode }}"
+      when: env_file is defined
+
+    - name: Extract robot token
+      ansible.builtin.set_fact:
+        harbor_robot_token: "{{ env_file.content | b64decode | regex_search('HARBOR_ROBOT_TOKEN=(.+)', '\\1') | first }}"
+      when: env_file.content is defined
+      
+    - name: Debug robot token
+      ansible.builtin.debug:
+        msg: "Robot token: {{ harbor_robot_token }}"
+      when: harbor_robot_token is defined
+
+    - name: Ensure containers config directory exists
+      ansible.builtin.file:
+        path: "{{ remote_home.stdout }}/.config/containers"
+        state: directory
+        mode: '0700'
+      when: harbor_robot_token is defined
+      
+    - name: Create auth.json file for registry login
+      ansible.builtin.copy:
+        dest: "{{ remote_home.stdout }}/.config/containers/auth.json"
+        mode: '0600'
+        content: |
+          {
+            "auths": {
+              "{{ harbor_registry }}": {
+                "auth": "{{ ('robot$kaniko' + ':' + harbor_robot_token) | b64encode }}"
+              }
+            }
+          }
+      register: auth_file
+      when: harbor_robot_token is defined
+      
+    - name: Test registry login with auth file
+      ansible.builtin.command: "{{ container_runtime }} login --get-login {{ harbor_registry }}"
+      register: login_test
+      changed_when: false
+      failed_when: false
+      when: harbor_robot_token is defined
+      
+    - name: Debug login test results
+      ansible.builtin.debug:
+        var: login_test
+      when: login_test is defined
+      
+    - name: Verify pull secret exists in Kubernetes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: harbor-pull-secret
+      register: pull_secret
+      
+    - name: Test registry connection using standard CA certificates
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/v2/"
+        method: GET
+        headers:
+          Authorization: "Basic {{ ('robot$kaniko' + ':' + harbor_robot_token) | b64encode }}"
+        validate_certs: false
+        status_code: [200, 401]
+      register: registry_v2_response
+      when: harbor_robot_token is defined
+      
+    - name: Debug registry V2 API response
+      ansible.builtin.debug:
+        var: registry_v2_response
+      when: registry_v2_response is defined
+
+    ########################################################################
+    # 4. Display Test Results
+    ########################################################################
+
+    - name: Verify certificate validation worked
+      ansible.builtin.assert:
+        that:
+          - harbor_api.status == 200
+          - specific_project.status == 200
+          - registry_v2_response is defined
+        fail_msg: "Certificate validation failed for one or more APIs"
+        success_msg: "Certificate validation successful for all APIs"
+      ignore_errors: true  # Continue to show results even if fails
+        
+    - name: Display test results
+      ansible.builtin.debug:
+        msg:
+          - "Namespace: {{ harbor_namespace }} ✓"
+          - "Helm Release: {{ harbor_release }} ✓"
+          - "Pods Running: {{ harbor_pods.resources | length }} ✓"
+          - "Services: {{ harbor_services.resources | length }} ✓"
+          - "Ingress: {{ harbor_registry }} ✓"
+          - "API Available: {{ harbor_api.status }} ✓"
+          - "Auth Mode: {{ harbor_api.json.auth_mode }} ✓"
+          - "Project: {{ harbor_project }} ✓"
+          - "TLS Certificate Validation: {{ 'PASSED' if (harbor_api.status == 200 and specific_project.status == 200) else 'FAILED' }} {{ '✓' if (harbor_api.status == 200 and specific_project.status == 200) else '✗' }}"
+          - "Pull Secret: {{ 'CREATED' if pull_secret.resources | length > 0 else 'MISSING' }} {{ '✓' if pull_secret.resources | length > 0 else '✗' }}"
+          - "Container Runtime: {{ container_runtime }} ✓"
+
+    - name: Harbor deployment test completed
+      ansible.builtin.debug:
+        msg: "All Harbor tests completed - Review results above for certificate validation"

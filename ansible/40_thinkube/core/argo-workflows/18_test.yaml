@@ -1,0 +1,261 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/argo-workflows/18_test.yaml
+# Description:
+#   Test Argo Workflows and Argo Events deployment and functionality
+#
+# Requirements:
+#   - MicroK8s Kubernetes cluster
+#   - Argo Workflows deployed (run 11_deploy.yaml first)
+#   - Argo token configured (run 12_setup_token.yaml first)
+#   - MinIO artifact storage configured (run 13_setup_artifacts.yaml first)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/argo-workflows/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain name for all services
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - kubectl_bin: Path to kubectl binary
+#
+# Dependencies:
+#   - CORE-001: MicroK8s Control Node
+#   - CORE-003: Cert-Manager (for TLS)
+#   - CORE-004: Keycloak (for SSO)
+#   - CORE-006: MinIO (for artifact storage)
+#   - CORE-008: Argo Workflows (all deployment playbooks)
+
+- name: Test Argo Workflows and Argo Events deployment
+  hosts: microk8s_control_plane
+  gather_facts: false
+  become: false
+
+  # No vars section needed - all variables come from inventory
+    
+  tasks:
+    ###################################################################
+    # 1) Basic deployment tests
+    ###################################################################
+    - name: Verify Argo Workflows namespace exists
+      ansible.builtin.shell: "{{ kubectl_bin }} get namespace {{ argo_namespace }}"
+      register: namespace_check
+      changed_when: false
+      failed_when: namespace_check.rc != 0
+      
+    - name: Verify Argo Workflows pods are running
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ argo_namespace }} | grep -E 'workflow|server|controller' | grep Running
+      register: pods_check
+      changed_when: false
+      failed_when: pods_check.rc != 0
+      
+    - name: Verify Argo Ingress resources exist
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get ingress -n {{ argo_namespace }} | grep -E 'argo-ingress|argo-grpc-ingress'
+      register: ingress_check
+      changed_when: false
+      failed_when: ingress_check.rc != 0
+      
+    - name: Verify Argo Events CRDs are installed
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get crd | grep -E "eventbus|eventsources|sensors"
+      register: crds_check
+      changed_when: false
+      failed_when: crds_check.rc != 0
+      
+    - name: Verify Argo Events controller is running
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ argo_namespace }} -l app.kubernetes.io/name=argo-events-controller-manager | grep Running
+      register: events_check
+      changed_when: false
+      failed_when: events_check.rc != 0
+      
+    ###################################################################
+    # 2) TLS certificate verification
+    ###################################################################
+    - name: Verify TLS certificate for UI endpoint
+      ansible.builtin.shell: |
+        curl -sI https://{{ argo_domain }} | grep -i "HTTP/2 200\|HTTP/1.1 302"
+      register: ui_tls_check
+      changed_when: false
+      failed_when: ui_tls_check.rc != 0
+      
+    - name: Verify TLS certificate for gRPC endpoint
+      ansible.builtin.shell: |
+        curl -sI https://{{ argo_grpc_domain }} | grep -i "HTTP/2\|HTTP/1.1"
+      register: grpc_tls_check
+      changed_when: false
+      failed_when: grpc_tls_check.rc != 0
+      
+    ###################################################################
+    # 3) Authentication verification
+    ###################################################################
+    - name: Verify Argo SSO secret exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret -n {{ argo_namespace }} argo-server-sso
+      register: sso_secret_check
+      changed_when: false
+      failed_when: sso_secret_check.rc != 0
+      
+    - name: Verify Keycloak client exists
+      ansible.builtin.shell: |
+        curl -s -I {{ keycloak_url }}/realms/{{ keycloak_realm }}/.well-known/openid-configuration | grep -i "HTTP/1.1 200\|HTTP/2 200"
+      register: keycloak_check
+      changed_when: false
+      failed_when: keycloak_check.rc != 0
+      
+    ###################################################################
+    # 4) Token verification
+    ###################################################################
+    - name: Verify service account token exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret -n {{ argo_namespace }} argo-workflows-server-sa-token
+      register: token_check
+      changed_when: false
+      failed_when: token_check.rc != 0
+      
+    - name: Verify Argo CLI is installed
+      ansible.builtin.shell: |
+        which argo && argo version
+      register: cli_check
+      changed_when: false
+      failed_when: cli_check.rc != 0
+      
+    ###################################################################
+    # 5) Artifact storage verification
+    ###################################################################
+    - name: Verify artifact repository ConfigMap exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get configmap -n {{ argo_namespace }} artifact-repositories
+      register: artifact_cm_check
+      changed_when: false
+      failed_when: artifact_cm_check.rc != 0
+      
+    - name: Verify artifact credentials secret exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret -n {{ argo_namespace }} argo-artifacts-s3
+      register: artifact_secret_check
+      changed_when: false
+      failed_when: artifact_secret_check.rc != 0
+      
+    ###################################################################
+    # 6) Test workflow execution
+    ###################################################################
+    - name: Submit test workflow
+      ansible.builtin.shell: |
+        KUBECONFIG={{ kubeconfig }} argo submit -n {{ argo_namespace }} --watch=false - <<EOF
+        apiVersion: argoproj.io/v1alpha1
+        kind: Workflow
+        metadata:
+          generateName: hello-world-
+        spec:
+          entrypoint: whalesay
+          templates:
+          - name: whalesay
+            container:
+              image: docker/whalesay:latest
+              command: [cowsay]
+              args: ["Hello World! Testing Argo Workflows."]
+        EOF
+      register: workflow_submit
+      changed_when: false
+      failed_when: workflow_submit.rc != 0
+      
+    - name: Wait for workflow to complete
+      ansible.builtin.shell: |
+        # Extract the workflow name from the submit output
+        WORKFLOW_NAME=$(echo "{{ workflow_submit.stdout }}" | grep -o "hello-world-[a-z0-9]*")
+        if [ -n "$WORKFLOW_NAME" ]; then
+          echo "Waiting for workflow $WORKFLOW_NAME to complete..."
+          timeout 120 bash -c "until {{ kubectl_bin }} get workflows -n {{ argo_namespace }} | grep $WORKFLOW_NAME | grep -q Succeeded; do echo 'Waiting...'; sleep 5; done"
+        else
+          echo "Could not determine workflow name, using default pattern"
+          timeout 120 bash -c 'until {{ kubectl_bin }} get workflows -n {{ argo_namespace }} | grep hello-world | grep -q Succeeded; do echo "Waiting..."; sleep 5; done'
+        fi
+      register: workflow_complete
+      changed_when: false
+      failed_when: workflow_complete.rc != 0
+      
+    ###################################################################
+    # 7) Test Argo Events webhook infrastructure
+    ###################################################################
+    - name: Verify EventBus is deployed
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get eventbus -n {{ argo_namespace }} default -o jsonpath='{.status.conditions[?(@.type=="Deployed")].status}'
+      register: eventbus_check
+      changed_when: false
+      failed_when: eventbus_check.stdout != "True"
+      
+    - name: Verify Gitea webhook EventSource exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get eventsource -n {{ argo_namespace }} gitea-webhook
+      register: eventsource_check
+      changed_when: false
+      failed_when: eventsource_check.rc != 0
+      
+    - name: Verify Gitea webhook Service exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get service -n {{ argo_namespace }} gitea-webhook-eventsource
+      register: webhook_service_check
+      changed_when: false
+      failed_when: webhook_service_check.rc != 0
+      
+    - name: Verify Argo Events webhook Ingress exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get ingress -n {{ argo_namespace }} argo-events-webhook-ingress
+      register: webhook_ingress_check
+      changed_when: false
+      failed_when: webhook_ingress_check.rc != 0
+      
+    - name: Verify webhook endpoint is accessible
+      ansible.builtin.shell: |
+        curl -sI https://argo-events.{{ domain_name }}/gitea | grep -i "HTTP/2\|HTTP/1.1"
+      register: webhook_endpoint_check
+      changed_when: false
+      failed_when: webhook_endpoint_check.rc != 0
+      
+    - name: Verify Gitea push Sensor exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get sensor -n {{ argo_namespace }} gitea-push
+      register: sensor_check
+      changed_when: false
+      failed_when: sensor_check.rc != 0
+      
+    - name: Verify webhook secret exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret -n {{ argo_namespace }} gitea-webhook-secret
+      register: webhook_secret_check
+      changed_when: false
+      failed_when: webhook_secret_check.rc != 0
+
+    ###################################################################
+    # 8) Display test results
+    ###################################################################
+    - name: Display test results
+      ansible.builtin.debug:
+        msg:
+          - "✅ Argo Workflows namespace: {{ argo_namespace }} exists"
+          - "✅ Argo Workflows pods are running"
+          - "✅ Argo Ingress resources exist"
+          - "✅ Argo Events CRDs are installed"
+          - "✅ Argo Events controller is running"
+          - "✅ TLS certificate for UI endpoint is valid"
+          - "✅ TLS certificate for gRPC endpoint is valid"
+          - "✅ Argo SSO secret exists"
+          - "✅ Keycloak OIDC configuration is accessible"
+          - "✅ Service account token exists"
+          - "✅ Argo CLI is installed"
+          - "✅ Artifact repository ConfigMap exists"
+          - "✅ Artifact credentials secret exists"
+          - "✅ Test workflow executed successfully"
+          - "✅ EventBus is deployed and ready"
+          - "✅ Gitea webhook EventSource exists"
+          - "✅ Gitea webhook Service exists"
+          - "✅ Argo Events webhook Ingress exists"
+          - "✅ Webhook endpoint is accessible"
+          - "✅ Gitea push Sensor exists"
+          - "✅ Webhook secret exists"

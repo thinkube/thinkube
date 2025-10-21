@@ -1,0 +1,399 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Deploy Ingress Controllers
+#
+# This playbook disables the MicroK8s built‑in ingress addon and deploys two separate ingress
+# controllers via Helm:
+#
+#     1. Primary Ingress Controller (for general services)
+#        - Namespace: ingress
+#        - Release Name: primary-ingress
+#        - IngressClass: "nginx" (set as default)
+#        - The controller is deployed as a Deployment whose service name is expected to be:
+#          primary-ingress-ingress-nginx-controller
+#
+#     2. Secondary Ingress Controller (for specialized workloads)
+#        - Namespace: ingress-kn
+#        - Release Name: secondary-ingress
+#        - IngressClass: "nginx-kn"
+#
+# Requirements:
+#   - MicroK8s is installed on the target host.
+#   - MetalLB is already enabled by MicroK8s installation.
+#   - The kubernetes.core collection is installed.
+#   - acme-certificates must be deployed first to create the wildcard certificate
+#
+# This playbook also copies the wildcard certificate to the ingress namespaces after the controllers
+# are deployed, to ensure that the namespaces exist before certificates are copied.
+#
+# Usage:
+#   Run from ansible root directory:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/ingress/10_deploy.yaml
+
+- name: Disable MicroK8s Ingress Addon and Deploy Primary Ingress Controller
+  hosts: microk8s_control_plane
+  become: true
+  vars:
+    primary_release: "primary-ingress"
+    primary_controller_class: "k8s.io/primary-ingress-nginx"
+    # Determine subnet prefix based on network mode
+    subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    # Build the required variables from inventory
+    metallb_ip_range: "{{ subnet_prefix }}{{ metallb_ip_start_octet }}-{{ subnet_prefix }}{{ metallb_ip_end_octet }}"
+    primary_ingress_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
+    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
+    kubectl_bin: "/snap/bin/microk8s.kubectl"
+    helm_bin: "/snap/bin/microk8s.helm3"
+
+  pre_tasks:
+    - name: Add ingress-nginx Helm repository
+      ansible.builtin.command: "{{ helm_bin }} repo add ingress-nginx https://kubernetes.github.io/ingress-nginx --force-update"
+      ignore_errors: yes
+
+    - name: Update Helm repositories
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+
+  tasks:
+    - name: Debug Python interpreter path
+      ansible.builtin.debug:
+        msg:
+          - "ansible_python_interpreter: {{ ansible_python_interpreter }}"
+          - "Test kubernetes import:"
+      
+    - name: Test kubernetes module import
+      ansible.builtin.command: "{{ ansible_python_interpreter }} -c 'import kubernetes; print(kubernetes.__version__)'"
+      register: k8s_test
+      failed_when: false
+      changed_when: false
+      
+    - name: Install kubernetes module if missing
+      ansible.builtin.pip:
+        name: 
+          - kubernetes>=26.1.0
+          - pyyaml>=6.0
+        executable: "{{ ansible_python_interpreter | dirname }}/pip"
+      when: k8s_test.rc != 0
+      become: false
+      
+    - name: Show kubernetes module version
+      ansible.builtin.debug:
+        var: k8s_test.stdout
+      when: k8s_test.rc == 0
+        
+    - name: Debug MetalLB configuration values
+      ansible.builtin.debug:
+        msg:
+          - "network_mode: {{ network_mode }}"
+          - "subnet_prefix: {{ subnet_prefix }}"
+          - "metallb_ip_start_octet: {{ metallb_ip_start_octet }}"
+          - "metallb_ip_end_octet: {{ metallb_ip_end_octet }}"
+          - "metallb_ip_range: {{ metallb_ip_range }}"
+          - "primary_ingress_ip_octet: {{ primary_ingress_ip_octet }}"
+          - "primary_ingress_ip: {{ primary_ingress_ip }}"
+
+    - name: Disable MicroK8s ingress addon (if enabled)
+      ansible.builtin.command: microk8s disable ingress
+      ignore_errors: yes
+
+    # MetalLB is already enabled by CoreDNS deployment
+    - name: Verify MetalLB is enabled
+      ansible.builtin.command: microk8s status --addon metallb
+      register: metallb_status
+      changed_when: false
+      failed_when: metallb_status.rc != 0 or 'enabled' not in metallb_status.stdout
+
+    - name: Show MetalLB status
+      ansible.builtin.debug:
+        msg: "MetalLB is enabled with range {{ metallb_ip_range }}"
+
+    - name: Check MetalLB ConfigMap
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: config
+        namespace: metallb-system
+      register: metallb_config
+      ignore_errors: yes
+
+    - name: Show MetalLB configuration
+      ansible.builtin.debug:
+        msg: "{{ metallb_config.resources[0].data if metallb_config.resources is defined and metallb_config.resources|length > 0 else 'MetalLB config not found' }}"
+
+    - name: Create primary ingress namespace if not exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        validate_certs: false
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ ingress_namespace }}"
+    
+    # TCP services ConfigMap is created automatically by Helm chart when tcp values are provided
+
+    - name: Deploy Primary Ingress Controller via Helm
+      kubernetes.core.helm:
+        state: present
+        binary_path: "{{ helm_bin }}"
+        name: "{{ primary_release }}"
+        chart_ref: ingress-nginx/ingress-nginx
+        release_namespace: "{{ ingress_namespace }}"
+        create_namespace: false
+        wait: true
+        values:
+          controller:
+            electionID: "primary-ingress-ingress-nginx-leader"
+            ingressClass: "{{ primary_ingress_class }}"
+            ingressClassResource:
+              name: "{{ primary_ingress_class }}"
+              enabled: true
+              default: true
+              controllerValue: "{{ primary_controller_class }}"
+            watchIngressWithoutClass: false
+            service:
+              type: LoadBalancer
+              loadBalancerIP: "{{ primary_ingress_ip }}"
+              ports:
+                http: 80
+                https: 443
+              targetPorts:
+                http: http
+                https: https
+            publishService:
+              enabled: true
+              path: "{{ ingress_namespace }}/{{ primary_ingress_service }}"
+            extraArgs:
+              controller-class: "{{ primary_controller_class }}"
+              default-ssl-certificate: "{{ ingress_namespace }}/{{ ingress_namespace }}-tls-secret"
+            metrics:
+              enabled: true
+              port: 10254
+              service:
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "10254"
+          # TCP services configuration - Helm will create ConfigMap and configure controller
+          tcp:
+            # PostgreSQL (if exposed)
+            5432: "postgres/postgresql-official:5432"
+            # Gitea SSH (when deployed)
+            2222: "gitea/gitea:22"
+
+    - name: Get Primary Ingress Service Info
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        validate_certs: false
+        api_version: v1
+        kind: Service
+        namespace: "{{ ingress_namespace }}"
+        name: "{{ primary_ingress_service }}"
+      register: svc_info
+
+    - name: Debug Primary Ingress Service Data
+      ansible.builtin.debug:
+        var: svc_info
+
+    - name: Wait for Primary Ingress Service External IP Assignment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        validate_certs: false
+        api_version: v1
+        kind: Service
+        namespace: "{{ ingress_namespace }}"
+        name: "{{ primary_ingress_service }}"
+      register: svc_info
+      until: (svc_info.resources | length > 0) and
+             (svc_info.resources[0].status.loadBalancer is defined) and
+             (svc_info.resources[0].status.loadBalancer.ingress is defined) and
+             (svc_info.resources[0].status.loadBalancer.ingress[0].ip == primary_ingress_ip)
+      retries: 20
+      delay: 3
+
+    - name: Delete extra IngressClass 'public' (if exists) to avoid conflicts
+      ansible.builtin.shell: "{{ kubectl_bin }} delete ingressclass public"
+      ignore_errors: yes
+
+    - name: Patch IngressClass '{{ primary_ingress_class }}' to be default
+      ansible.builtin.shell: >
+        {{ kubectl_bin }} patch ingressclass {{ primary_ingress_class }} --type=json -p='[{"op":"add","path":"/metadata/annotations","value":{"ingressclass.kubernetes.io/is-default-class":"true"}}]'
+      ignore_errors: yes
+
+    - name: Patch primary ingress controller to publish its service IP
+      ansible.builtin.shell: >
+        {{ kubectl_bin }} patch deployment {{ primary_ingress_service }} -n {{ ingress_namespace }} --type='json'
+        -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--publish-service={{ ingress_namespace }}/{{ primary_ingress_service }}"}]'
+      register: patch_primary_ds
+
+    - name: Restart primary ingress controller pods to pick up new args
+      ansible.builtin.shell: "{{ kubectl_bin }} rollout restart deployment {{ primary_ingress_service }} -n {{ ingress_namespace }}"
+
+- name: Deploy Secondary Ingress Controller via Helm (for specialized workloads)
+  hosts: microk8s_control_plane
+  become: true
+  vars:
+    secondary_release: "secondary-ingress"
+    secondary_controller_class: "k8s.io/secondary-ingress-nginx"
+    # Use the same subnet prefix as primary ingress
+    subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    secondary_ingress_ip: "{{ subnet_prefix }}{{ secondary_ingress_ip_octet }}"
+    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
+    kubectl_bin: "/snap/bin/microk8s.kubectl"
+    helm_bin: "/snap/bin/microk8s.helm3"
+  tasks:
+    - name: Create secondary ingress namespace if not exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        validate_certs: false
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ ingress_kn_namespace }}"
+
+    - name: Deploy Secondary Ingress Controller via Helm
+      kubernetes.core.helm:
+        state: present
+        binary_path: "{{ helm_bin }}"
+        name: "{{ secondary_release }}"
+        chart_ref: ingress-nginx/ingress-nginx
+        release_namespace: "{{ ingress_kn_namespace }}"
+        create_namespace: false
+        wait: true
+        force: true
+        update_repo_cache: true
+        values:
+          controller:
+            electionID: "secondary-ingress-ingress-nginx-leader"
+            ingressClass: "{{ secondary_ingress_class }}"
+            ingressClassResource:
+              name: "{{ secondary_ingress_class }}"
+              enabled: true
+              default: false
+              controllerValue: "{{ secondary_controller_class }}"
+            watchIngressWithoutClass: false
+            service:
+              type: LoadBalancer
+              loadBalancerIP: "{{ secondary_ingress_ip }}"
+            publishService:
+              enabled: true
+              path: "{{ ingress_kn_namespace }}/{{ secondary_release }}-ingress-nginx-controller"
+            extraArgs:
+              controller-class: "{{ secondary_controller_class }}"
+              default-ssl-certificate: "{{ ingress_kn_namespace }}/{{ ingress_kn_namespace }}-tls-secret"
+            metrics:
+              enabled: true
+              port: 10254
+              service:
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "10254"
+
+    - name: Get Secondary Ingress Service Info
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        validate_certs: false
+        api_version: v1
+        kind: Service
+        namespace: "{{ ingress_kn_namespace }}"
+        name: "{{ secondary_release }}-ingress-nginx-controller"
+      register: svc_info_kn
+
+    - name: Debug Secondary Ingress Service Data
+      ansible.builtin.debug:
+        var: svc_info_kn
+
+    - name: Wait for Secondary Ingress Service External IP Assignment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        validate_certs: false
+        api_version: v1
+        kind: Service
+        namespace: "{{ ingress_kn_namespace }}"
+        name: "{{ secondary_release }}-ingress-nginx-controller"
+      register: svc_info_kn
+      until: (svc_info_kn.resources | length > 0) and
+             (svc_info_kn.resources[0].status.loadBalancer is defined) and
+             (svc_info_kn.resources[0].status.loadBalancer.ingress is defined) and
+             (svc_info_kn.resources[0].status.loadBalancer.ingress[0].ip == secondary_ingress_ip)
+      retries: 20
+      delay: 3
+
+    - name: Patch secondary ingress controller to publish its service IP
+      ansible.builtin.shell: >
+        {{ kubectl_bin }} patch deployment {{ secondary_release }}-ingress-nginx-controller -n {{ ingress_kn_namespace }} --type='json'
+        -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--publish-service={{ ingress_kn_namespace }}/{{ secondary_release }}-ingress-nginx-controller"}]'
+      register: patch_secondary_ds
+
+    - name: Restart secondary ingress controller pods to pick up new args
+      ansible.builtin.shell: "{{ kubectl_bin }} rollout restart deployment {{ secondary_release }}-ingress-nginx-controller -n {{ ingress_kn_namespace }}"
+
+- name: Copy wildcard certificates to ingress namespaces
+  hosts: microk8s_control_plane
+  become: true
+  vars:
+    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
+    kubectl_bin: "/snap/bin/microk8s.kubectl"
+  tasks:
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name | replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to primary ingress namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ ingress_namespace }}-tls-secret"
+            namespace: "{{ ingress_namespace }}"
+            labels:
+              app.kubernetes.io/name: "wildcard-certificate"
+              app.kubernetes.io/instance: "ingress"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+      tags:
+        - certificate
+
+    - name: Copy wildcard certificate to secondary ingress namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ ingress_kn_namespace }}-tls-secret"
+            namespace: "{{ ingress_kn_namespace }}"
+            labels:
+              app.kubernetes.io/name: "wildcard-certificate"
+              app.kubernetes.io/instance: "ingress-kn"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+      tags:
+        - certificate
+
+    - name: Display certificate status
+      ansible.builtin.debug:
+        msg:
+          - "Wildcard certificates successfully copied to ingress namespaces"
+          - "Primary ingress: {{ ingress_namespace }}/{{ ingress_namespace }}-tls-secret"
+          - "Secondary ingress: {{ ingress_kn_namespace }}/{{ ingress_kn_namespace }}-tls-secret"
+      tags:
+        - info

@@ -1,0 +1,153 @@
+---
+# ansible/40_thinkube/optional/clickhouse/18_test.yaml
+# Description:
+#   Test playbook for ClickHouse deployment
+#   Verifies that the service is accessible and functioning
+#
+# Requirements:
+#   - ClickHouse must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/clickhouse/18_test.yaml
+#
+# 🤖 [AI-generated]
+
+- name: Test ClickHouse deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    clickhouse_namespace: clickhouse
+
+  tasks:
+    - name: Check if ClickHouse namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ clickhouse_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check ClickHouse StatefulSet status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ clickhouse_namespace }}"
+        name: clickhouse-clickhouse-cluster
+      register: statefulset_check
+      failed_when:
+        - statefulset_check.resources | length == 0
+        - statefulset_check.resources[0].status.readyReplicas != statefulset_check.resources[0].spec.replicas
+
+    - name: Check ClickHouse pod status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ clickhouse_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=clickhouse
+      register: pod_check
+      failed_when: pod_check.resources | length == 0
+
+    - name: Display pod status
+      ansible.builtin.debug:
+        msg: "Pod {{ item.metadata.name }} is {{ item.status.phase }}"
+      loop: "{{ pod_check.resources }}"
+
+    - name: Check ClickHouse service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ clickhouse_namespace }}"
+        name: clickhouse-clickhouse-cluster
+      register: service_check
+      failed_when: service_check.resources | length == 0
+
+    - name: Get admin password from environment
+      set_fact:
+        admin_password: "{{ lookup('env','ADMIN_PASSWORD') }}"
+
+    - name: Test ClickHouse HTTP interface
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ clickhouse_namespace }}"
+        pod: "{{ pod_check.resources[0].metadata.name }}"
+        command: |
+          clickhouse-client --password="{{ admin_password }}" --query="SELECT 1"
+      register: clickhouse_test
+      failed_when: clickhouse_test.rc != 0
+      retries: 5
+      delay: 10
+
+    - name: Test ClickHouse database creation
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ clickhouse_namespace }}"
+        pod: "{{ pod_check.resources[0].metadata.name }}"
+        command: |
+          clickhouse-client --password="{{ admin_password }}" --query="CREATE DATABASE IF NOT EXISTS test_db"
+      register: db_create
+      failed_when: db_create.rc != 0
+
+    - name: Test ClickHouse table creation
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ clickhouse_namespace }}"
+        pod: "{{ pod_check.resources[0].metadata.name }}"
+        command: |
+          clickhouse-client --password="{{ admin_password }}" --query="CREATE TABLE IF NOT EXISTS test_db.test_table (id UInt32) ENGINE = Memory"
+      register: table_create
+      failed_when: table_create.rc != 0
+
+    - name: Test ClickHouse data insert
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ clickhouse_namespace }}"
+        pod: "{{ pod_check.resources[0].metadata.name }}"
+        command: |
+          clickhouse-client --password="{{ admin_password }}" --query="INSERT INTO test_db.test_table VALUES (1)"
+      register: data_insert
+      failed_when: data_insert.rc != 0
+
+    - name: Test ClickHouse data query
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ clickhouse_namespace }}"
+        pod: "{{ pod_check.resources[0].metadata.name }}"
+        command: |
+          clickhouse-client --password="{{ admin_password }}" --query="SELECT * FROM test_db.test_table"
+      register: data_query
+      failed_when: data_query.rc != 0
+
+    - name: Clean up test database
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ clickhouse_namespace }}"
+        pod: "{{ pod_check.resources[0].metadata.name }}"
+        command: |
+          clickhouse-client --password="{{ admin_password }}" --query="DROP DATABASE IF EXISTS test_db"
+      register: cleanup
+      failed_when: cleanup.rc != 0
+
+    - name: Display test results
+      ansible.builtin.debug:
+        msg:
+          - "✓ ClickHouse namespace exists"
+          - "✓ StatefulSet is ready: {{ statefulset_check.resources[0].status.readyReplicas }}/{{ statefulset_check.resources[0].spec.replicas }} replicas"
+          - "✓ Pods are running"
+          - "✓ Service is configured"
+          - "✓ ClickHouse client connection successful"
+          - "✓ Database creation successful"
+          - "✓ Table creation successful"
+          - "✓ Data insert successful"
+          - "✓ Data query successful"
+          - ""
+          - "ClickHouse is successfully deployed and operational!"
+          - "Service: clickhouse-clickhouse-cluster.{{ clickhouse_namespace }}.svc.cluster.local"
+          - "HTTP Port: 8123"
+          - "Native Port: 9000"

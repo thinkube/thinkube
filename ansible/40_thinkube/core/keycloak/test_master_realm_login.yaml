@@ -1,0 +1,53 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Test Master Realm Login
+  hosts: microk8s_control_plane
+  gather_facts: false
+  
+  vars:
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+  tasks:
+    - name: Test admin authentication on master realm
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: password
+        validate_certs: no  # Temporarily disabled due to wildcard certificate
+        status_code: 200
+      register: auth_test
+      
+    - name: Show authentication result
+      ansible.builtin.debug:
+        msg: |
+          Authentication Result:
+          {% if auth_test.status == 200 %}
+          SUCCESS! Token received.
+          Token type: {{ auth_test.json.token_type }}
+          Expires in: {{ auth_test.json.expires_in }} seconds
+          {% else %}
+          FAILED! Status: {{ auth_test.status }}
+          {% endif %}
+          
+    - name: Test getting user info with token
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master/protocol/openid-connect/userinfo"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ auth_test.json.access_token }}"
+        validate_certs: no
+        status_code: 200
+      register: userinfo_test
+      when: auth_test.status == 200
+      
+    - name: Show user info
+      ansible.builtin.debug:
+        var: userinfo_test.json
+      when: userinfo_test is defined

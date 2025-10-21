@@ -1,0 +1,156 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/mlflow/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for MLflow by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - MLflow must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/mlflow/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#   - mlflow_hostname: Hostname for MLflow UI access
+#
+# 🤖 AI-assisted
+
+- name: Configure MLflow service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    mlflow_hostname: "mlflow.{{ domain_name }}"
+    mlflow_namespace: "mlflow"
+    mlflow_client_id: "mlflow"
+    auth_realm_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    - name: Get MLflow client secret from K8s secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ mlflow_namespace }}"
+        name: oauth2-proxy-secret
+      register: mlflow_secret
+      failed_when: mlflow_secret.resources | length == 0
+
+    - name: Set client secret fact
+      ansible.builtin.set_fact:
+        mlflow_client_secret: "{{ mlflow_secret.resources[0].data['client-secret'] | b64decode }}"
+
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: mlflow
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "mlflow"
+          data:
+            service.yaml: |
+              service:
+                name: mlflow
+                display_name: "MLflow"
+                description: "ML experiment tracking and model registry"
+                type: optional
+                category: ai
+                icon: /icons/tk_ai.svg
+
+                endpoints:
+                  - name: web
+                    type: http
+                    url: "https://{{ mlflow_hostname }}"
+                    health_url: "https://{{ mlflow_hostname }}/health"
+                    description: "Web interface"
+                    primary: true
+
+                dependencies:
+                  - postgres
+                  - seaweedfs
+                  - keycloak
+
+                scaling:
+                  resource_type: deployment
+                  resource_name: mlflow
+                  namespace: mlflow
+                  min_replicas: 1
+                  can_disable: true
+
+                environment_variables:
+                  - name: MLFLOW_TRACKING_URI
+                    value: "https://{{ mlflow_hostname }}"
+                  - name: MLFLOW_AUTH_USERNAME
+                    value: "{{ auth_realm_username }}"
+                  - name: MLFLOW_AUTH_PASSWORD
+                    value: "{{ auth_realm_password }}"
+                  - name: MLFLOW_KEYCLOAK_TOKEN_URL
+                    value: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
+                  - name: MLFLOW_KEYCLOAK_CLIENT_ID
+                    value: "mlflow"
+                  - name: MLFLOW_CLIENT_SECRET
+                    value: "{{ mlflow_client_secret }}"
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: mlflow
+      register: configmap_info
+
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for MLflow"
+      when: configmap_info.resources | length > 0
+
+    - name: Update code-server environment variables
+      include_role:
+        name: code_server_env_update
+
+    - name: Create MLflow auth helper script (Bash) from template
+      ansible.builtin.template:
+        src: templates/mlflow-auth.sh.j2
+        dest: /tmp/mlflow-auth.sh
+        mode: '0755'
+
+    - name: Copy MLflow auth helper script (Bash) to code-server
+      ansible.builtin.shell: |
+        microk8s.kubectl cp /tmp/mlflow-auth.sh code-server/$(microk8s.kubectl get pod -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'):/home/thinkube/mlflow-auth.sh
+      changed_when: true
+
+    - name: Remove temporary Bash script
+      ansible.builtin.file:
+        path: /tmp/mlflow-auth.sh
+        state: absent
+
+    - name: Create MLflow auth helper script (Fish) from template
+      ansible.builtin.template:
+        src: templates/mlflow-auth.fish.j2
+        dest: /tmp/mlflow-auth.fish
+        mode: '0755'
+
+    - name: Copy MLflow auth helper script (Fish) to code-server
+      ansible.builtin.shell: |
+        microk8s.kubectl cp /tmp/mlflow-auth.fish code-server/$(microk8s.kubectl get pod -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'):/home/thinkube/mlflow-auth.fish
+      changed_when: true
+
+    - name: Remove temporary Fish script
+      ansible.builtin.file:
+        path: /tmp/mlflow-auth.fish
+        state: absent

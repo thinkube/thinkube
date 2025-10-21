@@ -1,0 +1,385 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/keycloak/16_configure_theme.yaml
+# Description:
+#   Configures custom theme for Keycloak login pages
+#   - Creates ConfigMap with custom theme files
+#   - Mounts theme into Keycloak container
+#   - Configures realm to use custom theme
+#
+# Requirements:
+#   - Keycloak must be deployed (10_deploy.yaml)
+#   - Realm must be configured (15_configure_realm.yaml)
+#   - Custom theme files in ansible/40_thinkube/core/keycloak/theme/
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/keycloak/16_configure_theme.yaml
+#
+# Variables from inventory:
+#   - keycloak_url: Full URL to Keycloak
+#   - keycloak_realm: Realm to configure
+#   - domain_name: Base domain for branding
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Keycloak custom theme
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    keycloak_namespace: keycloak
+    theme_name: thinkube
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    - name: Check if theme directory exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/theme"
+      register: theme_dir
+      delegate_to: localhost
+
+    - name: Create example theme structure if not exists
+      when: not theme_dir.stat.exists
+      delegate_to: localhost
+      block:
+        - name: Create theme directories
+          ansible.builtin.file:
+            path: "{{ playbook_dir }}/theme/{{ item }}"
+            state: directory
+            mode: '0755'
+          loop:
+            - login
+            - login/resources
+            - login/resources/css
+            - login/resources/img
+            - account
+            - email
+
+        - name: Create login theme.properties
+          ansible.builtin.copy:
+            dest: "{{ playbook_dir }}/theme/login/theme.properties"
+            content: |
+              parent=keycloak
+              import=common/keycloak
+              
+              # Theme configuration
+              styles=css/login.css
+              
+              # Localization
+              locales=en
+            mode: '0644'
+
+        - name: Create login.css
+          ansible.builtin.copy:
+            dest: "{{ playbook_dir }}/theme/login/resources/css/login.css"
+            content: |
+              /* Thinkube Custom Theme */
+              
+              /* Override Keycloak default colors */
+              :root {
+                --pf-v5-global--primary-color--100: #1a73e8;
+                --pf-v5-global--primary-color--200: #0052cc;
+                --pf-v5-global--BackgroundColor--100: #f5f7fa;
+              }
+              
+              /* Custom login card styling */
+              .login-pf body {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+              }
+              
+              #kc-header-wrapper {
+                padding-top: 2rem;
+                text-align: center;
+              }
+              
+              #kc-header-wrapper h1 {
+                color: white;
+                font-size: 2.5rem;
+                margin-bottom: 1rem;
+              }
+              
+              .card-pf {
+                border-radius: 8px;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+              }
+              
+              /* Custom button styling */
+              #kc-login {
+                background-color: var(--pf-v5-global--primary-color--100);
+                border: none;
+                padding: 12px 24px;
+                font-weight: 600;
+                transition: all 0.3s ease;
+              }
+              
+              #kc-login:hover {
+                background-color: var(--pf-v5-global--primary-color--200);
+                transform: translateY(-1px);
+                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+              }
+            mode: '0644'
+
+        - name: Create login template override
+          ansible.builtin.copy:
+            dest: "{{ playbook_dir }}/theme/login/template.ftl"
+            content: |
+              <#macro registrationLayout bodyClass="" displayInfo=false displayMessage=true displayRequiredFields=false showAnotherWayIfPresent=true>
+              <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+              <html xmlns="http://www.w3.org/1999/xhtml" class="${properties.kcHtmlClass!}">
+              <head>
+                  <meta charset="utf-8">
+                  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+                  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                  <title>Thinkube - ${msg("loginTitle",(realm.displayName!''))}</title>
+                  <link rel="icon" href="${url.resourcesPath}/img/favicon.ico" />
+                  <#if properties.meta?has_content>
+                      <#list properties.meta?split(' ') as meta>
+                          <meta name="${meta?split('==')[0]}" content="${meta?split('==')[1]}"/>
+                      </#list>
+                  </#if>
+                  <#if properties.styles?has_content>
+                      <#list properties.styles?split(' ') as style>
+                          <link href="${url.resourcesPath}/${style}" rel="stylesheet" />
+                      </#list>
+                  </#if>
+                  <#if properties.scripts?has_content>
+                      <#list properties.scripts?split(' ') as script>
+                          <script src="${url.resourcesPath}/${script}" type="text/javascript"></script>
+                      </#list>
+                  </#if>
+              </head>
+              <body class="${properties.kcBodyClass!}">
+                  <div id="kc-header" class="${properties.kcHeaderClass!}">
+                      <div id="kc-header-wrapper">
+                          <h1>Thinkube Platform</h1>
+                          <p style="color: white; opacity: 0.8;">AI Development Environment</p>
+                      </div>
+                  </div>
+                  <div class="${properties.kcFormCardClass!}">
+                      <header class="${properties.kcFormHeaderClass!}">
+                          <#if displayInfo>
+                              <div id="kc-info" class="${properties.kcSignUpClass!}">
+                                  <div id="kc-info-wrapper" class="${properties.kcInfoAreaWrapperClass!}">
+                                      <#nested "info">
+                                  </div>
+                              </div>
+                          </#if>
+                      </header>
+                      <div id="kc-content" class="${properties.kcContentWrapperClass!}">
+                          <#nested "form">
+                      </div>
+                  </div>
+              </body>
+              </html>
+              </#macro>
+            mode: '0644'
+
+        - name: Inform user about theme directory
+          ansible.builtin.debug:
+            msg: |
+              Created example theme structure at {{ playbook_dir }}/theme
+              Customize the files and re-run this playbook to deploy.
+
+    - name: Create ConfigMap from theme files
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ theme_name }}-theme"
+            namespace: "{{ keycloak_namespace }}"
+          data:
+            # Use flat keys with content that will be organized by init container
+            "login-theme.properties": |
+              parent=base
+              import=common/keycloak
+              
+              # Theme configuration
+              styles=css/login.css
+              stylesCommon=
+              
+              # Disable PatternFly
+              kcLoginClass=
+              kcFormClass=
+              kcFormCardClass=
+              kcFormHeaderClass=
+              
+              # Localization
+              locales=en
+            "login-css-login.css": |
+              {{ lookup('file', playbook_dir + '/theme/login/resources/css/login.css') | indent(14) }}
+            "login-img-logo.svg": |
+              {{ lookup('file', playbook_dir + '/theme/login/resources/img/tk_full_logo.svg') | indent(14) }}
+            "login-template.ftl": |
+              {{ lookup('file', playbook_dir + '/theme/login/template.ftl') | indent(14) }}
+            "login-login.ftl": |
+              {{ lookup('file', playbook_dir + '/theme/login/login.ftl') | indent(14) }}
+            "setup-theme.sh": |
+              #!/bin/bash
+              # Create theme directory structure
+              mkdir -p /opt/keycloak/themes/{{ theme_name }}/login/resources/css
+              mkdir -p /opt/keycloak/themes/{{ theme_name }}/login/resources/img
+              
+              # Copy theme files to correct locations
+              cp /theme-data/login-theme.properties /opt/keycloak/themes/{{ theme_name }}/login/theme.properties
+              cp /theme-data/login-css-login.css /opt/keycloak/themes/{{ theme_name }}/login/resources/css/login.css
+              cp /theme-data/login-img-logo.svg /opt/keycloak/themes/{{ theme_name }}/login/resources/img/logo.svg
+              cp /theme-data/login-template.ftl /opt/keycloak/themes/{{ theme_name }}/login/template.ftl
+              cp /theme-data/login-login.ftl /opt/keycloak/themes/{{ theme_name }}/login/login.ftl
+              
+              # Set proper permissions
+              chmod -R 755 /opt/keycloak/themes/{{ theme_name }}
+              echo "Theme {{ theme_name }} setup complete"
+
+    - name: Get current deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak
+      register: current_deployment
+
+    - name: Remove conflicting theme-installer init container
+      kubernetes.core.k8s_json_patch:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak
+        patch:
+          - op: remove
+            path: /spec/template/spec/initContainers/1
+      when: 
+        - current_deployment.resources[0].spec.template.spec.initContainers | length > 1
+        - current_deployment.resources[0].spec.template.spec.initContainers[1].name == 'theme-installer'
+      ignore_errors: yes
+
+    - name: Update Keycloak deployment to mount theme
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        merge_type: strategic-merge
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: keycloak
+            namespace: "{{ keycloak_namespace }}"
+          spec:
+            template:
+              spec:
+                initContainers:
+                  - name: theme-setup
+                    image: quay.io/keycloak/keycloak:26.1.0
+                    command: ["/bin/bash", "/theme-data/setup-theme.sh"]
+                    volumeMounts:
+                      - name: theme-data
+                        mountPath: /theme-data
+                      - name: theme-volume
+                        mountPath: /opt/keycloak/themes
+                volumes:
+                  - name: theme-data
+                    configMap:
+                      name: "{{ theme_name }}-theme"
+                      defaultMode: 0755
+                  - name: theme-volume
+                    emptyDir: {}
+                containers:
+                  - name: keycloak
+                    volumeMounts:
+                      - name: theme-volume
+                        mountPath: "/opt/keycloak/themes"
+
+    - name: Force new deployment revision by updating annotation
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        merge_type: strategic-merge
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: keycloak
+            namespace: "{{ keycloak_namespace }}"
+          spec:
+            template:
+              metadata:
+                annotations:
+                  kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
+                  theme.config/version: "{{ ansible_date_time.epoch }}"
+      register: restart_result
+      
+    - name: Wait for Keycloak deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak
+      register: keycloak_deployment
+      until: 
+        - keycloak_deployment.resources | length > 0
+        - keycloak_deployment.resources[0].status.replicas is defined
+        - keycloak_deployment.resources[0].status.readyReplicas is defined
+        - keycloak_deployment.resources[0].status.replicas == keycloak_deployment.resources[0].status.readyReplicas
+        - keycloak_deployment.resources[0].metadata.generation == keycloak_deployment.resources[0].status.observedGeneration
+      retries: 30
+      delay: 10
+      
+    - name: Additional wait for Keycloak to fully initialize
+      ansible.builtin.wait_for:
+        timeout: 30
+      delegate_to: localhost
+
+    - name: Get admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: password
+        validate_certs: false
+      register: admin_token
+      retries: 5
+      delay: 10
+      until: admin_token.status == 200
+
+    - name: Configure realm to use custom theme
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ admin_token.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          loginTheme: "{{ theme_name }}"
+          accountTheme: "{{ theme_name }}"
+          emailTheme: "{{ theme_name }}"
+          adminTheme: "{{ theme_name }}"
+        validate_certs: false
+      register: realm_update
+      failed_when: realm_update.status not in [204, 200]
+
+    - name: Display success message
+      ansible.builtin.debug:
+        msg: |
+          ✅ Keycloak theme '{{ theme_name }}' has been deployed successfully!
+          
+          The {{ keycloak_realm }} realm is now using the custom theme.
+          Visit {{ keycloak_url }}/realms/{{ keycloak_realm }}/account to see the theme in action.
+          
+          To customize further:
+          1. Edit files in {{ playbook_dir }}/theme/
+          2. Re-run this playbook to deploy changes
+
+# 🤖 Generated with [Claude Code](https://claude.ai/code)
+# Co-Authored-By: Claude <noreply@anthropic.com>

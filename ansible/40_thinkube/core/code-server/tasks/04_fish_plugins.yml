@@ -1,0 +1,115 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Adapted from ansible/misc/tasks/04_fish_plugins.yml
+# Fish Plugins Setup - Fisher plugin manager and useful extensions
+# Installs plugins in code-server pod
+
+- name: Create fish functions directory in pod
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      mkdir -p {{ fish_config_dir }}/functions
+  changed_when: false
+  tags: [fish, plugins]
+
+- name: Download Fisher plugin manager
+  ansible.builtin.shell:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      bash -c 'curl -sL https://raw.githubusercontent.com/jorgebucaran/fisher/main/functions/fisher.fish
+      -o {{ fish_config_dir }}/functions/fisher.fish'
+  changed_when: true
+  tags: [fish, plugins]
+
+- name: Check if fish_plugins file exists
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      test -f {{ fish_config_dir }}/fish_plugins
+  register: fish_plugins_exists
+  failed_when: false
+  changed_when: false
+  tags: [fish, plugins]
+
+- name: Create fish_plugins file with default plugins
+  ansible.builtin.shell:
+    cmd: |
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} -- \
+        bash -c 'cat > {{ fish_config_dir }}/fish_plugins << '\''PLUGEOF'\''
+      edc/bass
+      PatrickF1/fzf.fish
+      franciscolourenco/done
+      jorgebucaran/autopair.fish
+      PLUGEOF'
+  when: fish_plugins_exists.rc != 0
+  changed_when: true
+  tags: [fish, plugins]
+
+- name: Initialize Fisher plugin manager
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      fish -c 'source {{ fish_config_dir }}/functions/fisher.fish; fisher update'
+  environment:
+    TERM: dumb
+    NONINTERACTIVE: "1"
+  register: fisher_init
+  changed_when: "'Updated' in fisher_init.stdout"
+  tags: [fish, plugins]
+
+- name: List installed plugins
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      fish -c 'source {{ fish_config_dir }}/functions/fisher.fish; fisher list'
+  environment:
+    TERM: dumb
+    NONINTERACTIVE: "1"
+  register: plugin_list
+  changed_when: false
+  tags: [fish, plugins]
+
+- name: Display current plugins
+  ansible.builtin.debug:
+    msg: "Installed Fisher plugins: {{ plugin_list.stdout_lines }}"
+  tags: [fish, plugins]
+
+- name: Install Fish plugins
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      fish -c 'source {{ fish_config_dir }}/functions/fisher.fish; fisher install {{ item }}'
+  environment:
+    TERM: dumb
+    NONINTERACTIVE: "1"
+  loop: "{{ fisher_plugins }}"
+  register: plugin_install
+  changed_when: "'Installing' in plugin_install.stdout"
+  tags: [fish, plugins]
+
+- name: Final plugin list after installation
+  ansible.builtin.command:
+    cmd: >
+      microk8s.kubectl exec -n {{ code_server_namespace }} {{ codeserver_pod }} --
+      fish -c 'source {{ fish_config_dir }}/functions/fisher.fish; fisher list'
+  environment:
+    TERM: dumb
+    NONINTERACTIVE: "1"
+  register: final_plugin_list
+  changed_when: false
+  tags: [fish, plugins]
+
+- name: Display installed plugins
+  ansible.builtin.debug:
+    msg: |
+      Fish plugins installed successfully:
+      {{ final_plugin_list.stdout_lines | join('\n') }}
+
+      Plugins provide:
+      - bass: Run bash utilities from fish
+      - fzf.fish: Fuzzy finder integration
+      - done: Command completion notifications
+      - autopair.fish: Auto-close brackets and quotes
+  tags: [fish, plugins]

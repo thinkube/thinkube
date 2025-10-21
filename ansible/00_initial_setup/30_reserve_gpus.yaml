@@ -1,0 +1,754 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 30_reserve_gpus.yaml - Reserve GPUs for later passthrough to VMs
+#
+# Purpose:
+#   Configures a host system to keep one GPU for the host OS
+#   while reserving others for future passthrough configuration
+#
+# Requirements:
+#   - Host system should have multiple GPUs for this to be useful
+#   - If only one GPU is present, it will be kept for the host with no passthrough
+#
+# Variables:
+#   - host_gpu_type: GPU type to keep for host ('intel', 'amd', 'nvidia')
+#   - host_gpu_index: If multiple of the same type, which one to keep (0-based)
+#   - server_type: 'desktop' or 'headless' (determines X.org config needs)
+#
+# Run with:
+#   ansible-playbook -i inventory/inventory.yaml ansible/00_initial_setup/30_reserve_gpus.yaml -e "ansible_become_pass=$ANSIBLE_BECOME_PASSWORD"
+#
+# This should be the first playbook executed in systems with multiple GPUs
+
+- name: Reserve GPUs for Later Passthrough
+  hosts: baremetal
+  become: true
+  gather_facts: true
+  
+  vars:
+    # Default values that can be overridden in inventory
+    host_gpu_type: "amd"  # Which GPU to keep for host: 'intel', 'amd', 'nvidia'
+    host_gpu_index: 0     # If multiple of same type, which one to keep (0-based)
+    
+  tasks:
+    - name: Check if GPU passthrough should be configured
+      ansible.builtin.debug:
+        msg: "Skipping GPU passthrough configuration for {{ inventory_hostname }} - configure_gpu_passthrough is not true"
+      when: configure_gpu_passthrough is not defined or not configure_gpu_passthrough
+
+    - name: Skip host if GPU passthrough not needed
+      ansible.builtin.meta: end_host
+      when: configure_gpu_passthrough is not defined or not configure_gpu_passthrough
+
+    - name: Display setup information
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          🔧 Reserving GPUs for Passthrough ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          This playbook will configure the system to reserve GPUs
+          for future passthrough while keeping one GPU for the host OS.
+          
+          Host OS will use: {{ host_gpu_type }} GPU (index {{ host_gpu_index }})
+          All other GPUs will be reserved for passthrough.
+          
+          ═════════════════════════════════════════════════════════
+    
+    # Phase 1: Detect all GPUs in the system
+    - name: Detect all GPUs
+      ansible.builtin.shell: |
+        lspci -nnk | grep -A3 "VGA\|3D\|Display" | grep -v "Kernel driver in use" | grep -v "Kernel modules"
+      register: gpu_list
+      changed_when: false
+      
+    - name: Parse GPU list
+      ansible.builtin.set_fact:
+        detected_gpus: "{{ gpu_list.stdout_lines }}"
+        
+    - name: Display detected GPUs
+      ansible.builtin.debug:
+        msg: "Detected GPUs: {{ detected_gpus }}"
+    
+    # Phase 2: Identify GPU types and assign host/passthrough roles
+    - name: Identify GPU types
+      ansible.builtin.set_fact:
+        nvidia_gpus: "{{ detected_gpus | select('search', 'NVIDIA') | list }}"
+        amd_gpus: "{{ detected_gpus | select('search', 'AMD') | list }}"
+        intel_gpus: "{{ detected_gpus | select('search', 'Intel') | list }}"
+    
+    - name: Display GPU counts by type
+      ansible.builtin.debug:
+        msg: |
+          GPU Count by Type:
+          - NVIDIA: {{ nvidia_gpus | length }}
+          - AMD: {{ amd_gpus | length }}
+          - Intel: {{ intel_gpus | length }}
+    
+    # Determine if passthrough makes sense based on the server type
+    - name: Calculate total GPUs
+      ansible.builtin.set_fact:
+        total_gpus: "{{ nvidia_gpus | length + amd_gpus | length + intel_gpus | length }}"
+    
+    # Debug server_type variable
+    - name: Debug server_type
+      ansible.builtin.debug:
+        msg: "Server type for {{ inventory_hostname }}: {{ server_type | default('undefined') }}"
+        verbosity: 1
+    
+    # For desktop systems, require at least 2 GPUs (one for host, one for passthrough)
+    # For headless systems, allow single GPU passthrough (we need a special flag for this case)
+    - name: Determine if GPU passthrough is safe for this system
+      ansible.builtin.set_fact:
+        can_configure_passthrough: "{{ (total_gpus | int >= 2) or (server_type is defined and server_type == 'headless' and total_gpus | int == 1) }}"
+        single_gpu_passthrough: "{{ server_type is defined and server_type == 'headless' and total_gpus | int == 1 }}"
+    
+    - name: Display warning if skipping configuration
+      ansible.builtin.debug:
+        msg: |
+          WARNING: Only one GPU detected on a desktop system. Skipping passthrough configuration
+          to prevent rendering the system unusable. For headless servers, a single GPU can be
+          used for passthrough.
+      when: not can_configure_passthrough | bool and (server_type is defined and server_type == 'desktop' and total_gpus | int < 2)
+      
+    - name: Display single GPU passthrough on headless server
+      ansible.builtin.debug:
+        msg: |
+          NOTE: Single GPU detected on headless server {{ inventory_hostname }}. 
+          This GPU will be configured for passthrough since display capabilities 
+          are not needed on a headless server accessed via SSH.
+      when: can_configure_passthrough | bool and total_gpus | int == 1 and server_type is defined and server_type == 'headless'
+    
+    - name: Select GPUs for passthrough
+      ansible.builtin.set_fact:
+        passthrough_gpus: "{% if single_gpu_passthrough | bool %}{{ nvidia_gpus + amd_gpus + intel_gpus }}{% elif host_gpu_type == 'nvidia' %}{{ nvidia_gpus[:host_gpu_index] + nvidia_gpus[(host_gpu_index + 1):] + amd_gpus + intel_gpus }}{% elif host_gpu_type == 'amd' %}{{ amd_gpus[:host_gpu_index] + amd_gpus[(host_gpu_index + 1):] + nvidia_gpus + intel_gpus }}{% elif host_gpu_type == 'intel' %}{{ intel_gpus[:host_gpu_index] + intel_gpus[(host_gpu_index + 1):] + nvidia_gpus + amd_gpus }}{% endif %}"
+      when: can_configure_passthrough
+      
+    - name: Select Host GPU
+      ansible.builtin.set_fact:
+        host_gpu: >-
+          {% if single_gpu_passthrough | bool %}
+            ""
+          {% elif host_gpu_type == 'nvidia' and nvidia_gpus | length > host_gpu_index %}
+            {{ nvidia_gpus[host_gpu_index] }}
+          {% elif host_gpu_type == 'amd' and amd_gpus | length > host_gpu_index %}
+            {{ amd_gpus[host_gpu_index] }}
+          {% elif host_gpu_type == 'intel' and intel_gpus | length > host_gpu_index %}
+            {{ intel_gpus[host_gpu_index] }}
+          {% else %}
+            {% if nvidia_gpus | length > 0 %}
+              {{ nvidia_gpus[0] }}
+            {% elif amd_gpus | length > 0 %}
+              {{ amd_gpus[0] }}
+            {% elif intel_gpus | length > 0 %}
+              {{ intel_gpus[0] }}
+            {% else %}
+              ""
+            {% endif %}
+          {% endif %}
+      when: can_configure_passthrough
+    
+    - name: Display host GPU
+      ansible.builtin.debug:
+        msg: "Host GPU: {{ host_gpu }}"
+      when: can_configure_passthrough and host_gpu is defined
+    
+    # Extract host GPU PCI ID to exclude it from passthrough
+    - name: Extract host GPU PCI ID
+      ansible.builtin.set_fact:
+        host_gpu_pci_id: "{{ host_gpu | regex_findall('\\[[0-9a-f]{4}:[0-9a-f]{4}\\]') | first | regex_replace('\\[([0-9a-f]{4}:[0-9a-f]{4})\\]', '\\1') }}"
+      when: can_configure_passthrough and host_gpu is defined and host_gpu is search('\\[[0-9a-f]{4}:[0-9a-f]{4}\\]')
+      
+    # Check for assigned PCI slots in inventory
+    - name: Check if PCI slots are explicitly assigned in inventory
+      ansible.builtin.set_fact:
+        assigned_pci_slots: "{{ assigned_pci_slots | default([]) }}"
+      when: assigned_pci_slots is defined
+    
+    - name: Display assigned PCI slots from inventory
+      ansible.builtin.debug:
+        msg: |
+          PCI slots explicitly assigned for passthrough:
+          {{ assigned_pci_slots | default([]) | join(', ') }}
+      when: assigned_pci_slots is defined
+    
+    # Extract PCI IDs for passthrough GPUs based on assigned PCI slots
+    - name: Extract PCI IDs for assigned GPUs
+      ansible.builtin.set_fact:
+        gpu_pci_ids: "{{ gpu_pci_ids | default([]) + [detected_id] }}"
+      vars:
+        pci_slot: "{{ item | regex_search('^[0-9a-f]{2}:[0-9a-f]{2}\\.[0-9a-f]') | default('') }}"
+        detected_id: "{{ item | regex_findall('\\[[0-9a-f]{4}:[0-9a-f]{4}\\]') | first | regex_replace('\\[([0-9a-f]{4}:[0-9a-f]{4})\\]', '\\1') }}"
+      loop: "{{ nvidia_gpus + amd_gpus + intel_gpus }}"
+      when: >
+        assigned_pci_slots is defined and
+        assigned_pci_slots | length > 0 and
+        item is regex('\\[[0-9a-f]{4}:[0-9a-f]{4}\\]') and
+        pci_slot != '' and
+        (pci_slot | lower in assigned_pci_slots or
+         pci_slot | replace('.', ':') | lower in assigned_pci_slots)
+        
+    # Fallback: Skip PCI ID extraction when no slots are assigned
+    - name: Skip automatic GPU binding when no slots assigned
+      ansible.builtin.debug:
+        msg: |
+          No specific PCI slots assigned for passthrough.
+          Skipping automatic PCI ID extraction to prevent binding all GPUs.
+          Only GPUs explicitly listed in assigned_pci_slots will be configured for passthrough.
+      when: assigned_pci_slots is not defined or assigned_pci_slots | length == 0
+        
+    # Find audio devices only for assigned GPU slots
+    - name: Get associated audio devices for assigned GPUs
+      ansible.builtin.shell:
+        cmd: |
+          slots='{{ assigned_pci_slots | default([]) | join(" ") }}'
+          if [ -n "$slots" ]; then
+            for slot in $slots; do
+              audio_slot="${slot%.0}.1"
+              if lspci -n -s "$audio_slot" 2>/dev/null | grep -q "0403"; then
+                lspci -n -s "$audio_slot" | awk '{print $3}'
+              fi
+            done
+          else
+            echo ""
+          fi
+        executable: /bin/bash
+      register: audio_devices_result
+      changed_when: false
+      when: can_configure_passthrough
+      
+    # Add audio device IDs to the PCI IDs for passthrough
+    - name: Add audio device IDs to passthrough list
+      ansible.builtin.set_fact:
+        gpu_pci_ids: "{{ gpu_pci_ids + audio_devices_result.stdout_lines }}"
+      when: can_configure_passthrough and (audio_devices_result is defined and audio_devices_result.stdout != "")
+      
+    # Use a more direct approach for IOMMU group detection but only for GPUs in assigned slots
+    - name: Find all devices in the same IOMMU groups as assigned GPUs
+      ansible.builtin.shell: 
+        cmd: |
+          set -e
+          # Get GPU PCI slots from assigned slots in inventory
+          gpu_slots='{{ assigned_pci_slots | default([]) | join(" ") }}'
+          if [ -n "$gpu_slots" ]; then
+            for gpu in $gpu_slots; do
+              # Find IOMMU group
+              for group_dir in /sys/kernel/iommu_groups/*/devices/0000:$gpu; do
+                if [ -e "$group_dir" ]; then
+                  group=$(echo $group_dir | cut -d/ -f5)
+                  echo "IOMMU Group $group for GPU $gpu:"
+                  # List all devices in this group by vendor:device ID
+                  for dev in /sys/kernel/iommu_groups/$group/devices/*; do
+                    dev_addr=$(basename $dev)
+                    vendor_device=$(lspci -n -s $dev_addr | awk '{print $3}')
+                    if [ -n "$vendor_device" ]; then
+                      echo "$vendor_device"
+                    fi
+                  done
+                fi
+              done
+            done
+          else
+            # No assigned slots - don't process any IOMMU groups
+            echo ""
+          fi
+          
+          # Show PCI slot format for reference
+          echo -e "\nCurrent GPU PCI slots:"
+          lspci | grep -E "VGA|3D|Display"
+        executable: /bin/bash
+      register: iommu_devices_result
+      changed_when: false
+      when: can_configure_passthrough and (gpu_pci_ids is defined and gpu_pci_ids | length > 0)
+      
+    # Add IOMMU devices to passthrough list but exclude host GPU
+    - name: Add IOMMU devices to passthrough list
+      ansible.builtin.set_fact:
+        gpu_pci_ids: "{{ ((gpu_pci_ids + iommu_devices_result.stdout_lines | select('match', '^[0-9a-f]{4}:[0-9a-f]{4}$') | list) | unique | reject('equalto', host_gpu_pci_id) | list) }}"
+      when: 
+        - can_configure_passthrough
+        - iommu_devices_result is defined
+        - iommu_devices_result.stdout is defined
+        - iommu_devices_result.stdout != ""
+        - host_gpu_pci_id is defined
+      
+    # Display complete list of PCI IDs for VFIO binding
+    - name: Display complete list of PCI IDs for VFIO binding
+      ansible.builtin.debug:
+        msg: |
+          Complete list of PCI IDs for VFIO binding:
+          {{ gpu_pci_ids | sort | join(', ') }}
+          
+          This includes GPUs, audio controllers, and all other devices in the same IOMMU groups.
+          Host GPU PCI ID (excluded from VFIO binding): {{ host_gpu_pci_id | default('None') }}
+      when: can_configure_passthrough and (gpu_pci_ids is defined and gpu_pci_ids | length > 0)
+    
+    # Handle multiple GPU case
+    # The previous task now handles all PCI ID extraction
+      
+    # Extract the BusID from host_gpu if it matches the pattern
+    - name: Extract GPU BusID for X.org
+      ansible.builtin.shell: |
+        if echo "{{ host_gpu|default('') }}" | grep -qE "^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]"; then
+          echo "{{ host_gpu|string }}" | grep -oE "^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]"
+        else
+          echo ""
+        fi
+      register: gpu_busid_raw
+      changed_when: false
+      when: can_configure_passthrough and host_gpu is defined and host_gpu|string != ""
+      
+    # Format the BusID for X.org if it was successfully extracted
+    - name: Format BusID for X.org
+      ansible.builtin.set_fact:
+        xorg_busid: "PCI:{{ busid_parts[0]|int }}:{{ busid_parts[1]|int }}:{{ busid_parts[2]|int }}"
+      vars:
+        busid: "{{ gpu_busid_raw.stdout|default('') }}"
+        busid_parts:
+          - "{{ busid.split(':')[0]|default('0')|replace('0', '')|int|default(0) }}"
+          - "{{ busid.split(':')[1].split('.')[0]|default('0')|int|default(0) if ':' in busid else 0 }}"
+          - "{{ busid.split(':')[1].split('.')[1]|default('0')|int|default(0) if ':' in busid and '.' in busid.split(':')[1] else 0 }}"
+      when: can_configure_passthrough and gpu_busid_raw is defined and gpu_busid_raw.stdout|default('')|trim != ""
+      
+    - name: Display GPUs for passthrough
+      ansible.builtin.debug:
+        msg: |
+          GPUs selected for passthrough:
+          {% if assigned_pci_slots is defined and assigned_pci_slots|length > 0 %}
+          Only GPUs explicitly assigned in inventory:
+          {{ assigned_pci_slots | join(', ') }}
+          {% elif passthrough_gpus is defined %}
+          {{ passthrough_gpus | join('\n') }}
+          {% else %}
+          All GPUs
+          {% endif %}
+          
+          PCI IDs for VFIO:
+          {{ gpu_pci_ids | join(', ') }}
+      when: can_configure_passthrough and gpu_pci_ids is defined and gpu_pci_ids | length > 0
+    
+    # Phase 3: Enable IOMMU in GRUB
+    - name: Detect CPU vendor (needed for all cases)
+      ansible.builtin.set_fact:
+        is_amd_cpu: "{{ ansible_processor[0] is regex('AMD') }}"
+    
+    - name: Set IOMMU parameter based on CPU vendor
+      ansible.builtin.set_fact:
+        iommu_param: "{{ 'amd_iommu=on' if is_amd_cpu else 'intel_iommu=on' }}"
+    
+    - name: Check current GRUB configuration
+      ansible.builtin.slurp:
+        src: /etc/default/grub
+      register: grub_content
+    
+    - name: Parse current GRUB_CMDLINE_LINUX_DEFAULT
+      ansible.builtin.set_fact:
+        current_cmdline: "{{ (grub_content.content | b64decode | regex_search('GRUB_CMDLINE_LINUX_DEFAULT=\"([^\"]*)\"', '\\1')) | first | default('') }}"
+    
+    - name: Check if IOMMU is already configured
+      ansible.builtin.set_fact:
+        iommu_configured: "{{ current_cmdline is search('amd_iommu=on') or current_cmdline is search('intel_iommu=on') }}"
+        iommu_pt_configured: "{{ current_cmdline is search('iommu=pt') }}"
+    
+    - name: Remove incorrect IOMMU parameter if present
+      ansible.builtin.replace:
+        path: /etc/default/grub
+        regexp: '^(GRUB_CMDLINE_LINUX_DEFAULT=".*?){{ "intel_iommu=on" if is_amd_cpu else "amd_iommu=on" }}(.*")'
+        replace: '\1\2'
+        backup: yes
+      when: iommu_configured and current_cmdline is search("intel_iommu=on" if is_amd_cpu else "amd_iommu=on")
+      register: grub_cleaned
+    
+    - name: Add correct IOMMU parameter to GRUB
+      ansible.builtin.replace:
+        path: /etc/default/grub
+        regexp: '^(GRUB_CMDLINE_LINUX_DEFAULT=")(.*)(")'
+        replace: '\1\2 {{ iommu_param }}\3'
+        backup: yes
+      when: not iommu_configured or grub_cleaned.changed | default(false)
+      register: grub_iommu_updated
+    
+    - name: Add iommu=pt parameter to GRUB
+      ansible.builtin.replace:
+        path: /etc/default/grub
+        regexp: '^(GRUB_CMDLINE_LINUX_DEFAULT=")(.*)(")'
+        replace: '\1\2 iommu=pt\3'
+        backup: yes
+      when: not iommu_pt_configured
+      register: grub_pt_updated
+    
+    - name: Set grub_updated fact
+      ansible.builtin.set_fact:
+        grub_updated:
+          changed: "{{ grub_iommu_updated.changed | default(false) or grub_pt_updated.changed | default(false) or grub_cleaned.changed | default(false) }}"
+    
+    # Phase 4: Configure VFIO modules
+    # For hosts with specifically assigned PCI slots, create a base VFIO configuration
+    - name: Create VFIO configuration - general settings
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/vfio.conf
+        content: |
+          # Basic VFIO configuration
+          options vfio-pci disable_vga=1
+        mode: '0644'
+      when: can_configure_passthrough
+      
+    # Create audio unbinding configuration to prevent snd_hda_intel from binding to GPU audio devices
+    - name: Create audio unbinding configuration for NVIDIA GPU audio devices
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/nvidia-audio-unbind.conf
+        content: |
+          # Prevent snd_hda_intel from binding to NVIDIA GPU audio devices
+          # This ensures the audio components of passthrough GPUs stay bound to vfio-pci
+          
+          # Specific no_bind configuration for assigned audio devices
+          {% if assigned_pci_slots is defined and assigned_pci_slots | length > 0 %}
+          {% for slot in assigned_pci_slots %}
+          {% set audio_slot = slot | replace('.0', '.1') %}
+          options snd_hda_intel id=GPU{{ loop.index }},{{ audio_slot }} no_bind=1
+          {% endfor %}
+          {% endif %}
+        mode: '0644'
+      when: >
+        can_configure_passthrough and
+        assigned_pci_slots is defined and
+        assigned_pci_slots | length > 0
+        
+    # Create udev rule to prevent audio devices from binding to snd_hda_intel
+    - name: Create udev rule for GPU audio devices
+      ansible.builtin.template:
+        src: templates/vfio-pci-audio.rules.j2
+        dest: /etc/udev/rules.d/80-vfio-pci-audio.rules
+        mode: '0644'
+      when: >
+        can_configure_passthrough and
+        assigned_pci_slots is defined and
+        assigned_pci_slots | length > 0
+        
+    # Create audio binding script for udev rule
+    - name: Create audio binding script for udev
+      ansible.builtin.template:
+        src: templates/vfio-bind-audio.sh.j2
+        dest: /usr/local/bin/vfio-bind-audio.sh
+        mode: '0755'
+      when: >
+        can_configure_passthrough and
+        assigned_pci_slots is defined and
+        assigned_pci_slots | length > 0
+      
+    # Create dedicated binding scripts for specific PCI slots
+    - name: Create dedicated VFIO binding script for each slot
+      ansible.builtin.template:
+        src: templates/vfio-bind.sh.j2
+        dest: "/usr/local/bin/vfio-bind-{{ item | replace(':', '-') }}.sh"
+        mode: '0755'
+        owner: root
+        group: root
+      loop: "{{ assigned_pci_slots | default([]) }}"
+      vars:
+        pci_slot: "{{ item }}"
+      when: >
+        assigned_pci_slots is defined and
+        assigned_pci_slots | length > 0
+
+    # Create systemd service to run the binding script at boot
+    - name: Create systemd service for VFIO binding
+      ansible.builtin.template:
+        src: templates/vfio-bind.service.j2
+        dest: "/etc/systemd/system/vfio-bind-{{ item | replace(':', '-') }}.service"
+        mode: '0644'
+      vars:
+        pci_slot: "{{ item }}"
+      loop: "{{ assigned_pci_slots | default([]) }}"
+      when: >
+        assigned_pci_slots is defined and
+        assigned_pci_slots | length > 0
+        
+    # Enable the systemd service
+    - name: Enable VFIO binding service
+      ansible.builtin.systemd:
+        name: "vfio-bind-{{ item | replace(':', '-') }}.service"
+        enabled: yes
+        daemon_reload: yes
+      loop: "{{ assigned_pci_slots | default([]) }}"
+      when: >
+        assigned_pci_slots is defined and
+        assigned_pci_slots | length > 0
+    
+    # Extract ALL GPU PCI IDs on the system for duplicate detection
+    - name: Extract all GPU PCI IDs for duplicate detection
+      ansible.builtin.set_fact:
+        all_gpu_pci_ids: "{{ all_gpu_pci_ids | default([]) + [detected_id] }}"
+      vars:
+        detected_id: "{{ item | regex_findall('\\[[0-9a-f]{4}:[0-9a-f]{4}\\]') | first | regex_replace('\\[([0-9a-f]{4}:[0-9a-f]{4})\\]', '\\1') }}"
+      loop: "{{ nvidia_gpus + amd_gpus + intel_gpus }}"
+      when: item is regex('\\[[0-9a-f]{4}:[0-9a-f]{4}\\]')
+
+    # Check if any assigned GPU has a PCI ID that appears multiple times in the system
+    - name: Check for duplicate PCI IDs between assigned and all GPUs
+      ansible.builtin.set_fact:
+        has_duplicate_pci_ids: false
+      
+    - name: Check each assigned GPU PCI ID against all system GPUs
+      ansible.builtin.set_fact:
+        has_duplicate_pci_ids: true
+      when: >
+        gpu_pci_ids is defined and
+        all_gpu_pci_ids is defined and
+        item in gpu_pci_ids and
+        all_gpu_pci_ids | select('equalto', item) | list | length > 1
+      loop: "{{ all_gpu_pci_ids | default([]) | unique }}"
+
+    - name: Display warning if duplicate PCI IDs detected
+      ansible.builtin.debug:
+        msg: |
+          WARNING: Identical GPUs detected (duplicate PCI IDs)
+          PCI IDs: {{ gpu_pci_ids | join(', ') }}
+          The modprobe configuration will NOT use PCI IDs to avoid binding all identical GPUs.
+          Only the systemd services will bind the specific PCI slots: {{ assigned_pci_slots | join(', ') }}
+      when: 
+        - has_duplicate_pci_ids | default(false)
+        - gpu_pci_ids is defined
+
+    # Create VFIO configuration with specific PCI IDs only for assigned slots
+    - name: Create VFIO configuration - specific slots only
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/vfio-pci-ids.conf
+        content: |
+          # VFIO configuration for specific GPU passthrough
+          # Only bind GPUs that are explicitly assigned for passthrough
+          {% if assigned_pci_slots is defined and assigned_pci_slots | length > 0 and gpu_pci_ids is defined and gpu_pci_ids | length > 0 %}
+          {% if has_duplicate_pci_ids | default(false) %}
+          # WARNING: Duplicate PCI IDs detected (identical GPUs)
+          # Using driver override method instead of PCI IDs to avoid binding all identical GPUs
+          # GPU passthrough is handled by per-device systemd services
+          {% else %}
+          # Using PCI IDs from assigned slots only
+          # PCI IDs: {{ gpu_pci_ids | join(', ') }}
+          options vfio-pci ids={{ gpu_pci_ids | select('match', '^[0-9a-f]{4}:[0-9a-f]{4}$') | list | join(',') }}
+          {% endif %}
+          {% else %}
+          # No specific slots assigned - VFIO will not auto-bind any devices
+          # Devices must be manually bound if needed
+          {% endif %}
+        mode: '0644'
+      when: can_configure_passthrough
+    
+    - name: Ensure VFIO modules are loaded early
+      ansible.builtin.lineinfile:
+        path: /etc/initramfs-tools/modules
+        line: "{{ item }}"
+        create: yes
+      loop:
+        - "vfio"
+        - "vfio_iommu_type1"
+        - "vfio_pci"
+        - "vfio_virqfd"
+      when: assigned_pci_slots is defined and assigned_pci_slots | length > 0
+    
+    # Ensure audio module loads at boot to prevent loss of system audio
+    - name: Check if system uses HD Audio
+      ansible.builtin.shell: |
+        lspci -k | grep -i "audio" | grep -E "snd_hda_intel|hda" || true
+      register: hda_audio_check
+      changed_when: false
+      
+    - name: Ensure snd_hda_intel module loads at boot (if HD Audio is present)
+      ansible.builtin.lineinfile:
+        path: /etc/modules
+        line: "snd_hda_intel"
+        create: yes
+      when: 
+        - nvidia_gpus | length > 0
+        - hda_audio_check.stdout | length > 0
+    
+    # Phase 5: Configure GPU drivers for passthrough devices
+    # Only blacklist nouveau (for all systems)
+    - name: Only blacklist nouveau driver
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/blacklist-nouveau.conf
+        content: |
+          # Only blacklist the open source nvidia driver (nouveau)
+          # to allow NVIDIA proprietary driver to load
+          blacklist nouveau
+        mode: '0644'
+      when: nvidia_gpus | length > 0
+      
+    # Add vfio-pci driver options to control driver binding
+    - name: Configure VFIO binding priority
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/nvidia-vfio.conf
+        content: |
+          # Set VFIO to load first, so it can claim devices based on configuration
+          # before NVIDIA driver loads
+          softdep nvidia pre: vfio-pci
+        mode: '0644'
+      when: nvidia_gpus | length > 0
+      
+    - name: Blacklist AMD drivers if AMD GPUs are for passthrough
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/blacklist-amdgpu.conf
+        content: |
+          blacklist amdgpu
+          blacklist radeon
+        mode: '0644'
+      when: >
+        amd_gpus | length > 0 and
+        (single_gpu_passthrough or host_gpu_type != 'amd' or amd_gpus | length > 1)
+      
+    # Phase 6: Configure X.org to use the host GPU (for desktop systems)
+    - name: Generate Xorg configuration
+      ansible.builtin.template:
+        src: templates/xorg.conf.j2
+        dest: /etc/X11/xorg.conf
+        mode: '0644'
+      vars:
+        xorg_driver: >-
+          {% if host_gpu_type == 'nvidia' %}nvidia{% elif host_gpu_type == 'amd' %}amdgpu{% elif host_gpu_type == 'intel' %}intel{% endif %}
+      when: >
+        can_configure_passthrough and
+        server_type is defined and
+        server_type == 'desktop' and
+        host_gpu is defined and
+        host_gpu != ""
+    
+    - name: Skip X.org configuration for headless servers
+      ansible.builtin.debug:
+        msg: "Skipping X.org configuration for headless server {{ inventory_hostname }}"
+      when: server_type is defined and server_type == 'headless'
+    
+    # Phase 7: Update system
+    - name: Update initramfs
+      ansible.builtin.command: update-initramfs -u
+      when: grub_updated.changed | default(false) or (assigned_pci_slots is defined and assigned_pci_slots | length > 0)
+    
+    - name: Update GRUB
+      ansible.builtin.command: update-grub
+      when: grub_updated.changed | default(false)
+    
+    # Phase 8: Output useful debugging info
+    - name: Save GPU information for later verification
+      ansible.builtin.copy:
+        dest: /var/tmp/gpu_passthrough_info.txt
+        content: |
+          # GPU Passthrough Configuration for {{ inventory_hostname }}
+          # Generated on {{ ansible_date_time.date }} at {{ ansible_date_time.time }}
+          
+          ## All Detected GPUs
+          {{ detected_gpus | join('\n') }}
+          
+          ## GPU Types
+          NVIDIA: {{ nvidia_gpus | length }}
+          AMD: {{ amd_gpus | length }}
+          Intel: {{ intel_gpus | length }}
+          
+          ## Server Type
+          {{ server_type | default('unknown') }}
+          
+          ## Single GPU Passthrough Mode
+          {{ single_gpu_passthrough | default(false) }}
+          
+          {% if not single_gpu_passthrough | default(false) %}
+          ## Host GPU
+          {{ host_gpu | default('None specified') }}
+          
+          ## GPUs Reserved for Passthrough
+          {% if passthrough_gpus is defined %}
+          {% for gpu in passthrough_gpus %}
+          {{ gpu }}
+          {% endfor %}
+          {% else %}
+          None
+          {% endif %}
+          {% else %}
+          ## All GPUs Reserved for Passthrough (Headless mode)
+          {{ detected_gpus | join('\n') }}
+          {% endif %}
+          
+          ## PCI IDs for VFIO
+          {% if gpu_pci_ids is defined and gpu_pci_ids | length > 0 %}
+          {{ gpu_pci_ids | join(', ') }}
+          {% else %}
+          None
+          {% endif %}
+          
+          ## X.org Configuration
+          {% if server_type is defined and server_type == 'desktop' %}
+          Driver: {{ xorg_driver | default('Not specified') }}
+          BusID: {{ xorg_busid | default('Not specified') }}
+          {% else %}
+          Not applicable (headless server)
+          {% endif %}
+          
+          ## CPU Type
+          {{ is_amd_cpu | ternary('AMD', 'Intel') }}
+          
+          ## Assigned PCI Slots
+          {% if assigned_pci_slots is defined and assigned_pci_slots | length > 0 %}
+          {{ assigned_pci_slots | join(', ') }}
+          {% else %}
+          None specifically assigned
+          {% endif %}
+        mode: '0644'
+    
+    # Phase 9: Display completion message
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: >-
+          
+          ═════════════════════════════════════════════════════════
+          {% if can_configure_passthrough | bool and gpu_pci_ids is defined and gpu_pci_ids | length > 0 %}
+          ✅ GPU Reservation Complete ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          The system has been configured to reserve GPUs for future passthrough:
+          - IOMMU is enabled with the {{ is_amd_cpu | ternary('AMD', 'Intel') }} IOMMU driver
+          - {{ gpu_pci_ids | length }} GPUs have been reserved for passthrough
+          - VFIO is configured for IDs: {{ gpu_pci_ids | join(', ') }}
+          {% if single_gpu_passthrough | default(false) %}
+          - All GPUs reserved for passthrough (headless server)
+          {% else %}
+          - Host will use the {{ host_gpu_type | upper }} GPU
+          {% endif %}
+          
+          ⚠️ IMPORTANT: A system reboot is required for changes to take effect.
+          
+          NEXT STEPS:
+          1. Reboot the system: sudo reboot
+          2. After reboot, verify with: 38_test_gpu_reservation.yaml
+          3. Continue with other deployment playbooks
+          
+          {% elif single_gpu_passthrough | default(false) %}
+          ✅ Single GPU Passthrough Configured ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          The single NVIDIA GPU on headless server {{ inventory_hostname }} has been
+          configured for passthrough:
+          - IOMMU is enabled with the {{ is_amd_cpu | ternary('AMD', 'Intel') }} IOMMU driver
+          - GPU will be bound to VFIO driver after reboot
+          
+          ⚠️ IMPORTANT: A system reboot is required for changes to take effect.
+          
+          NEXT STEPS:
+          1. Reboot the system: sudo reboot
+          2. After reboot, verify with: 38_test_gpu_reservation.yaml
+          3. Continue with other deployment playbooks
+          
+          {% else %}
+          ⚠️ GPU Reservation Skipped ({{ inventory_hostname }})
+          ═════════════════════════════════════════════════════════
+          
+          GPU passthrough configuration was skipped because only {{ total_gpus }} 
+          GPU(s) were detected on a desktop system. At least 2 GPUs are required 
+          for passthrough on desktop systems.
+          
+          The system configuration was not modified.
+          
+          NEXT STEPS:
+          1. Continue with other deployment playbooks
+          
+          {% endif %}
+          ═════════════════════════════════════════════════════════

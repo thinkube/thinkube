@@ -1,0 +1,104 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/pgadmin/10_configure_keycloak.yaml
+# Description:
+#   Configure Keycloak client for pgAdmin authentication
+#   This playbook only creates the client in Keycloak
+#
+# Requirements:
+#   - Kubernetes cluster with MicroK8s
+#   - Keycloak instance running and accessible
+#   - KEYCLOAK_ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/pgadmin/11_configure_keycloak.yaml
+#
+# Variables from inventory:
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username for Keycloak
+#   - pgadmin_hostname: Hostname for pgAdmin access
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Keycloak client "pgadmin" for realm "kubernetes"
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    ###################################################################
+    # Get admin password from environment
+    ###################################################################
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    
+    ###################################################################
+    # Keycloak connection info
+    ###################################################################
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ admin_password }}"
+    keycloak_validate_certs: false
+
+    ###################################################################
+    # Setup configuration for the keycloak_setup role
+    ###################################################################
+    keycloak_setup_client_id: "pgadmin"
+    
+    keycloak_setup_client_body:
+      clientId: "pgadmin"
+      enabled: true
+      protocol: "openid-connect"
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      publicClient: false
+      redirectUris: 
+        - "https://{{ pgadmin_hostname }}/oauth2/authorize"
+      webOrigins:
+        - "https://{{ pgadmin_hostname }}"
+
+  tasks:
+    ###################################################################
+    # Setup pgAdmin in Keycloak
+    ###################################################################
+    - name: Create pgAdmin client in Keycloak
+      include_role:
+        name: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ keycloak_setup_client_id }}"
+        keycloak_client_body: "{{ keycloak_setup_client_body }}"
+
+    ###################################################################
+    # Configure protocol mapper to override preferred_username with email
+    ###################################################################
+    - name: Configure protocol mapper for preferred_username
+      include_role:
+        name: keycloak/keycloak_mapper
+      vars:
+        keycloak_mapper_target_type: "client"
+        keycloak_mapper_target_uuid: "{{ keycloak_client_uuid }}"
+        keycloak_mapper_body:
+          name: "email-as-preferred-username"
+          protocol: "openid-connect"
+          protocolMapper: "oidc-usermodel-property-mapper"
+          consentRequired: false
+          config:
+            "user.attribute": "email"
+            "claim.name": "preferred_username"
+            "jsonType.label": "String"
+            "id.token.claim": "true"
+            "access.token.claim": "true"
+            "userinfo.token.claim": "true"
+
+    ###################################################################
+    # Final output
+    ###################################################################
+    - name: Final info
+      ansible.builtin.debug:
+        msg:
+          - "Realm => {{ keycloak_realm }}"
+          - "Client => '{{ keycloak_setup_client_id }}' => id={{ keycloak_client_uuid }}"
+          - "Redirect URIs => {{ keycloak_setup_client_body.redirectUris }}"
+          - "Client secret => {{ keycloak_client_secret }}"
+      when: keycloak_client_uuid is defined and keycloak_client_secret is defined

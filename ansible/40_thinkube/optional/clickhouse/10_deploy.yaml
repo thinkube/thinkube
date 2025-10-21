@@ -1,0 +1,280 @@
+---
+# ansible/40_thinkube/optional/clickhouse/10_deploy.yaml
+# Description:
+#   Deploy ClickHouse analytics database on Kubernetes with external access
+#   Provides analytics capabilities for CVAT and other services
+#   Configures both HTTP (port 8123) and native TCP (port 9000) access
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - NGINX Ingress Controller with TCP passthrough support
+#   - Wildcard TLS certificate in default namespace
+#   - Helm must be available
+#   - ADMIN_PASSWORD environment variable must be set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/clickhouse/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#   - helm_bin: Path to helm binary
+#   - admin_username: Admin username
+#   - ingress_namespace: Namespace for ingress controller
+#   - primary_ingress_service: Ingress controller service name
+#   - primary_ingress_class: Ingress class name
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy ClickHouse on Kubernetes
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    clickhouse_namespace: clickhouse
+    # Get admin password from environment
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    clickhouse_hostname: "clickhouse.{{ domain_name }}"
+    clickhouse_http_port: 8123
+    clickhouse_native_port: 9000
+    clickhouse_tls_secret_name: "{{ clickhouse_namespace }}-tls-secret"
+    ingress_tcp_configmap_name: "primary-ingress-ingress-nginx-tcp"
+
+  tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+          - admin_username is defined
+          - admin_password is defined and admin_password != ""
+        fail_msg: "Required variables are not defined. Please check your inventory or environment."
+
+    - name: Create ClickHouse namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ clickhouse_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Add Altinity Helm repository
+      kubernetes.core.helm_repository:
+        binary_path: "{{ helm_bin }}"
+        name: altinity
+        repo_url: https://helm.altinity.com
+
+    - name: Deploy ClickHouse using Altinity chart
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        name: clickhouse
+        chart_ref: altinity/clickhouse
+        release_namespace: "{{ clickhouse_namespace }}"
+        kubeconfig: "{{ kubeconfig }}"
+        create_namespace: false
+        values:
+          clickhouse:
+            replicasCount: 1
+            shardsCount: 1
+            defaultUser:
+              password: "{{ admin_password }}"
+              allowExternalAccess: true
+            persistence:
+              enabled: true
+              size: 10Gi
+              storageClass: microk8s-hostpath
+
+    - name: Wait for ClickHouse to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ clickhouse_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=clickhouse
+      register: clickhouse_pods
+      until:
+        - clickhouse_pods.resources is defined
+        - clickhouse_pods.resources | length > 0
+        - clickhouse_pods.resources[0].status.phase == "Running"
+      retries: 30
+      delay: 10
+
+    ###########################################################################
+    # Configure external access via Ingress
+    ###########################################################################
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to ClickHouse namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ clickhouse_tls_secret_name }}"
+            namespace: "{{ clickhouse_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Create HTTP Ingress for ClickHouse
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: clickhouse-http-ingress
+            namespace: "{{ clickhouse_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+              nginx.ingress.kubernetes.io/proxy-body-size: "0"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ clickhouse_hostname }}"
+                secretName: "{{ clickhouse_tls_secret_name }}"
+            rules:
+              - host: "{{ clickhouse_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: clickhouse-clickhouse
+                          port:
+                            number: "{{ clickhouse_http_port }}"
+
+    - name: Configure NGINX Ingress TCP passthrough for ClickHouse native protocol
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch configmap {{ ingress_tcp_configmap_name }} \
+          -n {{ ingress_namespace }} \
+          --type=merge \
+          -p='{"data":{"{{ clickhouse_native_port }}":"{{ clickhouse_namespace }}/clickhouse-clickhouse:{{ clickhouse_native_port }}"}}'
+      become: true
+      register: tcp_passthrough
+      changed_when: "'configured' in tcp_passthrough.stdout or tcp_passthrough.rc == 0"
+
+    - name: Restart NGINX Ingress controller to pick up TCP config changes
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout restart deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }}
+      become: true
+      register: rollout_restart
+
+    - name: Wait for Ingress controller to restart
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }} --timeout=60s
+      become: true
+      register: rollout_status
+      failed_when: rollout_status.rc != 0
+
+    - name: Check if ClickHouse native port is already exposed in Ingress deployment
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.template.spec.containers[0].ports[*].containerPort}' | grep -q "{{ clickhouse_native_port }}"
+      become: true
+      register: port_check
+      changed_when: false
+      failed_when: false
+
+    - name: Patch NGINX Ingress controller deployment to expose ClickHouse native port
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} \
+          --type=json \
+          -p='[
+            {
+              "op": "add",
+              "path": "/spec/template/spec/containers/0/ports/-",
+              "value": {
+                "name": "ch-{{ clickhouse_native_port }}",
+                "containerPort": {{ clickhouse_native_port }},
+                "hostPort": {{ clickhouse_native_port }},
+                "protocol": "TCP"
+              }
+            }
+          ]'
+      become: true
+      register: patch_deploy
+      changed_when: "'patched' in patch_deploy.stdout or patch_deploy.rc == 0"
+      when: port_check.rc != 0
+
+    - name: Check if ClickHouse native port is already exposed in Ingress service
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get service -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.ports[*].port}' | grep -q "{{ clickhouse_native_port }}"
+      become: true
+      register: service_port_check
+      changed_when: false
+      failed_when: false
+
+    - name: Patch NGINX Ingress controller service to expose ClickHouse native port
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch service -n {{ ingress_namespace }} {{ primary_ingress_service }} \
+          --type=json \
+          -p='[
+            {
+              "op": "add",
+              "path": "/spec/ports/-",
+              "value": {
+                "name": "ch-{{ clickhouse_native_port }}",
+                "port": {{ clickhouse_native_port }},
+                "targetPort": {{ clickhouse_native_port }},
+                "protocol": "TCP"
+              }
+            }
+          ]'
+      become: true
+      register: patch_service
+      changed_when: "'patched' in patch_service.stdout or patch_service.rc == 0"
+      when: service_port_check.rc != 0
+
+    - name: Wait for changes to propagate
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Create ClickHouse config from template
+      ansible.builtin.template:
+        src: templates/clickhouse-config.xml.j2
+        dest: /tmp/clickhouse-config.xml
+        mode: '0600'
+      no_log: true
+
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy ClickHouse config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.clickhouse-client
+        {{ kubectl_bin }} cp /tmp/clickhouse-config.xml code-server/{{ code_server_pod.stdout }}:/home/thinkube/.clickhouse-client/config.xml
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.clickhouse-client/config.xml
+        rm -f /tmp/clickhouse-config.xml
+        echo '✅ ClickHouse CLI configured in code-server'
+      no_log: true
+
+    - name: Display ClickHouse connection info
+      ansible.builtin.debug:
+        msg:
+          - "ClickHouse has been deployed successfully!"
+          - "External HTTPS URL: https://{{ clickhouse_hostname }}"
+          - "Native TCP: {{ clickhouse_hostname }}:{{ clickhouse_native_port }}"
+          - "Service: clickhouse-clickhouse-cluster.{{ clickhouse_namespace }}.svc.cluster.local"
+          - "HTTP Port: {{ clickhouse_http_port }}"
+          - "Native Port: {{ clickhouse_native_port }}"
+          - "Default user: default"
+          - "Password: (from ADMIN_PASSWORD)"

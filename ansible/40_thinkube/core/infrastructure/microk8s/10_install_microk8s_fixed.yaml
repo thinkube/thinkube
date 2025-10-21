@@ -1,0 +1,297 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Install and Configure MicroK8s Control Node - FIXED VERSION
+# This version properly configures MicroK8s for multi-node operation
+#
+# Key fixes:
+# - Does not modify k8s-dqlite listen configuration (uses Unix socket)
+# - Ensures cluster-agent is properly configured for worker joins
+# - Opens required firewall ports if needed
+
+- name: Install and Configure MicroK8s on Control Node
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    node_ip: "{{ lan_ip }}"
+    user: "{{ system_username }}"
+    kube_config_dir: "{{ user_home }}/.kube"
+    
+    # Required ports for MicroK8s cluster
+    microk8s_ports:
+      - 16443  # API server
+      - 10250  # kubelet
+      - 10255  # kubelet read-only
+      - 25000  # cluster-agent
+      - 12379  # etcd client
+      - 10257  # kube-controller
+      - 10259  # kube-scheduler
+      - 19001  # dqlite
+
+    # MicroK8s addons configuration
+    microk8s_addons:
+      required:
+        - dns
+        - storage
+        - helm3
+      optional:
+        - dashboard
+
+    # Thinkube alias system integration
+    user_home: "/home/{{ user }}"
+    thinkube_alias_dir: "{{ user_home }}/.thinkube_shared_shell/aliases"
+    kubectl_aliases_file: "{{ thinkube_alias_dir }}/kubectl_aliases.json"
+    helm_aliases_file: "{{ thinkube_alias_dir }}/helm_aliases.json"
+
+    # Wrapper script locations
+    local_bin_dir: "{{ user_home }}/.local/bin"
+
+  tasks:
+    - name: Ensure snapd is running
+      ansible.builtin.systemd:
+        name: snapd
+        state: started
+        enabled: true
+      become: true
+      tags:
+        - setup
+        - snapd
+
+    - name: Wait for snapd initialization
+      ansible.builtin.wait_for:
+        timeout: 10
+      tags:
+        - setup
+        - snapd
+
+    - name: Install MicroK8s
+      ansible.builtin.command: snap install microk8s --classic
+      register: snap_install
+      changed_when: "'already installed' not in snap_install.stderr"
+      become: true
+      tags:
+        - setup
+        - microk8s
+
+    - name: Add user to microk8s group
+      ansible.builtin.user:
+        name: "{{ user }}"
+        groups: microk8s
+        append: true
+      become: true
+      notify: Refresh user groups
+      tags:
+        - setup
+        - config
+
+    - name: Create .kube directory with proper permissions
+      ansible.builtin.file:
+        path: "{{ kube_config_dir }}"
+        state: directory
+        mode: '0700'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+      tags:
+        - config
+
+    - name: Create .local/bin directory
+      ansible.builtin.file:
+        path: "{{ local_bin_dir }}"
+        state: directory
+        mode: '0755'
+      tags:
+        - config
+
+    - name: Stop MicroK8s for configuration
+      ansible.builtin.command: microk8s stop
+      register: stop_result
+      changed_when: stop_result.rc == 0
+      become: true
+      tags:
+        - config
+
+    - name: Configure node IP for kubelet
+      ansible.builtin.lineinfile:
+        path: /var/snap/microk8s/current/args/kubelet
+        line: "--node-ip={{ node_ip }}"
+        create: true
+        mode: '0644'
+      become: true
+      notify: Restart kubelite
+      tags:
+        - config
+        
+    - name: Configure API server advertise address
+      ansible.builtin.lineinfile:
+        path: /var/snap/microk8s/current/args/kube-apiserver
+        line: "--advertise-address={{ node_ip }}"
+        create: false
+        mode: '0644'
+      become: true
+      notify: Restart kubelite
+      tags:
+        - config
+        
+    # CRITICAL: Configure cluster-agent to bind to external IP for worker joins
+    - name: Ensure cluster-agent binds to all interfaces
+      ansible.builtin.lineinfile:
+        path: /var/snap/microk8s/current/args/cluster-agent
+        line: "--bind=0.0.0.0:25000"
+        create: true
+        mode: '0644'
+      become: true
+      tags:
+        - config
+        - cluster-agent
+
+    # Ensure firewall allows MicroK8s traffic
+    - name: Check if ufw is active
+      ansible.builtin.command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+      become: true
+      tags:
+        - firewall
+
+    - name: Allow MicroK8s ports through firewall
+      ansible.builtin.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: "{{ microk8s_ports }}"
+      become: true
+      when: "'Status: active' in ufw_status.stdout"
+      tags:
+        - firewall
+
+    - name: Allow traffic from cluster nodes
+      ansible.builtin.ufw:
+        rule: allow
+        src: "{{ hostvars[item]['lan_ip'] }}"
+      loop: "{{ groups['microk8s'] }}"
+      become: true
+      when: 
+        - "'Status: active' in ufw_status.stdout"
+        - hostvars[item]['lan_ip'] is defined
+        - hostvars[item]['lan_ip'] != node_ip
+      tags:
+        - firewall
+
+    - name: Start MicroK8s
+      ansible.builtin.command: microk8s start
+      register: start_result
+      changed_when: start_result.rc == 0
+      become: true
+      tags:
+        - config
+
+    - name: Wait for MicroK8s to be ready
+      ansible.builtin.command: microk8s status --wait-ready
+      register: status_result
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: status_result.rc == 0
+      failed_when: status_result.rc != 0
+      become: true
+      tags:
+        - config
+        - verify
+
+    - name: Verify MicroK8s installation
+      ansible.builtin.command: "/snap/bin/microk8s.kubectl version --client"
+      register: kubectl_version
+      changed_when: false
+      become: true
+      tags:
+        - verify
+
+    - name: Configure kubectl access
+      ansible.builtin.shell: |
+        microk8s config > {{ kube_config_dir }}/config
+        chmod 600 {{ kube_config_dir }}/config
+        chown {{ user }}:{{ user }} {{ kube_config_dir }}/config
+      become: true
+      tags:
+        - config
+        - kubectl
+
+    # Enable required addons
+    - name: Enable required MicroK8s addons
+      ansible.builtin.command: microk8s enable {{ item }}
+      register: enable_result
+      changed_when: "'already enabled' not in enable_result.stdout"
+      become: true
+      loop: "{{ microk8s_addons.required }}"
+      tags:
+        - addons
+
+    - name: Wait for DNS to be ready
+      ansible.builtin.command: microk8s kubectl get pods -n kube-system -l k8s-app=kube-dns
+      register: dns_pods
+      until: "'Running' in dns_pods.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+      become: true
+      tags:
+        - addons
+        - verify
+
+    # Create wrapper scripts
+    - name: Create kubectl wrapper script
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          # Wrapper script for kubectl using MicroK8s
+          exec /snap/bin/microk8s.kubectl "$@"
+        dest: "{{ local_bin_dir }}/kubectl"
+        mode: '0755'
+      tags:
+        - wrappers
+
+    - name: Create helm wrapper script
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          # Wrapper script for helm using MicroK8s
+          exec /snap/bin/microk8s.helm3 "$@"
+        dest: "{{ local_bin_dir }}/helm"
+        mode: '0755'
+      tags:
+        - wrappers
+
+    # Verify cluster is ready for workers
+    - name: Verify cluster-agent is listening
+      ansible.builtin.shell: |
+        ss -tlnp | grep :25000 || netstat -tlnp | grep :25000
+      register: cluster_agent_check
+      changed_when: false
+      become: true
+      failed_when: "':25000' not in cluster_agent_check.stdout"
+      tags:
+        - verify
+        - cluster-agent
+
+    - name: Display installation status
+      ansible.builtin.debug:
+        msg:
+          - "MicroK8s control node installed successfully"
+          - "Node IP: {{ node_ip }}"
+          - "Kubectl version: {{ kubectl_version.stdout }}"
+          - "Cluster agent listening: {{ cluster_agent_check.stdout }}"
+          - ""
+          - "NOTE: User may need to log out and back in for group membership to take effect"
+          - "NOTE: Workers can now join using port 25000"
+
+  handlers:
+    - name: Refresh user groups
+      ansible.builtin.debug:
+        msg: "User added to microk8s group - logout/login required"
+
+    - name: Restart kubelite
+      ansible.builtin.command: microk8s stop && microk8s start
+      become: true

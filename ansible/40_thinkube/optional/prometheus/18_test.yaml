@@ -1,0 +1,163 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/prometheus/18_test.yaml
+# Description:
+#   Test Prometheus Operator deployment and verify recording rules
+#
+# This playbook tests:
+#   1. Prometheus Operator pods are running
+#   2. Prometheus StatefulSet is ready
+#   3. Recording rules (kubernetes-mixin) are deployed
+#   4. Prometheus API is accessible
+#   5. Recording rules are being evaluated
+#
+# Requirements:
+#   - Prometheus Operator must be deployed (11_deploy.yaml)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/prometheus/18_test.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Test Prometheus Operator Deployment
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    prometheus_namespace: "monitoring"
+
+  tasks:
+    ###################################################################
+    # 1) Test Prometheus Operator is running
+    ###################################################################
+    - name: Check Prometheus Operator deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Deployment
+        namespace: "{{ prometheus_namespace }}"
+        name: prometheus-operator
+      register: operator_deployment
+      failed_when:
+        - operator_deployment.resources | length == 0
+        - operator_deployment.resources[0].status.availableReplicas | default(0) < 1
+
+    - name: Display Prometheus Operator status
+      ansible.builtin.debug:
+        msg: "✅ Prometheus Operator: {{ operator_deployment.resources[0].status.availableReplicas }}/{{ operator_deployment.resources[0].spec.replicas }} replicas ready"
+
+    ###################################################################
+    # 2) Test Prometheus StatefulSet is ready
+    ###################################################################
+    - name: Check Prometheus StatefulSet
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: StatefulSet
+        namespace: "{{ prometheus_namespace }}"
+        name: prometheus-k8s
+      register: prometheus_sts
+      failed_when:
+        - prometheus_sts.resources | length == 0
+        - prometheus_sts.resources[0].status.readyReplicas | default(0) < 1
+
+    - name: Display Prometheus status
+      ansible.builtin.debug:
+        msg: "✅ Prometheus: {{ prometheus_sts.resources[0].status.readyReplicas }}/{{ prometheus_sts.resources[0].spec.replicas }} replicas ready"
+
+    ###################################################################
+    # 3) Test recording rules are deployed
+    ###################################################################
+    - name: List PrometheusRules
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} get prometheusrule -n {{ prometheus_namespace }} --no-headers | wc -l
+      register: rules_count
+      changed_when: false
+
+    - name: Verify PrometheusRules exist
+      ansible.builtin.assert:
+        that:
+          - rules_count.stdout | int > 0
+        fail_msg: "No PrometheusRules found"
+        success_msg: "✅ Found {{ rules_count.stdout }} PrometheusRules"
+
+    - name: Check for kubernetes-mixin recording rules
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} get prometheusrule -n {{ prometheus_namespace }} -o yaml | grep -c "node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"
+      register: mixin_rules
+      changed_when: false
+      failed_when: mixin_rules.rc > 1
+
+    - name: Verify kubernetes-mixin recording rules
+      ansible.builtin.assert:
+        that:
+          - mixin_rules.stdout | int > 0
+        fail_msg: "kubernetes-mixin recording rules not found"
+        success_msg: "✅ kubernetes-mixin recording rules found: {{ mixin_rules.stdout }} occurrences"
+
+    ###################################################################
+    # 4) Test Prometheus API accessibility
+    ###################################################################
+    - name: Get Prometheus pod name
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} get pod -n {{ prometheus_namespace }} -l app.kubernetes.io/name=prometheus -o jsonpath='{.items[0].metadata.name}'
+      register: prometheus_pod
+      changed_when: false
+
+    - name: Test Prometheus API health
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} exec -n {{ prometheus_namespace }} {{ prometheus_pod.stdout }} -- wget -qO- http://localhost:9090/-/healthy
+      register: prometheus_health
+      changed_when: false
+      failed_when: prometheus_health.stdout != "Prometheus Server is Healthy."
+
+    - name: Display Prometheus health
+      ansible.builtin.debug:
+        msg: "✅ Prometheus API health: {{ prometheus_health.stdout }}"
+
+    ###################################################################
+    # 5) Test recording rules are being evaluated
+    ###################################################################
+    - name: Query recording rule to verify it's working
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} exec -n {{ prometheus_namespace }} {{ prometheus_pod.stdout }} -- \
+          wget -qO- 'http://localhost:9090/api/v1/query?query=node_namespace_pod_container:container_cpu_usage_seconds_total:sum_rate5m' | grep -o '"status":"success"'
+      register: recording_rule_query
+      changed_when: false
+      failed_when: recording_rule_query.stdout != '"status":"success"'
+
+    - name: Display recording rule query result
+      ansible.builtin.debug:
+        msg: "✅ Recording rules are being evaluated successfully"
+
+    ###################################################################
+    # 6) Summary
+    ###################################################################
+    - name: Test summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Prometheus Operator Tests PASSED
+          ════════════════════════════════════════════════════════
+
+          ✅ Prometheus Operator deployment: Ready
+          ✅ Prometheus StatefulSet: Ready
+          ✅ PrometheusRules deployed: {{ rules_count.stdout }}
+          ✅ kubernetes-mixin recording rules: Found
+          ✅ Prometheus API: Healthy
+          ✅ Recording rules: Being evaluated
+
+          📊 READY FOR:
+          ─────────────────────────
+          • Perses dashboard integration
+          • Metrics querying with recording rules
+          ════════════════════════════════════════════════════════

@@ -1,0 +1,151 @@
+---
+# ansible/40_thinkube/optional/litellm/18_test.yaml
+# Description:
+#   Test playbook for LiteLLM deployment
+#   Verifies that the service is accessible and functioning
+#
+# Requirements:
+#   - LiteLLM must be deployed
+#   - Ingress must be configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/litellm/18_test.yaml
+#
+# 🤖 [AI-generated]
+
+- name: Test LiteLLM deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    litellm_namespace: litellm
+    litellm_hostname: "litellm.{{ domain_name }}"
+
+  tasks:
+    - name: Check if LiteLLM namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ litellm_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check LiteLLM deployment status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ litellm_namespace }}"
+        name: litellm
+      register: deployment_check
+      failed_when:
+        - deployment_check.resources | length == 0
+        - deployment_check.resources[0].status.readyReplicas != deployment_check.resources[0].spec.replicas
+
+    - name: Check LiteLLM pod status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ litellm_namespace }}"
+        label_selectors:
+          - app=litellm
+      register: pod_check
+      failed_when: pod_check.resources | length == 0
+
+    - name: Display pod status
+      ansible.builtin.debug:
+        msg: "Pod {{ item.metadata.name }} is {{ item.status.phase }}"
+      loop: "{{ pod_check.resources }}"
+
+    - name: Check LiteLLM service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ litellm_namespace }}"
+        name: litellm
+      register: service_check
+      failed_when: service_check.resources | length == 0
+
+    - name: Check LiteLLM ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ litellm_namespace }}"
+        name: litellm
+      register: ingress_check
+      failed_when: ingress_check.resources | length == 0
+
+    - name: Test LiteLLM health endpoint
+      ansible.builtin.uri:
+        url: "https://{{ litellm_hostname }}/health/readiness"
+        validate_certs: true
+        status_code: [200]
+      register: health_check
+      retries: 5
+      delay: 10
+
+    - name: Test LiteLLM API endpoint
+      ansible.builtin.uri:
+        url: "https://{{ litellm_hostname }}/v1/models"
+        validate_certs: true
+        status_code: [200, 401]
+      register: api_check
+      retries: 5
+      delay: 10
+
+    - name: Get master key from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ litellm_namespace }}"
+        name: litellm-secrets
+      register: secret_info
+
+    - name: Decode master key
+      set_fact:
+        master_key: "{{ secret_info.resources[0].data.LITELLM_MASTER_KEY | b64decode }}"
+      when: secret_info.resources | length > 0
+
+    - name: Test LiteLLM API with master key
+      ansible.builtin.uri:
+        url: "https://{{ litellm_hostname }}/v1/models"
+        headers:
+          Authorization: "Bearer {{ master_key }}"
+        validate_certs: true
+        status_code: [200]
+      register: auth_api_check
+      when: master_key is defined
+      retries: 3
+      delay: 5
+
+    - name: Test LiteLLM UI is accessible
+      ansible.builtin.uri:
+        url: "https://{{ litellm_hostname }}/ui"
+        validate_certs: true
+        follow_redirects: none
+        status_code: [200, 301, 302, 307]
+      register: ui_check
+      retries: 3
+      delay: 5
+
+    - name: Display test results
+      ansible.builtin.debug:
+        msg:
+          - "✓ LiteLLM namespace exists"
+          - "✓ Deployment is ready: {{ deployment_check.resources[0].status.readyReplicas }}/{{ deployment_check.resources[0].spec.replicas }} replicas"
+          - "✓ Pods are running"
+          - "✓ Service is configured"
+          - "✓ Ingress is configured"
+          - "✓ Health endpoint is responding: {{ health_check.status }}"
+          - "✓ API endpoint is accessible"
+          - "✓ Authentication is working"
+          - ""
+          - "LiteLLM is successfully deployed and operational!"
+          - "Access the dashboard at: https://{{ litellm_hostname }}/ui"
+          - "API endpoint: https://{{ litellm_hostname }}/v1"

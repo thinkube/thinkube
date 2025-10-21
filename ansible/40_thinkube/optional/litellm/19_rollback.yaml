@@ -1,0 +1,167 @@
+---
+# ansible/40_thinkube/optional/litellm/19_rollback.yaml
+# Description:
+#   Rollback/uninstall playbook for LiteLLM
+#   Removes all LiteLLM resources from the cluster
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/litellm/19_rollback.yaml
+#
+# 🤖 [AI-generated]
+
+- name: Rollback LiteLLM deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    litellm_namespace: litellm
+    keycloak_url: "https://auth.{{ domain_name }}"
+    litellm_client_id: "litellm"
+    # Get admin password from environment
+    admin_password: "{{ lookup('env','ADMIN_PASSWORD') }}"
+
+  tasks:
+    - name: Verify kubeconfig is defined
+      ansible.builtin.assert:
+        that:
+          - kubeconfig is defined
+        fail_msg: "kubeconfig is not defined"
+
+    - name: Check if LiteLLM namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ litellm_namespace }}"
+      register: namespace_check
+
+    - name: Drop LiteLLM database
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "litellm-db-cleanup-{{ ansible_date_time.epoch }}"
+            namespace: postgres
+          spec:
+            ttlSecondsAfterFinished: 60
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: drop-db
+                    image: postgres:15-alpine
+                    env:
+                      - name: PGPASSWORD
+                        value: "{{ admin_password }}"
+                      - name: PGHOST
+                        value: "postgresql-official.postgres.svc.cluster.local"
+                      - name: PGUSER
+                        value: "{{ admin_username }}"
+                      - name: PGDATABASE
+                        value: "postgres"
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'litellm' AND pid <> pg_backend_pid();"
+                        psql -c "DROP DATABASE IF EXISTS litellm;"
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Wait for database cleanup job to complete
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: batch/v1
+        kind: Job
+        namespace: postgres
+        label_selectors:
+          - "job-name=litellm-db-cleanup-{{ ansible_date_time.epoch }}"
+      register: cleanup_job
+      until:
+        - cleanup_job.resources | length > 0
+        - cleanup_job.resources[0].status.succeeded is defined
+        - cleanup_job.resources[0].status.succeeded == 1
+      retries: 10
+      delay: 5
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete LiteLLM namespace (this will delete all resources in the namespace)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ litellm_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: absent
+        wait: true
+        wait_timeout: 300
+      when: namespace_check.resources | length > 0
+
+    - name: Remove LiteLLM from Keycloak
+      when:
+        - domain_name is defined
+        - admin_username is defined
+        - lookup('env','ADMIN_PASSWORD') != ""
+      block:
+        - name: Get Keycloak admin token
+          ansible.builtin.uri:
+            url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+            method: POST
+            body_format: form-urlencoded
+            body:
+              client_id: admin-cli
+              username: "{{ admin_username }}"
+              password: "{{ admin_password }}"
+              grant_type: password
+            validate_certs: true
+          register: keycloak_token
+          failed_when: false
+
+        - name: Get LiteLLM client from Keycloak
+          ansible.builtin.uri:
+            url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ litellm_client_id }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+            validate_certs: true
+          register: litellm_client
+          when: keycloak_token is succeeded
+          failed_when: false
+
+        - name: Delete LiteLLM client from Keycloak
+          ansible.builtin.uri:
+            url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ litellm_client.json[0].id }}"
+            method: DELETE
+            headers:
+              Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+            validate_certs: true
+            status_code: [204, 404]
+          when:
+            - keycloak_token is succeeded
+            - litellm_client is succeeded
+            - litellm_client.json | length > 0
+          failed_when: false
+
+    - name: Verify namespace is deleted
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ litellm_namespace }}"
+      register: final_check
+      failed_when: final_check.resources | length > 0
+
+    - name: Display rollback status
+      ansible.builtin.debug:
+        msg:
+          - "LiteLLM has been successfully removed from the cluster"
+          - "All resources in the {{ litellm_namespace }} namespace have been deleted"
+          - "LiteLLM database has been dropped from PostgreSQL"
+          - "Keycloak client configuration has been removed"

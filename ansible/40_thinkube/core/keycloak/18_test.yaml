@@ -1,0 +1,207 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Test playbook for Keycloak component
+# Description:
+#   Validates Keycloak deployment and configuration
+#   Tests include:
+#   - Namespace and resources exist
+#   - Pod is running and healthy
+#   - Service is accessible
+#   - Ingress is configured correctly
+#   - Keycloak API is responsive
+#   - Thinkube realm exists
+#   - Admin user can authenticate to master realm
+#   - Realm user exists in thinkube realm
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/keycloak/18_test.yaml
+
+- name: Test Keycloak Component
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    keycloak_namespace: keycloak
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+  tasks:
+    - name: Check if namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ keycloak_namespace }}"
+      register: namespace_info
+      failed_when: namespace_info.resources | length == 0
+      
+    - name: Check if deployment exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak
+      register: deployment_info
+      failed_when: deployment_info.resources | length == 0
+      
+    - name: Check deployment status
+      ansible.builtin.assert:
+        that:
+          - deployment_info.resources[0].status.readyReplicas | default(0) >= 1
+          - deployment_info.resources[0].status.availableReplicas | default(0) >= 1
+        fail_msg: "Keycloak deployment is not ready"
+        
+    - name: Check if service exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak
+      register: service_info
+      failed_when: service_info.resources | length == 0
+      
+    - name: Check if ingress exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak
+      register: ingress_info
+      failed_when: ingress_info.resources | length == 0
+      
+    - name: Verify ingress configuration
+      ansible.builtin.assert:
+        that:
+          - ingress_info.resources[0].spec.ingressClassName == "nginx"
+          - ingress_info.resources[0].spec.rules[0].host == keycloak_hostname
+        fail_msg: "Ingress configuration is incorrect"
+        
+    - name: Check if TLS secret exists (copied from wildcard)
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak-tls-secret
+      register: tls_secret_info
+      failed_when: tls_secret_info.resources | length == 0
+      
+    - name: Verify TLS secret type
+      ansible.builtin.assert:
+        that:
+          - tls_secret_info.resources[0].type == "kubernetes.io/tls"
+          - tls_secret_info.resources[0].data['tls.crt'] is defined
+          - tls_secret_info.resources[0].data['tls.key'] is defined
+        fail_msg: "TLS secret is not valid"
+      
+    - name: Check pod status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ keycloak_namespace }}"
+        label_selectors:
+          - app=keycloak
+      register: pod_info
+      failed_when: pod_info.resources | length == 0
+      
+    - name: Verify pod is running
+      ansible.builtin.assert:
+        that:
+          - pod_info.resources[0].status.phase == "Running"
+          - pod_info.resources[0].status.containerStatuses[0].ready | default(false)
+        fail_msg: "Keycloak pod is not running or ready"
+        
+    - name: Test Keycloak availability
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/"
+        validate_certs: no  # Set to no temporarily due to wildcard certificate
+        follow_redirects: all
+        status_code: [200, 302]
+      register: keycloak_check
+      until: keycloak_check.status in [200, 302]
+      retries: 5
+      delay: 10
+      
+    - name: Test Keycloak master realm endpoint
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master"
+        validate_certs: no  # Set to no temporarily due to wildcard certificate
+        status_code: 200
+      register: master_realm_check
+      
+    - name: Test Keycloak thinkube realm endpoint
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/{{ keycloak_realm }}"
+        validate_certs: no  # Set to no temporarily due to wildcard certificate
+        status_code: [200, 404]
+      register: thinkube_realm_check
+      failed_when: false
+      
+    - name: Display {{ keycloak_realm }} realm status
+      ansible.builtin.debug:
+        msg: "{{ keycloak_realm | capitalize }} realm {% if thinkube_realm_check.status == 200 %}exists{% else %}does not exist yet (this is expected if realm hasn't been created){% endif %}"
+      when: thinkube_realm_check is defined
+      
+    - name: Test admin authentication
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: password
+        status_code: 200
+        validate_certs: no  # Set to no temporarily due to wildcard certificate
+      register: auth_test
+      no_log: true
+      
+    - name: Verify authentication successful
+      ansible.builtin.assert:
+        that:
+          - auth_test.json.access_token is defined
+          - auth_test.json.access_token | length > 0
+        fail_msg: "Admin authentication failed"
+        
+    - name: Test realm user in kubernetes realm
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ keycloak_realm }}/users?username={{ auth_realm_username }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ auth_test.json.access_token }}"
+        status_code: 200
+        validate_certs: no  # Set to no temporarily due to wildcard certificate
+      register: user_check
+      failed_when: false
+      when: thinkube_realm_check.status | default(0) == 200
+      
+    - name: Verify realm user exists in kubernetes realm
+      ansible.builtin.assert:
+        that:
+          - user_check.json | length > 0
+          - user_check.json[0].username == auth_realm_username
+        fail_msg: "Realm user ({{ auth_realm_username }}) not found in kubernetes realm"
+      when: 
+        - thinkube_realm_check.status | default(0) == 200
+        - user_check is defined
+        
+    - name: Display test results
+      ansible.builtin.debug:
+        msg:
+          - "Namespace: {{ keycloak_namespace }} ✓"
+          - "Deployment: keycloak ({{ deployment_info.resources[0].status.readyReplicas }}/{{ deployment_info.resources[0].spec.replicas }} replicas) ✓"
+          - "Service: keycloak ✓"
+          - "Ingress: keycloak ({{ keycloak_hostname }}) ✓"
+          - "TLS Secret: keycloak-tls-secret ✓"
+          - "Pod Status: {{ pod_info.resources[0].status.phase }} ✓"
+          - "Keycloak Available: {{ keycloak_check.status }} ✓"
+          - "Master Realm: {{ master_realm_check.status }} ✓"
+          - "{{ keycloak_realm | capitalize }} Realm: {{ thinkube_realm_check.status | default('Not configured') }}"
+          - "Admin Authentication: {{ 'Successful' if auth_test.json.access_token is defined else 'Failed' }} ✓"
+          - "Realm User ({{ auth_realm_username }}) in {{ keycloak_realm }} realm: {{ 'Exists' if (user_check.json | default([]) | length > 0) else 'Not configured' }}"

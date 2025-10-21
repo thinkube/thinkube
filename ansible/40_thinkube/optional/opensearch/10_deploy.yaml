@@ -1,0 +1,884 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/opensearch/10_deploy.yaml
+# Description:
+#   Deploy OpenSearch and OpenSearch Dashboards with TLS, Basic Auth, and Keycloak OIDC
+#   This combines the Keycloak setup and OpenSearch deployment from the original playbooks
+#
+# Requirements:
+#   - MicroK8s cluster with kubectl and helm
+#   - Keycloak deployed and running (CORE-003)
+#   - TLS certificates available
+#   - ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   export ADMIN_PASSWORD='your-secure-password'
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/opensearch/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - admin_username: Administrator username
+#   - auth_realm_username: SSO/realm username
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - tls_crt_path, tls_key_path: Paths to TLS certificates
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+#   - primary_ingress_ip: Primary ingress IP address
+#   - primary_ingress_class: Primary ingress class name
+
+- name: Deploy OpenSearch with Keycloak integration
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    # Password configuration (defined first)
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    
+    # Namespace configuration
+    namespace: opensearch
+    
+    # Service hostnames
+    opensearch_hostname: "opensearch.{{ domain_name }}"
+    opensearch_dashboards_hostname: "osd.{{ domain_name }}"
+    
+    # Keycloak / OIDC settings
+    opensearch_client_id: "opensearch"
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ admin_password }}"
+    keycloak_validate_certs: false
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  pre_tasks:
+    - name: Install apache2-utils for htpasswd
+      ansible.builtin.package:
+        name: apache2-utils
+        state: present
+      become: true
+
+    - name: Verify required passwords are set
+      ansible.builtin.fail:
+        msg: "{{ item }} environment variable must be set"
+      when: lookup('env', item) == ''
+      loop:
+        - ADMIN_PASSWORD
+    
+    - name: Generate bcrypt hash for OpenSearch
+      ansible.builtin.shell: |
+        # Generate bcrypt hash and keep the $ prefix
+        htpasswd -bnBC 12 "" '{{ admin_password }}' | tr -d ':\n'
+      register: bcrypt_hash
+      changed_when: false
+      no_log: true
+      failed_when: bcrypt_hash.rc != 0
+
+  tasks:
+    ###################################################################
+    # 1. Configure Keycloak client and roles
+    ###################################################################
+    - name: Configure Keycloak for OpenSearch
+      include_role:
+        name: keycloak/keycloak_setup
+      vars:
+        keycloak_setup_client_id: "{{ opensearch_client_id }}"
+        keycloak_setup_client_body:
+          clientId: "{{ opensearch_client_id }}"
+          enabled: true
+          protocol: "openid-connect"
+          standardFlowEnabled: true
+          implicitFlowEnabled: false
+          directAccessGrantsEnabled: true
+          publicClient: false
+          attributes:
+            "oauth.pkce.required": "false"
+          redirectUris:
+            - "https://{{ opensearch_dashboards_hostname }}/*"
+            - "https://{{ opensearch_dashboards_hostname }}/auth/openid/login"
+          webOrigins:
+            - "https://{{ opensearch_dashboards_hostname }}"
+          rootUrl: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/account/"
+          adminUrl: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/account/"
+        
+        keycloak_setup_scopes:
+          - name: "opensearch-authorization"
+            protocol: "openid-connect"
+            description: "Client scope for OpenSearch token claims"
+            includeInTokenScope: true
+        
+        keycloak_setup_client_mappers:
+          - name: "preferred_username"
+            protocol: "openid-connect"
+            protocolMapper: "oidc-usermodel-property-mapper"
+            config:
+              "user.attribute": "username"
+              "claim.name": "preferred_username"
+              "jsonType.label": "String"
+              "id.token.claim": "true"
+              "access.token.claim": "true"
+          - name: "roles"
+            protocol: "openid-connect"
+            protocolMapper: "oidc-usermodel-realm-role-mapper"
+            config:
+              "claim.name": "roles"
+              "jsonType.label": "String"
+              "multivalued": "true"
+              "id.token.claim": "true"
+              "access.token.claim": "true"
+        
+        keycloak_setup_scope_mappers:
+          - scope_name: "opensearch-authorization"
+            mapper:
+              name: "preferred-username"
+              protocol: "openid-connect"
+              protocolMapper: "oidc-usermodel-property-mapper"
+              consentRequired: false
+              config:
+                "userinfo.token.claim": "true"
+                "user.attribute": "username"
+                "id.token.claim": "true"
+                "access.token.claim": "true"
+                "claim.name": "preferred_username"
+                "jsonType.label": "String"
+          - scope_name: "opensearch-authorization"
+            mapper:
+              name: "realm roles"
+              protocol: "openid-connect"
+              protocolMapper: "oidc-usermodel-realm-role-mapper"
+              consentRequired: false
+              config:
+                "claim.name": "roles"
+                "jsonType.label": "String"
+                "multivalued": "true"
+                "id.token.claim": "true"
+                "access.token.claim": "true"
+                "userinfo.token.claim": "true"
+        
+        keycloak_setup_scope_assignments:
+          - name: "opensearch-authorization"
+            uuid: "{{ keycloak_scope_uuid }}"
+        
+        keycloak_setup_user_roles:
+          - username: "{{ auth_realm_username }}"
+            role_name: "opensearch_admin"
+            role_description: "Realm role for OpenSearch admin"
+
+    - name: Display Keycloak configuration
+      ansible.builtin.debug:
+        msg:
+          - "Keycloak client '{{ opensearch_client_id }}' configured"
+          - "Client UUID: {{ keycloak_client_uuid | default('N/A') }}"
+          - "Client secret will be retrieved for OpenSearch configuration"
+
+    ###################################################################
+    # 2. Create namespace
+    ###################################################################
+    - name: Ensure namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ namespace }}"
+
+    ###################################################################
+    # 3. Copy and convert TLS certificate from default namespace
+    ###################################################################
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Create temporary directory for certificate conversion
+      ansible.builtin.file:
+        path: /tmp/ssl-convert
+        state: directory
+        mode: '0700'
+      become: true
+
+    - name: Write certificate to temporary file
+      ansible.builtin.copy:
+        content: "{{ wildcard_cert.resources[0].data['tls.crt'] | b64decode }}"
+        dest: /tmp/ssl-convert/tls.crt.orig
+        mode: '0600'
+      become: true
+
+    - name: Write key to temporary file
+      ansible.builtin.copy:
+        content: "{{ wildcard_cert.resources[0].data['tls.key'] | b64decode }}"
+        dest: /tmp/ssl-convert/tls.key.orig
+        mode: '0600'
+      become: true
+
+    - name: Convert certificate to PEM format
+      ansible.builtin.shell: "openssl x509 -in /tmp/ssl-convert/tls.crt.orig -outform PEM -out /tmp/ssl-convert/tls.crt"
+      args:
+        executable: /bin/bash
+      become: true
+
+    - name: Convert private key to PKCS8 format (required by OpenSearch)
+      ansible.builtin.shell: |
+        # OpenSearch requires PKCS8 format for private keys
+        # Convert the key to PKCS8 format without encryption
+        openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -in /tmp/ssl-convert/tls.key.orig -out /tmp/ssl-convert/tls.key
+      args:
+        executable: /bin/bash
+      become: true
+      register: key_conversion
+      failed_when: key_conversion.rc != 0
+
+    - name: Verify key is in PKCS8 format
+      ansible.builtin.shell: |
+        head -n 1 /tmp/ssl-convert/tls.key | grep -q "BEGIN PRIVATE KEY" || \
+        (echo "ERROR: Key not in PKCS8 format" && exit 1)
+      args:
+        executable: /bin/bash
+      become: true
+
+    - name: Read converted certificate file
+      ansible.builtin.slurp:
+        src: /tmp/ssl-convert/tls.crt
+      register: ssl_certificate
+      become: true
+
+    - name: Read converted key file
+      ansible.builtin.slurp:
+        src: /tmp/ssl-convert/tls.key
+      register: ssl_key
+      become: true
+
+    - name: Create TLS secret for OpenSearch and Dashboards
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: opensearch-tls-secret
+            namespace: "{{ namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ ssl_certificate.content }}"
+            tls.key: "{{ ssl_key.content }}"
+
+    ###################################################################
+    # 4. Create OpenSearch admin password secret
+    ###################################################################
+    - name: Create OpenSearch admin password secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: opensearch-admin-password
+            namespace: "{{ namespace }}"
+          type: Opaque
+          stringData:
+            password: "{{ admin_password }}"
+
+    ###################################################################
+    # 5. Retrieve Keycloak admin token and OIDC client secret
+    ###################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: "password"
+        validate_certs: false
+      register: keycloak_token
+      no_log: true
+
+    - name: Retrieve OIDC client credentials from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ opensearch_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+      register: oidc_client_credentials
+
+    - name: Set OIDC client secret fact
+      ansible.builtin.set_fact:
+        opensearch_oidc_client_secret: "{{ oidc_client_credentials.json[0].secret }}"
+
+    ###################################################################
+    # 6. Create Security Config Secret
+    ###################################################################
+    - name: Create OpenSearch Security Config Secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: opensearch-security-config
+            namespace: "{{ namespace }}"
+          type: Opaque
+          stringData:
+            config.yml: |
+              _meta:
+                type: "config"
+                config_version: 2
+              config:
+                dynamic:
+                  http:
+                    anonymous_auth_enabled: false
+                  authc:
+                    openid_auth_domain:
+                      description: "Keycloak OIDC"
+                      http_enabled: true
+                      transport_enabled: false
+                      order: 1
+                      http_authenticator:
+                        type: openid
+                        challenge: false
+                        config:
+                          openid_connect_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/.well-known/openid-configuration"
+                          client_id: "{{ opensearch_client_id }}"
+                          client_secret: "{{ opensearch_oidc_client_secret }}"
+                          subject_key: "preferred_username"
+                          roles_key: "roles"
+                      authentication_backend:
+                        type: noop
+
+                    basic_internal_auth_domain:
+                      description: "Internal basic auth"
+                      http_enabled: true
+                      transport_enabled: true
+                      order: 2
+                      http_authenticator:
+                        type: basic
+                        challenge: true
+                      authentication_backend:
+                        type: internal
+            internal_users.yml: |
+              _meta:
+                type: "internalusers"
+                config_version: 2
+              admin:
+                hash: "{{ bcrypt_hash.stdout }}"
+                reserved: true
+                backend_roles:
+                  - "admin"
+                description: "Admin user"
+            roles.yml: |
+              _meta:
+                type: "roles"
+                config_version: 2
+
+              admin:
+                reserved: true
+                cluster_permissions:
+                  - "*"
+                index_permissions:
+                  - index_patterns:
+                      - "*"
+                    allowed_actions:
+                      - "*"
+                tenant_permissions:
+                  - tenant_patterns:
+                      - "*"
+                    allowed_actions:
+                      - "kibana_all_write"
+            roles_mapping.yml: |
+              _meta:
+                type: "rolesmapping"
+                config_version: 2
+              admin:
+                reserved: true
+                backend_roles:
+                  - "opensearch_admin"
+                users:
+                  - "admin"
+            action_groups.yml: |
+              _meta:
+                type: "actiongroups"
+                config_version: 2
+              admin_all:
+                reserved: true
+                allowed_actions:
+                  - "*"
+            tenants.yml: |
+              _meta:
+                type: "tenants"
+                config_version: 2
+              admin_tenant:
+                reserved: true
+                description: "Admin tenant"
+            nodes_dn.yml: |
+              _meta:
+                type: "nodesdn"
+                config_version: 2
+              nodes_dn: {}
+            whitelist.yml: |
+              _meta:
+                type: "whitelist"
+                config_version: 2
+              whitelist: {}
+
+    ###################################################################
+    # 7. Create OpenSearch Helm values
+    ###################################################################
+    - name: Create OpenSearch Helm values file
+      ansible.builtin.copy:
+        dest: /tmp/opensearch-values.yaml
+        content: |
+          clusterName: "opensearch-cluster"
+          nodeGroup: "master"
+          singleNode: true
+          replicas: 1
+
+          securityConfig:
+            enabled: true
+            config:
+              securityConfigSecret: "opensearch-security-config"
+              dataComplete: true
+              data: {}
+
+          config:
+            opensearch.yml: |
+              cluster.name: opensearch-cluster
+              network.host: 0.0.0.0
+              plugins.security.ssl.http.enabled: true
+              plugins.security.ssl.http.pemcert_filepath: /usr/share/opensearch/config/certificates/tls.crt
+              plugins.security.ssl.http.pemkey_filepath: /usr/share/opensearch/config/certificates/tls.key
+              plugins.security.ssl.http.pemtrustedcas_filepath: /usr/share/opensearch/config/certificates/tls.crt
+              plugins.security.ssl.transport.enabled: true
+              plugins.security.ssl.transport.pemcert_filepath: /usr/share/opensearch/config/certificates/tls.crt
+              plugins.security.ssl.transport.pemkey_filepath: /usr/share/opensearch/config/certificates/tls.key
+              plugins.security.ssl.transport.pemtrustedcas_filepath: /usr/share/opensearch/config/certificates/tls.crt
+              plugins.security.allow_default_init_securityindex: true
+              plugins.security.authcz.admin_dn:
+                - 'CN=*.{{ domain_name }}'
+                - 'CN={{ domain_name }}'
+                - 'CN=admin.cluster.local'
+              plugins.security.audit.type: internal_opensearch
+              plugins.security.enable_snapshot_restore_privilege: true
+              plugins.security.check_snapshot_restore_write_privileges: true
+              plugins.security.restapi.roles_enabled: ["all_access", "security_rest_api_access"]
+
+          persistence:
+            enabled: true
+            accessModes:
+              - ReadWriteOnce
+            size: 30Gi
+
+          extraVolumes:
+            - name: certificates
+              secret:
+                secretName: opensearch-tls-secret
+                defaultMode: 0600
+
+          extraVolumeMounts:
+            - name: certificates
+              mountPath: /usr/share/opensearch/config/certificates
+              readOnly: true
+
+          extraEnvs:
+            - name: DISABLE_INSTALL_DEMO_CONFIG
+              value: "true"
+            - name: DISABLE_SECURITY_PLUGIN
+              value: "false"
+            - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opensearch-admin-password
+                  key: password
+            - name: OPENSEARCH_JAVA_OPTS
+              value: "-Xms1g -Xmx1g"
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+          service:
+            type: ClusterIP
+
+    ###################################################################
+    # 8. Add OpenSearch Helm repository
+    ###################################################################
+    - name: Add OpenSearch Helm repository
+      ansible.builtin.command: >
+        {{ helm_bin }} repo add opensearch https://opensearch-project.github.io/helm-charts/
+      become: true
+
+    - name: Update Helm repositories
+      ansible.builtin.command: >
+        {{ helm_bin }} repo update
+      become: true
+
+    ###################################################################
+    # 9. Deploy OpenSearch
+    ###################################################################
+    - name: Deploy OpenSearch via Helm
+      ansible.builtin.command: >
+        {{ helm_bin }} upgrade --install gato-opensearch opensearch/opensearch
+        --namespace {{ namespace }} -f /tmp/opensearch-values.yaml
+        --timeout 10m
+      become: true
+
+    ###################################################################
+    # 10. Wait for OpenSearch deployment and initialize security
+    ###################################################################
+    - name: Wait for OpenSearch pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=opensearch"
+      register: opensearch_pods
+      until: opensearch_pods.resources | length > 0 and opensearch_pods.resources[0].status.phase == "Running"
+      retries: 30
+      delay: 10
+
+    - name: Create temporary directory for securityadmin
+      ansible.builtin.file:
+        path: /tmp/opensearch-security
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      become: true
+
+    - name: Copy security tools and certificates from pod using kubectl exec
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch -- \
+          tar -C /usr/share/opensearch/plugins/opensearch-security/tools -cf - securityadmin.sh | \
+          tar -C /tmp/opensearch-security -xvf -
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch -- \
+          tar -C /usr/share/opensearch/config/certificates -cf - tls.crt | \
+          tar -C /tmp/opensearch-security -xvf -
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch -- \
+          tar -C /usr/share/opensearch/config/certificates -cf - tls.key | \
+          tar -C /tmp/opensearch-security -xvf -
+      args:
+        executable: /bin/bash
+      become: true
+      register: copy_result
+
+    - name: Make securityadmin executable
+      ansible.builtin.file:
+        path: /tmp/opensearch-security/securityadmin.sh
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      become: true
+
+    - name: Run securityadmin to initialize security
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ namespace }} opensearch-cluster-master-0 -c opensearch -- bash -c '
+        cd /usr/share/opensearch/plugins/opensearch-security/tools
+        export JAVA_HOME=/usr/share/opensearch/jdk
+        export OPENSEARCH_JAVA_HOME=/usr/share/opensearch/jdk
+        ./securityadmin.sh \
+          -cd /usr/share/opensearch/config/opensearch-security \
+          -icl -nhnv \
+          -h localhost \
+          -p 9200 \
+          -cacert /usr/share/opensearch/config/certificates/tls.crt \
+          -cert /usr/share/opensearch/config/certificates/tls.crt \
+          -key /usr/share/opensearch/config/certificates/tls.key \
+          -ff
+        ' 2>&1
+      environment:
+        OPENSEARCH_JAVA_HOME: "/usr/share/opensearch/jdk"
+        JAVA_HOME: "/usr/share/opensearch/jdk"
+      register: securityadmin_result
+      until: securityadmin_result.rc == 0
+      retries: 3
+      delay: 10
+      become: true
+
+    - name: Display securityadmin output
+      ansible.builtin.debug:
+        var: securityadmin_result
+
+    - name: Clean up temporary directory
+      ansible.builtin.file:
+        path: /tmp/opensearch-security
+        state: absent
+      become: true
+
+    - name: Wait for OpenSearch to be ready
+      ansible.builtin.pause:
+        seconds: 30
+
+    ###################################################################
+    # 11. Test OpenSearch Connectivity
+    ###################################################################
+    - name: Test OpenSearch admin login via kubectl exec
+      ansible.builtin.shell: >
+        {{ kubectl_bin }} exec -n {{ namespace }} {{ opensearch_pods.resources[0].metadata.name }} -c opensearch --
+        curl -ks -u admin:'{{ admin_password }}' https://localhost:9200/_plugins/_security/authinfo
+      register: auth_test
+      retries: 10
+      delay: 30
+      until: auth_test.rc == 0 and 'Unauthorized' not in auth_test.stdout
+      failed_when: "'Unauthorized' in auth_test.stdout"
+      become: true
+
+    - name: Display authentication test result
+      ansible.builtin.debug:
+        var: auth_test
+
+    ###################################################################
+    # 12. Create OpenSearch Ingress
+    ###################################################################
+    - name: Create OpenSearch Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: opensearch-ingress
+            namespace: "{{ namespace }}"
+            annotations:
+              kubernetes.io/ingress.class: nginx
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+              nginx.ingress.kubernetes.io/ssl-verify: "false"
+              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+              nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+              nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+              nginx.ingress.kubernetes.io/proxy-buffer-size: "128k"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ opensearch_hostname }}"
+                secretName: opensearch-tls-secret
+            rules:
+              - host: "{{ opensearch_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: "opensearch-cluster-master"
+                          port:
+                            number: 9200
+
+    ###################################################################
+    # 13. Create OpenSearch Dashboards OIDC Secret
+    ###################################################################
+    - name: Create OpenSearch Dashboards OIDC Secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: opensearch-dashboards-oidc
+            namespace: "{{ namespace }}"
+          type: Opaque
+          stringData:
+            OIDC_CLIENT_SECRET: "{{ opensearch_oidc_client_secret }}"
+
+    ###################################################################
+    # 14. Create OpenSearch Dashboards Helm values file
+    ###################################################################
+    - name: Create OpenSearch Dashboards Helm values file
+      ansible.builtin.copy:
+        dest: /tmp/osd-values.yaml
+        content: |
+          ########################################################################
+          # 1) Place your Dashboards configuration inside config.opensearch_dashboards.yml
+          ########################################################################
+          config:
+            opensearch_dashboards.yml: |
+              server.name: opensearch-dashboards
+              server.host: "0.0.0.0"
+
+              opensearch.hosts: ["https://opensearch-cluster-master:9200"]
+              opensearch.ssl.verificationMode: none
+              opensearch.requestTimeout: 120000
+              opensearch.ssl.certificateAuthorities: ["/usr/share/opensearch-dashboards/config/certificates/tls.crt"]
+
+              opensearch.username: admin
+              opensearch.password: "${OPENSEARCH_DASHBOARDS_PASSWORD}"
+              opensearch.requestHeadersAllowlist: ["authorization", "securitytenant"]
+
+              opensearch_security.auth.type: ["basicauth", "openid"]
+              opensearch_security.auth.multiple_auth_enabled: true
+
+              # OIDC Configuration
+              opensearch_security.openid.connect_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/.well-known/openid-configuration"
+              opensearch_security.openid.client_id: "{{ opensearch_client_id }}"
+              opensearch_security.openid.client_secret: "${OIDC_CLIENT_SECRET}"
+              opensearch_security.openid.base_redirect_url: "https://{{ opensearch_dashboards_hostname }}"
+              opensearch_security.openid.verify_hostnames: false
+              opensearch_security.cookie.secure: true
+              opensearch_security.cookie.password: "${OIDC_CLIENT_SECRET}"
+              opensearch_security.openid.scope: "openid profile email roles"
+              opensearch_security.auth.anonymous_auth_enabled: false
+
+              logging.verbose: true
+              opensearch.logQueries: true
+
+              # Uncomment if you want a custom OIDC button label on login page:
+              # opensearch_security.openid.login_button_name: "Login via Keycloak"
+
+          ########################################################################
+          # 2) Use extraEnvs to populate OPENSEARCH_DASHBOARDS_PASSWORD and OIDC_CLIENT_SECRET
+          ########################################################################
+          extraEnvs:
+            - name: OPENSEARCH_DASHBOARDS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opensearch-admin-password
+                  key: password
+
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: opensearch-dashboards-oidc
+                  key: OIDC_CLIENT_SECRET
+
+          ########################################################################
+          # 3) (Optional) Mount the same TLS secret if you want to trust that CA
+          ########################################################################
+          extraVolumes:
+            - name: certificates
+              secret:
+                secretName: opensearch-tls-secret
+                defaultMode: 0644
+
+          extraVolumeMounts:
+            - name: certificates
+              mountPath: /usr/share/opensearch-dashboards/config/certificates
+              readOnly: true
+
+          ########################################################################
+          # 4) Customize the Dashboards service type if desired
+          ########################################################################
+          service:
+            type: ClusterIP
+      become: true
+
+    ###################################################################
+    # 15. Deploy OpenSearch Dashboards via Helm
+    ###################################################################
+    - name: Deploy OpenSearch Dashboards via Helm
+      ansible.builtin.command: >
+        {{ helm_bin }} upgrade --install gato-opensearch-dashboards opensearch/opensearch-dashboards
+        --namespace {{ namespace }} -f /tmp/osd-values.yaml
+      become: true
+
+    ###################################################################
+    # 16. Create OpenSearch Dashboards Ingress
+    ###################################################################
+    - name: Create OpenSearch Dashboards Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: osd-ingress
+            namespace: "{{ namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/proxy-buffer-size: "128k"
+              nginx.ingress.kubernetes.io/proxy-buffers: "4 256k"
+              nginx.ingress.kubernetes.io/proxy-busy-buffers-size: "256k"
+              nginx.ingress.kubernetes.io/rewrite-target: /
+              nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ opensearch_dashboards_hostname }}"
+                secretName: opensearch-tls-secret
+            rules:
+              - host: "{{ opensearch_dashboards_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: "gato-opensearch-dashboards"
+                          port:
+                            number: 5601
+
+    ###################################################################
+    # 17. Cleanup temporary files
+    ###################################################################
+    - name: Cleanup temporary files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/opensearch-values.yaml
+        - /tmp/osd-values.yaml
+        - /tmp/opensearch-security
+        - /tmp/ssl-convert
+      become: true
+
+    ###################################################################
+    # 18. Configure OpenSearch CLI in code-server
+    ###################################################################
+    - name: Create OpenSearch config from template
+      ansible.builtin.template:
+        src: templates/opensearch-config.yaml.j2
+        dest: /tmp/opensearch-config.yaml
+        mode: '0600'
+      no_log: true
+
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy OpenSearch config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.opensearch
+        {{ kubectl_bin }} cp /tmp/opensearch-config.yaml code-server/{{ code_server_pod.stdout }}:/home/thinkube/.opensearch/config.yaml
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.opensearch/config.yaml
+        rm -f /tmp/opensearch-config.yaml
+        echo '✅ OpenSearch CLI configured in code-server'
+      no_log: true
+
+    ###################################################################
+    # 19. Display deployment information
+    ###################################################################
+    - name: Display deployment information
+      ansible.builtin.debug:
+        msg:
+          - "OpenSearch deployment completed successfully"
+          - "OpenSearch URL: https://{{ opensearch_hostname }}"
+          - "OpenSearch Dashboards URL: https://{{ opensearch_dashboards_hostname }}"
+          - "Admin credentials: admin / [ADMIN_PASSWORD from environment]"
+          - "Keycloak SSO enabled for {{ auth_realm_username }}"

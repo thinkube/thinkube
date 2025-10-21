@@ -1,0 +1,121 @@
+---
+# ansible/40_thinkube/optional/clickhouse/19_rollback.yaml
+# Description:
+#   Rollback/uninstall playbook for ClickHouse
+#   Removes all ClickHouse resources from the cluster
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/clickhouse/19_rollback.yaml
+#
+# 🤖 [AI-generated]
+
+- name: Rollback ClickHouse deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    clickhouse_namespace: clickhouse
+
+  tasks:
+    - name: Verify kubeconfig is defined
+      ansible.builtin.assert:
+        that:
+          - kubeconfig is defined
+        fail_msg: "kubeconfig is not defined"
+
+    - name: Get ClickHouseInstallation resources
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: clickhouse.altinity.com/v1
+        kind: ClickHouseInstallation
+        namespace: "{{ clickhouse_namespace }}"
+      register: chi_resources
+      ignore_errors: true
+
+    - name: Remove finalizers from ClickHouseInstallation resources
+      ansible.builtin.shell: |
+        kubectl --kubeconfig={{ kubeconfig }} patch clickhouseinstallation {{ item.metadata.name }} \
+          -n {{ clickhouse_namespace }} \
+          --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]' || true
+      loop: "{{ chi_resources.resources | default([]) }}"
+      when: chi_resources.resources is defined and chi_resources.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete ClickHouseInstallation resources directly
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: clickhouse.altinity.com/v1
+        kind: ClickHouseInstallation
+        namespace: "{{ clickhouse_namespace }}"
+        name: "{{ item.metadata.name }}"
+        state: absent
+        wait: false
+      loop: "{{ chi_resources.resources | default([]) }}"
+      when: chi_resources.resources is defined and chi_resources.resources | length > 0
+      ignore_errors: true
+
+    - name: Wait for ClickHouseInstallation resources to be deleted
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: clickhouse.altinity.com/v1
+        kind: ClickHouseInstallation
+        namespace: "{{ clickhouse_namespace }}"
+      register: chi_check
+      until: chi_check.resources | length == 0
+      retries: 30
+      delay: 2
+      ignore_errors: true
+
+    - name: Delete ClickHouse namespace (deletes everything)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ clickhouse_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: absent
+        wait: false
+
+    - name: Wait briefly and check if namespace is stuck
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ clickhouse_namespace }}"
+      register: ns_check
+      until: ns_check.resources | length == 0 or (ns_check.resources[0].status.phase is defined and ns_check.resources[0].status.phase == "Terminating")
+      retries: 3
+      delay: 2
+      ignore_errors: true
+
+    - name: Force remove finalizers if namespace is stuck
+      ansible.builtin.shell: |
+        kubectl --kubeconfig={{ kubeconfig }} get namespace {{ clickhouse_namespace }} -o json 2>/dev/null | \
+        jq '.spec.finalizers = []' | \
+        kubectl --kubeconfig={{ kubeconfig }} replace --raw /api/v1/namespaces/{{ clickhouse_namespace }}/finalize -f - || true
+      when:
+        - ns_check.resources is defined
+        - ns_check.resources | length > 0
+        - ns_check.resources[0].status.phase == "Terminating"
+      ignore_errors: true
+
+    - name: Wait for namespace to be fully deleted
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ clickhouse_namespace }}"
+      register: final_ns_check
+      until: final_ns_check.resources | length == 0
+      retries: 30
+      delay: 2
+      ignore_errors: true
+
+    - name: Display rollback status
+      ansible.builtin.debug:
+        msg:
+          - "ClickHouse namespace deletion initiated"
+          - "All resources in the {{ clickhouse_namespace }} namespace will be deleted"

@@ -1,0 +1,441 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/19_rollback.yaml
+# Description:
+#   Rollback Thinkube Control deployment and remove all related resources
+#
+# Requirements:
+#   - MicroK8s cluster running
+#   - kubectl configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 [AI-assisted]
+
+- name: Rollback Thinkube Control Deployment
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    control_namespace: "thinkube-control"
+    argocd_namespace: "argocd"
+    argo_workflows_namespace: "argo"
+    gitea_namespace: "gitea"
+    gitea_hostname: "git.{{ domain_name }}"
+    app_name: "thinkube-control"
+
+  tasks:
+    - name: Verify kubeconfig is defined
+      ansible.builtin.fail:
+        msg: "kubeconfig is not defined. Please set it in inventory."
+      when: kubeconfig is not defined or kubeconfig == ""
+
+    # Remove ArgoCD application
+    - name: Delete Control Hub ArgoCD application
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        name: "{{ app_name }}"
+        namespace: "{{ argocd_namespace }}"
+        state: absent
+
+    # Remove Argo Workflows
+    - name: Delete all Control workflows
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete workflows -n {{ argo_workflows_namespace }} -l app={{ app_name }} --ignore-not-found=true
+        # Also delete by name pattern in case labels are missing
+        {{ kubectl_bin }} get workflows -n {{ argo_workflows_namespace }} -o name | grep -i "control" | xargs -r {{ kubectl_bin }} delete -n {{ argo_workflows_namespace }}
+      register: workflow_cleanup
+
+    - name: Delete Control build workflow templates
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: argoproj.io/v1alpha1
+        kind: WorkflowTemplate
+        namespace: "{{ argo_workflows_namespace }}"
+        state: absent
+        name: "{{ item }}"
+      loop:
+        - "{{ app_name }}-build"
+        - "{{ app_name }}-build-template"
+        - "build-{{ app_name }}-template"
+        - "{{ app_name }}-build-initial-template"
+        - "build-{{ app_name }}"  # The actual template name from deployment
+      failed_when: false  # Don't fail if template doesn't exist
+
+
+    # Remove secrets
+    - name: Delete Control secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ control_namespace }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - control-tls-secret
+        - github-token
+        - thinkube-control-keycloak
+        - docker-config
+
+    # Remove service account
+    - name: Delete Kaniko service account
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ServiceAccount
+        name: kaniko-builder
+        namespace: "{{ control_namespace }}"
+        state: absent
+    
+    # Remove Keycloak client
+    - name: Include common Keycloak tasks to get admin token
+      include_role:
+        name: keycloak/keycloak_common
+      vars:
+        keycloak_namespace: "keycloak"
+        keycloak_realm: "thinkube"
+        keycloak_url: "https://auth.{{ domain_name }}"
+        keycloak_admin_username: "{{ admin_username }}"
+        keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+        keycloak_validate_certs: false
+
+    - name: Get {{ app_name }} client details from Keycloak
+      uri:
+        url: "https://auth.{{ domain_name }}/admin/realms/thinkube/clients?clientId={{ app_name }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: [200]
+      register: control_hub_client
+      when: keycloak_token is defined
+
+    - name: Delete {{ app_name }} client from Keycloak
+      uri:
+        url: "https://auth.{{ domain_name }}/admin/realms/thinkube/clients/{{ control_hub_client.json[0].id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: [204]
+      when: 
+        - keycloak_token is defined
+        - control_hub_client.json is defined
+        - control_hub_client.json | length > 0
+
+    # Remove Gitea repository and webhooks
+    - name: Get Gitea admin token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ gitea_namespace }}"
+        name: gitea-admin-token
+      register: gitea_token_secret
+    
+    # First delete webhooks before deleting repository
+    - name: List Gitea webhooks for the repository
+      uri:
+        url: "https://{{ gitea_hostname }}/api/v1/repos/thinkube-deployments/{{ app_name }}/hooks"
+        method: GET
+        headers:
+          Authorization: "token {{ gitea_token_secret.resources[0].data.token | b64decode }}"
+        validate_certs: false
+        status_code: [200, 404]
+      when: 
+        - gitea_token_secret.resources is defined
+        - gitea_token_secret.resources | length > 0
+      register: gitea_webhooks
+      failed_when: false
+
+    - name: Delete each Gitea webhook
+      uri:
+        url: "https://{{ gitea_hostname }}/api/v1/repos/thinkube-deployments/{{ app_name }}/hooks/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "token {{ gitea_token_secret.resources[0].data.token | b64decode }}"
+        validate_certs: false
+        status_code: [204, 404]
+      when: 
+        - gitea_webhooks.status == 200
+        - gitea_webhooks.json is defined
+      loop: "{{ gitea_webhooks.json if (gitea_webhooks.status == 200 and gitea_webhooks.json is defined and gitea_webhooks.json is iterable and gitea_webhooks.json is not string) else [] }}"
+      loop_control:
+        label: "{{ item.id | default('unknown') }}"
+    
+    - name: Delete Gitea repository
+      uri:
+        url: "https://{{ gitea_hostname }}/api/v1/repos/thinkube-deployments/{{ app_name }}"
+        method: DELETE
+        headers:
+          Authorization: "token {{ gitea_token_secret.resources[0].data.token | b64decode }}"
+        validate_certs: false
+        status_code: [204, 404]
+      when: 
+        - gitea_token_secret.resources is defined
+        - gitea_token_secret.resources | length > 0
+      register: gitea_delete_result
+
+    - name: Verify Gitea repository was deleted
+      uri:
+        url: "https://{{ gitea_hostname }}/api/v1/repos/thinkube-deployments/{{ app_name }}"
+        method: GET
+        headers:
+          Authorization: "token {{ gitea_token_secret.resources[0].data.token | b64decode }}"
+        validate_certs: false
+        status_code: [404]
+      when: 
+        - gitea_token_secret.resources is defined
+        - gitea_token_secret.resources | length > 0
+        - gitea_delete_result is defined
+    
+    # Remove CI/CD ConfigMaps from Argo namespace
+    - name: Delete CI/CD ConfigMaps
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ argo_workflows_namespace }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - cicd-pipeline-script
+        - cicd-stage-scripts
+      failed_when: false  # Don't fail if ConfigMaps don't exist
+
+    # Remove Gitea token from Argo namespace
+    - name: Delete Gitea token from Argo namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: gitea-admin-token
+        namespace: "{{ argo_workflows_namespace }}"
+        state: absent
+
+    # Remove ArgoCD repository secrets
+    - name: Delete ArgoCD repository secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "gitea-{{ app_name }}-ssh"
+        - "gitea-{{ app_name }}-https"
+        - "github-{{ app_name }}-ssh"
+      failed_when: false  # Don't fail if secrets don't exist
+
+    # Remove ArgoCD webhook token if exists
+    - name: List ArgoCD webhook tokens
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ argocd_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/part-of=argocd"
+          - "argocd.argoproj.io/secret-type=webhook"
+      register: argocd_webhook_secrets
+
+    - name: Delete ArgoCD webhook secrets for this app
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ argocd_namespace }}"
+        name: "{{ item.metadata.name }}"
+        state: absent
+      when: app_name in item.metadata.name
+      loop: "{{ argocd_webhook_secrets.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    # Remove webhook adapters deployed by thinkube-control
+    - name: Delete harbor webhook adapter deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: harbor-webhook-adapter
+        namespace: "{{ argocd_namespace }}"
+        state: absent
+
+    - name: Delete harbor webhook adapter service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        name: harbor-webhook-adapter
+        namespace: "{{ argocd_namespace }}"
+        state: absent
+
+    - name: Delete harbor webhook adapter ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: harbor-webhook-adapter-script
+        namespace: "{{ argocd_namespace }}"
+        state: absent
+
+    - name: Delete ArgoCD sync webhook deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: argocd-sync-webhook
+        namespace: "{{ argocd_namespace }}"
+        state: absent
+
+    - name: Delete ArgoCD sync webhook service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        name: argocd-sync-webhook
+        namespace: "{{ argocd_namespace }}"
+        state: absent
+
+    - name: Delete ArgoCD sync webhook ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: argocd-sync-webhook-script
+        namespace: "{{ argocd_namespace }}"
+        state: absent
+
+    - name: Delete sync webhook secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: sync-webhook-secret
+        namespace: "{{ argocd_namespace }}"
+        state: absent
+
+    # Remove namespace (this will clean up any remaining resources)
+    - name: Delete Control namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ control_namespace }}"
+        state: absent
+        wait: true
+        wait_condition:
+          type: Terminating
+          status: "False"
+        wait_timeout: 300
+
+    # Clean up Harbor images
+    - name: Check if control-backend repository exists in Harbor
+      uri:
+        url: "https://registry.{{ domain_name }}/api/v2.0/projects/thinkube/repositories/control-backend"
+        method: GET
+        user: admin
+        password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+        force_basic_auth: yes
+        validate_certs: false
+        status_code: [200, 404]
+      register: backend_repo_check
+
+    - name: Delete control-backend images from Harbor
+      uri:
+        url: "https://registry.{{ domain_name }}/api/v2.0/projects/thinkube/repositories/control-backend"
+        method: DELETE
+        user: admin
+        password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+        force_basic_auth: yes
+        validate_certs: false
+        status_code: [200, 202]
+      register: backend_image_delete
+      when: backend_repo_check.status == 200
+
+    - name: Check if control-frontend repository exists in Harbor
+      uri:
+        url: "https://registry.{{ domain_name }}/api/v2.0/projects/thinkube/repositories/control-frontend"
+        method: GET
+        user: admin
+        password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+        force_basic_auth: yes
+        validate_certs: false
+        status_code: [200, 404]
+      register: frontend_repo_check
+
+    - name: Delete control-frontend images from Harbor
+      uri:
+        url: "https://registry.{{ domain_name }}/api/v2.0/projects/thinkube/repositories/control-frontend"
+        method: DELETE
+        user: admin
+        password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+        force_basic_auth: yes
+        validate_certs: false
+        status_code: [200, 202]
+      register: frontend_image_delete
+      when: frontend_repo_check.status == 200
+
+    # Clean up cloned repository
+    - name: Check if cloned repository exists
+      ansible.builtin.stat:
+        path: "/home/{{ system_username | default('thinkube') }}/shared-code/thinkube-control"
+      register: repo_dir
+
+    - name: Remove cloned repository from shared-code directory
+      ansible.builtin.file:
+        path: "/home/{{ system_username | default('thinkube') }}/shared-code/thinkube-control"
+        state: absent
+      when: repo_dir.stat.exists
+      become: true
+      ignore_errors: true
+      register: remove_repo
+      
+    # If regular removal fails due to permission issues (files created by containers),
+    # force removal with sudo
+    - name: Force remove repository if permission denied
+      ansible.builtin.command:
+        cmd: "rm -rf /home/{{ system_username | default('thinkube') }}/shared-code/thinkube-control"
+      become: true
+      when: 
+        - repo_dir.stat.exists
+        - remove_repo is failed | default(false)
+      register: force_remove
+
+    - name: Display rollback completion message
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Thinkube Control Rollback Completed
+          ════════════════════════════════════════════════════════
+          
+          All Control resources have been removed:
+          - ArgoCD applications deleted
+          - Argo Workflows and old runs deleted
+          - Workflow templates cleaned up (all variants)
+          - CI/CD ConfigMaps removed
+          - Secrets cleaned up
+          - Webhook adapters removed (harbor-webhook-adapter, argocd-sync-webhook)
+          - Webhook secrets and ConfigMaps deleted
+          - Gitea webhooks deleted
+          - ArgoCD repository secrets deleted
+          - ArgoCD webhook tokens cleaned up
+          - Harbor images deleted
+          - Gitea repository deleted
+          - Local repository cleaned up
+          - Namespace deleted
+          
+          ════════════════════════════════════════════════════════

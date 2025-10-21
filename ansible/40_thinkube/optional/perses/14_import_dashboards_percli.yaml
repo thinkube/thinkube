@@ -1,0 +1,331 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/perses/14_import_dashboards_percli.yaml
+# Description:
+#   Import Thinkube monitoring dashboards using percli
+#
+# This playbook:
+#   1. Creates Perses projects (kubernetes, node-exporter, prometheus, alertmanager, applications, gpu)
+#   2. Creates Prometheus datasources for each project
+#   3. Clones thinkube-monitor repository (curated dashboard collection)
+#   4. Imports all Thinkube dashboards using percli
+#
+# The thinkube-monitor repository contains:
+#   - Modified community dashboards (cluster variable removed for single-cluster)
+#   - Custom NGINX Ingress dashboard
+#   - Migrated NVIDIA DCGM dashboard
+#
+# Requirements:
+#   - Perses must be deployed (11_deploy.yaml)
+#   - Prometheus Operator with recording rules deployed (11_deploy.yaml)
+#   - percli must be installed on control plane (10_install_tools.yaml)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/perses/14_import_dashboards_percli.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain
+#   - admin_username: Admin username for authentication
+#
+# Reference:
+#   https://github.com/thinkube/thinkube-monitor
+#
+# 🤖 AI-assisted
+
+- name: Import Dashboards to Perses using percli
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    perses_hostname: "perses.{{ domain_name }}"
+    perses_url: "https://{{ perses_hostname }}"
+    perses_namespace: "perses"
+    prometheus_namespace: "monitoring"
+    prometheus_url: "http://prometheus-k8s.{{ prometheus_namespace }}.svc.cluster.local:9090"
+    work_dir: "/tmp/perses-dashboards"
+    thinkube_monitor_version: "main"  # Use main branch for latest
+    thinkube_monitor_repo: "https://github.com/thinkube/thinkube-monitor.git"
+
+    # Dashboard categories from thinkube-monitor repository
+    # Each maps to a Perses project
+    dashboard_categories:
+      - path: "kubernetes"
+        project: "kubernetes"
+      - path: "node-exporter"
+        project: "node-exporter"
+      - path: "prometheus"
+        project: "prometheus"
+      - path: "alertmanager"
+        project: "alertmanager"
+      - path: "applications"
+        project: "applications"
+      - path: "gpu"
+        project: "gpu"
+
+  tasks:
+    ###################################################################
+    # 0) Setup: Get admin password and prepare work directory
+    ###################################################################
+    - name: Get admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    - name: Verify admin password is available
+      ansible.builtin.fail:
+        msg: "Admin password not found. Set ADMIN_PASSWORD environment variable."
+      when: admin_password is not defined or admin_password == ""
+
+    - name: Clean work directory
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: absent
+
+    - name: Create work directory
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: directory
+        mode: '0755'
+
+    ###################################################################
+    # 1) Clone thinkube-monitor repository
+    ###################################################################
+    - name: Clone thinkube-monitor repository
+      ansible.builtin.git:
+        repo: "{{ thinkube_monitor_repo }}"
+        dest: "{{ work_dir }}/thinkube-monitor"
+        version: "{{ thinkube_monitor_version }}"
+        depth: 1
+        force: true
+        update: true
+      register: git_clone
+
+    - name: Display clone result
+      ansible.builtin.debug:
+        msg: "✅ Cloned thinkube-monitor repository ({{ thinkube_monitor_repo }})"
+
+    - name: Verify cloned commit
+      ansible.builtin.shell: |
+        cd "{{ work_dir }}/thinkube-monitor"
+        git log -1 --format="%H %s"
+      register: clone_commit
+      changed_when: false
+
+    - name: Display cloned commit
+      ansible.builtin.debug:
+        msg: "Cloned commit: {{ clone_commit.stdout }}"
+
+    ###################################################################
+    # 2) Login to Perses using native authentication
+    ###################################################################
+    - name: Login to Perses with percli
+      ansible.builtin.shell: |
+        export PATH=$PATH:/usr/local/bin
+        percli login "{{ perses_url }}" \
+          --username "{{ admin_username }}" \
+          --password "{{ admin_password }}"
+      register: percli_login
+      changed_when: "'logged in successfully' in percli_login.stdout or percli_login.rc == 0"
+      failed_when: percli_login.rc != 0
+
+    - name: Display login result
+      ansible.builtin.debug:
+        msg: "✅ Logged in to Perses as {{ admin_username }}"
+
+    ###################################################################
+    # 3) Create Perses projects
+    ###################################################################
+    - name: Create project definitions
+      ansible.builtin.copy:
+        dest: "{{ work_dir }}/project-{{ item.name }}.yaml"
+        mode: '0644'
+        content: |
+          kind: Project
+          metadata:
+            name: "{{ item.name }}"
+          spec:
+            display:
+              name: "{{ item.display }}"
+      loop:
+        - { name: "kubernetes", display: "Kubernetes" }
+        - { name: "node-exporter", display: "Node Exporter" }
+        - { name: "prometheus", display: "Prometheus" }
+        - { name: "alertmanager", display: "AlertManager" }
+        - { name: "applications", display: "Applications" }
+        - { name: "gpu", display: "GPU" }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Apply projects to Perses
+      ansible.builtin.shell: |
+        export PATH=$PATH:/usr/local/bin
+        percli apply --file "{{ work_dir }}/project-{{ item.name }}.yaml"
+      loop:
+        - { name: "kubernetes", display: "Kubernetes" }
+        - { name: "node-exporter", display: "Node Exporter" }
+        - { name: "prometheus", display: "Prometheus" }
+        - { name: "alertmanager", display: "AlertManager" }
+        - { name: "applications", display: "Applications" }
+        - { name: "gpu", display: "GPU" }
+      loop_control:
+        label: "{{ item.name }}"
+      register: project_apply
+      changed_when: "'created' in project_apply.stdout or 'updated' in project_apply.stdout"
+
+    ###################################################################
+    # 4) Create Prometheus datasources for each project
+    ###################################################################
+    - name: Create datasource definitions
+      ansible.builtin.copy:
+        dest: "{{ work_dir }}/datasource-{{ item }}.yaml"
+        mode: '0644'
+        content: |
+          kind: Datasource
+          metadata:
+            name: prometheus-datasource
+            project: {{ item }}
+          spec:
+            default: true
+            plugin:
+              kind: PrometheusDatasource
+              spec:
+                proxy:
+                  kind: HTTPProxy
+                  spec:
+                    url: {{ prometheus_url }}
+                    allowedEndpoints:
+                      - endpointPattern: /api/v1/labels
+                        method: POST
+                      - endpointPattern: /api/v1/series
+                        method: POST
+                      - endpointPattern: /api/v1/metadata
+                        method: GET
+                      - endpointPattern: /api/v1/query
+                        method: POST
+                      - endpointPattern: /api/v1/query_range
+                        method: POST
+                      - endpointPattern: /api/v1/label/([a-zA-Z0-9_-]+)/values
+                        method: GET
+      loop:
+        - kubernetes
+        - node-exporter
+        - prometheus
+        - alertmanager
+        - applications
+        - gpu
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Apply datasources to Perses
+      ansible.builtin.shell: |
+        export PATH=$PATH:/usr/local/bin
+        percli apply --file "{{ work_dir }}/datasource-{{ item }}.yaml"
+      loop:
+        - kubernetes
+        - node-exporter
+        - prometheus
+        - alertmanager
+        - applications
+        - gpu
+      loop_control:
+        label: "{{ item }}"
+      register: datasource_apply
+      changed_when: "'created' in datasource_apply.stdout or 'updated' in datasource_apply.stdout"
+
+    ###################################################################
+    # 5) Import Thinkube monitoring dashboards
+    ###################################################################
+    - name: Import thinkube-monitor dashboards by category
+      ansible.builtin.shell: |
+        export PATH=$PATH:/usr/local/bin
+        cd "{{ work_dir }}/thinkube-monitor"
+        percli apply -d "dashboards/perses/{{ item.path }}/" --project "{{ item.project }}"
+      loop: "{{ dashboard_categories }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: dashboard_import
+      changed_when: "'created' in dashboard_import.stdout or 'updated' in dashboard_import.stdout"
+
+    - name: Display dashboard import results
+      ansible.builtin.debug:
+        msg: "✅ Imported {{ item.item.path }} dashboards to {{ item.item.project }} project"
+      loop: "{{ dashboard_import.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    ###################################################################
+    # 6) Summary
+    ###################################################################
+    - name: Get all imported dashboards
+      ansible.builtin.shell: |
+        export PATH=$PATH:/usr/local/bin
+        for project in kubernetes node-exporter prometheus alertmanager applications gpu; do
+          echo "Project: $project"
+          percli get dashboards --project $project 2>/dev/null || echo "  No dashboards"
+          echo ""
+        done
+      register: dashboard_list
+      changed_when: false
+
+    - name: Dashboard import summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Thinkube Monitoring Dashboards Imported to Perses
+          ════════════════════════════════════════════════════════
+
+          📦 IMPORTED FROM: thinkube-monitor repository
+          https://github.com/thinkube/thinkube-monitor
+
+          📊 DASHBOARD COLLECTION (25 dashboards):
+          ─────────────────────────
+          • Kubernetes (18 dashboards)
+            - Cluster, namespace, node, pod, workload resources
+            - Networking, persistent volumes, API server
+            - Controller manager, scheduler, kubelet, proxy
+
+          • Node Exporter (2 dashboards)
+            - Cluster USE method, node metrics
+
+          • Prometheus (2 dashboards)
+            - Prometheus overview, remote write
+
+          • AlertManager (1 dashboard)
+            - AlertManager overview
+
+          • Applications (1 dashboard)
+            - NGINX Ingress Controller (custom dashboard)
+
+          • GPU (1 dashboard)
+            - NVIDIA DCGM Exporter (migrated from Grafana)
+
+          ✨ MODIFICATIONS:
+          ─────────────────────────
+          • All dashboards adapted for single-cluster deployments
+          • Removed cluster variable requirements
+          • Simplified queries (no cluster filters)
+          • Custom NGINX dashboard with essential metrics
+
+          🔧 PROJECTS CREATED:
+          ─────────────────────────
+          • kubernetes - Kubernetes cluster monitoring
+          • node-exporter - System metrics
+          • prometheus - Prometheus server monitoring
+          • alertmanager - Alert management
+          • applications - Application monitoring (NGINX)
+          • gpu - GPU monitoring (NVIDIA)
+
+          📊 DATASOURCES:
+          ─────────────────────────
+          • Prometheus datasource configured for each project
+          • URL: {{ prometheus_url }}
+
+          🌐 ACCESS:
+          ─────────────────────────
+          Perses UI: {{ perses_url }}
+
+          📋 IMPORTED DASHBOARDS:
+          {{ dashboard_list.stdout | default('Run: percli get dashboards --all-projects') }}
+          ════════════════════════════════════════════════════════

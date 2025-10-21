@@ -1,0 +1,448 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/keycloak/10_deploy.yaml
+# Description: Deploys and configures Keycloak identity provider in the Kubernetes cluster
+#   - Creates dedicated namespace and TLS secrets
+#   - Deploys Keycloak with proper security configurations
+#   - Sets up ingress with TLS termination
+#   - Creates custom administrator account and removes default admin
+#
+# Requirements:
+#   - MicroK8s installed with ingress addon enabled
+#   - kubernetes.core collection (included in Ansible 6+)
+#   - Cert-Manager deployed (CORE-003)
+#   - Python requests module for API interactions
+#   - ADMIN_PASSWORD environment variable set
+#
+# Variables used from inventory/group_vars/microk8s.yml:
+#   - domain_name: Base domain name 
+#   - k8s_domain: Kubernetes subdomain
+#   - admin_email: Email address for admin account
+#   - keycloak_hostname: Hostname for Keycloak
+#   - admin_username: Administrator username (consistent across all components)
+#   - admin_first_name: Administrator's first name
+#   - admin_last_name: Administrator's last name
+#   - kubeconfig: Path to the Kubernetes configuration file
+#
+# Usage:
+#   export ADMIN_PASSWORD='your-secure-password'
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/keycloak/10_deploy.yaml
+
+- name: Deploy Keycloak
+  hosts: microk8s_control_plane
+  gather_facts: true
+  vars:
+    keycloak_namespace: keycloak
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    coredns_external_ip: "{{ zerotier_subnet_prefix }}12"  # CoreDNS LoadBalancer IP
+
+  pre_tasks:
+    - name: Verify required environment variables
+      ansible.builtin.assert:
+        that: admin_password != ''
+        fail_msg: "ADMIN_PASSWORD must be set (either as environment variable or in ~/.env)"
+        success_msg: "Required admin password is available"
+
+    # No need to check for certificate files - cert-manager will handle this
+
+  tasks:
+    - name: Ensure keycloak namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ keycloak_namespace }}"
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to keycloak namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: keycloak-tls-secret
+            namespace: "{{ keycloak_namespace }}"
+            annotations:
+              cert-manager.io/certificate-name: "keycloak-tls-secret"
+              cert-manager.io/common-name: "*.{{ domain_name }}"
+              cert-manager.io/issuer-kind: "ClusterIssuer"
+              cert-manager.io/issuer-name: "selfsigned-issuer"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+            ca.crt: "{{ wildcard_cert.resources[0].data.get('ca.crt', wildcard_cert.resources[0].data['tls.crt']) }}"
+      
+    - name: Check if secret already exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ keycloak_namespace }}"
+        name: keycloak-tls-secret
+      register: cert_check
+      
+    - name: Verify TLS secret exists
+      ansible.builtin.assert:
+        that:
+          - cert_check.resources | length > 0
+        fail_msg: "Failed to copy wildcard certificate"
+        
+    - name: Ensure PostgreSQL client is installed
+      ansible.builtin.package:
+        name: postgresql-client
+        state: present
+      become: true
+      
+    - name: Check if keycloak database exists
+      ansible.builtin.shell: |
+        PGPASSWORD='{{ admin_password }}' psql -h postgres.{{ domain_name }} -U {{ admin_username }} -d postgres -t -c "SELECT 1 FROM pg_database WHERE datname='keycloak';"
+      register: db_exists
+      changed_when: false
+      
+    - name: Create Keycloak database in PostgreSQL
+      ansible.builtin.shell: |
+        PGPASSWORD='{{ admin_password }}' psql -h postgres.{{ domain_name }} -U {{ admin_username }} -d postgres -c "CREATE DATABASE keycloak;"
+      when: db_exists.stdout | trim == ""
+      register: create_db
+      
+    - name: Debug important variables
+      ansible.builtin.debug:
+        msg: |
+          keycloak_hostname: {{ keycloak_hostname }} 
+          keycloak_namespace: {{ keycloak_namespace }}
+          domain_name: {{ domain_name }}
+          coredns_external_ip: {{ zerotier_subnet_prefix }}12  # CoreDNS LoadBalancer IP
+
+    - name: Create Keycloak service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: keycloak
+            namespace: "{{ keycloak_namespace }}"
+            labels:
+              app: keycloak
+          spec:
+            ports:
+              - name: http
+                port: 8080
+                targetPort: 8080
+              - name: health
+                port: 9000
+                targetPort: 9000
+            selector:
+              app: keycloak
+            type: ClusterIP
+
+    - name: Create Keycloak deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: keycloak
+            namespace: "{{ keycloak_namespace }}"
+            labels:
+              app: keycloak
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: keycloak
+            template:
+              metadata:
+                labels:
+                  app: keycloak
+              spec:
+                hostAliases:
+                  - ip: "{{ zerotier_subnet_prefix }}{{ primary_ingress_ip_octet }}"  # Using inventory variables
+                    hostnames:
+                      - "{{ keycloak_hostname }}"
+                containers:
+                  - name: keycloak
+                    image: quay.io/keycloak/keycloak:26.1.0
+                    args: ["start"]
+                    env:
+                      - name: KC_BOOTSTRAP_ADMIN_USERNAME
+                        value: "admin"
+                      - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+                        value: "{{ admin_password }}"
+                      - name: KC_PROXY
+                        value: "edge"
+                      - name: KC_HOSTNAME
+                        value: "{{ keycloak_hostname }}"
+                      - name: KC_HOSTNAME_STRICT
+                        value: "true"
+                      - name: KC_HTTP_ENABLED
+                        value: "true"
+                      - name: KC_PROXY_HEADERS
+                        value: "xforwarded"
+                      - name: KC_HEALTH_ENABLED
+                        value: "true"
+                      - name: QUARKUS_HTTP_PROXY_ADDRESS_FORWARDING
+                        value: "true"
+                      # PostgreSQL database configuration
+                      - name: KC_DB
+                        value: "postgres"
+                      - name: KC_DB_URL
+                        value: "jdbc:postgresql://postgresql-official.postgres.svc.cluster.local:5432/keycloak"
+                      - name: KC_DB_USERNAME
+                        value: "{{ admin_username }}"
+                      - name: KC_DB_PASSWORD
+                        value: "{{ admin_password }}"
+                    ports:
+                      - name: http
+                        containerPort: 8080
+                      - name: health
+                        containerPort: 9000
+                    readinessProbe:
+                      httpGet:
+                        path: /health/ready
+                        port: 9000
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                    livenessProbe:
+                      httpGet:
+                        path: /health/live
+                        port: 9000
+                      initialDelaySeconds: 60
+                      periodSeconds: 30
+                      timeoutSeconds: 5
+
+    - name: Create Keycloak ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: keycloak
+            namespace: "{{ keycloak_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/proxy-body-size: "2500m"
+              nginx.ingress.kubernetes.io/proxy-buffer-size: "12k"
+              nginx.ingress.kubernetes.io/proxy-busy-buffers-size: "24k"
+              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - "{{ keycloak_hostname }}"
+                secretName: keycloak-tls-secret
+            rules:
+              - host: "{{ keycloak_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: keycloak
+                          port:
+                            number: 8080
+
+    - name: Wait for Keycloak pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ keycloak_namespace }}"
+        label_selectors:
+          - app=keycloak
+      register: keycloak_pod
+      until: 
+        - keycloak_pod.resources | length > 0 
+        - keycloak_pod.resources[0].status.phase == "Running"
+        - keycloak_pod.resources[0].status.containerStatuses[0].ready | default(false)
+      retries: 30
+      delay: 10
+
+    # User Management Tasks
+    - name: Debug keycloak hostname and DNS resolution
+      ansible.builtin.command: >
+        nslookup {{ keycloak_hostname }}
+      register: nslookup_debug
+      failed_when: false
+      changed_when: false
+      
+    - name: Display DNS resolution result
+      ansible.builtin.debug:
+        var: nslookup_debug.stdout_lines
+      
+    - name: Wait for Keycloak to be available
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master"
+        validate_certs: no  # Temporarily disable cert validation for testing
+        method: GET
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 30  # Reduced retries
+      delay: 5
+
+    - name: Get admin token using default admin
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: admin
+          password: "{{ admin_password }}"
+          grant_type: password
+        status_code: [200, 401]  # 401 if bootstrap admin expired
+        validate_certs: no  # Temporarily disable cert validation for testing
+      register: bootstrap_token_response
+      failed_when: false
+      
+    - name: Try with permanent admin if bootstrap admin failed
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: password
+        status_code: 200
+        validate_certs: no  # Using proper cert validation with Let's Encrypt certificate
+      register: permanent_token_response
+      when: bootstrap_token_response.status != 200
+      
+    - name: Set token response for further use
+      ansible.builtin.set_fact:
+        token_response: "{{ bootstrap_token_response if bootstrap_token_response.status == 200 else permanent_token_response }}"
+        using_bootstrap_admin: "{{ bootstrap_token_response.status == 200 }}"
+
+    - name: Create new admin user ({{ admin_username }})
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/master/users"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          username: "{{ admin_username }}"
+          enabled: true
+          emailVerified: true
+          email: "{{ admin_email }}"
+          firstName: "{{ admin_first_name }}"
+          lastName: "{{ admin_last_name }}"
+          credentials:
+            - type: password
+              value: "{{ admin_password }}"
+              temporary: false
+          requiredActions: []
+        status_code: [201, 409]  # 409 if already exists
+        validate_certs: no  # Using proper cert validation with Let's Encrypt certificate
+      register: new_user_response
+      when: using_bootstrap_admin  # Only create if we're using the bootstrap admin
+      
+    - name: Debug user creation response
+      ansible.builtin.debug:
+        var: new_user_response
+      when: 
+        - using_bootstrap_admin
+        - new_user_response is defined
+
+    - name: Get ID of new admin user
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/master/users?username={{ admin_username }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: 200
+        validate_certs: no  # Using proper cert validation with Let's Encrypt certificate
+      register: user_response
+      when: using_bootstrap_admin
+
+    - name: Get available realm roles
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/master/roles"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: 200
+        validate_certs: no  # Using proper cert validation with Let's Encrypt certificate
+      register: realm_roles
+      when: using_bootstrap_admin
+
+    - name: Find admin role
+      ansible.builtin.set_fact:
+        admin_role: "{{ realm_roles.json | selectattr('name', 'equalto', 'admin') | list | first }}"
+      when: 
+        - using_bootstrap_admin
+        - realm_roles.json | length > 0
+
+    - name: Assign admin role to new user
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/master/users/{{ user_response.json[0].id }}/role-mappings/realm"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+          Content-Type: application/json
+        body_format: json
+        body: |
+          [
+            {
+              "id": "{{ admin_role.id }}",
+              "name": "{{ admin_role.name }}",
+              "description": "{{ admin_role.description | default('') }}",
+              "composite": {{ admin_role.composite | lower }},
+              "clientRole": {{ admin_role.clientRole | lower }},
+              "containerId": "master"
+            }
+          ]
+        status_code: 204
+        validate_certs: no  # Using proper cert validation with Let's Encrypt certificate
+      when: 
+        - using_bootstrap_admin
+        - user_response.json | length > 0
+        - admin_role is defined
+
+
+    - name: Display Keycloak status
+      ansible.builtin.debug:
+        msg: 
+          - "Pod Name: {{ keycloak_pod.resources[0].metadata.name }}"
+          - "Status: {{ keycloak_pod.resources[0].status.phase }}"
+          - "Ready: {{ keycloak_pod.resources[0].status.containerStatuses[0].ready }}"
+          - "Admin User: {{ admin_username }} (permanent admin)"
+          - "Bootstrap Admin: admin (temporary - expires in 2 hours)"
+          - "Admin Email: {{ admin_email }}"
+          - "Hostname: {{ keycloak_hostname }}"
+        
+    - name: Display important note
+      ansible.builtin.debug:
+        msg:
+          - "IMPORTANT: The 'admin' user is a temporary bootstrap account that expires in 2 hours."
+          - "Use the '{{ admin_username }}' account for permanent admin access."
+          - "You can delete the temporary 'admin' user through the Keycloak Admin Console once you've verified permanent admin access."

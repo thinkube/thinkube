@@ -1,0 +1,217 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/devpi/15_configure_cli.yaml
+# Description:
+#   Install DevPi CLI tools and configure fish shell integration
+#
+# Requirements:
+#   - DevPi must be deployed and running (run 10_deploy.yaml first)
+#   - python3-pip must be available
+#   - fish shell should be installed
+#   - Environment variable: ADMIN_PASSWORD
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/devpi/15_configure_cli.yaml
+#
+# Variables from inventory:
+#   - devpi_api_hostname: API endpoint hostname
+#   - devpi_dashboard_hostname: Dashboard hostname
+#   - admin_username: Administrator username (used as DevPi admin)
+#   - devpi_index_name: Default index name
+#   - admin_username: System admin username
+
+- name: Configure DevPi CLI and fish shell integration
+  hosts: microk8s_control_plane
+  become: true
+  gather_facts: true
+  
+  vars:
+    # Admin password - use ADMIN_PASSWORD env var with fallback to ANSIBLE_BECOME_PASSWORD
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+    # CLI installation paths
+    user_scripts_path: "/home/{{ admin_username }}/devpi-scripts"
+    fish_config_path: "/home/{{ admin_username }}/.config/fish"
+    
+  pre_tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - devpi_api_hostname is defined
+          - devpi_dashboard_hostname is defined
+          - devpi_index_name is defined
+          - admin_username is defined
+          - admin_password != ""
+        fail_msg: "Required variables are not defined"
+
+  tasks:
+    - name: Ensure python3-pip is installed
+      ansible.builtin.package:
+        name: python3-pip
+        state: present
+
+    - name: Create scripts directory
+      ansible.builtin.file:
+        path: "{{ user_scripts_path }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+
+    - name: Install DevPi client in system Python
+      ansible.builtin.pip:
+        name: devpi-client
+        state: present
+
+    - name: Ensure fish config directory exists
+      ansible.builtin.file:
+        path: "{{ fish_config_path }}/conf.d"
+        state: directory
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+        mode: '0755'
+
+    - name: Create fish configuration for DevPi
+      ansible.builtin.copy:
+        dest: "{{ fish_config_path }}/conf.d/devpi.fish"
+        content: |
+          # DevPi configuration for fish shell
+          
+          # Set DevPi URL to API endpoint
+          set -gx DEVPI_URL "https://{{ devpi_api_hostname }}"
+          
+          # Helper function to refresh or display the DevPi URL setting
+          function devpi-env
+              echo "DevPi environment is set to: $DEVPI_URL"
+              echo "DevPi CLI is ready to use with this endpoint"
+              echo "Web interface (Keycloak protected) is available at: https://{{ devpi_dashboard_hostname }}"
+          end
+          
+          # Output suppressed during shell startup
+          
+          # Create shortcut function to initialize admin user
+          function devpi-init-admin
+              
+              # Try to use the server and create root URL if needed
+              devpi use https://{{ devpi_api_hostname }}
+              
+              # Check if we can connect to the server
+              echo "Checking server connection..."
+              devpi use
+              
+              # Create admin user
+              echo "Creating admin user: {{ admin_username }}"
+              devpi user -c {{ admin_username }} password={{ admin_password }}
+              if test $status -ne 0
+                  echo "Admin user already exists or creation failed"
+                  echo "Trying to login with provided credentials..."
+              end
+              
+              # Login as admin
+              echo "Logging in as admin user"
+              devpi login {{ admin_username }} --password={{ admin_password }}
+              
+              # Create index if it doesn't exist
+              echo "Creating/using index: /{{ admin_username }}/{{ devpi_index_name }}"
+              devpi index -c {{ devpi_index_name }} bases=root/pypi
+              if test $status -ne 0
+                  echo "Index already exists, using it instead"
+                  devpi use {{ admin_username }}/{{ devpi_index_name }}
+              end
+              
+              echo "DevPi initialization completed"
+              echo "You are now using index: /{{ admin_username }}/{{ devpi_index_name }}"
+          end
+          
+          # Package upload shortcut
+          function devpi-upload-pkg
+              if test (count $argv) -lt 1
+                  echo "Usage: devpi-upload-pkg PATH_TO_PACKAGE"
+                  return 1
+              end
+              
+              set PACKAGE_PATH $argv[1]
+              
+              if test ! -f "$PACKAGE_PATH"
+                  echo "Package file not found: $PACKAGE_PATH"
+                  return 1
+              end
+              
+              # Ensure we're logged in
+              echo "Checking login status..."
+              devpi use
+              if test $status -ne 0
+                  echo "Please log in first:"
+                  echo "devpi login USERNAME --password=PASSWORD"
+                  return 1
+              end
+              
+              # Upload the package
+              echo "Uploading package: $PACKAGE_PATH"
+              devpi upload "$PACKAGE_PATH"
+          end
+          
+          # Load or create configuration
+          set -l devpi_config_file "$HOME/.devpi.ini"
+          if test ! -f "$devpi_config_file"
+              echo "Creating default DevPi configuration file at $devpi_config_file"
+              echo "[devpi]" > "$devpi_config_file"
+              echo "index = {{ admin_username }}/{{ devpi_index_name }}" >> "$devpi_config_file"
+              chmod 600 "$devpi_config_file"
+          end
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+        mode: '0644'
+
+    - name: Create devpi-init-admin script
+      ansible.builtin.template:
+        src: devpi-init-admin.sh.j2
+        dest: "{{ user_scripts_path }}/devpi-init-admin.sh"
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+        mode: '0755'
+
+    - name: Create pip configuration directory
+      ansible.builtin.file:
+        path: "/home/{{ admin_username }}/.pip"
+        state: directory
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+        mode: '0755'
+
+    - name: Create pip.conf for using DevPi
+      ansible.builtin.copy:
+        dest: "/home/{{ admin_username }}/.pip/pip.conf"
+        content: |
+          [global]
+          index-url = https://{{ devpi_api_hostname }}/{{ admin_username }}/{{ devpi_index_name }}/+simple/
+          trusted-host = {{ devpi_api_hostname }}
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+        mode: '0644'
+
+    - name: Display configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "DevPi CLI configuration complete"
+          - "-----------------------------------"
+          - "The following fish functions are available:"
+          - "  1. Display DevPi configuration:"
+          - "     devpi-env    # Shows current endpoint information"
+          - " "
+          - "  2. Initialize admin user and create index:"
+          - "     devpi-init-admin"
+          - " "
+          - "  3. Upload a package:"
+          - "     devpi-upload-pkg path/to/package.whl"
+          - " "
+          - "IMPORTANT: To complete setup, run:"
+          - "  fish -c \"devpi-init-admin\""
+          - " "
+          - "Or use the bash script:"
+          - "  {{ user_scripts_path }}/devpi-init-admin.sh"
+          - "-----------------------------------"
+          - "pip is now configured to use DevPi as the default index"

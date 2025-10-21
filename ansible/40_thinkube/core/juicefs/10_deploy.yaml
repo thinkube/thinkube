@@ -1,0 +1,434 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/juicefs/10_deploy.yaml
+# Description:
+#   Deploy JuiceFS distributed filesystem providing true ReadWriteMany (RWX) storage
+#   Uses PostgreSQL for metadata and SeaweedFS S3 for data storage
+#
+# Requirements:
+#   - MicroK8s cluster operational
+#   - PostgreSQL deployed and accessible
+#   - SeaweedFS deployed with S3 API configured
+#   - Helm installed on control plane
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/juicefs/10_deploy.yaml
+#
+# Variables from inventory:
+#   - juicefs_namespace: Namespace for JuiceFS CSI driver
+#   - postgres_hostname: PostgreSQL hostname for metadata storage
+#   - admin_username: PostgreSQL admin username
+#   - admin_password: PostgreSQL admin password (via ADMIN_PASSWORD env var)
+#   - seaweedfs_namespace: SeaweedFS namespace
+#   - domain_name: Base domain for S3 endpoint
+#
+# Dependencies:
+#   - CORE: PostgreSQL (metadata storage)
+#   - CORE: SeaweedFS (S3 object storage)
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy JuiceFS distributed filesystem with RWX support
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Admin password from environment variable
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    # Helm binary path
+    helm_bin: /snap/bin/microk8s.helm3
+
+    # JuiceFS configuration
+    juicefs_volume_name: "thinkube-shared"
+    juicefs_storage_class_name: "juicefs-rwx"
+    juicefs_csi_version: "0.30.0"  # Latest stable version
+
+    # PostgreSQL connection (using internal cluster DNS)
+    postgres_internal_host: "postgresql-official.{{ postgres_namespace }}.svc.cluster.local"
+    postgres_port: "5432"
+    postgres_database: "juicefs"
+
+    # SeaweedFS S3 configuration (internal cluster endpoint)
+    s3_endpoint_internal: "http://seaweedfs-filer.{{ seaweedfs_namespace }}.svc.cluster.local:8333"
+    s3_bucket: "juicefs-data"
+
+  pre_tasks:
+    - name: Verify admin password available
+      ansible.builtin.assert:
+        that: admin_password != ''
+        fail_msg: "ADMIN_PASSWORD environment variable must be set"
+        success_msg: "Admin password loaded from environment"
+
+    - name: Check for required variables
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined or item | length == 0
+      loop:
+        - juicefs_namespace
+        - postgres_namespace
+        - admin_username
+        - kubeconfig
+        - kubectl_bin
+        - seaweedfs_namespace
+        - domain_name
+
+  tasks:
+    ###########################################################################
+    # Task 1: Namespace and Prerequisites
+    ###########################################################################
+    - name: Ensure JuiceFS namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ juicefs_namespace }}"
+
+    - name: Verify PostgreSQL is accessible
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/postgresql-official -- \
+          psql -U {{ admin_username }} -d mydatabase -c "SELECT 1" > /dev/null 2>&1 && echo "ok" || echo "failed"
+      environment:
+        PGPASSWORD: "{{ admin_password }}"
+      register: postgres_check
+      failed_when: postgres_check.stdout != "ok"
+      become: true
+
+    - name: Verify SeaweedFS S3 is accessible
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: seaweedfs-s3-credentials
+        namespace: "{{ seaweedfs_namespace }}"
+      register: s3_creds_check
+      failed_when: s3_creds_check.resources | length == 0
+
+    - name: Get S3 credentials from SeaweedFS
+      ansible.builtin.set_fact:
+        s3_access_key: "{{ s3_creds_check.resources[0].data.access_key | b64decode }}"
+        s3_secret_key: "{{ s3_creds_check.resources[0].data.secret_key | b64decode }}"
+
+    ###########################################################################
+    # Task 2: Create JuiceFS database in PostgreSQL
+    ###########################################################################
+    - name: Check if JuiceFS database exists in PostgreSQL
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/postgresql-official -- \
+          psql -U {{ admin_username }} -d mydatabase -tAc "SELECT 1 FROM pg_database WHERE datname='{{ postgres_database }}'"
+      environment:
+        PGPASSWORD: "{{ admin_password }}"
+      register: db_check
+      become: true
+      changed_when: false
+
+    - name: Create JuiceFS database in PostgreSQL
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/postgresql-official -- \
+          psql -U {{ admin_username }} -d mydatabase -c "CREATE DATABASE {{ postgres_database }}"
+      environment:
+        PGPASSWORD: "{{ admin_password }}"
+      when: db_check.stdout == ""
+      register: db_create
+      become: true
+
+    ###########################################################################
+    # Task 3: Create S3 bucket for JuiceFS
+    ###########################################################################
+    - name: Get SeaweedFS filer pod
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ seaweedfs_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=seaweedfs
+          - app.kubernetes.io/component=filer
+      register: filer_pods
+
+    - name: Create S3 bucket for JuiceFS in SeaweedFS
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ seaweedfs_namespace }} {{ filer_pods.resources[0].metadata.name }} -- \
+          sh -c 's3.bucket.create -name={{ s3_bucket }} | weed shell -master=seaweedfs-master:9333' || true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: bucket_create
+      become: true
+      changed_when: "'created' in bucket_create.stdout"
+
+    ###########################################################################
+    # Task 4: Add JuiceFS Helm repository
+    ###########################################################################
+    - name: Add JuiceFS Helm repository
+      ansible.builtin.shell: |
+        {{ helm_bin }} repo add juicefs https://juicedata.github.io/charts/
+        {{ helm_bin }} repo update
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout or 'Update Complete' in helm_repo_add.stdout"
+      become: true
+
+    ###########################################################################
+    # Task 5: Create JuiceFS configuration secret
+    ###########################################################################
+    - name: Create JuiceFS volume configuration secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: juicefs-secret
+            namespace: "{{ juicefs_namespace }}"
+          type: Opaque
+          stringData:
+            name: "{{ juicefs_volume_name }}"
+            metaurl: "postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable"
+            storage: "s3"
+            bucket: "{{ s3_endpoint_internal }}/{{ s3_bucket }}"
+            access-key: "{{ s3_access_key }}"
+            secret-key: "{{ s3_secret_key }}"
+
+    ###########################################################################
+    # Task 6: Deploy JuiceFS CSI Driver
+    ###########################################################################
+    - name: Install/Upgrade JuiceFS CSI driver via Helm using Harbor registry
+      ansible.builtin.shell: |
+        {{ helm_bin }} upgrade --install juicefs-csi-driver juicefs/juicefs-csi-driver \
+          --namespace kube-system \
+          --version {{ juicefs_csi_version }} \
+          --set image.repository={{ harbor_registry }}/library/juicefs-csi-driver \
+          --set image.tag=v{{ juicefs_csi_version }} \
+          --set sidecars.livenessProbeImage.repository={{ harbor_registry }}/library/livenessprobe \
+          --set sidecars.livenessProbeImage.tag=v2.11.0 \
+          --set sidecars.nodeDriverRegistrarImage.repository={{ harbor_registry }}/library/csi-node-driver-registrar \
+          --set sidecars.nodeDriverRegistrarImage.tag=v2.9.0 \
+          --set sidecars.csiProvisionerImage.repository={{ harbor_registry }}/library/csi-provisioner \
+          --set sidecars.csiProvisionerImage.tag=v2.2.2 \
+          --set jfsMountImage.repository={{ harbor_registry }}/library/juicefs-mount \
+          --set jfsMountImage.tag=ce-v1.2.3 \
+          --set storageClasses[0].enabled=false \
+          --set kubeletDir=/var/snap/microk8s/common/var/lib/kubelet
+      register: helm_install
+      become: true
+
+    ###########################################################################
+    # Task 7: Wait for CSI driver pods to be ready
+    ###########################################################################
+    - name: Wait for JuiceFS CSI controller to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        name: juicefs-csi-controller
+        namespace: kube-system
+      register: csi_controller
+      until:
+        - csi_controller.resources | length > 0
+        - csi_controller.resources[0].status.readyReplicas is defined
+        - csi_controller.resources[0].status.readyReplicas == csi_controller.resources[0].spec.replicas
+      retries: 30
+      delay: 5
+
+    - name: Wait for JuiceFS CSI node pods to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: DaemonSet
+        name: juicefs-csi-node
+        namespace: kube-system
+      register: csi_node
+      until:
+        - csi_node.resources | length > 0
+        - csi_node.resources[0].status.numberReady is defined
+        - csi_node.resources[0].status.numberReady == csi_node.resources[0].status.desiredNumberScheduled
+      retries: 30
+      delay: 5
+
+    ###########################################################################
+    # Task 8: Create StorageClass for RWX volumes
+    ###########################################################################
+    - name: Create JuiceFS RWX StorageClass
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: "{{ juicefs_storage_class_name }}"
+          provisioner: csi.juicefs.com
+          parameters:
+            csi.storage.k8s.io/provisioner-secret-name: juicefs-secret
+            csi.storage.k8s.io/provisioner-secret-namespace: "{{ juicefs_namespace }}"
+            csi.storage.k8s.io/node-publish-secret-name: juicefs-secret
+            csi.storage.k8s.io/node-publish-secret-namespace: "{{ juicefs_namespace }}"
+          reclaimPolicy: Retain
+          volumeBindingMode: Immediate
+
+    ###########################################################################
+    # Deploy S3 Gateway
+    ###########################################################################
+    - name: Deploy JuiceFS S3 Gateway
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: juicefs-gateway
+            namespace: "{{ juicefs_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: juicefs-gateway
+            template:
+              metadata:
+                labels:
+                  app: juicefs-gateway
+              spec:
+                containers:
+                - name: gateway
+                  image: juicedata/juicefs-csi-driver:v0.30.0
+                  command:
+                    - sh
+                    - -c
+                    - |
+                      /usr/local/bin/juicefs gateway \
+                        --access-log=/dev/stdout \
+                        postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable \
+                        0.0.0.0:9000
+                  env:
+                    - name: MINIO_ROOT_USER
+                      value: "{{ admin_username }}"
+                    - name: MINIO_ROOT_PASSWORD
+                      value: "{{ admin_password }}"
+                  ports:
+                    - containerPort: 9000
+                      protocol: TCP
+
+    - name: Create S3 Gateway Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: juicefs-gateway
+            namespace: "{{ juicefs_namespace }}"
+          spec:
+            type: ClusterIP
+            selector:
+              app: juicefs-gateway
+            ports:
+              - port: 9000
+                targetPort: 9000
+                protocol: TCP
+
+    ###########################################################################
+    # Configure dashboard to use English locale
+    ###########################################################################
+    - name: Get current dashboard deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: juicefs-csi-dashboard
+        namespace: kube-system
+      register: dashboard_current
+
+    - name: Patch JuiceFS dashboard to use English locale
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: patched
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: juicefs-csi-dashboard
+            namespace: kube-system
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: dashboard
+                    env:
+                      - name: LANG
+                        value: "en_US.UTF-8"
+      when: dashboard_current.resources | length > 0
+
+    - name: Wait for dashboard to restart after locale change
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: juicefs-csi-dashboard
+        namespace: kube-system
+      register: dashboard_status
+      until:
+        - dashboard_status.resources | length > 0
+        - dashboard_status.resources[0].status.readyReplicas is defined
+        - dashboard_status.resources[0].status.readyReplicas == dashboard_status.resources[0].spec.replicas
+      retries: 20
+      delay: 3
+
+    ###########################################################################
+    # Task 10: Create dashboard ingress
+    ###########################################################################
+    - name: Create JuiceFS dashboard ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: juicefs-dashboard
+            namespace: kube-system
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - "juicefs.{{ domain_name }}"
+                secretName: juicefs-dashboard-tls
+            rules:
+              - host: "juicefs.{{ domain_name }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: juicefs-csi-dashboard
+                          port:
+                            number: 8088
+
+    ###########################################################################
+    # Task 11: Summary
+    ###########################################################################
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "JuiceFS distributed filesystem deployed successfully!"
+          - "=================================================="
+          - "Storage Class: {{ juicefs_storage_class_name }}"
+          - "Access Mode: ReadWriteMany (RWX)"
+          - "Metadata: PostgreSQL ({{ postgres_database }} database)"
+          - "Data Storage: SeaweedFS S3 ({{ s3_bucket }} bucket)"
+          - "Dashboard: https://juicefs.{{ domain_name }}"
+          - "=================================================="
+          - "To use JuiceFS in your PVCs:"
+          - "  storageClassName: {{ juicefs_storage_class_name }}"
+          - "  accessModes: [ReadWriteMany]"
+          - "=================================================="

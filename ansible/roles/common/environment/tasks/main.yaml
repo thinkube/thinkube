@@ -1,0 +1,118 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# roles/common/environment/tasks/main.yaml
+# This role handles loading of environment variables and path settings
+
+- name: Source .env file and get variables
+  shell: |
+    if [ -f {{ env_file_path }} ]; then
+      set -a
+      . {{ env_file_path }}
+      set +a
+      # Just echo the values we need
+      echo "argocd_password=$ARGOCD_PASSWORD"
+      echo "argocd_token=$ARGOCD_DEPLOYMENT_SECRET"
+      echo "harbor_robot_token=$HARBOR_ROBOT_TOKEN"
+      echo "github_token=$GITHUB_TOKEN"
+      echo "github_username=$GITHUB_USERNAME"
+      echo "code_source_path=$CODE_SOURCE_PATH"
+      echo "zerotier_network_id=$ZEROTIER_NETWORK_ID"
+      echo "zerotier_auth_token=$ZEROTIER_AUTH_TOKEN"
+    else
+      echo "ENV_FILE_NOT_FOUND=true"
+    fi
+  args:
+    executable: /bin/bash
+  register: env_vars
+  changed_when: false
+
+- name: Set facts from environment
+  set_fact:
+    "{{ item.split('=')[0] }}": "{{ item.split('=', 1)[1] }}"
+  loop: "{{ env_vars.stdout_lines }}"
+  when: 
+    - "'ENV_FILE_NOT_FOUND' not in env_vars.stdout"
+    - "'=' in item"
+
+- name: Debug environment variables status
+  debug:
+    msg:
+      - "ARGOCD_PASSWORD exists: {{ (argocd_password | default('') | length) > 0 }}"
+      - "ARGOCD_DEPLOYMENT_SECRET exists: {{ (argocd_token | default('') | length) > 0 }}"
+      - "HARBOR_ROBOT_TOKEN exists: {{ (harbor_robot_token | default('') | length) > 0 }}"
+      - "GITHUB_TOKEN exists: {{ (github_token | default('') | length) > 0 }}"
+      - "GITHUB_USERNAME exists: {{ (github_username | default('') | length) > 0 }}"
+      - "CODE_SOURCE_PATH exists: {{ (code_source_path | default('') | length) > 0 }}"
+      - "ZEROTIER_NETWORK_ID exists: {{ (zerotier_network_id | default('') | length) > 0 }}"
+      - "ZEROTIER_AUTH_TOKEN exists: {{ (zerotier_auth_token | default('') | length) > 0 }}"
+
+- name: Check if code-server path exists
+  stat:
+    path: "{{ code_source_path }}"
+  register: code_server_dir
+  when: code_source_path is defined and code_source_path != ""
+
+- name: Show code-server directory status
+  debug:
+    msg: "Code-server directory {{ 'exists' if code_server_dir.stat.exists | default(false) else 'does not exist' }} at {{ code_source_path }}"
+  when: code_source_path is defined and code_source_path != ""
+
+# Update local_repo_path if code_source_path is available
+- name: Set repository path based on code_source_path
+  set_fact:
+    local_repo_path: "{{ code_source_path }}/{{ github_repo_name }}"
+  when: code_source_path is defined and code_source_path != "" and code_server_dir.stat.exists | default(false) and github_repo_name is defined
+
+# Set default repository path when code-server is not available
+- name: Set default repository path when code-server is not available
+  set_fact:
+    local_repo_path: "{{ ansible_env.HOME }}/thinkube-apps/{{ github_repo_name }}"
+  when: 
+    - local_repo_path is not defined
+    - github_repo_name is defined
+    - code_source_path is not defined or code_source_path == ""
+
+# Commented out - code-server is now optional, will be handled when code-server is migrated
+# - name: Ensure repository path is properly set
+#   fail:
+#     msg: "Cannot determine repository path. Ensure CODE_SOURCE_PATH is correctly set in {{ env_file_path }} and the directory exists."
+#   when: (code_source_path is not defined or code_source_path == '' or not (code_server_dir.stat.exists | default(false))) and github_repo_name is defined
+
+- name: Debug repository path
+  debug:
+    msg: "Repository path set to: {{ local_repo_path }}"
+  when: local_repo_path is defined
+
+- name: Report missing environment variables
+  debug:
+    msg: "Missing environment variables: {{ missing_vars | join(', ') }}"
+  vars:
+    missing_vars: "{{ [] + 
+      ([] if (argocd_password | default('') | length) > 0 else ['ARGOCD_PASSWORD']) + 
+      ([] if (argocd_token | default('') | length) > 0 else ['ARGOCD_DEPLOYMENT_SECRET']) + 
+      ([] if (harbor_robot_token | default('') | length) > 0 else ['HARBOR_ROBOT_TOKEN']) + 
+      ([] if (github_token | default('') | length) > 0 else ['GITHUB_TOKEN']) + 
+      ([] if (github_username | default('') | length) > 0 else ['GITHUB_USERNAME']) +
+      ([] if (zerotier_network_id | default('') | length) > 0 else ['ZEROTIER_NETWORK_ID']) +
+      ([] if (zerotier_auth_token | default('') | length) > 0 else ['ZEROTIER_AUTH_TOKEN'])
+    }}"
+    
+- name: Ensure required credentials are available
+  fail:
+    msg: "Could not find required credentials in environment variables"
+  when: >
+    (argocd_password | default('') | length) == 0 or 
+    (argocd_token | default('') | length) == 0 or 
+    (harbor_robot_token | default('') | length) == 0
+
+- name: Ensure required namespace exists (app)
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ app_namespace }}"
+  when: app_namespace is defined

@@ -1,0 +1,165 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/langfuse/18_test.yaml
+# Description:
+#   Test Langfuse deployment and functionality
+#   - Verify pods are running
+#   - Test health endpoint
+#   - Verify database connectivity
+#   - Check OIDC configuration
+#
+# Requirements:
+#   - Langfuse must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/langfuse/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - kubeconfig: Path to kubectl configuration
+#
+# 🤖 [AI-assisted]
+
+- name: Test Langfuse deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    k8s_namespace: "langfuse"
+    langfuse_hostname: "langfuse.{{ domain_name }}"
+
+  tasks:
+    ###########################################################################
+    # Step 1: Verify Langfuse pods are running
+    ###########################################################################
+    - name: Get Langfuse pods
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ k8s_namespace }}"
+        label_selectors:
+          - "app=langfuse"
+      register: langfuse_pods
+
+    - name: Verify Langfuse pod exists
+      ansible.builtin.assert:
+        that:
+          - langfuse_pods.resources | length >= 1
+        fail_msg: "No Langfuse pods found"
+        success_msg: "Langfuse pod is present"
+
+    - name: Verify Langfuse pod is running
+      ansible.builtin.assert:
+        that:
+          - item.status.phase == "Running"
+        fail_msg: "Pod {{ item.metadata.name }} is not running: {{ item.status.phase }}"
+        success_msg: "Pod {{ item.metadata.name }} is running"
+      loop: "{{ langfuse_pods.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    ###########################################################################
+    # Step 2: Check Langfuse service
+    ###########################################################################
+    - name: Get Langfuse service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        namespace: "{{ k8s_namespace }}"
+        name: "langfuse"
+      register: langfuse_service
+
+    - name: Verify Langfuse service exists
+      ansible.builtin.assert:
+        that:
+          - langfuse_service.resources | length == 1
+        fail_msg: "Langfuse service not found"
+        success_msg: "Langfuse service exists"
+
+    ###########################################################################
+    # Step 3: Test Langfuse health endpoint
+    ###########################################################################
+    - name: Test Langfuse health endpoint (internal)
+      ansible.builtin.uri:
+        url: "http://langfuse.{{ k8s_namespace }}.svc.cluster.local:3000/api/public/health"
+        method: GET
+        status_code: 200
+      register: health_check_internal
+      retries: 12
+      delay: 5
+      until: health_check_internal.status == 200
+      delegate_to: "{{ groups['microk8s_control_plane'][0] }}"
+
+    - name: Test Langfuse health endpoint (external)
+      ansible.builtin.uri:
+        url: "https://{{ langfuse_hostname }}/api/public/health"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: health_check_external
+      retries: 12
+      delay: 5
+      until: health_check_external.status == 200
+
+    ###########################################################################
+    # Step 4: Verify database connectivity
+    ###########################################################################
+    - name: Check Langfuse logs for database connection
+      kubernetes.core.k8s_log:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ k8s_namespace }}"
+        name: "{{ langfuse_pods.resources[0].metadata.name }}"
+        container: langfuse
+        tail_lines: 50
+      register: langfuse_logs
+
+    - name: Verify no database connection errors in logs
+      ansible.builtin.assert:
+        that:
+          - "'Error: P1001' not in langfuse_logs.log"
+          - "'Error: P1017' not in langfuse_logs.log"
+        fail_msg: "Database connection errors found in logs"
+        success_msg: "No database connection errors"
+
+    ###########################################################################
+    # Step 5: Verify ingress configuration
+    ###########################################################################
+    - name: Get Langfuse ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Ingress
+        namespace: "{{ k8s_namespace }}"
+        name: "langfuse"
+      register: langfuse_ingress
+
+    - name: Verify Langfuse ingress exists
+      ansible.builtin.assert:
+        that:
+          - langfuse_ingress.resources | length == 1
+        fail_msg: "Langfuse ingress not found"
+        success_msg: "Langfuse ingress configured"
+
+    ###########################################################################
+    # Step 6: Summary
+    ###########################################################################
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "===================================="
+          - "Langfuse Test Summary"
+          - "===================================="
+          - "✓ Langfuse pods running: {{ langfuse_pods.resources | length }}"
+          - "✓ Service: Available"
+          - "✓ Health endpoint (internal): OK"
+          - "✓ Health endpoint (external): OK"
+          - "✓ Database connectivity: OK"
+          - "✓ Ingress: Configured"
+          - ""
+          - "Langfuse is fully operational!"
+          - "URL: https://{{ langfuse_hostname }}"
+          - "Authentication: Keycloak OIDC"
+        verbosity: 0

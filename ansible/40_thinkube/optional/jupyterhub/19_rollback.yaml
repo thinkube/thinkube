@@ -1,0 +1,128 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/jupyterhub/19_rollback.yaml
+# Description:
+#   Rollback JupyterHub deployment including Helm release, namespace, and persistent volumes
+#
+# Requirements:
+#   - MicroK8s cluster with kubectl and helm configured
+#   - kubectl_bin and helm_bin variables set in inventory
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/19_rollback.yaml
+#
+# Variables from inventory:
+#   - Domain and namespace configuration
+#
+# 🤖 [AI-assisted]
+
+- name: Rollback JupyterHub Deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    jupyterhub_namespace: "jupyterhub"
+    jupyterhub_release_name: "jupyterhub"
+    kubeconfig: /var/snap/microk8s/current/credentials/client.config
+    helm_bin: /snap/bin/microk8s.helm3
+
+  tasks:
+    - name: Check if JupyterHub namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ jupyterhub_namespace }}"
+      register: namespace_check
+
+    - name: Uninstall JupyterHub Helm release
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        name: "{{ jupyterhub_release_name }}"
+        release_namespace: "{{ jupyterhub_namespace }}"
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        wait: true
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Force delete stuck pods if any
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pods --all -n {{ jupyterhub_namespace }} --grace-period=0 --force || true
+      vars:
+        kubectl_bin: /snap/bin/microk8s.kubectl
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete persistent volume claims
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ jupyterhub_namespace }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - jupyterhub-notebooks-pvc
+        - jupyterhub-datasets-pvc
+        - jupyterhub-models-pvc
+        - hub-db-dir
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ jupyterhub_namespace }}"
+        name: jupyterhub-ingress
+        state: absent
+      when: namespace_check.resources | length > 0
+      ignore_errors: true
+
+    - name: Delete JupyterHub namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ jupyterhub_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: absent
+        wait: true
+        wait_timeout: 60
+      when: namespace_check.resources | length > 0
+      register: namespace_delete
+      ignore_errors: true
+
+    - name: Force remove namespace finalizers if stuck
+      ansible.builtin.shell: |
+        NS_STATUS=$({{ kubectl_bin }} get namespace {{ jupyterhub_namespace }} -o json 2>/dev/null | jq -r '.status.phase')
+        if [ "$NS_STATUS" = "Terminating" ]; then
+          echo "Namespace stuck in Terminating, removing finalizers..."
+          {{ kubectl_bin }} get namespace {{ jupyterhub_namespace }} -o json | \
+            jq '.spec.finalizers = []' | \
+            {{ kubectl_bin }} replace --raw /api/v1/namespaces/{{ jupyterhub_namespace }}/finalize -f -
+        fi
+      vars:
+        kubectl_bin: /snap/bin/microk8s.kubectl
+      when:
+        - namespace_check.resources | length > 0
+        - namespace_delete is failed or namespace_delete.changed == false
+
+    - name: Display cleanup status
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "JupyterHub Rollback Complete"
+          - "========================================="
+          - "Resources removed:"
+          - "  - Helm release: jupyterhub"
+          - "  - Namespace: jupyterhub"
+          - "  - PVCs: All JuiceFS claims"
+          - "  - Ingress: jupyterhub-ingress"
+          - ""
+          - "Note: Custom images remain in Harbor"
+          - "========================================="

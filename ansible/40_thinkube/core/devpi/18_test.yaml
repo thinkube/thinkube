@@ -1,0 +1,211 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/devpi/18_test.yaml
+# Description:
+#   Test DevPi deployment and functionality
+#
+# Requirements:
+#   - DevPi must be deployed (run 10_deploy.yaml first)
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/devpi/18_test.yaml
+#
+# Variables from inventory:
+#   - devpi_namespace: DevPi namespace
+#   - devpi_dashboard_hostname: Dashboard hostname
+#   - devpi_api_hostname: API hostname
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Test DevPi deployment
+  hosts: microk8s_control_plane
+  become: false
+  gather_facts: true
+  
+  vars:
+    test_results: []
+
+  tasks:
+    - name: Check if namespace exists
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} get namespace {{ devpi_namespace }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: namespace_check
+      failed_when: false
+
+    - name: Record namespace test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Namespace exists: ' + (namespace_check.rc == 0) | string] }}"
+
+    - name: Check DevPi deployment
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} get deployment -n {{ devpi_namespace }} devpi -o json"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: deployment_check
+      failed_when: false
+
+    - name: Record deployment test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['DevPi deployment exists: ' + (deployment_check.rc == 0) | string] }}"
+
+    - name: Check deployment readiness
+      ansible.builtin.set_fact:
+        deployment_ready: "{{ (deployment_check.stdout | from_json).status.readyReplicas | default(0) > 0 }}"
+      when: deployment_check.rc == 0
+
+    - name: Record deployment readiness
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['DevPi deployment ready: ' + (deployment_ready | default(false)) | string] }}"
+      when: deployment_check.rc == 0
+
+    - name: Check DevPi service
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} get service -n {{ devpi_namespace }} devpi -o json"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: service_check
+      failed_when: false
+
+    - name: Record service test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['DevPi service exists: ' + (service_check.rc == 0) | string] }}"
+
+    - name: Check Redis deployment
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} get deployment -n {{ devpi_namespace }} ephemeral-redis -o json"  # Valkey deployment
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: redis_check
+      failed_when: false
+
+    - name: Record Redis test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Redis deployment exists: ' + (redis_check.rc == 0) | string] }}"
+
+    - name: Check OAuth2 Proxy deployment
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} get deployment -n {{ devpi_namespace }} oauth2-proxy -o json"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: oauth_check
+      failed_when: false
+
+    - name: Record OAuth2 Proxy test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['OAuth2 Proxy deployment exists: ' + (oauth_check.rc == 0) | string] }}"
+
+    - name: Check ingresses
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} get ingress -n {{ devpi_namespace }} -o json"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: ingress_check
+      failed_when: false
+
+    - name: Parse ingress data
+      ansible.builtin.set_fact:
+        ingress_json: "{{ ingress_check.stdout | from_json if ingress_check.rc == 0 else {} }}"
+        
+    - name: Extract ingress names
+      ansible.builtin.set_fact:
+        ingress_names: "{{ ingress_json.get('items', []) | map(attribute='metadata.name') | list }}"
+
+    - name: Check for dashboard ingress
+      ansible.builtin.set_fact:
+        dashboard_ingress_exists: "{{ 'devpi-http-ingress' in ingress_names }}"
+
+    - name: Check for API ingress
+      ansible.builtin.set_fact:
+        api_ingress_exists: "{{ 'devpi-api-ingress' in ingress_names }}"
+
+    - name: Record ingress test results
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Dashboard ingress exists: ' + (dashboard_ingress_exists | default(false)) | string, 'API ingress exists: ' + (api_ingress_exists | default(false)) | string] }}"
+
+    - name: Check PVC
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} get pvc -n {{ devpi_namespace }} devpi-data-pvc -o json"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: pvc_check
+      failed_when: false
+
+    - name: Record PVC test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['PVC exists: ' + (pvc_check.rc == 0) | string] }}"
+
+    - name: Check PVC bound status
+      ansible.builtin.set_fact:
+        pvc_bound: "{{ (pvc_check.stdout | from_json).status.phase == 'Bound' }}"
+      when: pvc_check.rc == 0
+
+    - name: Record PVC bound status
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['PVC bound: ' + (pvc_bound | default(false)) | string] }}"
+      when: pvc_check.rc == 0
+
+
+    - name: Test API endpoint connectivity
+      ansible.builtin.uri:
+        url: "https://{{ devpi_api_hostname }}/+api"
+        validate_certs: false
+        status_code: [200]
+      register: api_test
+      failed_when: false
+
+    - name: Record API test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['API endpoint accessible: ' + (api_test.status == 200) | string] }}"
+
+    - name: Test dashboard endpoint (should redirect to OAuth2)
+      ansible.builtin.uri:
+        url: "https://{{ devpi_dashboard_hostname }}/"
+        validate_certs: false
+        follow_redirects: none
+        status_code: [302, 200]
+      register: dashboard_test
+      failed_when: false
+
+    - name: Record dashboard test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Dashboard endpoint accessible: ' + (dashboard_test.status in [302, 200]) | string] }}"
+
+    - name: Check if CLI is installed
+      ansible.builtin.command:
+        cmd: "which devpi"
+      register: cli_check
+      failed_when: false
+      become: true
+
+    - name: Record CLI test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['DevPi CLI installed: ' + (cli_check.rc == 0) | string] }}"
+
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "DevPi Test Results"
+          - "=================="
+          - "{{ test_results }}"
+
+    - name: Determine overall test status
+      ansible.builtin.set_fact:
+        all_tests_passed: "{{ test_results | select('search', 'False') | list | length == 0 }}"
+
+    - name: Fail if any tests failed
+      ansible.builtin.fail:
+        msg: "Some DevPi tests failed. Please check the test results above."
+      when: not all_tests_passed
+
+    - name: Success message
+      ansible.builtin.debug:
+        msg:
+          - "All DevPi tests passed successfully!"
+          - "Web interface: https://{{ devpi_dashboard_hostname }}"
+          - "API endpoint: https://{{ devpi_api_hostname }}"

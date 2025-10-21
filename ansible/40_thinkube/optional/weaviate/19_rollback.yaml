@@ -1,0 +1,201 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/weaviate/19_rollback.yaml
+# Description:
+#   Rollback Weaviate deployment and clean up resources
+#   This playbook removes Weaviate and optionally its persistent data
+#
+# Requirements:
+#   - MicroK8s kubectl access
+#   - Weaviate must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   # Basic rollback (preserves data):
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/weaviate/19_rollback.yaml
+#
+#   # Complete cleanup (removes data):
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/weaviate/19_rollback.yaml -e remove_data=true
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#
+# Extra variables:
+#   - remove_data: Set to true to remove persistent data (default: false)
+#
+# 🤖 AI-assisted
+
+- name: Rollback Weaviate deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    weaviate_namespace: "weaviate"
+    remove_data: false
+    force_namespace_deletion: false
+
+  tasks:
+    - name: Display rollback configuration
+      ansible.builtin.debug:
+        msg: |
+          Starting Weaviate rollback with the following configuration:
+          - Namespace: {{ weaviate_namespace }}
+          - Remove persistent data: {{ remove_data }}
+          - Force namespace deletion: {{ force_namespace_deletion }}
+
+    - name: Scale down Weaviate StatefulSet
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: weaviate
+            namespace: "{{ weaviate_namespace }}"
+          spec:
+            replicas: 0
+      ignore_errors: true
+
+    - name: Wait for pods to terminate
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ weaviate_namespace }}"
+        label_selectors:
+          - app=weaviate
+      register: pod_check
+      until: pod_check.resources | length == 0
+      retries: 30
+      delay: 2
+      ignore_errors: true
+
+    - name: Delete Weaviate Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        name: weaviate-ingress
+        namespace: "{{ weaviate_namespace }}"
+      ignore_errors: true
+
+    - name: Delete Weaviate services
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Service
+        name: "{{ item }}"
+        namespace: "{{ weaviate_namespace }}"
+      loop:
+        - weaviate
+        - weaviate-headless
+      ignore_errors: true
+
+    - name: Delete Weaviate StatefulSet
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: apps/v1
+        kind: StatefulSet
+        name: weaviate
+        namespace: "{{ weaviate_namespace }}"
+      ignore_errors: true
+
+    - name: Delete ConfigMaps
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: ConfigMap
+        name: "{{ item }}"
+        namespace: "{{ weaviate_namespace }}"
+      loop:
+        - weaviate-config
+        - thinkube-service-config
+      ignore_errors: true
+
+    - name: Delete secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "{{ item }}"
+        namespace: "{{ weaviate_namespace }}"
+      loop:
+        - weaviate-auth
+        - weaviate-tls-secret
+      ignore_errors: true
+
+    - name: Delete PersistentVolumeClaim if remove_data is true
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: weaviate-data-pvc
+        namespace: "{{ weaviate_namespace }}"
+      when: remove_data | bool
+      ignore_errors: true
+
+    - name: Get remaining resources in namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: all
+        namespace: "{{ weaviate_namespace }}"
+      register: remaining_resources
+      ignore_errors: true
+
+    - name: Display remaining resources
+      ansible.builtin.debug:
+        msg: |
+          Remaining resources in namespace:
+          {% for resource in remaining_resources.resources %}
+          - {{ resource.kind }}: {{ resource.metadata.name }}
+          {% endfor %}
+      when: remaining_resources.resources is defined and remaining_resources.resources | length > 0
+
+    - name: Delete namespace if force_namespace_deletion is true
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ weaviate_namespace }}"
+      when: force_namespace_deletion | bool
+      ignore_errors: true
+
+    - name: Display rollback summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          Weaviate Rollback Summary
+          ========================================
+          ✓ Scaled down StatefulSet
+          ✓ Deleted Ingress
+          ✓ Deleted Services
+          ✓ Deleted ConfigMaps
+          ✓ Deleted Secrets
+          {% if remove_data %}
+          ✓ Deleted PersistentVolumeClaim (data removed)
+          {% else %}
+          ℹ PersistentVolumeClaim preserved (data retained)
+          {% endif %}
+          {% if force_namespace_deletion %}
+          ✓ Deleted namespace
+          {% else %}
+          ℹ Namespace preserved
+          {% endif %}
+
+          Rollback completed successfully!
+
+          {% if not remove_data %}
+          Note: Persistent data has been retained. To completely remove data, run:
+          ./scripts/run_ansible.sh ansible/40_thinkube/optional/weaviate/19_rollback.yaml -e remove_data=true
+          {% endif %}

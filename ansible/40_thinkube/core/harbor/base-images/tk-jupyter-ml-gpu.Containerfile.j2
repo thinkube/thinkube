@@ -1,0 +1,198 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Jupyter ML GPU - Machine Learning development environment with CUDA support
+# Base: NVIDIA CUDA 12.6 with cuDNN on Ubuntu 24.04
+# Includes: PyTorch with CUDA, transformers, and all Thinkube service clients
+
+FROM {{ harbor_registry }}/library/cuda:12.6.0-cudnn-runtime-ubuntu24.04
+
+# Avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python 3.12 and system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-venv \
+        python3-pip \
+        git \
+        wget \
+        curl \
+        vim \
+        build-essential \
+        ca-certificates \
+        gnupg \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/lib/python*/EXTERNALLY-MANAGED
+
+# Install Node.js 20.x LTS (required for Claude Code CLI)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI globally
+RUN npm install -g @anthropic-ai/claude-code && \
+    # Get npm prefix and construct bin path
+    NPM_PREFIX=$(npm config get prefix) && \
+    NPM_BIN="$NPM_PREFIX/bin" && \
+    echo "NPM prefix: $NPM_PREFIX" && \
+    echo "NPM bin: $NPM_BIN" && \
+    echo "Listing $NPM_BIN:" && ls -la "$NPM_BIN/" && \
+    # Find and link the claude binary
+    if [ -f "$NPM_BIN/claude" ]; then \
+        ln -sf "$NPM_BIN/claude" /usr/local/bin/claude; \
+        echo "Linked claude from $NPM_BIN/claude"; \
+    elif [ -f "$NPM_BIN/claude-code" ]; then \
+        ln -sf "$NPM_BIN/claude-code" /usr/local/bin/claude; \
+        echo "Linked claude-code from $NPM_BIN/claude-code"; \
+    else \
+        echo "ERROR: Claude binary not found in $NPM_BIN!"; \
+        exit 1; \
+    fi
+
+# Set Python 3.12 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+
+# Get existing UID 1000 user or create jovyan
+RUN if id 1000 2>/dev/null; then \
+        NB_USER=$(id -nu 1000); \
+        if [ "$NB_USER" != "jovyan" ]; then \
+            usermod -l jovyan -d /home/jovyan -m $NB_USER; \
+        fi; \
+    else \
+        useradd -m -s /bin/bash -N -u 1000 jovyan; \
+    fi
+
+ENV NB_UID=1000
+ENV NB_GID=100
+
+USER root
+
+# Install uv for fast package installation
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+RUN uv pip install --system \
+    jupyterlab==4.4.9 \
+    jupyterhub==5.3.0 \
+    jupyter-collaboration==4.1.1
+
+# Install jupyter-server-nbmodel from git main (includes bugfix for KeyError: 'name')
+RUN uv pip install --system "git+https://github.com/datalayer/jupyter-server-nbmodel.git@main#egg=jupyter-server-nbmodel[lab]"
+
+# Install jupyter-nbmodel-client for programmatic notebook interaction
+RUN uv pip install --system jupyter-nbmodel-client jupyter-kernel-client
+
+RUN uv pip install --system \
+    torch==2.5.1 \
+    torchvision==0.20.1 \
+    torchaudio==2.5.1
+
+RUN uv pip install --system \
+    transformers==4.56.2 \
+    datasets==4.1.1 \
+    accelerate==1.10.1
+
+RUN uv pip install --system \
+    pandas==2.3.2 \
+    scikit-learn==1.7.2 \
+    matplotlib==3.10.6 \
+    seaborn==0.13.2 \
+    plotly==6.3.0
+
+RUN uv pip install --system \
+    psycopg2-binary==2.9.10 \
+    redis==6.4.0 \
+    qdrant-client==1.15.1 \
+    opensearch-py==3.0.0 \
+    mlflow==3.4.0 \
+    boto3==1.40.40 \
+    clickhouse-connect \
+    chromadb \
+    nats-py
+
+RUN uv pip install --system \
+    weaviate-client==4.17.0 \
+    litellm==1.74.9 \
+    kubernetes \
+    PyGithub \
+    hera-workflows \
+    argilla \
+    cvat-sdk \
+    langfuse
+
+RUN uv pip install --system \
+    python-dotenv==1.1.1 \
+    requests==2.32.5 \
+    httpx==0.28.1 \
+    pydantic==2.11.9
+
+RUN uv pip install --system \
+    sqlalchemy \
+    alembic \
+    ipywidgets \
+    tqdm \
+    Pillow \
+    opencv-python \
+    sentence-transformers \
+    spacy \
+    grpcio \
+    grpcio-tools \
+    gql \
+    websockets
+
+RUN uv pip install --system claude-agent-sdk
+
+USER jovyan
+WORKDIR /home/jovyan
+
+# Add user's local bin to PATH (must be before using jupyter command)
+ENV PATH="/home/jovyan/.local/bin:${PATH}"
+
+# Copy Thinkube environment configuration
+USER root
+COPY .thinkube_env /home/jovyan/.thinkube_env
+RUN chown $NB_UID:$NB_GID /home/jovyan/.thinkube_env
+USER $NB_UID
+
+# Source Thinkube environment in bashrc
+RUN echo 'if [ -f /home/jovyan/.thinkube_env ]; then source /home/jovyan/.thinkube_env; fi' >> /home/jovyan/.bashrc
+
+# Copy startup script (templated with correct image name)
+USER root
+COPY startup.sh /usr/local/bin/startup.sh
+RUN chmod +x /usr/local/bin/startup.sh
+
+# Copy Thinkube environment setup files (will be installed at runtime by startup.sh)
+RUN mkdir -p /opt/thinkube
+COPY 00-thinkube-env.py /opt/thinkube/
+COPY test-thinkube-services.ipynb /opt/thinkube/
+COPY icons/ /opt/thinkube/icons/
+
+USER $NB_UID
+
+# Expose JupyterLab port
+EXPOSE 8888
+
+# Use startup script as entrypoint to handle examples, then run the command
+ENTRYPOINT ["/usr/local/bin/startup.sh"]
+
+# Default command for standalone use (JupyterHub will override with jupyterhub-singleuser)
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
+
+USER root
+ARG CACHE_BUST=1
+RUN echo "Cache bust: ${CACHE_BUST}" && \
+    uv pip install --system --reinstall git+https://github.com/thinkube/tk-ai-extension.git && \
+    uv pip install --system --reinstall git+https://github.com/thinkube/thinkube-ai-lab-theme.git && \
+    jupyter lab build --minimize=False
+
+# Set Thinkube AI Lab theme as default for all users
+RUN mkdir -p /usr/local/share/jupyter/lab/settings && \
+    echo '{"@jupyterlab/apputils-extension:themes": {"theme": "thinkube-ai-lab-theme"}}' > /usr/local/share/jupyter/lab/settings/overrides.json
+
+USER $NB_UID
+
+# 🤖 AI-assisted

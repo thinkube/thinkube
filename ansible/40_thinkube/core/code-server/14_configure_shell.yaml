@@ -1,0 +1,183 @@
+---
+# ansible/40_thinkube/core/code-server/14_configure_shell.yaml
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Adapted from ansible/misc/00_setup_shells.yml for container environment
+# FULL feature preservation - bash, zsh, AND fish support
+#
+# Description:
+#   Configure complete shell environment for code-server container
+#   - Starship prompt with Nerd Font icons
+#   - 15+ utility functions
+#   - JSON-based alias system
+#   - Full bash/zsh/fish support
+#   - Fish plugins via fisher
+#
+# Requirements:
+#   - code-server must be deployed and running
+#   - Nerd Fonts, zsh, fish, starship must be in container image
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/14_configure_shell.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 [AI-assisted]
+
+- name: Configure code-server Shell Environment
+  hosts: microk8s_control_plane
+  gather_facts: true
+  become: false
+
+  vars:
+    code_server_namespace: "code-server"
+    user_home: "/home/thinkube"
+
+    # Directory structure (SAME as misc)
+    thinkube_system_dir: "{{ user_home }}/.thinkube_shared_shell"
+    thinkube_system_functions_dir: "{{ thinkube_system_dir }}/functions"
+    thinkube_system_docs_dir: "{{ thinkube_system_dir }}/docs"
+    thinkube_system_aliases_dir: "{{ thinkube_system_dir }}/aliases"
+    thinkube_user_dir: "{{ user_home }}/.user_shared_shell"
+    thinkube_user_functions_dir: "{{ thinkube_user_dir }}/functions"
+    thinkube_user_aliases_dir: "{{ thinkube_user_dir }}/aliases"
+    starship_config_dir: "{{ user_home }}/.config"
+    fish_config_dir: "{{ user_home }}/.config/fish"
+
+    # Fish plugins (SAME as misc)
+    fisher_plugins:
+      - edc/bass
+      - PatrickF1/fzf.fish
+      - franciscolourenco/done
+      - jorgebucaran/autopair.fish
+
+    # Required packages (in Dockerfile)
+    required_packages:
+      - git
+      - curl
+      - zsh
+      - fish
+      - nano
+      - jq
+
+    # Common aliases (enhanced with groups for filtering)
+    common_aliases:
+      - { name: 'll', command: 'ls -la', description: 'List files with details', group: 'files' }
+      - { name: 'la', command: 'ls -A', description: 'List all files', group: 'files' }
+      - { name: 'l', command: 'ls -CF', description: 'List files in columns', group: 'files' }
+      - { name: '..', command: 'cd ..', description: 'Go up one directory', group: 'navigation' }
+      - { name: '...', command: 'cd ../..', description: 'Go up two directories', group: 'navigation' }
+      - { name: 'g', command: 'git', description: 'Shortcut for git', group: 'git' }
+      - { name: 'gco', command: 'git checkout', description: 'Git checkout', group: 'git' }
+      - { name: 'gst', command: 'git status', description: 'Git status', group: 'git' }
+      - { name: 'gd', command: 'git diff', description: 'Git diff', group: 'git' }
+      - { name: 'gb', command: 'git branch', description: 'Git branch', group: 'git' }
+      - { name: 'k', command: 'kubectl', description: 'Shortcut for kubectl', group: 'k8s' }
+      - { name: 'kc', command: 'kubectl', description: 'Alternative kubectl shortcut', group: 'k8s' }
+      - { name: 'mk', command: 'microk8s kubectl', description: 'MicroK8s kubectl', group: 'k8s' }
+      - { name: 'kx', command: 'kubectx', description: 'Shortcut for kubectx', group: 'k8s' }
+      - { name: 'kn', command: 'kubens', description: 'Shortcut for kubens', group: 'k8s' }
+      - { name: 'ans', command: 'ansible', description: 'Shortcut for ansible', group: 'ansible' }
+      - { name: 'ansp', command: 'ansible-playbook', description: 'Shortcut for ansible-playbook', group: 'ansible' }
+      - { name: 'ansl', command: 'ansible-lint', description: 'Shortcut for ansible-lint', group: 'ansible' }
+      - { name: 'tf', command: 'terraform', description: 'Shortcut for terraform', group: 'devops' }
+      - { name: 'dk', command: 'docker', description: 'Shortcut for docker', group: 'containers' }
+      - { name: 'sshdev', command: 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null', description: 'SSH with no host checking (development only)', group: 'network' }
+      - { name: 'runplay', command: '/home/thinkube/workspace/thinkube/scripts/run_ansible.sh', description: 'Run ansible playbook with proper settings', group: 'thinkube' }
+      - { name: 'set-shell', command: 'set_shell', description: 'Set default shell for terminals (bash/zsh/fish)', group: 'shell' }
+
+  tasks:
+    - name: Wait for code-server deployment to be ready (handles rolling updates)
+      ansible.builtin.command:
+        cmd: >
+          microk8s.kubectl rollout status deployment/code-server
+          -n {{ code_server_namespace }}
+          --timeout=300s
+      changed_when: false
+
+    - name: Get current code-server pod name (after deployment is stable)
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        kind: Pod
+        label_selectors:
+          - app=code-server
+        field_selectors:
+          - status.phase=Running
+      register: codeserver_pods
+      failed_when: codeserver_pods.resources | length == 0
+
+    - name: Set code-server pod name
+      ansible.builtin.set_fact:
+        codeserver_pod: "{{ codeserver_pods.resources[0].metadata.name }}"
+
+    - name: Display pod information
+      ansible.builtin.debug:
+        msg: "Configuring shell environment in pod: {{ codeserver_pod }}"
+
+    ###########################################################################
+    # Modular Task Includes (SAME structure as misc)
+    ###########################################################################
+
+    - name: Basic setup - Create directories
+      include_tasks: tasks/00_core_shell_setup.yml
+      tags: [setup, packages]
+
+    - name: Starship setup - Configure prompt
+      include_tasks: tasks/01_starship_setup.yml
+      tags: [starship]
+
+    - name: Functions system - Create shared functions
+      include_tasks: tasks/02_functions_system.yml
+      tags: [functions]
+
+    - name: Aliases system - Configure JSON-based aliases with groups
+      include_tasks: tasks/03_aliases_system.yml
+      tags: [aliases]
+
+    - name: Fish plugins - Install fisher and plugins
+      include_tasks: tasks/04_fish_plugins.yml
+      when: skip_fish_plugins is not defined or not skip_fish_plugins
+      tags: [fish, plugins]
+
+    - name: Shell configuration - Configure all shells
+      include_tasks: tasks/05_shell_config.yml
+      tags: [config]
+
+    ###########################################################################
+    # Completion Message
+    ###########################################################################
+
+    - name: Display final completion message
+      ansible.builtin.debug:
+        msg: |
+          🎉 code-server Shell Configuration COMPLETE! 🎉
+
+          ✅ All Units Completed (1-7):
+          - Unit 1: Directory structure and Starship ⭐
+          - Unit 2: Basic functions (load_dotenv, mkcd, extract, sysinfo, fif)
+          - Unit 3: Git functions (gst, gpl, gdf, gcm, gsh, git_shortcuts)
+          - Unit 4: Management functions (list_functions, hello example)
+          - Unit 5: Enhanced aliases with GROUP FILTERING! 🎯
+            * Groups: files, navigation, git, k8s, ansible, devops, containers, network, thinkube
+            * Commands: aliases --groups, aliases -g k8s
+          - Unit 6: Fish plugins 🐟
+            * bass, fzf.fish, done, autopair.fish
+          - Unit 7: Shell configuration files ✅
+            * Bash (~/.bashrc)
+            * Zsh (~/.zshrc)
+            * Fish (~/.config/fish/config.fish)
+
+          🚀 Shell Environment is READY!
+
+          Next login to code-server will have:
+          - Beautiful Starship prompt with Nerd Font icons
+          - 15+ utility functions
+          - Grouped aliases system
+          - Fish plugins
+          - All shells (bash/zsh/fish) fully configured
+
+          📝 Remaining: Update documentation (Unit 8)

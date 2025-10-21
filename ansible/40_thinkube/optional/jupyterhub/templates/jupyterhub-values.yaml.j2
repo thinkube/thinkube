@@ -1,0 +1,763 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# JupyterHub Helm chart values with dynamic image discovery
+# Images discovered at runtime from thinkube-control API
+# No fallbacks - fails if dependencies unavailable
+
+hub:
+  config:
+    JupyterHub:
+      # MANDATORY: Keycloak authentication only - no fallbacks
+      authenticator_class: generic-oauth
+      admin_access: true
+      admin_users:
+        - {{ admin_username }}
+      allow_named_servers: false
+      shutdown_on_logout: true
+
+      # Thinkube AI Lab branding
+      template_vars:
+        announcement: "Welcome to Thinkube AI Lab - Thinkube's intelligent notebook laboratory"
+
+    # Keycloak authentication is mandatory
+    GenericOAuthenticator:
+      client_id: jupyterhub
+      client_secret: "{{ jupyterhub_client_secret }}"
+      oauth_callback_url: "https://jupyter.{{ domain_name }}/hub/oauth_callback"
+      authorize_url: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/auth"
+      token_url: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
+      userdata_url: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/userinfo"
+      logout_redirect_url: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/logout?redirect_uri=https://control.{{ domain_name }}"
+      login_service: "Keycloak"
+      username_claim: "preferred_username"
+      scope:
+        - "openid"
+        - "profile"
+        - "email"
+      allow_all: true
+
+  extraConfig:
+    00-spawner-config: |
+      # Set default URL to JupyterLab opening in notebooks folder
+      c.Spawner.default_url = '/lab/tree/thinkube/notebooks'
+
+      # Configure KubeSpawner for faster pod deletion
+      # Based on official KubeSpawner documentation
+      c.KubeSpawner.delete_grace_period = 1  # Grace period for pod deletion
+      c.KubeSpawner.delete_stopped_pods = True  # Delete pods when stopped (default)
+
+      # Set terminationGracePeriodSeconds via extra_pod_config
+      # This controls how long Kubernetes waits before forcefully killing the pod
+      c.KubeSpawner.extra_pod_config = {
+          'terminationGracePeriodSeconds': 1
+      }
+
+      # Reduce spawn/stop timeouts
+      c.Spawner.http_timeout = 30  # Reduce from default 60
+      c.Spawner.start_timeout = 120  # Reduce from default 300
+      c.Spawner.stop_timeout = 10  # Reduce from default 60 - time to wait for stop
+
+      # Override command to source service discovery environment
+      import textwrap
+      c.KubeSpawner.cmd = ['bash', '-c', textwrap.dedent("""
+      if [ -f /home/jovyan/.config/thinkube/service-env.sh ]; then
+        echo "Loading service environment variables..."
+        source /home/jovyan/.config/thinkube/service-env.sh
+      fi
+      exec jupyterhub-singleuser
+      """).strip()]
+
+    01-dynamic-profile-generator: |
+      # Dynamic profile generation with flexible resource selection
+      import requests
+      import sys
+      import logging
+
+      def parse_memory_to_gb(memory_str):
+          """Convert memory string to GB for comparison"""
+          if memory_str.endswith('Gi'):
+              return int(memory_str[:-2])
+          elif memory_str.endswith('G'):
+              return int(memory_str[:-1])
+          elif memory_str.endswith('Mi'):
+              return int(memory_str[:-2]) / 1024
+          elif memory_str.endswith('M'):
+              return int(memory_str[:-1]) / 1024
+          return 0
+
+      def get_profile_list(spawner):
+          """Generate profiles with flexible resource selection forms"""
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+
+          try:
+              # Query thinkube-control for available resources
+              logger.info("Querying thinkube-control for cluster resources...")
+              resources_response = requests.get(
+                  'http://backend.thinkube-control.svc.cluster.local:8000/api/v1/cluster/resources',
+                  headers={'Accept': 'application/json'},
+                  timeout=10
+              )
+
+              if resources_response.status_code != 200:
+                  logger.error(f"Failed to get cluster resources: {resources_response.status_code}")
+                  sys.exit(1)
+
+              resources = resources_response.json()
+
+              # Query for available images
+              logger.info("Querying thinkube-control for available images...")
+              images_response = requests.get(
+                  'http://backend.thinkube-control.svc.cluster.local:8000/api/v1/images/jupyter',
+                  headers={'Accept': 'application/json'},
+                  timeout=10
+              )
+
+              if images_response.status_code != 200:
+                  logger.error(f"Failed to get images: {images_response.status_code}")
+                  sys.exit(1)
+
+              images = images_response.json()
+
+              # Query for JupyterHub configuration (defaults)
+              logger.info("Querying thinkube-control for JupyterHub configuration...")
+              config_response = requests.get(
+                  'http://backend.thinkube-control.svc.cluster.local:8000/api/v1/jupyterhub/config',
+                  headers={'Accept': 'application/json'},
+                  timeout=10
+              )
+
+              if config_response.status_code != 200:
+                  logger.error(f"Failed to get JupyterHub config: {config_response.status_code}")
+                  logger.error("Cannot proceed without JupyterHub configuration from thinkube-control")
+                  sys.exit(1)
+
+              jupyterhub_config = config_response.json()
+              logger.info(f"Loaded JupyterHub config: image={jupyterhub_config.get('default_image')}, node={jupyterhub_config.get('default_node')}, defaults=({jupyterhub_config['default_cpu_cores']}CPU, {jupyterhub_config['default_memory_gb']}GB, {jupyterhub_config['default_gpu_count']}GPU)")
+
+              profiles = []
+
+              # Find max capacity across all nodes (users should see full capacity, not just available)
+              max_cpu = max(node['capacity']['cpu'] for node in resources)
+              max_memory_gb = max(parse_memory_to_gb(node['capacity']['memory']) for node in resources)
+              has_gpu = any(node['available']['gpu'] > 0 for node in resources)
+
+              # Build dynamic CPU choices based on capacity
+              cpu_choices = {}
+              cpu_options = [1, 2, 4, 6, 8, 12, 16, 24, 32]
+
+              # Ensure default is an integer and add if not in standard options
+              default_cpu = int(jupyterhub_config['default_cpu_cores'])
+              if default_cpu not in cpu_options:
+                  cpu_options.append(default_cpu)
+                  cpu_options.sort()
+
+              # Find best default if configured default exceeds capacity
+              actual_default = default_cpu if default_cpu <= max_cpu else max(c for c in cpu_options if c <= max_cpu)
+              logger.info(f"CPU: configured default={default_cpu}, max_cpu={max_cpu}, actual_default={actual_default}")
+
+              for cores in cpu_options:
+                  if cores <= max_cpu:
+                      cpu_choices[str(cores)] = {
+                          'display_name': f"{cores} core{'s' if cores > 1 else ''}",
+                          'default': (cores == actual_default)
+                      }
+
+              # Build dynamic memory choices based on capacity
+              memory_choices = {}
+              memory_options = [2, 4, 8, 16, 32, 48, 64, 96, 128]
+
+              # Ensure default is an integer and add if not in standard options
+              default_memory = int(jupyterhub_config['default_memory_gb'])
+              if default_memory not in memory_options:
+                  memory_options.append(default_memory)
+                  memory_options.sort()
+
+              # Find best default if configured default exceeds capacity
+              actual_default_memory = default_memory if default_memory <= max_memory_gb else max(m for m in memory_options if m <= max_memory_gb)
+              logger.info(f"Memory: configured default={default_memory}GB, max_memory={max_memory_gb}GB, actual_default={actual_default_memory}GB")
+
+              for gb in memory_options:
+                  if gb <= max_memory_gb:
+                      memory_choices[f"{gb}G"] = {
+                          'display_name': f"{gb} GB",
+                          'default': (gb == actual_default_memory)
+                      }
+
+              # Build node choices with resource info (shared across all profiles)
+              node_choices = {}
+              for node in resources:
+                  node_label = (f"{node['name']} "
+                              f"({node['available']['cpu']:.1f}/{node['capacity']['cpu']} CPUs, "
+                              f"{node['available']['memory']}/{node['capacity']['memory']}")
+
+                  # Add GPU info if available
+                  if node['gpu_details']:
+                      available_gpus = [g for g in node['gpu_details'] if g['available']]
+                      if available_gpus:
+                          gpu = available_gpus[0]
+                          node_label += f", GPU: {gpu['model']} {gpu['memory_total']}"
+                      else:
+                          node_label += ", GPU: In use"
+                  else:
+                      node_label += ", No GPU"
+
+                  node_label += ")"
+                  node_choices[node['name']] = {
+                      'display_name': node_label,
+                      'default': (node['name'] == jupyterhub_config.get('default_node'))
+                  }
+
+              # Build GPU choices based on max available GPUs across nodes
+              max_gpus = max(node['available']['gpu'] for node in resources)
+              gpu_choices = {}
+              for i in range(0, max_gpus + 1):
+                  gpu_choices[str(i)] = {
+                      'display_name': f'{i} GPU{"s" if i > 1 else ""}' if i > 0 else 'No GPU',
+                      'default': (i == jupyterhub_config['default_gpu_count'])
+                  }
+
+              # Create a single "Resource Selection" profile with image choice
+              image_choices = {}
+              for img in images:
+                  image_choices[img['name']] = {
+                      'display_name': img.get('display_name', img['name']),
+                      'default': (img['name'] == jupyterhub_config.get('default_image')),
+                      'kubespawner_override': {
+                          'image': f"{{ harbor_registry }}/library/{img['name']}:latest"
+                      }
+                  }
+
+              profile = {
+                  'display_name': 'Custom Resource Allocation',
+                  'description': 'Select your image and compute resources',
+                  'default': True,
+                  'profile_options': {
+                      'image': {
+                          'display_name': 'Select Image',
+                          'choices': image_choices
+                      },
+                      'node': {
+                          'display_name': 'Select Node',
+                          'choices': node_choices
+                      },
+                      'cpu': {
+                          'display_name': 'CPU Cores',
+                          'choices': cpu_choices
+                      },
+                      'memory': {
+                          'display_name': 'Memory',
+                          'choices': memory_choices
+                      },
+                      'enable_gpu': {
+                          'display_name': 'Number of GPUs',
+                          'choices': gpu_choices
+                      }
+                  },
+                  'kubespawner_override': {
+                      'image_pull_policy': 'Always'
+                  }
+              }
+              profiles.append(profile)
+
+              # Debug logging to verify defaults (inside choices now)
+              default_image = next((k for k, v in image_choices.items() if v.get('default')), None)
+              default_node = next((k for k, v in node_choices.items() if v.get('default')), None)
+              default_cpu = next((k for k, v in cpu_choices.items() if v.get('default')), None)
+              default_memory = next((k for k, v in memory_choices.items() if v.get('default')), None)
+              default_gpu = next((k for k, v in gpu_choices.items() if v.get('default')), None)
+              logger.info(f"Profile defaults set to:")
+              logger.info(f"  image: {default_image}")
+              logger.info(f"  node: {default_node}")
+              logger.info(f"  cpu: {default_cpu}")
+              logger.info(f"  memory: {default_memory}")
+              logger.info(f"  gpu: {default_gpu}")
+
+              if not profiles:
+                  logger.error("No profiles could be generated")
+                  sys.exit(1)
+
+              logger.info(f"Successfully generated {len(profiles)} profiles with resource options")
+              return profiles
+
+          except Exception as e:
+              logger.error(f"Failed to generate profiles: {e}")
+              sys.exit(1)
+
+      # Apply resource selections using pre_spawn_hook
+      async def resource_selector_hook(spawner):
+          """Apply resource selections from profile_options"""
+          import logging
+          import requests
+          logger = logging.getLogger(__name__)
+
+          # Load user options first as per documentation
+          await spawner.load_user_options()
+
+          user_options = spawner.user_options
+          logger.info(f"Pre-spawn hook - user_options: {user_options}")
+
+          # Log the exact structure we're getting
+          if isinstance(user_options, dict):
+              logger.info(f"user_options keys: {user_options.keys()}")
+              if 'profile' in user_options:
+                  logger.info(f"profile value type: {type(user_options['profile'])}")
+                  logger.info(f"profile value: {user_options['profile']}")
+
+          # Get defaults from thinkube-control config
+          defaults = {'cpu': '4', 'memory': '8G', 'gpu': '0'}
+          try:
+              config_response = requests.get(
+                  'http://backend.thinkube-control.svc.cluster.local:8000/api/v1/jupyterhub/config',
+                  timeout=5
+              )
+              if config_response.status_code == 200:
+                  config = config_response.json()
+                  defaults['cpu'] = str(config['default_cpu_cores'])
+                  defaults['memory'] = f"{config['default_memory_gb']}G"
+                  defaults['gpu'] = str(config['default_gpu_count'])
+                  logger.info(f"Loaded defaults from thinkube-control: CPU={defaults['cpu']}, Memory={defaults['memory']}, GPU={defaults['gpu']}")
+          except Exception as e:
+              logger.warning(f"Could not load defaults from thinkube-control, using fallbacks: {e}")
+
+          # When using profile_options, the selected values are directly in user_options
+          if user_options:
+              # Apply node selection
+              node = user_options.get('node')
+              if node:
+                  spawner.node_selector = {"kubernetes.io/hostname": node}
+                  logger.info(f"Set node selector: {node}")
+
+              # Apply CPU and memory (use thinkube-control defaults as fallback)
+              cpu = user_options.get('cpu', defaults['cpu'])
+              spawner.cpu_limit = float(cpu)
+              spawner.cpu_guarantee = float(cpu) * 0.5
+              logger.info(f"Set CPU: {cpu}")
+
+              memory = user_options.get('memory', defaults['memory'])
+              spawner.mem_limit = memory
+              spawner.mem_guarantee = memory
+              logger.info(f"Set memory: {memory}")
+
+              # Apply GPU allocation
+              gpu_count = user_options.get('enable_gpu', defaults['gpu'])
+              if gpu_count != '0':
+                  spawner.extra_resource_limits = {"nvidia.com/gpu": gpu_count}
+                  spawner.extra_resource_guarantees = {"nvidia.com/gpu": gpu_count}
+                  logger.info(f"Set GPU count: {gpu_count}")
+
+      c.KubeSpawner.profile_list = get_profile_list
+      c.KubeSpawner.pre_spawn_hook = resource_selector_hook
+
+    02-thinkube-branding: |
+      # Thinkube branding - logo and custom templates
+      c.JupyterHub.logo_file = '/usr/local/share/jupyterhub/static/images/tk_ai.svg'
+
+      # Custom template directory (searched before default templates)
+      c.JupyterHub.template_paths = ['/usr/local/share/jupyterhub/custom-templates']
+
+  # Thinkube AI Lab branding assets
+  extraFiles:
+    tk-ai-logo:
+      mountPath: /usr/local/share/jupyterhub/static/images/tk_ai.svg
+      stringData: |
+        {{ lookup('file', playbook_dir + '/templates/tk_ai.svg') | indent(8) }}
+
+    thinkube-page-template:
+      mountPath: /usr/local/share/jupyterhub/custom-templates/page.html
+      stringData: |
+        {% raw %}{% extends "templates/page.html" %}
+
+        {% block favicon %}
+        <link rel="icon" type="image/svg+xml" href="{{ static_url('images/tk_ai.svg') }}">
+        {% endblock %}
+
+        {% block logo %}
+        <img src="{{ static_url('images/tk_ai.svg') }}" alt="Thinkube AI Lab" id="jupyterhub-logo" />
+        {% endblock %}
+
+        {% block stylesheet %}
+        {{ super() }}
+        <link rel="stylesheet" href="{{ static_url('css/thinkube.css') }}" type="text/css"/>
+        {% endblock %}{% endraw %}
+
+    thinkube-css:
+      mountPath: /usr/local/share/jupyterhub/static/css/thinkube.css
+      stringData: |
+        /* Thinkube AI Lab branding - Thinkube colors */
+        :root {
+          --tk-teal: #006680;
+          --tk-teal-light: #008bad;
+          --tk-teal-dark: #004d5c;
+        }
+
+        /* Navbar styling - full width with proper contrast */
+        .navbar-default {
+          background-color: var(--tk-teal) !important;
+          border-color: var(--tk-teal-dark) !important;
+        }
+
+        #thenavbar {
+          background-color: var(--tk-teal) !important;
+        }
+
+        .navbar-default .navbar-brand {
+          color: white !important;
+          font-weight: 600;
+        }
+
+        .navbar-default .navbar-nav > li > a {
+          color: rgba(255, 255, 255, 0.95) !important;
+          font-weight: 500;
+        }
+
+        .navbar-default .navbar-nav > li > a:hover,
+        .navbar-default .navbar-nav > li > a:focus {
+          color: white !important;
+          background-color: var(--tk-teal-light) !important;
+        }
+
+        /* Logo styling */
+        #jupyterhub-logo {
+          height: 50px;
+          width: auto;
+        }
+
+        /* Primary buttons - teal theme */
+        .btn-primary, .btn-jupyter {
+          background-color: var(--tk-teal) !important;
+          border-color: var(--tk-teal) !important;
+        }
+
+        .btn-primary:hover, .btn-jupyter:hover {
+          background-color: var(--tk-teal-light) !important;
+          border-color: var(--tk-teal-light) !important;
+        }
+
+        .btn-primary:active, .btn-jupyter:active {
+          background-color: var(--tk-teal-dark) !important;
+          border-color: var(--tk-teal-dark) !important;
+        }
+
+        /* Login page styling */
+        #login-main .service-login {
+          border-color: var(--tk-teal);
+        }
+
+        /* Announcement banner - teal background with white text */
+        #announcement-banner {
+          background-color: var(--tk-teal) !important;
+          color: white !important;
+          padding: 12px 20px;
+          font-weight: 500;
+          border-bottom: 2px solid var(--tk-teal-dark);
+        }
+
+proxy:
+  secretToken: "{{ jupyterhub_proxy_token | default(lookup('password', '/dev/null chars=hex_digits length=64')) }}"
+  service:
+    type: ClusterIP
+  https:
+    enabled: false
+  chp:
+    image:
+      name: quay.io/jupyterhub/configurable-http-proxy
+      tag: "5.0.0"  # Use 5.0+ for websocket options support
+    pdb:
+      enabled: false
+
+singleuser:
+  defaultUrl: "/lab"
+
+  # User ID configuration
+  uid: 1000
+  fsGid: 100  # Group ID for filesystem access
+
+  # Init containers to fix permissions on JuiceFS volumes
+  initContainers:
+    - name: fix-permissions
+      image: {{ harbor_registry }}/library/busybox:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - |
+          # First time setup - check marker in persistent area
+          if [ ! -f "/home/jovyan/thinkube/.thinkube-initialized" ]; then
+            echo "First time setup - creating directory structure..."
+
+            # Create base thinkube directory
+            mkdir -p /home/jovyan/thinkube
+
+            # Create notebook subdirectories in JuiceFS
+            mkdir -p /home/jovyan/thinkube/notebooks/projects
+            mkdir -p /home/jovyan/thinkube/notebooks/experiments
+            mkdir -p /home/jovyan/thinkube/notebooks/agents
+            mkdir -p /home/jovyan/thinkube/notebooks/fine-tuning
+            mkdir -p /home/jovyan/thinkube/notebooks/templates  # For read-only templates from examples
+            mkdir -p /home/jovyan/thinkube/notebooks/examples   # For editable copies from examples
+
+            # Create datasets structure
+            mkdir -p /home/jovyan/thinkube/datasets/raw
+            mkdir -p /home/jovyan/thinkube/datasets/processed
+            mkdir -p /home/jovyan/thinkube/datasets/embeddings
+
+            # Create models structure
+            mkdir -p /home/jovyan/thinkube/models/checkpoints
+            mkdir -p /home/jovyan/thinkube/models/production
+            mkdir -p /home/jovyan/thinkube/models/fine-tuned
+
+            # Create scratch structure (note: this is emptyDir, recreated each time)
+            mkdir -p /home/jovyan/scratch/tmp
+
+            # Mark as initialized
+            touch /home/jovyan/thinkube/.thinkube-initialized
+            echo "First time setup complete"
+          else
+            echo "Directory structure already initialized"
+          fi
+
+          # Always fix permissions for persistent areas only
+          echo "Fixing permissions..."
+          chown -R 1000:100 /home/jovyan/thinkube
+          chmod -R 755 /home/jovyan/thinkube
+          # Also fix scratch if it exists
+          if [ -d /home/jovyan/scratch ]; then
+            chown -R 1000:100 /home/jovyan/scratch
+            chmod -R 755 /home/jovyan/scratch
+          fi
+          echo "Permissions fixed"
+      securityContext:
+        runAsUser: 0  # Run as root to fix permissions
+      volumeMounts:
+        - name: notebooks
+          mountPath: /home/jovyan/thinkube/notebooks
+        - name: datasets
+          mountPath: /home/jovyan/thinkube/datasets
+        - name: models
+          mountPath: /home/jovyan/thinkube/models
+        - name: scratch
+          mountPath: /home/jovyan/scratch
+
+    # Clone examples repository on each pod start
+    - name: clone-examples
+      image: {{ harbor_registry }}/library/alpine-git:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          echo "Cloning examples repository to /home/jovyan/thinkube/examples-repo/..."
+          mkdir -p /home/jovyan/thinkube/examples-repo
+          git clone https://github.com/thinkube/thinkube-ai-examples.git /home/jovyan/thinkube/examples-repo/thinkube-ai-examples
+
+          # Fix ownership for jovyan user
+          chown -R 1000:100 /home/jovyan/thinkube/examples-repo
+          chmod -R 755 /home/jovyan/thinkube/examples-repo
+          echo "Examples repository ready"
+      securityContext:
+        runAsUser: 0  # Run as root to clone and set permissions
+      volumeMounts:
+        - name: examples-repo
+          mountPath: /home/jovyan/thinkube/examples-repo
+        - name: notebooks
+          mountPath: /home/jovyan/thinkube/notebooks
+
+    # Query service discovery and generate environment file
+    - name: service-discovery
+      image: {{ harbor_registry }}/library/tk-service-discovery:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - /scripts/service-discovery-init.sh
+      volumeMounts:
+        - name: service-discovery-script
+          mountPath: /scripts
+        - name: service-config
+          mountPath: /service-config
+      securityContext:
+        runAsUser: 0  # Need root to create config directory and fix permissions
+
+  # ServiceAccount for querying ConfigMaps
+  serviceAccountName: jupyter-service-discovery
+
+  # MANDATORY: JuiceFS storage - no fallbacks
+  storage:
+    type: none  # We define volumes manually
+    # Hybrid storage approach: JuiceFS (persistent) + local scratch (performance)
+    extraVolumes:
+    # JuiceFS for persistent notebooks (MANDATORY)
+    - name: notebooks
+      persistentVolumeClaim:
+        claimName: jupyterhub-notebooks-pvc
+
+    # JuiceFS for datasets (MANDATORY)
+    - name: datasets
+      persistentVolumeClaim:
+        claimName: jupyterhub-datasets-pvc
+
+    # JuiceFS for models (MANDATORY)
+    - name: models
+      persistentVolumeClaim:
+        claimName: jupyterhub-models-pvc
+
+    # Local scratch for fast I/O (per-pod temporary)
+    - name: scratch
+      emptyDir:
+        sizeLimit: 100Gi
+
+    # Examples repository (cloned fresh on each pod start)
+    - name: examples-repo
+      emptyDir:
+        sizeLimit: 1Gi
+
+    # Service discovery script (from ConfigMap)
+    - name: service-discovery-script
+      configMap:
+        name: jupyter-service-discovery-script
+        defaultMode: 0755
+
+    # Service config output (shared between init container and main container)
+    - name: service-config
+      emptyDir: {}
+
+    extraVolumeMounts:
+    # Primary notebook storage (JuiceFS - persistent across nodes)
+    - name: notebooks
+      mountPath: /home/jovyan/thinkube/notebooks
+
+    # Datasets directory (JuiceFS - persistent across nodes)
+    - name: datasets
+      mountPath: /home/jovyan/thinkube/datasets
+
+    # Models directory (JuiceFS - persistent across nodes)
+    - name: models
+      mountPath: /home/jovyan/thinkube/models
+
+    # Fast local scratch space (emptyDir - temporary)
+    - name: scratch
+      mountPath: /home/jovyan/scratch
+
+    # Examples repository (emptyDir - cloned on pod start)
+    - name: examples-repo
+      mountPath: /home/jovyan/thinkube/examples-repo
+
+    # Service discovery environment file (generated by init container)
+    - name: service-config
+      mountPath: /home/jovyan/.config/thinkube
+
+  # Image configuration
+  image:
+    pullPolicy: Always
+
+  # Remove all node restrictions to allow scheduling on any GPU node
+  nodeSelector: {}
+  extraNodeAffinity: {}
+
+  # Enable GPU support and AI capabilities
+  extraEnv:
+    # NVIDIA GPU support
+    # NVIDIA_VISIBLE_DEVICES automatically set by NVIDIA device plugin based on GPU resource request
+    NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+
+    # JupyterLab configuration
+    JUPYTER_ENABLE_LAB: "yes"
+    GRANT_SUDO: "yes"
+
+    # Enable collaborative mode for YDoc/RTC integration (JupyterLab >= 4.1)
+    JUPYTER_LAB_ENABLE_COLLABORATION: "true"
+
+    # AI API keys - managed by thinkube-control secrets
+    # Users should create ANTHROPIC_API_KEY secret in thinkube-control
+    ANTHROPIC_API_KEY:
+      valueFrom:
+        secretKeyRef:
+          name: anthropic-api-key
+          key: value
+          optional: true  # Don't fail pod startup if secret doesn't exist
+
+  # Default resource limits (overridden by dynamic profiles)
+  cpu:
+    limit: 4
+    guarantee: 1
+  memory:
+    limit: 8G
+    guarantee: 2G
+
+  # Allow privilege escalation for sudo
+  allowPrivilegeEscalation: true
+
+  # Network policy
+  networkPolicy:
+    enabled: false
+
+  # Start timeout (5 minutes for image pull)
+  startTimeout: 300
+
+  # Lifecycle hooks - add environment sourcing to shell configs
+  lifecycleHooks:
+    postStart:
+      exec:
+        command:
+          - "bash"
+          - "-c"
+          - |
+            # Add service-env.sh to bashrc for interactive shells
+            # (kernels get it via cmd override, but terminals need it too)
+            if [ -f /home/jovyan/.config/thinkube/service-env.sh ]; then
+              if ! grep -q "service-env.sh" /home/jovyan/.bashrc 2>/dev/null; then
+                echo "" >> /home/jovyan/.bashrc
+                echo "# Thinkube service discovery (auto-generated)" >> /home/jovyan/.bashrc
+                echo "if [ -f ~/.config/thinkube/service-env.sh ]; then" >> /home/jovyan/.bashrc
+                echo "  source ~/.config/thinkube/service-env.sh" >> /home/jovyan/.bashrc
+                echo "fi" >> /home/jovyan/.bashrc
+              fi
+            fi
+
+            # Add .secrets.env to bashrc for thinkube-control API keys
+            if [ -f /home/jovyan/thinkube/notebooks/.secrets.env ]; then
+              if ! grep -q "\.secrets\.env" /home/jovyan/.bashrc 2>/dev/null; then
+                echo "" >> /home/jovyan/.bashrc
+                echo "# Thinkube secrets (exported from thinkube-control)" >> /home/jovyan/.bashrc
+                echo "if [ -f /home/jovyan/thinkube/notebooks/.secrets.env ]; then" >> /home/jovyan/.bashrc
+                echo "  source /home/jovyan/thinkube/notebooks/.secrets.env" >> /home/jovyan/.bashrc
+                echo "fi" >> /home/jovyan/.bashrc
+              fi
+            fi
+
+# Ingress is handled separately in the deployment playbook
+ingress:
+  enabled: false
+
+# Scheduling configuration (disabled for simplicity)
+scheduling:
+  userScheduler:
+    enabled: false
+  podPriority:
+    enabled: false
+  userPlaceholder:
+    enabled: false
+
+# Pre-puller configuration (disabled - images pulled on demand)
+prePuller:
+  hook:
+    enabled: false
+  continuous:
+    enabled: false
+
+# Culling configuration
+cull:
+  enabled: true
+  timeout: 3600  # 1 hour idle timeout
+  every: 600  # Check every 10 minutes
+  maxAge: 0  # Don't cull based on age
+
+# Debug mode (disable in production)
+debug:
+  enabled: false
+
+# Global configuration
+global:
+  safeToShowValues: false

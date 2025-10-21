@@ -1,0 +1,293 @@
+#!/usr/bin/env fish
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Test script for all CLI tools configured in code-server (Fish shell version)
+# Usage: fish /home/thinkube/test-cli-tools.fish [-v]
+#   -v: Verbose mode - show all command output
+
+# Parse command line arguments
+set VERBOSE 0
+for arg in $argv
+    switch $arg
+        case '-v'
+            set VERBOSE 1
+        case '*'
+            echo "Invalid option: $arg" >&2
+            echo "Usage: $argv[0] [-v]"
+            exit 1
+    end
+end
+
+# Source environment configuration
+test -f ~/.thinkube_shared_shell/env_setup.fish; and source ~/.thinkube_shared_shell/env_setup.fish
+test -f ~/.config/thinkube/service-env.fish; and source ~/.config/thinkube/service-env.fish
+
+# Colors for output
+set RED '\033[0;31m'
+set GREEN '\033[0;32m'
+set YELLOW '\033[1;33m'
+set NC '\033[0m' # No Color
+
+# Track results
+set FAILED_TESTS 0
+set PASSED_TESTS 0
+
+echo "======================================================================"
+echo "  Thinkube CLI Tools Configuration Test (Fish Shell)"
+echo "======================================================================"
+echo ""
+
+# Helper function to test a CLI tool
+# Usage: test_cli "name" "config_check" "test_command" ["optional"]
+#   - config_check: Command to check if service is configured (e.g., test -n "$VAR")
+#   - test_command: The actual test to run
+#   - optional: If "optional", SKIP when not configured; otherwise FAIL
+function test_cli
+    set -l name $argv[1]
+    set -l config_check $argv[2]
+    set -l test_command $argv[3]
+    set -l is_optional false
+    if test (count $argv) -ge 4
+        set is_optional $argv[4]
+    end
+
+    echo -n "Testing $name... "
+
+    # First check if service is configured
+    if not eval $config_check >/dev/null 2>&1
+        # Service not configured
+        if test "$is_optional" = "optional"
+            echo -e "$YELLOW⊘ SKIP (service not configured)$NC"
+        else
+            echo -e "$RED❌ FAIL$NC (required service not configured)"
+            set FAILED_TESTS (math $FAILED_TESTS + 1)
+        end
+        return
+    end
+
+    # Service IS configured, run the actual test
+    if test "$VERBOSE" = "1"
+        # In verbose mode, show command output
+        if eval $test_command
+            echo -e "$GREEN✅ PASS$NC"
+            set PASSED_TESTS (math $PASSED_TESTS + 1)
+        else
+            echo -e "$RED❌ FAIL$NC"
+            set FAILED_TESTS (math $FAILED_TESTS + 1)
+        end
+    else
+        # In normal mode, suppress output
+        if eval $test_command >/dev/null 2>&1
+            echo -e "$GREEN✅ PASS$NC"
+            set PASSED_TESTS (math $PASSED_TESTS + 1)
+        else
+            echo -e "$RED❌ FAIL$NC"
+            set FAILED_TESTS (math $FAILED_TESTS + 1)
+        end
+    end
+end
+
+echo "=== Core CLI Tools ==="
+echo ""
+
+# Test kubectl
+test_cli "kubectl" "true" "kubectl cluster-info"
+
+# Test GitHub CLI
+test_cli "GitHub CLI (gh)" "true" "gh auth status"
+
+# Test ArgoCD CLI
+test_cli "ArgoCD CLI" "true" "argocd version"
+
+# Test Argo Workflows CLI (retry on failure due to intermittent connectivity)
+echo -n "Testing Argo Workflows CLI... "
+set ARGO_TEST_PASSED false
+for attempt in 1 2 3
+    if test "$VERBOSE" = "1"
+        if argo version
+            set ARGO_TEST_PASSED true
+            break
+        end
+    else
+        if argo version >/dev/null 2>&1
+            set ARGO_TEST_PASSED true
+            break
+        end
+    end
+    test $attempt -lt 3; and sleep 1
+end
+
+if test "$ARGO_TEST_PASSED" = "true"
+    echo -e "$GREEN✅ PASS$NC"
+    set PASSED_TESTS (math $PASSED_TESTS + 1)
+else
+    echo -e "$RED❌ FAIL$NC"
+    set FAILED_TESTS (math $FAILED_TESTS + 1)
+end
+
+# Test Tea (Gitea CLI)
+test_cli "Tea (Gitea CLI)" "true" "tea login list"
+
+# Test Harbor registry configuration (used with podman)
+test_cli "Harbor registry config" "true" "grep '{{ harbor_registry }}' ~/.docker/config.json"
+
+# Test git configuration
+echo -n "Testing git config... "
+if git config --get user.name >/dev/null 2>&1; and git config --get user.email >/dev/null 2>&1
+    echo -e "$GREEN✅ PASS$NC (user: "(git config --get user.name)")"
+    set PASSED_TESTS (math $PASSED_TESTS + 1)
+else
+    echo -e "$RED❌ FAIL$NC"
+    set FAILED_TESTS (math $FAILED_TESTS + 1)
+end
+
+# Test DevPi (core Python package index - verify CLI works with authentication)
+echo -n "Testing DevPi CLI... "
+if test -n "$DEVPI_URL"; and test -n "$DEVPI_USERNAME"; and test -n "$DEVPI_PASSWORD"
+    # Use temporary clientdir to avoid conflicts with server URL rewriting
+    set DEVPI_TEST_DIR (mktemp -d)
+    # Configure devpi to use the API endpoint (no OAuth2)
+    if test "$VERBOSE" = "1"
+        # Verbose mode - show output
+        if devpi use "$DEVPI_URL" --clientdir="$DEVPI_TEST_DIR"; and \
+           devpi login "$DEVPI_USERNAME" --password="$DEVPI_PASSWORD" --clientdir="$DEVPI_TEST_DIR"; and \
+           devpi use "$DEVPI_INDEX" --clientdir="$DEVPI_TEST_DIR"
+            echo -e "$GREEN✅ PASS$NC"
+            set PASSED_TESTS (math $PASSED_TESTS + 1)
+        else
+            echo -e "$RED❌ FAIL$NC (CLI authentication or index access failed)"
+            set FAILED_TESTS (math $FAILED_TESTS + 1)
+        end
+    else
+        # Normal mode - suppress output
+        if devpi use "$DEVPI_URL" --clientdir="$DEVPI_TEST_DIR" >/dev/null 2>&1; and \
+           devpi login "$DEVPI_USERNAME" --password="$DEVPI_PASSWORD" --clientdir="$DEVPI_TEST_DIR" >/dev/null 2>&1; and \
+           devpi use "$DEVPI_INDEX" --clientdir="$DEVPI_TEST_DIR" >/dev/null 2>&1
+            echo -e "$GREEN✅ PASS$NC"
+            set PASSED_TESTS (math $PASSED_TESTS + 1)
+        else
+            echo -e "$RED❌ FAIL$NC (CLI authentication or index access failed)"
+            set FAILED_TESTS (math $FAILED_TESTS + 1)
+        end
+    end
+    rm -rf "$DEVPI_TEST_DIR"
+else
+    echo -e "$RED❌ FAIL$NC (Environment variables not set)"
+    set FAILED_TESTS (math $FAILED_TESTS + 1)
+end
+
+# Test PostgreSQL connection (core service - validate credentials work)
+test_cli "PostgreSQL connection" "test -n \"\$POSTGRES_HOST\"; and test -n \"\$POSTGRES_PASSWORD\"" "python3 -c 'import psycopg2; import os; conn=psycopg2.connect(host=os.environ.get(\"POSTGRES_HOST\"), port=int(os.environ.get(\"POSTGRES_PORT\", 5432)), database=os.environ.get(\"POSTGRES_DB\"), user=os.environ.get(\"POSTGRES_USER\"), password=os.environ.get(\"POSTGRES_PASSWORD\")); cursor=conn.cursor(); cursor.execute(\"SELECT 1\"); cursor.close(); conn.close()' 2>/dev/null"
+
+# Test SeaweedFS S3 API (core service - validate credentials work)
+test_cli "SeaweedFS S3 API" "test -n \"\$SEAWEEDFS_S3_ENDPOINT\"; and test -n \"\$SEAWEEDFS_ACCESS_KEY\"; and test -n \"\$SEAWEEDFS_SECRET_KEY\"" "python3 -c 'import boto3; import os; s3=boto3.client(\"s3\", endpoint_url=os.environ.get(\"SEAWEEDFS_S3_ENDPOINT\"), aws_access_key_id=os.environ.get(\"SEAWEEDFS_ACCESS_KEY\"), aws_secret_access_key=os.environ.get(\"SEAWEEDFS_SECRET_KEY\"), verify=False); s3.list_buckets()' 2>/dev/null"
+
+echo ""
+echo "=== Optional Data Services ==="
+echo ""
+
+# Test Valkey (Redis-compatible - verify connection, no authentication)
+test_cli "Valkey connection" "test -n \"\$VALKEY_HOST\"" "python3 -c 'import redis; import os; r=redis.Redis(host=os.environ.get(\"VALKEY_HOST\"), port=int(os.environ.get(\"VALKEY_PORT\", 6379)), decode_responses=True); r.ping(); r.set(\"test_key\", \"test_value\"); r.delete(\"test_key\")' 2>/dev/null" "optional"
+
+# Test Qdrant (open-source version - no API key authentication)
+test_cli "Qdrant vector DB" "test -n \"\$QDRANT_URL\"" "python3 -c 'from qdrant_client import QdrantClient; import os; client=QdrantClient(url=os.environ.get(\"QDRANT_URL\"), port=443, https=True, verify=False); client.get_collections()' 2>/dev/null" "optional"
+
+# Test ClickHouse (verify credentials work with actual query)
+test_cli "ClickHouse database" "test -n \"\$CLICKHOUSE_HOST\"; and test -n \"\$CLICKHOUSE_USER\"; and test -n \"\$CLICKHOUSE_PASSWORD\"" "python3 -c 'import clickhouse_connect; import os; client=clickhouse_connect.get_client(host=os.environ.get(\"CLICKHOUSE_HOST\"), port=int(os.environ.get(\"CLICKHOUSE_HTTP_PORT\", 443)), username=os.environ.get(\"CLICKHOUSE_USER\"), password=os.environ.get(\"CLICKHOUSE_PASSWORD\"), secure=True, verify=False); result=client.query(\"SELECT 1\"); assert result.result_rows[0][0] == 1' 2>/dev/null" "optional"
+
+# Test NATS (verify connection with authentication)
+test_cli "NATS messaging" "test -n \"\$NATS_URL\"" "python3 -c 'import nats, asyncio, os
+async def test():
+    nc = await nats.connect(os.environ.get(\"NATS_URL\"), tls=None)
+    await nc.publish(\"test\", b\"hello\")
+    await nc.close()
+asyncio.run(test())' 2>/dev/null" "optional"
+
+# Test Chroma (verify token authentication works)
+test_cli "Chroma vector DB" "test -n \"\$CHROMA_API_URL\"; and test -n \"\$CHROMA_AUTH_TOKEN\"" "python3 -c 'import chromadb; from chromadb.config import Settings; import os; client=chromadb.HttpClient(host=os.environ.get(\"CHROMA_API_URL\").replace(\"https://\", \"\").replace(\"http://\", \"\"), port=443, ssl=True, headers={\"X-Chroma-Token\": os.environ.get(\"CHROMA_AUTH_TOKEN\")}); client.heartbeat()' 2>/dev/null" "optional"
+
+echo ""
+echo "=== Optional ML/AI Services ==="
+echo ""
+
+# Test Argilla (verify authentication with API key works)
+test_cli "Argilla client" "test -n \"\$ARGILLA_API_KEY\"" "python3 -c 'import argilla; import os; import urllib3; urllib3.disable_warnings(); client = argilla.Argilla(api_url=os.environ.get(\"ARGILLA_API_URL\"), api_key=os.environ.get(\"ARGILLA_API_KEY\")); client.me.username' 2>/dev/null" "optional"
+
+# Test CVAT (verify CLI authentication with basic auth on /api/ endpoint)
+test_cli "CVAT CLI" "test -n \"\$CVAT_USERNAME\"; and test -n \"\$CVAT_PASSWORD\"" "cvat-cli --server-host \"\$CVAT_API_URL\" --auth \"\$CVAT_USERNAME:\$CVAT_PASSWORD\" task ls 2>/dev/null" "optional"
+
+# Test MLflow
+echo -n "Testing MLflow config... "
+if test -n "$MLFLOW_TRACKING_URI"
+    # Get MLflow authentication token
+    if test -f ~/mlflow-auth.fish
+        source ~/mlflow-auth.fish >/dev/null 2>&1
+    end
+
+    # Try to connect to MLflow tracking server using Python SDK
+    if test -n "$MLFLOW_TRACKING_TOKEN"; and python3 -c "import mlflow; mlflow.set_tracking_uri('$MLFLOW_TRACKING_URI'); mlflow.search_experiments()" 2>/dev/null
+        echo -e "$GREEN✅ PASS$NC (URI: $MLFLOW_TRACKING_URI)"
+        set PASSED_TESTS (math $PASSED_TESTS + 1)
+    else
+        echo -e "$RED❌ FAIL$NC (Cannot connect to $MLFLOW_TRACKING_URI - run 'source ~/mlflow-auth.fish' first)"
+        set FAILED_TESTS (math $FAILED_TESTS + 1)
+    end
+else
+    echo -e "$YELLOW⊘ SKIP (optional service not installed)$NC"
+end
+
+# Test Perses (verify percli can connect and list dashboards)
+test_cli "Perses API" "test -n \"\$PERSES_URL\"; and test -n \"\$PERSES_USER\"; and test -n \"\$PERSES_PASSWORD\"" "percli config set url \$PERSES_URL; and echo \$PERSES_PASSWORD | percli login --username \$PERSES_USER --password-stdin; and percli get dashboards --project gpu | head -1" "optional"
+
+# Test OpenSearch (verify connection with credentials from environment)
+test_cli "OpenSearch client" "test -n \"\$OPENSEARCH_URL\"; and test -n \"\$OPENSEARCH_USER\"; and test -n \"\$OPENSEARCH_PASSWORD\"" "python3 -c 'from opensearchpy import OpenSearch; import os; client=OpenSearch([os.environ.get(\"OPENSEARCH_URL\")], http_auth=(os.environ.get(\"OPENSEARCH_USER\"), os.environ.get(\"OPENSEARCH_PASSWORD\")), use_ssl=True, verify_certs=False); client.info()' 2>/dev/null" "optional"
+
+# Test Weaviate (verify connection with API key from environment)
+test_cli "Weaviate client" "test -n \"\$WEAVIATE_URL\"; and test -n \"\$WEAVIATE_API_KEY\"" "python3 -c 'import weaviate; from weaviate.auth import AuthApiKey; import os; client=weaviate.connect_to_weaviate_cloud(cluster_url=os.environ.get(\"WEAVIATE_URL\"), auth_credentials=AuthApiKey(os.environ.get(\"WEAVIATE_API_KEY\")), skip_init_checks=True); client.is_ready(); client.close()' 2>/dev/null" "optional"
+
+# Test LiteLLM
+echo -n "Testing LiteLLM config... "
+if test -n "$LITELLM_ENDPOINT"
+    # Test authenticated access to LiteLLM API
+    if test -n "$LITELLM_MASTER_KEY"
+        if curl -s -f -k --max-time 5 -H "Authorization: Bearer $LITELLM_MASTER_KEY" "$LITELLM_ENDPOINT/health" >/dev/null 2>&1
+            echo -e "$GREEN✅ PASS$NC (Endpoint: $LITELLM_ENDPOINT)"
+            set PASSED_TESTS (math $PASSED_TESTS + 1)
+        else
+            echo -e "$RED❌ FAIL$NC (Cannot connect to $LITELLM_ENDPOINT with authentication)"
+            set FAILED_TESTS (math $FAILED_TESTS + 1)
+        end
+    else
+        echo -e "$RED❌ FAIL$NC (LITELLM_MASTER_KEY not set)"
+        set FAILED_TESTS (math $FAILED_TESTS + 1)
+    end
+else if test -f ~/.config/thinkube/service-env.sh; and grep -q "LITELLM_ENDPOINT" ~/.config/thinkube/service-env.sh
+    echo -e "$YELLOW⊘ SKIP (configured but not sourced in current shell)$NC"
+else
+    echo -e "$YELLOW⊘ SKIP (optional service not installed)$NC"
+end
+
+# Test Langfuse (verify API keys work)
+test_cli "Langfuse SDK" "test -f ~/.langfuse/credentials" "python3 -c 'from langfuse import Langfuse; import configparser; config=configparser.ConfigParser(); config.read(\"$HOME/.langfuse/credentials\"); langfuse=Langfuse(public_key=config[\"langfuse\"][\"public_key\"], secret_key=config[\"langfuse\"][\"secret_key\"], host=config[\"langfuse\"][\"host\"]); langfuse.auth_check()' 2>/dev/null" "optional"
+
+echo ""
+echo "======================================================================"
+echo "  Test Results"
+echo "======================================================================"
+echo -e "Passed: $GREEN$PASSED_TESTS$NC"
+echo -e "Failed: $RED$FAILED_TESTS$NC"
+echo ""
+
+if test $FAILED_TESTS -eq 0
+    echo -e "$GREEN✅ All configured CLI tools are working correctly!$NC"
+    exit 0
+else
+    echo -e "$RED❌ Some CLI tools failed configuration tests.$NC"
+    echo ""
+    echo "Troubleshooting:"
+    echo "1. Re-run: ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/15_configure_environment.yaml"
+    echo "2. Check logs for specific failures"
+    echo "3. Verify all required services are deployed"
+    exit 1
+end

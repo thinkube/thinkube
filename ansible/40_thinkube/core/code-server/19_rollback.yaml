@@ -1,0 +1,187 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/code-server/19_rollback.yaml
+# Description:
+#   Rollback Code Server deployment and clean up all resources
+#
+# Requirements:
+#   - MicroK8s must be installed
+#   - Must have access to Keycloak admin API
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/code-server/19_rollback.yaml
+#
+# Variables from inventory:
+#   - kubectl_bin: Path to kubectl binary
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username
+#
+# 🤖 [AI-generated]
+
+- name: Rollback Code Server deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    code_server_namespace: "code-server"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
+
+  tasks:
+    ###################################################################
+    # 1) Delete Kubernetes resources (stops code-server pods first)
+    ###################################################################
+    - name: Delete Code Server namespace (and all resources within)
+      ansible.builtin.shell: |
+        microk8s.kubectl delete namespace {{ code_server_namespace }} --wait --timeout=120s
+      register: namespace_delete
+      failed_when:
+        - namespace_delete.rc != 0
+        - '"NotFound" not in namespace_delete.stderr'
+
+    - name: Wait 5 seconds for pods to fully terminate
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Delete ClusterRoleBinding for CI/CD monitor
+      ansible.builtin.shell: |
+        microk8s.kubectl delete clusterrolebinding code-server-cicd-monitor
+      register: crb_delete
+      failed_when:
+        - crb_delete.rc != 0
+        - '"NotFound" not in crb_delete.stderr'
+
+    - name: Delete ClusterRole for CI/CD monitor
+      ansible.builtin.shell: |
+        microk8s.kubectl delete clusterrole thinkube-cicd-monitor
+      register: cr_delete
+      failed_when:
+        - cr_delete.rc != 0
+        - '"NotFound" not in cr_delete.stderr'
+
+    ###################################################################
+    # 2) Remove repository monitor service
+    ###################################################################
+    - name: Stop repository monitor service
+      become: true
+      ansible.builtin.systemd:
+        name: repo-monitor
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove repository monitor service file
+      become: true
+      ansible.builtin.file:
+        path: /etc/systemd/system/repo-monitor.service
+        state: absent
+
+    - name: Remove repository monitor script
+      become: true
+      ansible.builtin.file:
+        path: /usr/local/bin/repo-monitor.sh
+        state: absent
+
+    - name: Reload systemd daemon
+      become: true
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    ###################################################################
+    # 3) Remove Keycloak configuration
+    ###################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+      no_log: false
+
+    - name: Verify Keycloak authentication succeeded
+      ansible.builtin.assert:
+        that:
+          - keycloak_token is succeeded
+          - keycloak_token.json is defined
+          - keycloak_token.json.access_token is defined
+        fail_msg: |
+          ERROR: Failed to authenticate with Keycloak
+          
+          DETAILS:
+          - URL: {{ keycloak_url }}/realms/master/protocol/openid-connect/token
+          - Username: {{ admin_username }}
+          - Status: {{ keycloak_token.status | default('Unknown') }}
+          - Message: {{ keycloak_token.msg | default('No error message') }}
+          
+          POSSIBLE CAUSES:
+          - Keycloak is not accessible at {{ keycloak_url }}
+          - Admin credentials are incorrect
+          - ADMIN_PASSWORD environment variable not set correctly
+          
+          REQUIRED ACTION:
+          - Verify Keycloak is running: microk8s.kubectl get pods -n keycloak
+          - Verify ADMIN_PASSWORD is set in your ~/.env file
+          - Check Keycloak logs if authentication continues to fail
+
+    - name: Get code-server client from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId=code-server"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: code_server_client
+      when: 
+        - keycloak_token is succeeded
+        - keycloak_token.json is defined
+        - keycloak_token.json.access_token is defined
+      failed_when: false
+
+    - name: Delete code-server client from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ code_server_client.json[0].id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 204
+      when:
+        - keycloak_token is succeeded
+        - keycloak_token.json is defined
+        - keycloak_token.json.access_token is defined
+        - code_server_client is succeeded
+        - code_server_client.json is defined
+        - code_server_client.json | length > 0
+      failed_when: false
+
+    ###################################################################
+    # 4) Clean up local directories (optional)
+    ###################################################################
+    - name: Clean up all hidden directories and files in shared-code
+      ansible.builtin.shell: |
+        cd /home/thinkube/shared-code
+        find . -maxdepth 1 -name '.*' ! -name '.' ! -name '..' -exec rm -rf {} +
+        echo "Cleaned up all hidden directories and files in shared-code"
+      failed_when: false
+
+    - name: Display rollback completion
+      ansible.builtin.debug:
+        msg:
+          - "Code Server rollback completed"
+          - "-----------------------------------"
+          - "Removed namespace: {{ code_server_namespace }}"
+          - "Removed repository monitor service"
+          - "Removed Keycloak client configuration"
+          - "-----------------------------------"

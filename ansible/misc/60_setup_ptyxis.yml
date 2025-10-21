@@ -1,0 +1,153 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Set up Ptyxis (Desktop Configuration)
+  hosts: desktops  # This will target only hosts in the 'desktops' group
+  become: false  # Only become root when needed
+  vars:
+    ptyxis_flatpak_id: app.devsuite.Ptyxis
+    ptyxis_config_dir: "{{ ansible_env.HOME }}/.var/app/{{ ptyxis_flatpak_id }}/config/ptyxis"
+  
+  tasks:
+    - name: Update apt cache
+      become: true
+      apt:
+        update_cache: yes
+      
+    - name: Install Flatpak
+      become: true
+      apt:
+        name: flatpak
+        state: present
+    
+    - name: Install GNOME Software Flatpak plugin
+      become: true
+      apt:
+        name: gnome-software-plugin-flatpak
+        state: present
+    
+    - name: Add Flathub repository
+      command: flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+      register: add_flathub
+      changed_when: add_flathub.rc == 0 and "Remote flathub already exists" not in add_flathub.stderr
+      failed_when: add_flathub.rc != 0 and "Remote flathub already exists" not in add_flathub.stderr
+    
+    - name: Install Ptyxis via Flatpak
+      command: flatpak install -y flathub {{ ptyxis_flatpak_id }}
+      register: install_ptyxis
+      changed_when: install_ptyxis.rc == 0 and "is already installed" not in install_ptyxis.stdout
+      failed_when: install_ptyxis.rc != 0 and "is already installed" not in install_ptyxis.stdout
+    
+    - name: Create Ptyxis config directory
+      file:
+        path: "{{ ptyxis_config_dir }}"
+        state: directory
+        mode: '0755'
+    
+    - name: Configure Ptyxis profiles
+      copy:
+        dest: "{{ ptyxis_config_dir }}/profiles.json"
+        content: |
+          {
+            "profiles": {
+              "default": {
+                "font": "Monospace 12",
+                "font-scale": 1.0,
+                "scrollback-lines": 10000,
+                "audible-bell": false,
+                "cursor-blink-mode": "on",
+                "color-scheme": "dark"
+              },
+              "tmux": {
+                "font": "Monospace 12",
+                "font-scale": 1.0,
+                "scrollback-lines": 10000,
+                "audible-bell": false,
+                "cursor-blink-mode": "on",
+                "color-scheme": "dark",
+                "custom-command": "tmux",
+                "initial-title": "tmux session"
+              }
+            }
+          }
+        mode: '0644'
+    
+    # Prepare shell config files before modifying them
+    - name: Check if .bashrc exists
+      stat:
+        path: "{{ ansible_env.HOME }}/.bashrc"
+      register: bashrc_file
+    
+    - name: Create .bashrc if it doesn't exist
+      file:
+        path: "{{ ansible_env.HOME }}/.bashrc"
+        state: touch
+        mode: '0644'
+      when: not bashrc_file.stat.exists
+    
+    - name: Add Ptyxis Flatpak PATH to Bash
+      blockinfile:
+        path: "{{ ansible_env.HOME }}/.bashrc"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - Ptyxis Flatpak configuration"
+        block: |
+          # Add tmux to PATH if using Flatpak Ptyxis
+          if [ -n "$FLATPAK_ID" ] && [ "$FLATPAK_ID" = "{{ ptyxis_flatpak_id }}" ]; then
+              export PATH="$PATH:/usr/bin"
+          fi
+    
+    - name: Check if .zshrc exists
+      stat:
+        path: "{{ ansible_env.HOME }}/.zshrc"
+      register: zshrc_file
+    
+    - name: Create .zshrc if it doesn't exist
+      file:
+        path: "{{ ansible_env.HOME }}/.zshrc"
+        state: touch
+        mode: '0644'
+      when: not zshrc_file.stat.exists
+    
+    - name: Add Ptyxis Flatpak PATH to Zsh
+      blockinfile:
+        path: "{{ ansible_env.HOME }}/.zshrc"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - Ptyxis Flatpak configuration"
+        block: |
+          # Add tmux to PATH if using Flatpak Ptyxis
+          if [ -n "$FLATPAK_ID" ] && [ "$FLATPAK_ID" = "{{ ptyxis_flatpak_id }}" ]; then
+              export PATH="$PATH:/usr/bin"
+          fi
+    
+    - name: Create fish config directory
+      file:
+        path: "{{ ansible_env.HOME }}/.config/fish"
+        state: directory
+        mode: '0755'
+    
+    - name: Check if fish config exists
+      stat:
+        path: "{{ ansible_env.HOME }}/.config/fish/config.fish"
+      register: fish_config_file
+    
+    - name: Create fish config if it doesn't exist
+      file:
+        path: "{{ ansible_env.HOME }}/.config/fish/config.fish"
+        state: touch
+        mode: '0644'
+      when: not fish_config_file.stat.exists
+    
+    - name: Add Ptyxis Flatpak PATH to Fish
+      blockinfile:
+        path: "{{ ansible_env.HOME }}/.config/fish/config.fish"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - Ptyxis Flatpak configuration"
+        block: |
+          # Add tmux to PATH if using Flatpak Ptyxis
+          if test -n "$FLATPAK_ID" && test "$FLATPAK_ID" = "{{ ptyxis_flatpak_id }}"
+              set -x PATH $PATH /usr/bin
+          end
+    
+    - name: Installation complete message
+      debug:
+        msg: 
+          - "Ptyxis setup complete! You need to restart your system for Flatpak integration to fully work."
+          - "Launch Ptyxis from your applications menu and tmux will automatically start."

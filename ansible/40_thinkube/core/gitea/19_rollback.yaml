@@ -1,0 +1,132 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/gitea/19_rollback.yaml
+# Description:
+#   Rollback Gitea deployment and clean up resources
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/gitea/19_rollback.yaml
+
+- name: Rollback Gitea Deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  vars:
+    gitea_db_name: "gitea"
+    keycloak_client_id: "gitea"
+    postgres_host: "postgresql-official.{{ postgres_namespace }}.svc.cluster.local"
+    
+  tasks:
+    - name: Remove Gitea namespace (this will delete all resources)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ gitea_namespace }}"
+      ignore_errors: yes
+    
+    - name: Wait for namespace deletion
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ gitea_namespace }}"
+      register: namespace_check
+      until: namespace_check.resources | length == 0
+      retries: 60
+      delay: 5
+      ignore_errors: yes
+    
+    - name: Clean up PostgreSQL database
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "gitea-db-cleanup-{{ ansible_date_time.epoch }}"
+            namespace: "{{ postgres_namespace }}"
+          spec:
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: cleanup-db
+                  image: postgres:14
+                  env:
+                  - name: PGPASSWORD
+                    value: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+                  command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    # Drop database
+                    psql -h {{ postgres_host }} -U {{ admin_username }} -d mydatabase -c "DROP DATABASE IF EXISTS {{ gitea_db_name }};"
+                    
+                    echo "Database cleaned up"
+      when: lookup('env', 'ADMIN_PASSWORD') != ""
+    
+    - name: Remove Keycloak client
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_common
+      vars:
+        keycloak_admin_username: "{{ admin_username }}"
+        keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+      when: lookup('env', 'ADMIN_PASSWORD') != ""
+    
+    - name: Get Keycloak client ID
+      ansible.builtin.uri:
+        url: "https://auth.{{ domain_name }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ keycloak_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token }}"
+        validate_certs: false
+      register: client_response
+      when: 
+        - keycloak_admin_token is defined
+        - lookup('env', 'ADMIN_PASSWORD') != ""
+    
+    - name: Delete Keycloak client
+      ansible.builtin.uri:
+        url: "https://auth.{{ domain_name }}/admin/realms/{{ keycloak_realm }}/clients/{{ client_response.json[0].id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token }}"
+        validate_certs: false
+        status_code: 204
+      when: 
+        - client_response is defined
+        - client_response is not skipped
+        - client_response.json is defined
+        - client_response.json | length > 0
+        - keycloak_admin_token is defined
+    
+    - name: Summary of rollback
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Gitea Rollback Completed
+          ════════════════════════════════════════════════════════
+          
+          Removed:
+          ✓ Gitea namespace and all resources
+          ✓ PostgreSQL database (includes all webhooks)
+          ✓ Keycloak client configuration
+          ✓ All persistent data
+          ✓ Admin API tokens and secrets
+          ✓ Repository webhooks (via database removal)
+          
+          Note: If you redeploy Gitea, it will start fresh
+          with no existing repositories, users, or webhooks.
+          
+          Argo Events webhook infrastructure remains intact
+          and can be reused when Gitea is redeployed.
+          
+          ════════════════════════════════════════════════════════

@@ -1,0 +1,732 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/10_deploy.yaml
+# Description:
+#   Deploys Harbor container registry with OIDC authentication via Keycloak
+#   Creates Keycloak client, configures OIDC scopes, and sets up harbor-admins group
+#   Uses Helm chart for deployment with ingress exposure
+#   
+#   EXCEPTION: Harbor's built-in admin username cannot be changed from "admin"
+#   We change its password to our standard admin_password for consistency
+#
+# Requirements:
+#   - MicroK8s installed with storage addon enabled
+#   - Keycloak must be deployed and accessible
+#   - Wildcard TLS certificate available in default namespace
+#   - KEYCLOAK_ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/10_deploy.yaml
+#
+# Variables from inventory:
+#   - admin_username: Admin user for Keycloak and harbor-admins group
+#   - domain_name: Base domain for services
+#   - keycloak_url: Keycloak server URL
+#   - keycloak_realm: Keycloak realm for services
+#   - primary_ingress_class: Ingress class to use
+#   - harbor_namespace: Namespace for Harbor deployment
+#   - harbor_registry: Harbor registry domain
+#   - harbor_release: Helm release name
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+#
+# Environment Variables:
+#   - ADMIN_PASSWORD: Required for Keycloak authentication
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy Harbor with LoadBalancer Exposure and OIDC Authentication
+  hosts: microk8s_control_plane
+  gather_facts: false
+  vars:
+    harbor_values: "/tmp/harbor-values.yaml"
+    harbor_admin_user: "admin"  # Harbor's built-in admin user (EXCEPTION: Cannot be changed)
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+    # OIDC configuration  
+    oidc_client_id: "harbor"
+    oidc_group_claim: "groups"
+    oidc_admin_group: "harbor-admins"
+    oidc_scopes: "openid,profile,email,groups"
+    
+  pre_tasks:
+    - name: Verify admin password available
+      ansible.builtin.assert:
+        that: admin_password != ''
+        fail_msg: "ADMIN_PASSWORD environment variable must be set"
+        success_msg: "Required environment variables are set"
+
+  tasks:
+    ########################################################################
+    # 1. Keycloak OIDC Client, Scope Setup, harbor-admins Group
+    ########################################################################
+    
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: password
+          client_id: "admin-cli"
+        validate_certs: false  # TODO: Set to true once DNS resolves properly for auth.{{ domain_name }}
+        status_code: [200, 201]
+      register: keycloak_token
+      no_log: true
+
+    - name: Ensure harbor client exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          clientId: "{{ oidc_client_id }}"
+          enabled: true
+          protocol: "openid-connect"
+          publicClient: false
+          redirectUris:
+            - "https://{{ harbor_registry }}/c/oidc/callback"
+          baseUrl: "https://{{ harbor_registry }}"
+          attributes:
+            post.logout.redirect.uris: "+"
+        status_code: [201, 409]
+        validate_certs: false  # Self-signed certificate during initial deployment
+      register: harbor_client_creation
+
+    - name: Get harbor client ID
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ oidc_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: 200
+        validate_certs: false  # Self-signed certificate during initial deployment
+      register: harbor_client_info
+
+    - name: Set harbor client UUID fact
+      ansible.builtin.set_fact:
+        harbor_client_uuid: >-
+          {{ (harbor_client_info.json[0].id if harbor_client_info.json | length > 0 else
+          harbor_client_creation.json.id) }}
+
+    - name: Ensure OIDC scopes exist
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/client-scopes"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ item.name }}"
+          description: "{{ item.description }}"
+          protocol: "openid-connect"
+        status_code: [201, 409]
+        validate_certs: false  # Self-signed certificate during initial deployment
+      loop:
+        - { name: "openid", description: "OpenID Connect scope" }
+        - { name: "groups", description: "OIDC Groups scope" }
+        - { name: "profile", description: "OIDC Profile scope" }
+        - { name: "email", description: "OIDC Email scope" }
+
+    - name: Get all client scopes
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/client-scopes"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: 200
+        validate_certs: false  # Self-signed certificate during initial deployment
+      register: all_scopes
+
+    - name: Set scope IDs as facts
+      ansible.builtin.set_fact:
+        openid_scope_id: "{{ (all_scopes.json | selectattr('name', 'equalto', 'openid') | first).id }}"
+        groups_scope_id: "{{ (all_scopes.json | selectattr('name', 'equalto', 'groups') | first).id }}"
+        profile_scope_id: "{{ (all_scopes.json | selectattr('name', 'equalto', 'profile') | first).id }}"
+        email_scope_id: "{{ (all_scopes.json | selectattr('name', 'equalto', 'email') | first).id }}"
+
+    - name: Associate scopes with harbor client
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ harbor_client_uuid }}/default-client-scopes/{{ item }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: [204, 409]
+        validate_certs: false  # Self-signed certificate during initial deployment
+      loop:
+        - "{{ openid_scope_id }}"
+        - "{{ groups_scope_id }}"
+        - "{{ profile_scope_id }}"
+        - "{{ email_scope_id }}"
+
+    - name: Create groups mapper for groups scope
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/client-scopes/{{ groups_scope_id }}/protocol-mappers/models"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "groups-mapper"
+          protocol: "openid-connect"
+          protocolMapper: "oidc-group-membership-mapper"
+          config:
+            full.path: "false"
+            id.token.claim: "true"
+            access.token.claim: "true"
+            claim.name: "groups"
+            userinfo.token.claim: "true"
+        status_code: [201, 409]
+        validate_certs: false  # Self-signed certificate during initial deployment
+
+    - name: Create harbor-admins group
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/groups"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ oidc_admin_group }}"
+          attributes:
+            description: ["Harbor Registry Administrators"]
+        status_code: [201, 409]
+        validate_certs: false  # Self-signed certificate during initial deployment
+      register: group_creation
+
+    # Get harbor-admins group for adding users
+    - name: Get 'harbor-admins' group ID
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/groups"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: 200
+        validate_certs: false  # Self-signed certificate during initial deployment
+      register: groups_response
+      no_log: false
+        
+    # Add auth realm user to harbor-admins group
+    - name: Get auth realm user info
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users?username={{ auth_realm_username }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: 200
+        validate_certs: false  # Self-signed certificate during initial deployment
+      register: auth_realm_user_response
+      no_log: false
+      
+    - name: Add '{{ auth_realm_username }}' user to 'harbor-admins' group if it exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/{{ auth_realm_user_response.json[0].id }}/groups/{{ groups_response.json | selectattr('name', 'equalto', oidc_admin_group) | map(attribute='id') | first }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        status_code: 204
+        validate_certs: false  # Self-signed certificate during initial deployment
+      when: 
+        - auth_realm_user_response.json | length > 0
+        - groups_response.json | selectattr('name', 'equalto', oidc_admin_group) | list | length > 0
+
+    - name: Get client secret for harbor
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ harbor_client_uuid }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: 200
+        validate_certs: false  # Self-signed certificate during initial deployment
+      register: harbor_client_secret
+      no_log: true
+
+    - name: Save client secret to file
+      ansible.builtin.copy:
+        content: "{{ harbor_client_secret.json.value }}"
+        dest: /tmp/harbor_oidc_secret
+        mode: '0600'
+      no_log: true
+
+    ########################################################################
+    # 2. Harbor Deployment
+    ########################################################################
+
+    - name: Ensure Harbor namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ harbor_namespace }}"
+
+    - name: Check if wildcard certificate exists in default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Check if TLS secret already exists in harbor namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ harbor_namespace }}"
+        name: harbor-tls-secret
+      register: existing_cert_check
+
+    - name: Delete existing TLS secret if it exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Secret
+        namespace: "{{ harbor_namespace }}"
+        name: harbor-tls-secret
+      when: existing_cert_check.resources | length > 0
+      
+    - name: Copy wildcard certificate from default namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition: "{{ lookup('template', 'templates/harbor-tls-secret.yaml.j2') | from_yaml }}"
+      register: copy_cert
+      
+    - name: Check if TLS secret was created
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ harbor_namespace }}"
+        name: harbor-tls-secret
+      register: cert_check
+      
+    - name: Verify TLS secret exists
+      ansible.builtin.assert:
+        that:
+          - cert_check.resources | length > 0
+        fail_msg: "Failed to copy wildcard certificate"
+
+    - name: Add Harbor Helm repository
+      kubernetes.core.helm_repository:
+        binary_path: "{{ helm_bin }}"
+        name: harbor
+        repo_url: https://helm.goharbor.io
+        repo_state: present
+
+    - name: Update Helm repositories
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+      changed_when: false
+
+    - name: Create Harbor values file
+      ansible.builtin.copy:
+        dest: "{{ harbor_values }}"
+        content: |
+          expose:
+            type: ingress
+            ingress:
+              hosts:
+                core: "{{ harbor_registry }}"
+              annotations:
+                kubernetes.io/ingress.class: "{{ primary_ingress_class }}"
+                nginx.ingress.kubernetes.io/proxy-body-size: "0"
+                nginx.ingress.kubernetes.io/ssl-redirect: "true"
+                nginx.ingress.kubernetes.io/proxy-connect-timeout: "3600"
+                nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+                nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+            tls:
+              enabled: true
+              certSource: secret
+              secret:
+                secretName: harbor-tls-secret
+
+          externalURL: https://{{ harbor_registry }}
+
+          persistence:
+            enabled: true
+            resourcePolicy: "keep"
+            persistentVolumeClaim:
+              registry:
+                storageClass: "microk8s-hostpath"
+                accessMode: ReadWriteOnce
+                size: 50Gi
+              jobservice:
+                jobLog:
+                  storageClass: "microk8s-hostpath"
+                  accessMode: ReadWriteOnce
+                  size: 5Gi
+              database:
+                storageClass: "microk8s-hostpath"
+                accessMode: ReadWriteOnce
+                size: 10Gi
+              redis:
+                storageClass: "microk8s-hostpath"
+                accessMode: ReadWriteOnce
+                size: 2Gi
+              trivy:
+                storageClass: "microk8s-hostpath"
+                accessMode: ReadWriteOnce
+                size: 10Gi
+
+    - name: Deploy Harbor using Helm
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ harbor_release }}"
+        chart_ref: harbor/harbor
+        release_namespace: "{{ harbor_namespace }}"
+        create_namespace: false
+        values_files:
+          - "{{ harbor_values }}"
+        wait: true
+        wait_timeout: "600s"
+
+    - name: Wait for Harbor pods readiness
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ harbor_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/instance={{ harbor_release }}"
+      register: harbor_pods
+      until: >
+        harbor_pods.resources | length > 0 and
+        (harbor_pods.resources | map(attribute='status.phase') | list | unique == ['Running'])
+      retries: 30
+      delay: 10
+
+    - name: Get Harbor admin password
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ harbor_namespace }}"
+        name: harbor-core
+      register: harbor_secret
+      until: harbor_secret.resources | length > 0
+      retries: 30
+      delay: 10
+
+    - name: Get Harbor generated password
+      ansible.builtin.set_fact:
+        harbor_generated_password: "{{ harbor_secret.resources[0].data.HARBOR_ADMIN_PASSWORD | b64decode }}"
+      when: 
+        - harbor_secret.resources is defined
+        - harbor_secret.resources | length > 0
+        
+    - name: Fail if Harbor password secret not found
+      ansible.builtin.fail:
+        msg: "Harbor admin password secret not found. Harbor may not be properly deployed."
+      when: 
+        - harbor_secret.resources is not defined or harbor_secret.resources | length == 0
+
+    - name: Read OIDC secret - Checking if file exists first
+      ansible.builtin.stat:
+        path: /tmp/harbor_oidc_secret
+      register: secret_file_stat
+
+    - name: Fail if OIDC secret file doesn't exist
+      ansible.builtin.fail:
+        msg: "OIDC client secret file not found at /tmp/harbor_oidc_secret. Keycloak client configuration may have failed."
+      when: not secret_file_stat.stat.exists
+
+    - name: Read OIDC secret
+      ansible.builtin.slurp:
+        src: /tmp/harbor_oidc_secret
+      register: oidc_secret_file
+      when: secret_file_stat.stat.exists
+
+    - name: Set OIDC client secret fact
+      ansible.builtin.set_fact:
+        oidc_client_secret: "{{ oidc_secret_file.content | b64decode }}"
+      when: oidc_secret_file is defined
+
+    - name: Check if admin password is already set to our standard
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/configurations"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+          Accept: "application/json"
+        validate_certs: false
+        status_code: [200, 401]
+        follow_redirects: none
+      register: harbor_api_standard_pass
+
+    - name: Wait for Harbor API readiness with generated password
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/systeminfo"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + harbor_generated_password) | b64encode }}"
+        validate_certs: false
+        status_code: 200
+      register: harbor_api
+      until: harbor_api.status == 200
+      retries: 30
+      delay: 10
+      when: harbor_api_standard_pass.status == 401
+
+    - name: Change Harbor admin password to our standard
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/users/1/password"
+        method: PUT
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + harbor_generated_password) | b64encode }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          old_password: "{{ harbor_generated_password }}"
+          new_password: "{{ admin_password }}"
+        validate_certs: false
+        status_code: 200
+      when: harbor_api_standard_pass.status == 401
+        
+    # Verify Harbor admin password is now set correctly
+    - name: Verify Harbor API access with admin password
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/systeminfo"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+        validate_certs: false
+        status_code: 200
+      register: harbor_api_verify
+      retries: 3
+      delay: 5
+      until: harbor_api_verify.status == 200
+        
+    # Refresh Keycloak token before verifying group
+    - name: Refresh Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          username: "{{ admin_username }}"
+          password: "{{ admin_password }}"
+          grant_type: password
+          client_id: "admin-cli"
+        validate_certs: false
+        status_code: [200, 201]
+      register: keycloak_token_refresh
+      no_log: true
+      
+    - name: Update token variable
+      ansible.builtin.set_fact:
+        keycloak_token: "{{ keycloak_token_refresh }}"
+        
+    - name: Verify that harbor-admins group exists in Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/groups?search={{ oidc_admin_group }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        status_code: 200
+        validate_certs: false  # Self-signed certificate during initial deployment
+      register: verify_admin_group
+      
+    - name: Verify admin group exists
+      ansible.builtin.assert:
+        that: verify_admin_group.json | selectattr('name', 'equalto', oidc_admin_group) | list | length > 0
+        fail_msg: "The harbor-admins group does not exist in Keycloak! OIDC admin privileges will not work."
+        success_msg: "harbor-admins group exists in Keycloak"
+
+    # This follows exactly the approach from the original playbook
+    - name: Configure Harbor OIDC authentication
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/configurations"
+        method: PUT
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          auth_mode: oidc_auth
+          oidc_endpoint: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+          oidc_client_id: "{{ oidc_client_id }}"
+          oidc_client_secret: "{{ oidc_client_secret }}"
+          oidc_scope: "{{ oidc_scopes }}"
+          oidc_auto_onboard: true
+          oidc_groups_claim: "{{ oidc_group_claim }}"
+          oidc_admin_group: "{{ oidc_admin_group }}"
+        validate_certs: false
+        status_code: [200, 201]
+      register: oidc_config
+
+    # Copy the Let's Encrypt certificate to Harbor's trusted store
+    - name: Extract Let's Encrypt R11 certificate from default/{{ domain_name.replace('.', '-') }}-tls
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/{{ domain_name.replace('.', '-') }}.crt
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Get the intermediate certificate chain for Let's Encrypt
+      ansible.builtin.shell: |
+        openssl s_client -showcerts -connect auth.{{ domain_name }}:443 </dev/null 2>/dev/null | \
+        awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/{ if(!/BEGIN CERTIFICATE/ && !/END CERTIFICATE/) print }' > /tmp/lets-encrypt-chain.pem
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Read certificate files
+      ansible.builtin.slurp:
+        src: "/tmp/{{ domain_name.replace('.', '-') }}.crt"
+      register: cert_content
+
+    - name: Read chain files
+      ansible.builtin.slurp:
+        src: "/tmp/lets-encrypt-chain.pem"
+      register: chain_content
+
+    - name: Create a ConfigMap with the certificates
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: trusted-ca-bundle
+            namespace: "{{ harbor_namespace }}"
+          data:
+            ca-certificates.crt: "{{ cert_content.content | b64decode }}"
+            lets-encrypt-chain.pem: "{{ chain_content.content | b64decode }}"
+
+    - name: Patch Harbor core deployment to mount the ConfigMap
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch deployment harbor-core -n {{ harbor_namespace }} --type=json -p='[
+          {"op":"add", "path":"/spec/template/spec/volumes/-", "value":{"name":"trusted-ca-bundle","configMap":{"name":"trusted-ca-bundle"}}},
+          {"op":"add", "path":"/spec/template/spec/containers/0/volumeMounts/-", "value":{"name":"trusted-ca-bundle","mountPath":"/usr/local/share/ca-certificates","readOnly":true}}
+        ]'
+      args:
+        executable: /bin/bash
+      changed_when: true
+      ignore_errors: true  # In case the volume already exists
+
+    - name: Restart Harbor core to pick up certificate changes
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout restart deployment harbor-core -n {{ harbor_namespace }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Wait for Harbor core to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status deployment harbor-core -n {{ harbor_namespace }} --timeout=120s
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Verify Harbor authentication configuration
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/systeminfo"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+        validate_certs: false
+        status_code: 200
+      register: final_config
+      until: final_config.status == 200
+      retries: 10
+      delay: 10
+      
+    - name: Verify auth mode is OIDC
+      ansible.builtin.assert:
+        that:
+          - final_config.json.auth_mode == 'oidc_auth'
+        fail_msg: "Harbor auth mode is not OIDC: {{ final_config.json.auth_mode | default('unknown') }}"
+        success_msg: "Harbor is configured for OIDC authentication"
+      
+    - name: Verify OIDC configuration
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/configurations"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+        validate_certs: false
+        status_code: 200
+      register: harbor_config
+      until: harbor_config.status == 200
+      retries: 5
+      delay: 5
+      
+    - name: Display OIDC configuration
+      ansible.builtin.debug:
+        msg: 
+          - "Auth Mode: {{ harbor_config.json.auth_mode.value }}"
+          - "OIDC Admin Group: {{ harbor_config.json.oidc_admin_group.value }}"
+          - "OIDC Auto Onboard: {{ harbor_config.json.oidc_auto_onboard.value }}"
+          - "OIDC Groups Claim: {{ harbor_config.json.oidc_groups_claim.value }}"
+
+    - name: Check if local-registry-hosting ConfigMap exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: kube-public
+        name: local-registry-hosting
+      register: configmap_check
+
+    - name: Create or update local-registry-hosting ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: local-registry-hosting
+            namespace: kube-public
+          data:
+            localRegistryHosting.v1: |
+              help: "https://microk8s.io/docs/registry-built-in"
+              host: "{{ harbor_registry }}"
+
+    - name: Restart MicroK8s to apply registry changes
+      ansible.builtin.shell: |
+        microk8s stop && microk8s start
+      become: true
+      when: configmap_check.resources | length == 0
+
+    - name: Wait for MicroK8s to be ready
+      ansible.builtin.shell: |
+        microk8s status --wait-ready
+      become: true
+      register: microk8s_status
+      retries: 30
+      delay: 10
+      until: microk8s_status.rc == 0
+      when: configmap_check.resources | length == 0
+
+    - name: Display deployment status
+      ansible.builtin.debug:
+        msg:
+          - "Harbor deployed successfully"
+          - "Registry URL: https://{{ harbor_registry }}"
+          - "Authentication: OIDC via Keycloak"
+          - "Admin group: {{ oidc_admin_group }}"
+          - "Harbor admin password set to standard (user: admin)"
+          - "SSO user '{{ auth_realm_username }}' added to harbor-admins group"
+          - "Default registry configured: {{ harbor_registry }}"
+          - "Registry ConfigMap: {{ 'Created' if configmap_check.resources | length == 0 else 'Already exists' }}"
+

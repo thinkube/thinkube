@@ -1,0 +1,122 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Ansible Playbook to Install Claude Code
+# This playbook installs Node.js and Claude Code on Ubuntu 24.04 systems
+# 
+# Requirements:
+# - Anthropic Console account for OAuth authentication
+
+- name: Install Claude Code
+  hosts: bcn1
+  gather_facts: true
+  become: false  # Default to regular user
+
+  vars:
+    node_version: "18.x"  # Claude Code requires Node.js 18+
+    npm_prefix: "~/.npm-global"  # Non-root global npm installation directory
+
+  tasks:
+    # Install Node.js for Ubuntu 24.04
+    - name: Install required packages
+      become: true  # Use sudo for system packages
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+        state: present
+        update_cache: yes
+
+    # Download and run NodeSource setup script
+    - name: Download NodeSource setup script
+      become: true  # Use sudo
+      get_url:
+        url: https://deb.nodesource.com/setup_{{ node_version }}
+        dest: /tmp/setup_nodejs.sh
+        mode: '0755'
+      
+    - name: Run NodeSource setup script
+      become: true  # Use sudo
+      command: bash /tmp/setup_nodejs.sh
+      
+    - name: Install Node.js
+      become: true  # Use sudo
+      apt:
+        name: nodejs
+        state: present
+
+    # Configure npm for non-root global installation
+    - name: Create npm global directory
+      become: false
+      file:
+        path: "{{ npm_prefix }}"
+        state: directory
+        mode: '0755'
+
+    - name: Configure npm to use non-root global directory
+      become: false
+      shell: npm config set prefix '{{ npm_prefix }}'
+      args:
+        creates: "~/.npmrc"
+
+    - name: Get current user
+      become: false
+      command: whoami
+      register: current_user
+      changed_when: false
+
+    - name: Get user home directory
+      become: false
+      command: echo $HOME
+      register: user_home
+      changed_when: false
+
+    - name: Add npm global bin to PATH in bashrc
+      become: false
+      lineinfile:
+        path: "{{ user_home.stdout }}/.bashrc"
+        line: 'export PATH={{ npm_prefix }}/bin:$PATH'
+        state: present
+        create: yes
+
+    # Install Claude Code
+    - name: Install Claude Code globally using npm
+      become: false
+      shell: |
+        export PATH="{{ npm_prefix }}/bin:$PATH"
+        npm install -g @anthropic-ai/claude-code
+      args:
+        executable: /bin/bash
+
+    # Verify installation
+    - name: Verify Claude Code installation
+      shell: |
+        export PATH="{{ user_home.stdout }}/.npm-global/bin:$PATH"
+        which claude || echo "Claude not found"
+      register: claude_check
+      changed_when: false
+
+    - name: Display installation status
+      debug:
+        msg: >
+          {% if "Claude not found" not in claude_check.stdout %}
+          Claude Code has been successfully installed at {{ claude_check.stdout }}.
+          Navigate to your project directory and run 'claude' to start using it.
+          You will need to complete the one-time OAuth process with your Anthropic Console account.
+          {% else %}
+          Claude Code installation may have failed. Please check the error messages and try again.
+          Try sourcing your .bashrc or opening a new terminal to update your PATH, then run:
+          export PATH="{{ user_home.stdout }}/.npm-global/bin:$PATH"
+          which claude
+          {% endif %}
+
+    - name: Post-installation instructions
+      debug:
+        msg: |
+          To start using Claude Code:
+          1. Navigate to your project directory
+          2. Run 'claude' to start the agentic coding assistant
+          3. Complete the one-time OAuth authentication with your Anthropic Console account
+          4. For more information, visit https://docs.anthropic.com/en/docs/claude-code/getting-started

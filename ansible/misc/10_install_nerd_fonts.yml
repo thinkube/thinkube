@@ -1,0 +1,221 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/playbooks/thinkube/install_nerd_fonts.yml
+# Playbook to install developer-friendly Nerd Fonts on desktop systems
+
+- name: Install Nerd Fonts for Development
+  hosts: desktops
+  become: false
+  vars:
+    user_home: "{{ ansible_env.HOME }}"
+    fonts_dir: "{{ user_home }}/.local/share/fonts"
+    nerd_fonts_version: "3.0.2"
+    nerd_fonts_release_url: "https://github.com/ryanoasis/nerd-fonts/releases/download/v{{ nerd_fonts_version }}"
+    # Selected fonts good for development (reduced set to save space)
+    selected_fonts:
+      - Monoid
+      - Monofur
+      - IBMPlexMono  # This is "Blex" in Nerd Fonts terminology
+      - JetBrainsMono
+      - FiraCode
+      - Hack
+      - CascadiaCode
+      - UbuntuMono
+    # Default font to use in terminals and editors
+    default_font: "FiraCode Nerd Font"
+    default_font_size: "14"
+
+  tasks:
+    - name: Create fonts directory
+      file:
+        path: "{{ fonts_dir }}"
+        state: directory
+        mode: '0755'
+      tags: [fonts]
+
+    - name: Check if fonts are already installed
+      find:
+        paths: "{{ fonts_dir }}"
+        patterns: "*Nerd*Font*"
+      register: font_check
+      tags: [fonts]
+
+    - name: Install required packages
+      become: true
+      package:
+        name:
+          - unzip
+          - wget
+          - fontconfig
+        state: present
+      tags: [fonts, packages]
+
+    - name: Create temporary directory for fonts
+      file:
+        path: "/tmp/nerd_fonts"
+        state: directory
+        mode: '0755'
+      when: font_check.matched == 0 or font_check.matched < (selected_fonts | length)
+      tags: [fonts]
+
+    # Download each font separately
+    - name: Download Nerd Font
+      get_url:
+        url: "{{ nerd_fonts_release_url }}/{{ item }}.zip"
+        dest: "/tmp/nerd_fonts/{{ item }}.zip"
+        timeout: 120
+      loop: "{{ selected_fonts }}"
+      loop_control:
+        label: "{{ item }}"
+      register: font_download
+      when: font_check.matched == 0 or font_check.matched < (selected_fonts | length)
+      ignore_errors: yes
+      tags: [fonts]
+
+    # Extract each font separately
+    - name: Extract Nerd Font
+      unarchive:
+        src: "/tmp/nerd_fonts/{{ item }}.zip"
+        dest: "{{ fonts_dir }}"
+        remote_src: yes
+        exclude:
+          - "*.txt"
+          - "*.md"
+          - "*.json"
+          - "LICENSE*"
+      loop: "{{ selected_fonts }}"
+      loop_control:
+        label: "{{ item }}"
+      when: 
+        - font_check.matched == 0 or font_check.matched < (selected_fonts | length)
+        - not ansible_check_mode
+      ignore_errors: yes
+      tags: [fonts]
+
+    - name: Update font cache
+      command: fc-cache -f -v
+      changed_when: true
+      tags: [fonts]
+
+    - name: Clean up temporary files
+      file:
+        path: "/tmp/nerd_fonts"
+        state: absent
+      tags: [fonts, cleanup]
+
+    # Configure default terminal font (works for most terminals like GNOME Terminal)
+    - name: Check if GNOME Terminal is installed
+      command: which gnome-terminal
+      register: gnome_terminal_check
+      failed_when: false
+      changed_when: false
+      tags: [fonts, terminal]
+          
+    - name: Get current profile ID for GNOME Terminal
+      shell: gsettings get org.gnome.Terminal.ProfilesList default | tr -d "'"
+      register: terminal_profile
+      changed_when: false
+      when: gnome_terminal_check.rc == 0
+      tags: [fonts, terminal]
+          
+    - name: Set {{ default_font }} as default font in GNOME Terminal
+      command: "{{ item }}"
+      loop:
+        - "gsettings set org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{{ terminal_profile.stdout }}/ font '{{ default_font }} {{ default_font_size }}'"
+        - "gsettings set org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{{ terminal_profile.stdout }}/ use-system-font false"
+      when: 
+        - gnome_terminal_check.rc == 0
+        - terminal_profile.stdout is defined
+        - terminal_profile.stdout != ""
+      changed_when: true
+      ignore_errors: yes
+      tags: [fonts, terminal]
+
+    # Configure VS Code if installed
+    - name: Check if VS Code is installed
+      command: which code
+      register: vscode_check
+      failed_when: false
+      changed_when: false
+      tags: [fonts, vscode]
+        
+    - name: Ensure VS Code settings directory exists
+      file:
+        path: "{{ user_home }}/.config/Code/User"
+        state: directory
+        mode: '0755'
+      when: vscode_check.rc == 0
+      tags: [fonts, vscode]
+          
+    - name: Check if settings.json exists
+      stat:
+        path: "{{ user_home }}/.config/Code/User/settings.json"
+      register: vscode_settings_check
+      when: vscode_check.rc == 0
+      tags: [fonts, vscode]
+          
+    - name: Create basic VS Code settings.json if it doesn't exist
+      copy:
+        content: "{}"
+        dest: "{{ user_home }}/.config/Code/User/settings.json"
+        force: no
+      when: 
+        - vscode_check.rc == 0 
+        - not vscode_settings_check.stat.exists | default(false)
+      tags: [fonts, vscode]
+          
+    - name: Update VS Code font settings
+      shell: |
+        python3 << EOF
+        import json
+        file_path='{{ user_home }}/.config/Code/User/settings.json'
+        with open(file_path, 'r') as f:
+            settings = json.load(f)
+        settings.update({
+            'editor.fontFamily': '"{{ default_font }}", Consolas, "Courier New", monospace',
+            'terminal.integrated.fontFamily': '"{{ default_font }}"',
+            'editor.fontSize': {{ default_font_size }},
+            'terminal.integrated.fontSize': {{ default_font_size }}
+        })
+        with open(file_path, 'w') as f:
+            json.dump(settings, f, indent=2)
+        EOF
+      when: vscode_check.rc == 0
+      changed_when: true
+      ignore_errors: yes
+      tags: [fonts, vscode]
+
+    # Configure Gedit if installed (common text editor on Ubuntu/GNOME)
+    - name: Check if Gedit is installed
+      command: which gedit
+      register: gedit_check
+      failed_when: false
+      changed_when: false
+      tags: [fonts, gedit]
+          
+    - name: Set Monoid as default font in Gedit
+      command: gsettings set org.gnome.gedit.preferences.editor font '{{ default_font }} {{ default_font_size }}'
+      when: gedit_check.rc == 0
+      changed_when: true
+      ignore_errors: yes
+      tags: [fonts, gedit]
+
+    - name: Display completion message
+      debug:
+        msg: |
+          Nerd Fonts installation complete!
+          
+          Installed fonts:
+          {% for font in selected_fonts %}
+          - {{ font }}
+          {% endfor %}
+          
+          For best results:
+          1. Set '{{ default_font }}' as your terminal font
+          2. Update your editor font settings if not automatically done
+          3. Configure your Starship prompt to use Nerd Font icons
+          
+          You may need to restart applications to see the new fonts.
+      tags: [fonts, always]

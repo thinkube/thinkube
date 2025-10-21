@@ -1,0 +1,278 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/prometheus/10_install_tools.yaml
+# Description:
+#   Install Prometheus Operator tooling on control plane for kube-prometheus deployment
+#
+# This playbook:
+#   1. Installs Go programming language (required for jsonnet tooling)
+#   2. Installs jsonnet compiler for kube-prometheus manifest generation
+#   3. Installs jsonnet-bundler (jb) for dependency management
+#   4. Installs gojsontoyaml for JSON to YAML conversion
+#   5. Installs percli (Perses CLI) for automated dashboard deployment
+#
+# Requirements:
+#   - Internet access to download tools
+#   - sudo access on control plane node
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/prometheus/10_install_tools.yaml
+#
+# Variables from inventory:
+#   - None required (all tools installed to system paths)
+#
+# 🤖 AI-assisted
+
+- name: Install Prometheus Operator Tools on Control Plane
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    go_version: "1.23.5"
+    go_arch: "linux-amd64"
+    go_download_url: "https://go.dev/dl/go{{ go_version }}.{{ go_arch }}.tar.gz"
+    go_install_dir: "/usr/local"
+    perses_version: "0.52.0"
+    perses_arch: "linux_amd64"
+    # For future ARM64 support (dgx spark): perses_arch: "linux_arm64"
+
+  tasks:
+    ###################################################################
+    # 1) Install Go (required for jsonnet tooling)
+    ###################################################################
+    - name: Check if Go is already installed
+      ansible.builtin.command: go version
+      register: go_check
+      failed_when: false
+      changed_when: false
+
+    - name: Download Go
+      ansible.builtin.get_url:
+        url: "{{ go_download_url }}"
+        dest: "/tmp/go{{ go_version }}.tar.gz"
+        mode: '0644'
+      when: go_check.rc != 0
+
+    - name: Remove old Go installation
+      ansible.builtin.file:
+        path: "{{ go_install_dir }}/go"
+        state: absent
+      become: true
+      when: go_check.rc != 0
+
+    - name: Extract Go
+      ansible.builtin.unarchive:
+        src: "/tmp/go{{ go_version }}.tar.gz"
+        dest: "{{ go_install_dir }}"
+        remote_src: true
+      become: true
+      when: go_check.rc != 0
+
+    - name: Add Go to PATH in /etc/profile.d
+      ansible.builtin.copy:
+        dest: /etc/profile.d/go.sh
+        mode: '0644'
+        content: |
+          export PATH=$PATH:/usr/local/go/bin
+          export GOPATH=$HOME/go
+          export PATH=$PATH:$GOPATH/bin
+      become: true
+      when: go_check.rc != 0
+
+    - name: Verify Go installation
+      ansible.builtin.shell: |
+        export PATH=$PATH:/usr/local/go/bin
+        go version
+      register: go_version_check
+      changed_when: false
+
+    - name: Display Go version
+      ansible.builtin.debug:
+        msg: "✅ Go installed: {{ go_version_check.stdout }}"
+
+    ###################################################################
+    # 2) Install jsonnet compiler
+    ###################################################################
+    - name: Check if jsonnet is already installed
+      ansible.builtin.command: jsonnet --version
+      register: jsonnet_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install jsonnet
+      ansible.builtin.shell: |
+        export PATH=$PATH:/usr/local/go/bin
+        export GOPATH=$HOME/go
+        export PATH=$PATH:$GOPATH/bin
+        go install github.com/google/go-jsonnet/cmd/jsonnet@latest
+      when: jsonnet_check.rc != 0
+
+    - name: Create symlink for jsonnet
+      ansible.builtin.file:
+        src: "{{ ansible_env.HOME }}/go/bin/jsonnet"
+        dest: /usr/local/bin/jsonnet
+        state: link
+      become: true
+      when: jsonnet_check.rc != 0
+
+    - name: Verify jsonnet installation
+      ansible.builtin.command: jsonnet --version
+      register: jsonnet_version_check
+      changed_when: false
+
+    - name: Display jsonnet version
+      ansible.builtin.debug:
+        msg: "✅ jsonnet installed: {{ jsonnet_version_check.stdout }}"
+
+    ###################################################################
+    # 3) Install jsonnet-bundler (jb)
+    ###################################################################
+    - name: Check if jb is already installed
+      ansible.builtin.command: jb --version
+      register: jb_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install jsonnet-bundler (jb)
+      ansible.builtin.shell: |
+        export PATH=$PATH:/usr/local/go/bin
+        export GOPATH=$HOME/go
+        export PATH=$PATH:$GOPATH/bin
+        go install -a github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb@latest
+      when: jb_check.rc != 0
+
+    - name: Create symlink for jb
+      ansible.builtin.file:
+        src: "{{ ansible_env.HOME }}/go/bin/jb"
+        dest: /usr/local/bin/jb
+        state: link
+      become: true
+      when: jb_check.rc != 0
+
+    - name: Verify jb installation
+      ansible.builtin.command: jb --version
+      register: jb_version_check
+      changed_when: false
+
+    - name: Display jb version
+      ansible.builtin.debug:
+        msg: "✅ jb installed: {{ jb_version_check.stdout }}"
+
+    ###################################################################
+    # 4) Install gojsontoyaml
+    ###################################################################
+    - name: Check if gojsontoyaml is already installed
+      ansible.builtin.command: gojsontoyaml --help
+      register: gojsontoyaml_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install gojsontoyaml
+      ansible.builtin.shell: |
+        export PATH=$PATH:/usr/local/go/bin
+        export GOPATH=$HOME/go
+        export PATH=$PATH:$GOPATH/bin
+        go install github.com/brancz/gojsontoyaml@latest
+      when: gojsontoyaml_check.rc != 0
+
+    - name: Create symlink for gojsontoyaml
+      ansible.builtin.file:
+        src: "{{ ansible_env.HOME }}/go/bin/gojsontoyaml"
+        dest: /usr/local/bin/gojsontoyaml
+        state: link
+      become: true
+      when: gojsontoyaml_check.rc != 0
+
+    - name: Verify gojsontoyaml installation
+      ansible.builtin.command: gojsontoyaml --help
+      register: gojsontoyaml_help
+      changed_when: false
+      failed_when: false
+
+    - name: Display gojsontoyaml status
+      ansible.builtin.debug:
+        msg: "✅ gojsontoyaml installed successfully"
+
+    ###################################################################
+    # 5) Install percli (Perses CLI)
+    ###################################################################
+    - name: Check if percli is already installed
+      ansible.builtin.command: percli version
+      register: percli_check
+      failed_when: false
+      changed_when: false
+
+    - name: Download Perses package (contains percli)
+      ansible.builtin.get_url:
+        url: "https://github.com/perses/perses/releases/download/v{{ perses_version }}/perses_{{ perses_version }}_{{ perses_arch }}.tar.gz"
+        dest: "/tmp/perses_{{ perses_version }}.tar.gz"
+        mode: '0644'
+      when: percli_check.rc != 0
+
+    - name: Extract Perses package
+      ansible.builtin.unarchive:
+        src: "/tmp/perses_{{ perses_version }}.tar.gz"
+        dest: /tmp
+        remote_src: true
+      when: percli_check.rc != 0
+
+    - name: Install percli
+      ansible.builtin.copy:
+        src: /tmp/percli
+        dest: /usr/local/bin/percli
+        mode: '0755'
+        remote_src: true
+      become: true
+      when: percli_check.rc != 0
+
+    - name: Cleanup Perses download
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/perses_{{ perses_version }}.tar.gz"
+        - /tmp/percli
+        - /tmp/perses
+      when: percli_check.rc != 0
+
+    - name: Verify percli installation
+      ansible.builtin.command: percli version
+      register: percli_version_check
+      changed_when: false
+
+    - name: Display percli version
+      ansible.builtin.debug:
+        msg: "✅ percli installed: {{ percli_version_check.stdout }}"
+
+    ###################################################################
+    # 6) Summary
+    ###################################################################
+    - name: Installation summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Prometheus Operator Tools Installed
+          ════════════════════════════════════════════════════════
+
+          📦 INSTALLED TOOLS:
+          ─────────────────────────
+          • Go {{ go_version }}
+          • jsonnet compiler
+          • jsonnet-bundler (jb)
+          • gojsontoyaml
+          • percli v{{ perses_version }}
+
+          🔧 READY FOR:
+          ─────────────────────────
+          • kube-prometheus deployment (jsonnet, jb, gojsontoyaml)
+          • Automated dashboard deployment (percli)
+
+          📋 NEXT STEPS:
+          ─────────────────────────
+          1. Deploy kube-prometheus with recording rules
+          2. Import Perses dashboards using percli
+          3. Convert and import Grafana dashboards
+          ════════════════════════════════════════════════════════

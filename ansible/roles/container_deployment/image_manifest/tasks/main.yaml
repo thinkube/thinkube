@@ -1,0 +1,140 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/roles/container_deployment/image_manifest/tasks/main.yaml
+# Description:
+#   Role for managing Harbor image manifests that are stored as ConfigMaps
+#   for later discovery by thinkube-control
+#
+# Required Variables:
+#   - manifest_images: List of image dictionaries to add to manifest
+#   - manifest_category: Category of images (system/user)
+#   - harbor_registry: Harbor registry hostname
+#   - kubeconfig: Path to Kubernetes configuration file
+#
+# Optional Variables:
+#   - manifest_name: Name of the ConfigMap (default: harbor-{{ manifest_category }}-images)
+#   - manifest_namespace: Namespace for ConfigMap (default: registry)
+#
+
+- name: Validate required variables
+  ansible.builtin.assert:
+    that:
+      - manifest_images is defined
+      - manifest_category is defined
+      - manifest_category in ['system', 'user']
+      - harbor_registry is defined
+      - kubeconfig is defined
+    fail_msg: "Required variables for image_manifest role are not defined"
+
+- name: Set manifest defaults
+  ansible.builtin.set_fact:
+    manifest_name: "{{ manifest_name | default('harbor-' + manifest_category + '-images') }}"
+    manifest_namespace: "{{ manifest_namespace | default('registry') }}"
+
+- name: Check if manifest ConfigMap exists
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ manifest_namespace }}"
+    name: "{{ manifest_name }}"
+  register: existing_manifest
+
+- name: Parse existing manifest if it exists
+  ansible.builtin.set_fact:
+    existing_images: "{{ (existing_manifest.resources[0].data['manifest.json'] | from_json).images if existing_manifest.resources | length > 0 else [] }}"
+
+- name: Generate timestamp
+  ansible.builtin.set_fact:
+    current_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+- name: Process new images
+  ansible.builtin.set_fact:
+    processed_images: |
+      {% set images = [] %}
+      {% for image in manifest_images %}
+      {% set processed_image = {
+        'name': image.destination.split('/')[-1].split(':')[0],
+        'registry': harbor_registry,
+        'repository': image.destination.split('/', 1)[1].rsplit(':', 1)[0] if '/' in image.destination else image.destination.rsplit(':', 1)[0],
+        'tag': image.destination.split(':')[-1] if ':' in image.destination else 'latest',
+        'source_url': image.source,
+        'destination_url': image.destination,
+        'description': image.description | default(''),
+        'category': manifest_category,
+        'source': manifest_source | default('mirrored'),
+        'protected': manifest_category == 'system',
+        'mirror_date': current_timestamp,
+        'metadata': image.metadata | default({})
+      } %}
+      {% set _ = images.append(processed_image) %}
+      {% endfor %}
+      {{ images }}
+
+- name: Merge with existing images (avoid duplicates)
+  ansible.builtin.set_fact:
+    all_images: |
+      {% set merged = [] %}
+      {% set seen_destinations = [] %}
+      {% for image in (processed_images + existing_images) %}
+      {% if image.destination_url not in seen_destinations %}
+      {% set _ = merged.append(image) %}
+      {% set _ = seen_destinations.append(image.destination_url) %}
+      {% endif %}
+      {% endfor %}
+      {{ merged }}
+
+- name: Create manifest data structure
+  ansible.builtin.set_fact:
+    manifest_data:
+      manifest_version: "1.0"
+      generated_at: "{{ current_timestamp }}"
+      category: "{{ manifest_category }}"
+      registry: "{{ harbor_registry }}"
+      total_images: "{{ all_images | length }}"
+      images: "{{ all_images }}"
+
+- name: Create or update manifest ConfigMap
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ manifest_name }}"
+        namespace: "{{ manifest_namespace }}"
+        labels:
+          "thinkube.io/image-manifest": "true"
+          "thinkube.io/category": "{{ manifest_category }}"
+          "app.kubernetes.io/managed-by": "ansible"
+          "app.kubernetes.io/component": "harbor-images"
+        annotations:
+          "thinkube.io/last-updated": "{{ current_timestamp }}"
+          "thinkube.io/description": "Harbor image manifest for {{ manifest_category }} images"
+      data:
+        manifest.json: "{{ manifest_data | to_nice_json }}"
+        README: |
+          This ConfigMap contains the manifest of Harbor images for category: {{ manifest_category }}
+
+          Categories:
+          - core: Essential images mirrored during initial deployment (protected)
+          - custom: Custom-built base images (protected)
+          - user: User-added images (can be managed/deleted)
+
+          This manifest is discovered by thinkube-control on startup to populate
+          the image inventory database.
+
+          DO NOT EDIT MANUALLY - This is managed by Ansible playbooks
+
+- name: Display manifest summary
+  ansible.builtin.debug:
+    msg:
+      - "Image manifest created/updated:"
+      - "  ConfigMap: {{ manifest_namespace }}/{{ manifest_name }}"
+      - "  Category: {{ manifest_category }}"
+      - "  Total images: {{ all_images | length }}"
+      - "  New images added: {{ processed_images | length }}"
+      - "  Protected: {{ manifest_category == 'system' }}"

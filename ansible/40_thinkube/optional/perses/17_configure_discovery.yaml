@@ -1,0 +1,100 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/perses/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for Perses by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - Perses must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/perses/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Configure Perses service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    perses_hostname: "perses.{{ domain_name }}"
+    perses_namespace: "perses"
+
+  tasks:
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: perses
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "perses"
+          data:
+            service.yaml: |
+              service:
+                name: perses
+                display_name: "Perses"
+                description: "Observability visualization platform for metrics, traces, and logs"
+                type: optional
+                category: observability
+                icon: /icons/tk_monitoring.svg
+
+                endpoints:
+                  - name: web
+                    type: http
+                    url: "https://{{ perses_hostname }}"
+                    health_url: "https://{{ perses_hostname }}/api/health"
+                    description: "Perses dashboard interface"
+                    primary: true
+
+                dependencies:
+                  - prometheus
+                  - keycloak
+
+                scaling:
+                  resource_type: deployment
+                  resource_name: perses
+                  namespace: perses
+                  min_replicas: 1
+                  can_disable: true
+
+                features:
+                  - "PromQL native support"
+                  - "Grafana dashboard migration"
+                  - "Tempo tracing visualization"
+                  - "Loki log aggregation"
+                  - "Dashboard-as-Code (CRD)"
+                  - "Keycloak SSO integration"
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: perses
+      register: configmap_info
+
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for Perses"
+      when: configmap_info.resources | length > 0
+
+    - name: Update code-server environment variables
+      include_role:
+        name: code_server_env_update

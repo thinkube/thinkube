@@ -1,0 +1,196 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/16_build_codeserver_image.yaml
+# Description:
+#   Build and push code-server development image to Harbor thinkube project
+#   This image contains all CLI tools needed for Thinkube development
+#
+# Requirements:
+#   - Harbor registry deployed and accessible
+#   - Podman installed on the MicroK8s control plane node
+#   - Harbor admin credentials
+#   - Base codercom/code-server image mirrored to Harbor
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/16_build_codeserver_image.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Harbor registry hostname
+#   - admin_password: Admin password from environment
+#
+# Dependencies:
+#   - CORE-008: Harbor deployed
+#   - 13_mirror_public_images.yaml: Base images available
+#
+# 🤖 [AI-assisted]
+
+- name: Build and Push code-server Development Image to Harbor
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    local_base_images_dir: "{{ playbook_dir }}/base-images"
+    base_images_dir: "/tmp/harbor-base-images"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    - name: Install podman (ensure it's available)
+      ansible.builtin.apt:
+        name: podman
+        state: present
+        update_cache: yes
+      become: true
+      when: ansible_os_family == "Debian"
+
+    - name: Ensure library project exists in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects"
+        method: POST
+        headers:
+          Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
+        body_format: json
+        body:
+          project_name: "library"
+          public: true
+          metadata:
+            public: "true"
+        validate_certs: true
+        status_code: [201, 409]
+      register: library_project
+
+    - name: Create build context directory
+      ansible.builtin.file:
+        path: "{{ base_images_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create temp directory for templated Containerfiles
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: codeserver-dockerfile
+      register: temp_containerfiles_dir
+
+    - name: Copy base-images directory to build context
+      ansible.builtin.copy:
+        src: "{{ local_base_images_dir }}/"
+        dest: "{{ base_images_dir }}/"
+        mode: '0755'
+
+    - name: Template code-server-dev Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/code-server-dev.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/code-server-dev.Containerfile"
+
+    - name: Build code-server-dev image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/code-server-dev:latest \
+                     -f {{ temp_containerfiles_dir.path }}/code-server-dev.Containerfile \
+                     {{ base_images_dir }}
+      register: codeserver_build
+      changed_when: true
+
+    - name: Login to Harbor
+      ansible.builtin.shell: |
+        echo {{ admin_password }} | podman login {{ harbor_registry }} -u admin --password-stdin --tls-verify=true
+      changed_when: false
+      no_log: true
+
+    - name: Push code-server-dev image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/code-server-dev:latest
+      register: codeserver_push
+      changed_when: codeserver_push.rc == 0
+      failed_when: codeserver_push.rc != 0
+      retries: 2
+      delay: 10
+
+    - name: Clean up temp dockerfiles directory
+      ansible.builtin.file:
+        path: "{{ temp_containerfiles_dir.path }}"
+        state: absent
+      when: temp_containerfiles_dir.path is defined
+
+    - name: Create manifest for code-server-dev image
+      include_role:
+        name: container_deployment/image_manifest
+      vars:
+        manifest_images:
+          - destination: "{{ harbor_registry }}/library/code-server-dev:latest"
+            source: "custom-build"
+            description: "code-server development environment for Thinkube platform"
+            metadata:
+              purpose: "development"
+              base_image: "codercom/code-server:latest"
+              packages: "ansible kubectl helm k9s podman skopeo argo argocd gh tea nats mlflow devpi jq yq ripgrep fd bat httpie"
+              tools: "ansible-core kubernetes.core community.general postgresql-client redis-tools stern kubectx kubens"
+        manifest_category: "system"
+        manifest_source: "built"
+        manifest_namespace: "registry"
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          ✅ code-server Development Image Built Successfully
+          ════════════════════════════════════════════════════════
+
+          Image: {{ harbor_registry }}/library/code-server-dev:latest
+
+          This image includes all CLI tools for Thinkube development:
+
+          Platform Tools:
+            - kubectl v1.30.0 (Kubernetes CLI)
+            - helm (Kubernetes package manager)
+            - k9s v0.32.0 (Terminal UI for Kubernetes)
+            - stern v1.28.0 (Multi-pod log tailing)
+            - kubectx/kubens (Context and namespace switching)
+
+          Container Tools:
+            - podman (Container management)
+            - skopeo (Container image operations)
+            - podman-compose (Multi-container applications)
+
+          Ansible:
+            - ansible-core
+            - kubernetes.core collection
+            - community.general collection
+            - community.crypto collection
+            - ansible.posix collection
+            - community.docker collection
+
+          Thinkube Service CLIs:
+            - argo v3.5.5 (Argo Workflows)
+            - argocd v2.10.0 (Argo CD)
+            - gh (GitHub CLI)
+            - tea 0.9.2 (Gitea CLI)
+            - nats (NATS messaging)
+
+          Development Tools:
+            - jq (JSON processor)
+            - yq v4.40.5 (YAML processor)
+            - ripgrep (Fast text search)
+            - fd (Fast file finder)
+            - bat (Enhanced cat with syntax highlighting)
+            - httpie (HTTP client)
+
+          Database Clients:
+            - psql (PostgreSQL client)
+            - redis-tools (Redis/Valkey client)
+
+          Python Tools:
+            - mlflow (ML experiment tracking)
+            - devpi-client (Python package registry)
+            - copier (Project scaffolding)
+            - ansible-lint (Ansible linting)
+
+          Next Steps:
+            1. Update code-server deployment to use this image
+            2. Test complete development workflow
+            3. Verify all tools are accessible and functional
+
+          ════════════════════════════════════════════════════════

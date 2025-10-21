@@ -1,0 +1,94 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for Harbor Registry by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - Harbor must be deployed
+#   - MicroK8s kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Configure Harbor service discovery
+  hosts: microk8s_control_plane
+  gather_facts: true
+  
+  tasks:
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: registry
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "core"
+              thinkube.io/service-name: "harbor"
+          data:
+            service.yaml: |
+              service:
+                name: harbor
+                display_name: "Harbor Registry"
+                description: "Enterprise container registry with security scanning"
+                type: core
+                category: storage
+                icon: /icons/tk_artifact.svg
+                
+                endpoints:
+                  - name: web
+                    type: http
+                    url: "https://registry.{{ domain_name }}/c/oidc/login?redirect_url=/harbor/projects"
+                    health_url: "https://registry.{{ domain_name }}/api/v2.0/health"
+                    description: "Web UI and REST API"
+                    primary: true
+                    
+                  - name: docker
+                    type: docker-registry
+                    url: "https://registry.{{ domain_name }}"
+                    port: 443
+                    description: "Docker registry v2 endpoint"
+                    
+                  - name: notary
+                    type: http
+                    url: "https://notary.{{ domain_name }}"
+                    health_url: "https://notary.{{ domain_name }}/_notary_server/health"
+                    description: "Notary signing service"
+                    
+                dependencies:
+                  - postgresql
+                  - redis
+                  
+                scaling:
+                  resource_type: deployment
+                  resource_name: harbor-core
+                  namespace: registry
+                  min_replicas: 1
+                  can_disable: false
+                  
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: registry
+      register: configmap_info
+      
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for Harbor"
+      when: configmap_info.resources | length > 0

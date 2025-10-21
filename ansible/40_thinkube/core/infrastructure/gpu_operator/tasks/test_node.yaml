@@ -1,0 +1,38 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Tasks for testing CUDA on a single GPU node
+
+- name: Wait for CUDA test pod completion
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    kind: Pod 
+    name: "cuda-test-{{ current_node }}"
+    namespace: "{{ cuda_test_namespace }}"
+  register: cuda_pod_status
+  until: "cuda_pod_status.resources | length > 0 and cuda_pod_status.resources[0].status.phase in ['Succeeded', 'Failed']"
+  retries: 60
+  delay: 10
+
+- name: Record test result for node
+  ansible.builtin.set_fact:
+    node_test_results: "{{ node_test_results | default({}) | combine({current_node: cuda_pod_status.resources[0].status.phase}) }}"
+
+- name: Check for test failure
+  ansible.builtin.fail:
+    msg: "CUDA test on node {{ current_node }} failed with status: {{ cuda_pod_status.resources[0].status.phase }}"
+  when: cuda_pod_status.resources[0].status.phase == 'Failed'
+
+- name: Get CUDA test pod logs
+  ansible.builtin.command: "{{ kubectl_bin }} logs cuda-test-{{ current_node }} -n {{ cuda_test_namespace }}"
+  register: cuda_logs
+  changed_when: false
+
+- name: Display CUDA test results for node
+  ansible.builtin.debug:
+    msg: 
+      - "Node: {{ current_node }}"
+      - "Status: {{ cuda_pod_status.resources[0].status.phase }}"
+      - "Log excerpt:"
+      - "{{ cuda_logs.stdout_lines[-5:] if cuda_logs.stdout_lines | length > 5 else cuda_logs.stdout_lines }}"

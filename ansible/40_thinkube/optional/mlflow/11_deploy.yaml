@@ -1,0 +1,518 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/mlflow/11_deploy.yaml
+# Description:
+#   Deploy MLflow tracking server with PostgreSQL backend, SeaweedFS S3 storage, and Keycloak SSO
+#
+# This playbook:
+#   1. Creates "mlflow" namespace if it doesn't exist
+#   2. Creates a ConfigMap for MLflow configuration
+#   3. Creates necessary Kubernetes secrets for database and SeaweedFS S3 connections
+#   4. Creates the PostgreSQL database for MLflow (uses admin user for access)
+#   5. Creates the SeaweedFS S3 bucket for MLflow artifacts
+#   6. Deploys MLflow with built-in OIDC authentication
+#   7. Creates Service and Ingress for MLflow access
+#
+# Requirements:
+#   - MicroK8s must be installed and running
+#   - PostgreSQL must be deployed
+#   - SeaweedFS must be deployed (replaces MinIO)
+#   - Keycloak must be deployed and configured (run 10_configure_keycloak.yaml first)
+#   - MLflow custom image must be available in Harbor
+#   - ADMIN_PASSWORD environment variable must be set
+#   - MLFLOW_DB_PASSWORD environment variable (optional, defaults generated)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/mlflow/11_deploy.yaml
+#
+# Variables from inventory:
+#   - mlflow_hostname: Hostname for MLflow UI access
+#   - postgres_hostname: PostgreSQL server hostname
+#   - seaweedfs_s3_hostname: SeaweedFS S3 API hostname
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - harbor_registry: Harbor registry domain
+#   - harbor_project: Harbor project name
+#   - primary_ingress_class: Ingress controller class name
+#   - kubeconfig: Path to kubeconfig file
+#   - domain_name: Base domain for the cluster
+#
+# Dependencies:
+#   - PostgreSQL (core component)
+#   - SeaweedFS (core component, Apache 2.0 licensed S3-compatible storage)
+#   - Keycloak (core component)
+#   - MLflow custom image in Harbor registry
+#
+# 🤖 AI-assisted
+
+- name: Deploy MLflow Tracking Server
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    mlflow_namespace: "mlflow"
+    mlflow_hostname: "mlflow.{{ domain_name }}"
+    mlflow_capacity: "1Gi"
+    storage_class_name: "microk8s-hostpath"
+
+    postgres_namespace: "postgres"
+    postgres_release_name: "postgresql-official"
+    postgres_admin_user: "{{ admin_username }}"
+    postgres_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    keycloak_admin_user: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    keycloak_admin_username: "{{ admin_username }}"
+
+    mlflow_db_name: "mlflow"
+    mlflow_db_user: "{{ admin_username }}"
+    mlflow_db_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    seaweedfs_namespace: "seaweedfs"
+    seaweedfs_s3_secret: "seaweedfs-s3-config"
+    mlflow_artifacts_bucket: "mlflow"
+
+    mlflow_client_id: "mlflow"
+    mlflow_tls_secret_name: "mlflow-tls-secret"
+
+  tasks:
+    - name: Load Harbor robot token from .env file
+      ansible.builtin.shell: |
+        if [ -f "{{ ansible_env.HOME }}/.env" ]; then
+          source {{ ansible_env.HOME }}/.env
+          echo $HARBOR_ROBOT_TOKEN
+        else
+          echo ""
+        fi
+      args:
+        executable: /bin/bash
+      register: robot_token_result
+      changed_when: false
+
+    - name: Set Harbor credentials facts
+      ansible.builtin.set_fact:
+        harbor_robot_user: "robot${{ harbor_robot_name }}"
+        harbor_robot_token: "{{ robot_token_result.stdout.strip() }}"
+
+    - name: Verify Harbor robot token is available
+      ansible.builtin.fail:
+        msg: "HARBOR_ROBOT_TOKEN not found in {{ ansible_env.HOME }}/.env. Please ensure Harbor is configured."
+      when: harbor_robot_token == ""
+
+    - name: Create namespace for MLflow
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ mlflow_namespace }}"
+        kind: Namespace
+        state: present
+
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ keycloak_admin_username }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: "{{ keycloak_validate_certs | default(true) }}"
+        status_code: 200
+      register: keycloak_token
+
+    - name: Get MLflow client UUID
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ mlflow_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs | default(true) }}"
+        status_code: 200
+      register: mlflow_client_response
+
+    - name: Get MLflow client secret
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ mlflow_client_response.json[0].id }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs | default(true) }}"
+        status_code: 200
+      register: client_secret_response
+
+    - name: Set client secret fact
+      ansible.builtin.set_fact:
+        keycloak_client_secret: "{{ client_secret_response.json.value }}"
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: thinkube-com-tls
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to MLflow namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ mlflow_tls_secret_name }}"
+            namespace: "{{ mlflow_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Create Harbor registry pull secret in MLflow namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ mlflow_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: harbor-registry-secret
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: "{{ {'auths': {harbor_registry: {'username': harbor_robot_user, 'password': harbor_robot_token, 'auth': (harbor_robot_user + ':' + harbor_robot_token) | b64encode}}} | to_json | b64encode }}"
+
+    - name: Check if MLflow database exists
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ postgres_admin_password }}" psql -h {{ postgres_hostname }} -p 5432 -U {{ postgres_admin_user }} -d postgres -c "
+        SELECT datname FROM pg_database WHERE datname = '{{ mlflow_db_name }}';
+        "
+      register: db_check
+      become: true
+      changed_when: false
+
+    - name: Create MLflow database if it doesn't exist
+      ansible.builtin.shell: |
+        PGPASSWORD="{{ postgres_admin_password }}" psql -h {{ postgres_hostname }} -p 5432 -U {{ postgres_admin_user }} -d postgres -c "
+        CREATE DATABASE {{ mlflow_db_name }};
+        "
+      register: db_create
+      become: true
+      when: db_check.stdout.find(mlflow_db_name) == -1
+      changed_when: db_create.rc == 0
+
+    - name: Get SeaweedFS S3 credentials from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ seaweedfs_namespace }}"
+        name: "{{ seaweedfs_s3_secret }}"
+      register: seaweedfs_secret
+      failed_when: seaweedfs_secret.resources | length == 0
+
+    - name: Set SeaweedFS credentials as facts
+      ansible.builtin.set_fact:
+        s3_access_key: "{{ seaweedfs_secret.resources[0].data.access_key | b64decode }}"
+        s3_secret_key: "{{ seaweedfs_secret.resources[0].data.secret_key | b64decode }}"
+
+    - name: Create MLflow artifacts bucket in SeaweedFS
+      ansible.builtin.shell: |
+        s3cmd --config=/dev/null \
+          --access_key="{{ s3_access_key }}" \
+          --secret_key="{{ s3_secret_key }}" \
+          --host="https://{{ seaweedfs_s3_hostname }}" \
+          --host-bucket="https://{{ seaweedfs_s3_hostname }}/%(bucket)s" \
+          --no-ssl-certificate-check \
+          --signature-v2 \
+          mb s3://{{ mlflow_artifacts_bucket }} 2>&1 || true
+      register: seaweedfs_result
+      become: true
+      changed_when: "'Bucket created' in seaweedfs_result.stdout or seaweedfs_result.rc == 0"
+
+    - name: Create PostgreSQL secret for MLflow
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ mlflow_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: mlflow-db-secret
+          type: Opaque
+          stringData:
+            DB_HOST: "{{ postgres_release_name }}.{{ postgres_namespace }}.svc.cluster.local"
+            DB_PORT: "5432"
+            DB_NAME: "{{ mlflow_db_name }}"
+            DB_USER: "{{ mlflow_db_user }}"
+            DB_PASSWORD: "{{ mlflow_db_password }}"
+
+    - name: Create SeaweedFS S3 Secret for MLflow
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ mlflow_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: mlflow-s3-secret
+          type: Opaque
+          stringData:
+            AWS_ACCESS_KEY_ID: "{{ s3_access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ s3_secret_key }}"
+            S3_ENDPOINT_URL: "http://seaweedfs-filer.{{ seaweedfs_namespace }}.svc.cluster.local:8333"
+
+    - name: Create OIDC Client Secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ mlflow_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: oauth2-proxy-secret
+          type: Opaque
+          stringData:
+            client-id: "{{ mlflow_client_id }}"
+            client-secret: "{{ keycloak_client_secret }}"
+
+    - name: Create Persistent Volume Claim for MLflow local artifacts
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ mlflow_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: mlflow-storage
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            storageClassName: "{{ storage_class_name }}"
+            resources:
+              requests:
+                storage: "{{ mlflow_capacity }}"
+
+    - name: Create ConfigMap for custom Keycloak group detection plugin
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ mlflow_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: mlflow-group-plugin
+          data:
+            mlflow_keycloak_groups.py: "{{ lookup('template', 'templates/mlflow_keycloak_groups.py.j2') }}"
+
+    - name: Create MLflow Deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ mlflow_namespace }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: mlflow
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: mlflow
+            template:
+              metadata:
+                labels:
+                  app: mlflow
+              spec:
+                imagePullSecrets:
+                  - name: harbor-registry-secret
+                volumes:
+                  - name: mlflow-storage
+                    persistentVolumeClaim:
+                      claimName: mlflow-storage
+                  - name: plugins
+                    configMap:
+                      name: mlflow-group-plugin
+                      defaultMode: 420
+                containers:
+                  - name: mlflow
+                    image: "{{ harbor_registry }}/library/mlflow-custom:latest"
+                    command: ["mlflow"]
+                    args: ["server", "--host=0.0.0.0", "--port=5000", "--backend-store-uri=postgresql://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)", "--default-artifact-root=s3://mlflow/", "--app-name", "oidc-auth"]
+                    volumeMounts:
+                      - name: mlflow-storage
+                        mountPath: /mlflow/local-artifacts
+                      - name: plugins
+                        mountPath: /mlflow/plugins
+                    env:
+                      - name: PYTHONPATH
+                        value: "/mlflow/plugins"
+                      - name: DB_HOST
+                        valueFrom:
+                          secretKeyRef:
+                            name: mlflow-db-secret
+                            key: DB_HOST
+                      - name: DB_PORT
+                        valueFrom:
+                          secretKeyRef:
+                            name: mlflow-db-secret
+                            key: DB_PORT
+                      - name: DB_NAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: mlflow-db-secret
+                            key: DB_NAME
+                      - name: DB_USER
+                        valueFrom:
+                          secretKeyRef:
+                            name: mlflow-db-secret
+                            key: DB_USER
+                      - name: DB_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: mlflow-db-secret
+                            key: DB_PASSWORD
+                      - name: AWS_ACCESS_KEY_ID
+                        valueFrom:
+                          secretKeyRef:
+                            name: mlflow-s3-secret
+                            key: AWS_ACCESS_KEY_ID
+                      - name: AWS_SECRET_ACCESS_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: mlflow-s3-secret
+                            key: AWS_SECRET_ACCESS_KEY
+                      - name: MLFLOW_S3_ENDPOINT_URL
+                        valueFrom:
+                          secretKeyRef:
+                            name: mlflow-s3-secret
+                            key: S3_ENDPOINT_URL
+                      - name: MLFLOW_S3_IGNORE_TLS
+                        value: "true"
+                      - name: OIDC_DISCOVERY_URL
+                        value: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/.well-known/openid-configuration"
+                      - name: OIDC_CLIENT_ID
+                        value: "{{ mlflow_client_id }}"
+                      - name: OIDC_CLIENT_SECRET
+                        valueFrom:
+                          secretKeyRef:
+                            name: oauth2-proxy-secret
+                            key: client-secret
+                      - name: OIDC_PROVIDER_DISPLAY_NAME
+                        value: "Login with Keycloak"
+                      - name: OIDC_SCOPE
+                        value: "openid profile email"
+                      - name: OIDC_REDIRECT_URI
+                        value: "https://{{ mlflow_hostname }}/callback"
+                      - name: OIDC_GROUP_NAME
+                        value: "mlflow-user"
+                      - name: OIDC_ADMIN_GROUP_NAME
+                        value: "mlflow-admin"
+                      - name: OIDC_GROUPS_ATTRIBUTE
+                        value: "realm_access.roles"
+                      - name: OIDC_GROUP_DETECTION_PLUGIN
+                        value: "mlflow_keycloak_groups"
+                      - name: AUTOMATIC_LOGIN_REDIRECT
+                        value: "true"
+                      - name: DEFAULT_LANDING_PAGE_IS_PERMISSIONS
+                        value: "false"
+                      - name: SECRET_KEY
+                        value: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=32') }}"
+                    ports:
+                      - containerPort: 5000
+                        name: http
+                    livenessProbe:
+                      httpGet:
+                        path: /
+                        port: 5000
+                      initialDelaySeconds: 60
+                      timeoutSeconds: 5
+                    readinessProbe:
+                      httpGet:
+                        path: /
+                        port: 5000
+                      initialDelaySeconds: 30
+                      timeoutSeconds: 5
+                    resources:
+                      requests:
+                        memory: "256Mi"
+                        cpu: "100m"
+                      limits:
+                        memory: "1Gi"
+                        cpu: "500m"
+
+    - name: Create MLflow Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ mlflow_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: mlflow
+            labels:
+              app: mlflow
+          spec:
+            ports:
+              - port: 5000
+                targetPort: 5000
+                protocol: TCP
+                name: http
+            selector:
+              app: mlflow
+
+    - name: Create MLflow Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ mlflow_namespace }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: mlflow
+            annotations:
+              nginx.ingress.kubernetes.io/proxy-body-size: "0"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ mlflow_hostname }}"
+                secretName: "{{ mlflow_tls_secret_name }}"
+            rules:
+              - host: "{{ mlflow_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: mlflow
+                          port:
+                            number: 5000
+
+    - name: Final MLflow info
+      ansible.builtin.debug:
+        msg:
+          - "MLflow tracking server deployed with built-in OIDC auth integration."
+          - "Namespace: {{ mlflow_namespace }}"
+          - "TLS secret: {{ mlflow_tls_secret_name }}"
+          - "MLflow UI: https://{{ mlflow_hostname }}"
+          - "Database: MLflow database '{{ mlflow_db_name }}' created (using admin user for access)"
+          - "Artifacts: SeaweedFS S3 bucket '{{ mlflow_artifacts_bucket }}' created"
+          - "Image: {{ harbor_registry }}/library/mlflow-custom:latest"
+          - "Authentication is handled through MLflow OIDC auth plugin"
+          - "Uses Keycloak realm {{ keycloak_realm }} with client ID: {{ mlflow_client_id }}"
+          - "User group: mlflow-user, Admin group: mlflow-admin"
+          - "Storage: SeaweedFS (Apache 2.0 licensed S3-compatible storage)"

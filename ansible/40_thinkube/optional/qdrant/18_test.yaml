@@ -1,0 +1,258 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/qdrant/18_test.yaml
+# Description:
+#   Test Qdrant deployment and validate functionality
+#
+# Requirements:
+#   - Qdrant must be deployed (10_deploy.yaml)
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/qdrant/18_test.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubectl configuration
+#   - kubectl_bin: Path to kubectl binary
+#   - qdrant_namespace: Namespace for Qdrant
+#   - qdrant_hostname: Hostname for Qdrant API
+#   - qdrant_dashboard_hostname: Hostname for Qdrant dashboard
+#
+# 🤖 [AI-assisted]
+
+- name: Test Qdrant Deployment
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    k8s_namespace: "{{ qdrant_namespace }}"
+
+  tasks:
+    - name: Check if namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ k8s_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check Qdrant statefulset
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant"
+      register: qdrant_statefulset
+      failed_when: qdrant_statefulset.resources | length == 0
+
+    - name: Check OAuth2 Proxy deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+        name: "oauth2-proxy"
+      register: oauth2_deployment
+      failed_when: oauth2_deployment.resources | length == 0
+
+    - name: Check Valkey deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+        name: "ephemeral-valkey"
+      register: valkey_deployment
+      failed_when: valkey_deployment.resources | length == 0
+
+    - name: Check Qdrant service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant"
+      register: qdrant_service
+      failed_when: qdrant_service.resources | length == 0
+
+    - name: Check OAuth2 Proxy service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ k8s_namespace }}"
+        name: "oauth2-proxy"
+      register: oauth2_service
+      failed_when: oauth2_service.resources | length == 0
+
+    - name: Check Qdrant dashboard ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant-http-ingress"
+      register: dashboard_ingress
+      failed_when: dashboard_ingress.resources | length == 0
+
+    - name: Check Qdrant API ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant-api-ingress"
+      register: api_ingress
+      failed_when: api_ingress.resources | length == 0
+
+    - name: Check OAuth2 ingress
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ k8s_namespace }}"
+        name: "oauth2-proxy-ingress"
+      register: oauth2_ingress
+      failed_when: oauth2_ingress.resources | length == 0
+
+    - name: Check TLS secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant-tls-secret"
+      register: tls_secret
+      failed_when: tls_secret.resources | length == 0
+
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+
+    - name: Check Qdrant client in Keycloak
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ keycloak_realm }}/clients?clientId=qdrant-dashboard"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: qdrant_client
+      failed_when: qdrant_client.json | length == 0
+
+    - name: Test Qdrant API endpoint
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_hostname }}/"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: api_info
+
+    - name: Test Qdrant API collections endpoint
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_hostname }}/collections"
+        method: GET
+        validate_certs: false
+        headers:
+          Content-Type: "application/json"
+        status_code: 200
+      register: collections_test
+
+    - name: Test Qdrant Dashboard URL (should redirect)
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_dashboard_hostname }}/"
+        method: GET
+        follow_redirects: none
+        validate_certs: false
+        status_code: [301, 302, 303]
+      register: dashboard_test
+
+    - name: Verify redirect
+      ansible.builtin.assert:
+        that:
+          - dashboard_test.status in [301, 302, 303]
+          - "'dashboard' in dashboard_test.location"
+        success_msg: "Qdrant dashboard root is properly redirecting"
+        fail_msg: "Qdrant dashboard root is not properly redirecting"
+
+    - name: Test Qdrant Dashboard authentication
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_dashboard_hostname }}/dashboard"
+        method: GET
+        follow_redirects: none
+        validate_certs: false
+        status_code: [302, 303]
+      register: dashboard_auth_test
+        
+    - name: Verify auth redirect on dashboard
+      ansible.builtin.assert:
+        that:
+          - dashboard_auth_test.status in [302, 303]
+          - "'oauth2/start' in dashboard_auth_test.location or 'oauth2/auth' in dashboard_auth_test.location"
+        success_msg: "Qdrant dashboard is properly protected by authentication"
+        fail_msg: "Qdrant dashboard is not properly protected by authentication"
+
+    - name: Check persistent volume claim
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ k8s_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=qdrant"
+      register: pvc_check
+      failed_when: pvc_check.resources | length == 0
+
+    - name: Test summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Qdrant Test Results
+          ════════════════════════════════════════════════════════
+          
+          Namespace: {{ k8s_namespace }}
+          API URL: https://{{ qdrant_hostname }}
+          Dashboard URL: https://{{ qdrant_dashboard_hostname }}
+          
+          Component Status:
+          ✓ Qdrant statefulset: Running
+          ✓ OAuth2 Proxy: Running
+          ✓ Valkey session store: Running
+          ✓ Ingress configured: Yes
+          ✓ TLS certificate: Present
+          ✓ Keycloak client: Configured
+          ✓ API health check: Passed
+          ✓ Authentication redirect: Working
+          ✓ Persistent storage: Configured
+          
+          Access Instructions:
+          1. API Access: https://{{ qdrant_hostname }}
+          2. Dashboard: https://{{ qdrant_dashboard_hostname }}
+          3. Login via Keycloak SSO
+          
+          API Endpoints:
+          - Info: https://{{ qdrant_hostname }}/
+          - Collections: https://{{ qdrant_hostname }}/collections
+          - gRPC: {{ qdrant_hostname }}:6334
+          
+          Troubleshooting Commands:
+          - kubectl -n {{ k8s_namespace }} get pods
+          - kubectl -n {{ k8s_namespace }} logs statefulset/qdrant
+          - kubectl -n {{ k8s_namespace }} logs deployment/oauth2-proxy
+          
+          ════════════════════════════════════════════════════════

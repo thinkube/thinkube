@@ -1,0 +1,138 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/prometheus/17_service_discovery.yaml
+# Description:
+#   Register Prometheus Operator services in thinkube-control service discovery
+#
+# This playbook registers:
+#   - prometheus-k8s: Prometheus server
+#   - alertmanager-main: Alertmanager
+#   - grafana: Grafana (from kube-prometheus)
+#
+# Requirements:
+#   - Prometheus Operator must be deployed (11_deploy.yaml)
+#   - thinkube-control must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/prometheus/17_service_discovery.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - domain_name: Base domain
+#
+# 🤖 AI-assisted
+
+- name: Register Prometheus Operator Services
+  hosts: microk8s_control_plane
+  gather_facts: false
+
+  vars:
+    prometheus_namespace: "monitoring"
+    thinkube_control_namespace: "thinkube-control"
+
+    services:
+      - name: "prometheus"
+        display_name: "Prometheus"
+        service_name: "prometheus-k8s"
+        namespace: "{{ prometheus_namespace }}"
+        port: 9090
+        hostname: "prometheus.{{ domain_name }}"
+        description: "Prometheus monitoring and metrics server"
+        category: "monitoring"
+        health_check_path: "/-/healthy"
+
+      - name: "alertmanager"
+        display_name: "Alertmanager"
+        service_name: "alertmanager-main"
+        namespace: "{{ prometheus_namespace }}"
+        port: 9093
+        hostname: "alertmanager.{{ domain_name }}"
+        description: "Prometheus Alertmanager for alert routing"
+        category: "monitoring"
+        health_check_path: "/-/healthy"
+
+      - name: "grafana"
+        display_name: "Grafana (kube-prometheus)"
+        service_name: "grafana"
+        namespace: "{{ prometheus_namespace }}"
+        port: 3000
+        hostname: "grafana.{{ domain_name }}"
+        description: "Grafana dashboards (from kube-prometheus stack)"
+        category: "monitoring"
+        health_check_path: "/api/health"
+
+  tasks:
+    ###################################################################
+    # 1) Verify Prometheus Operator services exist
+    ###################################################################
+    - name: Check Prometheus Operator services
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        namespace: "{{ prometheus_namespace }}"
+        name: "{{ item.service_name }}"
+      loop: "{{ services }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: service_check
+      failed_when: service_check.resources | length == 0
+
+    ###################################################################
+    # 2) Create or update service discovery ConfigMap
+    ###################################################################
+    - name: Get existing service discovery ConfigMap
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: ConfigMap
+        namespace: "{{ thinkube_control_namespace }}"
+        name: service-discovery
+      register: existing_configmap
+
+    - name: Parse existing services
+      ansible.builtin.set_fact:
+        existing_services: "{{ (existing_configmap.resources[0].data.services | from_json) if existing_configmap.resources | length > 0 else [] }}"
+
+    - name: Merge Prometheus services with existing services
+      ansible.builtin.set_fact:
+        merged_services: "{{ existing_services | union(services) | unique(attribute='name') }}"
+
+    - name: Create or update service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: service-discovery
+            namespace: "{{ thinkube_control_namespace }}"
+          data:
+            services: "{{ merged_services | to_json }}"
+
+    ###################################################################
+    # 3) Summary
+    ###################################################################
+    - name: Service discovery summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Prometheus Operator Services Registered
+          ════════════════════════════════════════════════════════
+
+          📊 REGISTERED SERVICES:
+          ─────────────────────────
+          {% for svc in services %}
+          • {{ svc.display_name }} ({{ svc.name }})
+            - URL: https://{{ svc.hostname }}
+            - Service: {{ svc.service_name }}.{{ svc.namespace }}:{{ svc.port }}
+          {% endfor %}
+
+          🔧 SERVICE DISCOVERY:
+          ─────────────────────────
+          • ConfigMap: service-discovery
+          • Namespace: {{ thinkube_control_namespace }}
+          • Total services: {{ merged_services | length }}
+          ════════════════════════════════════════════════════════

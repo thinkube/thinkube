@@ -1,0 +1,479 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/langfuse/11_deploy.yaml
+# Description:
+#   Deploy Langfuse LLM observability platform with PostgreSQL and Keycloak OIDC
+#
+# Requirements:
+#   - MicroK8s must be installed
+#   - PostgreSQL must be deployed (core component)
+#   - Keycloak must be deployed and configured
+#   - Harbor registry must be accessible
+#   - ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/langfuse/11_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#   - harbor_registry: Harbor registry URL
+#   - keycloak_url: Keycloak URL
+#   - keycloak_realm: Keycloak realm name
+#
+# Dependencies:
+#   - CORE-005: PostgreSQL must be deployed
+#   - CORE-006: Keycloak must be deployed
+#   - Harbor registry must have langfuse image
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy Langfuse
+  hosts: microk8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Common settings
+    k8s_namespace: "langfuse"
+    langfuse_hostname: "langfuse.{{ domain_name }}"
+
+    # TLS settings
+    tls_secret_name: "langfuse-tls-secret"
+
+    # Admin password from environment
+    admin_password: "{{ lookup('env','ADMIN_PASSWORD') }}"
+
+    # PostgreSQL settings
+    postgres_admin_user: "{{ admin_username }}"
+    langfuse_db_name: "langfuse_db"
+    langfuse_db_user: "{{ admin_username }}"
+    langfuse_db_internal_host: "postgresql-official.postgres.svc.cluster.local"
+
+    # Keycloak settings
+    langfuse_client_id: "langfuse"
+    langfuse_oauth_secret_name: "langfuse-oauth-secret"
+
+    # Langfuse initialization settings
+    langfuse_init_org_id: "thinkube"
+    langfuse_init_org_name: "Thinkube"
+    langfuse_init_project_id: "default"
+    langfuse_init_project_name: "Default Project"
+
+  tasks:
+    ###########################################################################
+    # Step 1: Create Namespace and TLS Secret
+    ###########################################################################
+    - name: Ensure Langfuse namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ k8s_namespace }}"
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Langfuse namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ tls_secret_name }}"
+            namespace: "{{ k8s_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###########################################################################
+    # Step 2: Get Keycloak OAuth Credentials
+    ###########################################################################
+    - name: Get Keycloak OAuth secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ k8s_namespace }}"
+        name: "{{ langfuse_oauth_secret_name }}"
+      register: oauth_secret
+      failed_when: oauth_secret.resources | length == 0
+
+    - name: Extract OAuth client secret
+      ansible.builtin.set_fact:
+        keycloak_client_secret: "{{ oauth_secret.resources[0].data['client_secret'] | b64decode }}"
+
+    ###########################################################################
+    # Step 3: Create S3 Buckets for Langfuse
+    ###########################################################################
+    - name: Get SeaweedFS S3 credentials from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: seaweedfs-s3-config
+        namespace: seaweedfs
+      register: seaweedfs_secret
+      failed_when: seaweedfs_secret.resources | length == 0
+
+    - name: Set SeaweedFS credentials as facts
+      ansible.builtin.set_fact:
+        s3_access_key: "{{ seaweedfs_secret.resources[0].data.access_key | b64decode }}"
+        s3_secret_key: "{{ seaweedfs_secret.resources[0].data.secret_key | b64decode }}"
+        seaweedfs_s3_hostname: "s3.{{ domain_name }}"
+        langfuse_s3_events_bucket: "langfuse-events"
+        langfuse_s3_media_bucket: "langfuse-media"
+
+    - name: Create Langfuse events bucket in SeaweedFS
+      ansible.builtin.shell: |
+        s3cmd --config=/dev/null \
+          --access_key="{{ s3_access_key }}" \
+          --secret_key="{{ s3_secret_key }}" \
+          --host="https://{{ seaweedfs_s3_hostname }}" \
+          --host-bucket="https://{{ seaweedfs_s3_hostname }}/%(bucket)s" \
+          --no-ssl-certificate-check \
+          --signature-v2 \
+          mb s3://{{ langfuse_s3_events_bucket }} 2>&1 || true
+      register: s3_events_result
+      become: true
+      changed_when: "'Bucket created' in s3_events_result.stdout or s3_events_result.rc == 0"
+
+    - name: Create Langfuse media bucket in SeaweedFS
+      ansible.builtin.shell: |
+        s3cmd --config=/dev/null \
+          --access_key="{{ s3_access_key }}" \
+          --secret_key="{{ s3_secret_key }}" \
+          --host="https://{{ seaweedfs_s3_hostname }}" \
+          --host-bucket="https://{{ seaweedfs_s3_hostname }}/%(bucket)s" \
+          --no-ssl-certificate-check \
+          --signature-v2 \
+          mb s3://{{ langfuse_s3_media_bucket }} 2>&1 || true
+      register: s3_media_result
+      become: true
+      changed_when: "'Bucket created' in s3_media_result.stdout or s3_media_result.rc == 0"
+
+    ###########################################################################
+    # Step 4: Create Langfuse Secrets
+    ###########################################################################
+    - name: Generate NEXTAUTH_SECRET
+      ansible.builtin.set_fact:
+        nextauth_secret: "{{ lookup('password', '/dev/null length=64 chars=ascii_letters,digits') }}"
+
+    - name: Generate SALT
+      ansible.builtin.set_fact:
+        langfuse_salt: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Generate ENCRYPTION_KEY (64-char hex string for 256-bit encryption)
+      ansible.builtin.shell: openssl rand -hex 32
+      register: encryption_key_result
+      changed_when: false
+
+    - name: Set ENCRYPTION_KEY fact
+      ansible.builtin.set_fact:
+        langfuse_encryption_key: "{{ encryption_key_result.stdout }}"
+
+    - name: Generate Langfuse Admin API key
+      ansible.builtin.shell: openssl rand -hex 32
+      register: admin_api_key_result
+      changed_when: false
+
+    - name: Set ADMIN_API_KEY fact
+      ansible.builtin.set_fact:
+        langfuse_admin_api_key: "{{ admin_api_key_result.stdout }}"
+
+    - name: Generate Langfuse project public key
+      ansible.builtin.shell: |
+        echo "lf_pk_$(openssl rand -hex 16)"
+      register: project_public_key_result
+      changed_when: false
+
+    - name: Set project public key fact
+      ansible.builtin.set_fact:
+        langfuse_project_public_key: "{{ project_public_key_result.stdout }}"
+
+    - name: Generate Langfuse project secret key
+      ansible.builtin.shell: |
+        echo "lf_sk_$(openssl rand -hex 32)"
+      register: project_secret_key_result
+      changed_when: false
+
+    - name: Set project secret key fact
+      ansible.builtin.set_fact:
+        langfuse_project_secret_key: "{{ project_secret_key_result.stdout }}"
+
+    - name: Create Langfuse configuration secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: langfuse-config
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          stringData:
+            # Database configuration
+            DATABASE_URL: "postgresql://{{ langfuse_db_user }}:{{ admin_password }}@{{ langfuse_db_internal_host }}:5432/{{ langfuse_db_name }}"
+            # ClickHouse configuration
+            CLICKHOUSE_URL: "http://clickhouse-clickhouse.clickhouse.svc.cluster.local:8123"
+            CLICKHOUSE_MIGRATION_URL: "clickhouse://default:{{ admin_password }}@clickhouse-clickhouse.clickhouse.svc.cluster.local:9000"
+            CLICKHOUSE_CLUSTER_ENABLED: "false"
+            CLICKHOUSE_USER: "default"
+            CLICKHOUSE_PASSWORD: "{{ admin_password }}"
+            # Redis configuration (Langfuse v3 requirement)
+            REDIS_HOST: "valkey.valkey.svc.cluster.local"
+            REDIS_PORT: "6379"
+            # Encryption (Langfuse v3 requirement - 64-char hex string)
+            ENCRYPTION_KEY: "{{ langfuse_encryption_key }}"
+            # S3 Event Upload configuration (Langfuse v3 requirement)
+            LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "{{ langfuse_s3_events_bucket }}"
+            LANGFUSE_S3_EVENT_UPLOAD_REGION: "us-east-1"
+            LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://seaweedfs-s3.seaweedfs.svc.cluster.local:8333"
+            LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "{{ s3_access_key }}"
+            LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: "{{ s3_secret_key }}"
+            LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+            # S3 Media Upload configuration (Langfuse v3 requirement)
+            LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "{{ langfuse_s3_media_bucket }}"
+            LANGFUSE_S3_MEDIA_UPLOAD_REGION: "us-east-1"
+            LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://seaweedfs-s3.seaweedfs.svc.cluster.local:8333"
+            LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "{{ s3_access_key }}"
+            LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: "{{ s3_secret_key }}"
+            LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+            # NextAuth configuration
+            NEXTAUTH_URL: "https://{{ langfuse_hostname }}"
+            NEXTAUTH_SECRET: "{{ nextauth_secret }}"
+            SALT: "{{ langfuse_salt }}"
+            # Keycloak OIDC configuration (using native Keycloak provider)
+            AUTH_KEYCLOAK_CLIENT_ID: "{{ langfuse_client_id }}"
+            AUTH_KEYCLOAK_CLIENT_SECRET: "{{ keycloak_client_secret }}"
+            AUTH_KEYCLOAK_ISSUER: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+            AUTH_KEYCLOAK_ALLOW_ACCOUNT_LINKING: "true"
+            # Initial organization/project configuration
+            LANGFUSE_INIT_ORG_ID: "{{ langfuse_init_org_id }}"
+            LANGFUSE_INIT_ORG_NAME: "{{ langfuse_init_org_name }}"
+            LANGFUSE_INIT_PROJECT_ID: "{{ langfuse_init_project_id }}"
+            LANGFUSE_INIT_PROJECT_NAME: "{{ langfuse_init_project_name }}"
+            LANGFUSE_INIT_PROJECT_PUBLIC_KEY: "{{ langfuse_project_public_key }}"
+            LANGFUSE_INIT_PROJECT_SECRET_KEY: "{{ langfuse_project_secret_key }}"
+            # Admin API configuration
+            ADMIN_API_KEY: "{{ langfuse_admin_api_key }}"
+
+    ###########################################################################
+    # Step 5: Deploy Langfuse
+    ###########################################################################
+    - name: Create Langfuse Deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: langfuse
+            namespace: "{{ k8s_namespace }}"
+            labels:
+              app: langfuse
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: langfuse
+            template:
+              metadata:
+                labels:
+                  app: langfuse
+              spec:
+                initContainers:
+                  - name: wait-for-postgres
+                    image: busybox:1.35
+                    command: ['sh', '-c', 'until nc -z postgresql-official.postgres.svc.cluster.local 5432; do echo waiting for postgres; sleep 2; done;']
+                  - name: init-db
+                    image: "{{ harbor_registry }}/{{ library_project | default('library') }}/postgres:16-alpine"
+                    env:
+                      - name: PGPASSWORD
+                        value: "{{ admin_password }}"
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        echo "Creating Langfuse database if it doesn't exist..."
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '{{ langfuse_db_name }}'" | grep -q 1 || psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "CREATE DATABASE {{ langfuse_db_name }}"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE {{ langfuse_db_name }} TO {{ admin_username }}"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "ALTER DATABASE {{ langfuse_db_name }} OWNER TO {{ admin_username }}"
+                        psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d {{ langfuse_db_name }} -c "GRANT ALL ON SCHEMA public TO {{ admin_username }}"
+                        echo "Database initialization complete."
+                containers:
+                  - name: langfuse
+                    image: "{{ harbor_registry }}/library/langfuse:3.113.0"
+                    imagePullPolicy: IfNotPresent
+                    ports:
+                      - name: http
+                        containerPort: 3000
+                        protocol: TCP
+                    envFrom:
+                      - secretRef:
+                          name: langfuse-config
+                    resources:
+                      requests:
+                        cpu: "500m"
+                        memory: "1Gi"
+                      limits:
+                        cpu: "2"
+                        memory: "4Gi"
+                    livenessProbe:
+                      httpGet:
+                        path: /api/public/health
+                        port: http
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 3
+                    readinessProbe:
+                      httpGet:
+                        path: /api/public/health
+                        port: http
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                      timeoutSeconds: 3
+                      failureThreshold: 3
+
+    ###########################################################################
+    # Step 6: Create Langfuse Service
+    ###########################################################################
+    - name: Create Langfuse Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: langfuse
+            namespace: "{{ k8s_namespace }}"
+            labels:
+              app: langfuse
+          spec:
+            type: ClusterIP
+            ports:
+              - port: 3000
+                targetPort: http
+                protocol: TCP
+                name: http
+            selector:
+              app: langfuse
+
+    ###########################################################################
+    # Step 7: Create Langfuse Ingress
+    ###########################################################################
+    - name: Create Langfuse Ingress
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: langfuse
+            namespace: "{{ k8s_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+          spec:
+            ingressClassName: "{{ primary_ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ langfuse_hostname }}"
+                secretName: "{{ tls_secret_name }}"
+            rules:
+              - host: "{{ langfuse_hostname }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: langfuse
+                          port:
+                            number: 3000
+
+    ###########################################################################
+    # Step 8: Wait for Langfuse to be ready
+    ###########################################################################
+    - name: Wait for Langfuse pods to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ k8s_namespace }}"
+        label_selectors:
+          - "app=langfuse"
+      register: langfuse_pods
+      until: >
+        langfuse_pods.resources | length > 0 and
+        langfuse_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+      retries: 30
+      delay: 10
+
+    - name: Wait for Langfuse to be fully ready
+      ansible.builtin.uri:
+        url: "https://{{ langfuse_hostname }}/api/public/health"
+        validate_certs: false
+        status_code: 200
+      register: langfuse_health
+      until: langfuse_health.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Create Langfuse credentials from template
+      ansible.builtin.template:
+        src: templates/langfuse-credentials.yaml.j2
+        dest: /tmp/langfuse-credentials
+        mode: '0600'
+      vars:
+        langfuse_api_public_key: "{{ langfuse_project_public_key }}"
+        langfuse_api_secret_key: "{{ langfuse_project_secret_key }}"
+      no_log: true
+
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy Langfuse credentials to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.langfuse
+        {{ kubectl_bin }} cp /tmp/langfuse-credentials code-server/{{ code_server_pod.stdout }}:/home/thinkube/.langfuse/credentials
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.langfuse/credentials
+        rm -f /tmp/langfuse-credentials
+        echo '✅ Langfuse CLI configured in code-server'
+      no_log: true
+
+    - name: Display deployment results
+      ansible.builtin.debug:
+        msg:
+          - "Langfuse deployment complete!"
+          - "URL: https://{{ langfuse_hostname }}"
+          - "Database: {{ langfuse_db_name }}"
+          - "Authentication: Keycloak OIDC"
+          - ""
+          - "Default Organization: thinkube"
+          - "Default Project: default"
+          - "CLI configured in code-server with auto-generated API keys"
+        verbosity: 0
