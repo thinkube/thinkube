@@ -317,9 +317,9 @@ sudo k8s kubectl get nodes
 
 ## Playbook Requirements
 
-The Ansible playbooks must handle:
+Following the same structure as MicroK8s playbooks, we need 6 playbooks:
 
-### Control Plane (10_install_k8s.yaml)
+### Control Plane Installation (10_install_k8s.yaml)
 1. **UFW Configuration** (critical)
    - Set IP forwarding in sysctl
    - Set forward policy to ACCEPT
@@ -345,7 +345,44 @@ The Ansible playbooks must handle:
    - Wait for all pods Running
    - Verify GPU resources advertised
 
-### Worker Nodes (20_join_workers.yaml)
+6. **Create Wrappers**
+   - kubectl wrapper at ~/.local/bin/kubectl
+   - helm wrapper at ~/.local/bin/helm
+   - Thinkube alias integration
+
+### Control Plane Testing (18_test_control.yaml)
+1. **Cluster Status**
+   - Verify cluster ready
+   - Check all system pods Running
+
+2. **DNS Testing**
+   - Test service DNS resolution
+   - Verify CoreDNS responding
+
+3. **Network Testing**
+   - Test pod-to-pod connectivity
+   - Test external connectivity
+
+4. **GPU Testing** (if GPU present)
+   - Verify GPU resources advertised
+   - Test GPU allocation
+
+### Control Plane Rollback (19_rollback_control.yaml)
+1. **Remove k8s-snap**
+   - `sudo snap remove k8s --purge`
+
+2. **Clean UFW Rules**
+   - Remove k8s-snap specific rules
+   - Restore forward policy if needed
+
+3. **Restore Docker** (DGX Spark only)
+   - Re-enable Docker if it was disabled
+
+4. **Verification**
+   - Confirm snap removed
+   - Verify no k8s processes running
+
+### Worker Node Join (20_join_workers.yaml)
 1. **UFW Configuration** (same as control plane)
 
 2. **DGX Spark Specific**
@@ -364,6 +401,37 @@ The Ansible playbooks must handle:
    - Verify node appears in cluster
    - Check node is Ready
    - Verify system pods running on worker
+
+### Worker Node Testing (28_test_worker.yaml)
+1. **Node Status** (from control plane)
+   - Verify worker node Ready
+   - Check node labels
+
+2. **Pod Distribution**
+   - Verify system pods on worker
+   - Test pod scheduling to worker
+
+3. **GPU Testing** (if GPU present)
+   - Verify GPU resources advertised on worker
+   - Test GPU workload scheduling
+
+### Worker Node Rollback (29_rollback_workers.yaml)
+1. **Remove from Cluster** (from control plane)
+   - Drain node
+   - Delete node from cluster
+
+2. **Remove k8s-snap** (on worker)
+   - `sudo snap remove k8s --purge`
+
+3. **Clean UFW Rules**
+   - Remove k8s-snap specific rules
+
+4. **Restore Docker** (DGX Spark only)
+   - Re-enable Docker if it was disabled
+
+5. **Verification**
+   - Confirm node removed from cluster
+   - Verify snap removed from worker
 
 ## References
 
