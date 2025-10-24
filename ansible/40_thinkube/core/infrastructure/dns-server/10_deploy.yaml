@@ -9,7 +9,7 @@
 #   Separate from Kubernetes CoreDNS which handles cluster.local
 #
 # Requirements:
-#   - MicroK8s must be installed and running
+#   - Kubernetes must be installed and running
 #   - MetalLB must be enabled for LoadBalancer services
 #   - DNS external IP must be configured on control plane node
 #
@@ -36,12 +36,31 @@
   
   vars:
     dns_namespace: "dns-system"
+    bind9_image_name: "localhost/thinkube-bind9:latest"
+    bind9_build_dir: "/tmp/thinkube-bind9-build"
     # Determine subnet prefix based on network mode
     subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     dns_external_ip: "{{ subnet_prefix }}{{ dns_external_ip_octet }}"
     primary_ingress_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
     secondary_ingress_ip: "{{ subnet_prefix }}{{ secondary_ingress_ip_octet }}"
     control_plane_hostname: "{{ inventory_hostname }}"
+    bind9_containerfile: |
+      FROM ubuntu:24.04
+
+      # Install bind9 and dependencies
+      RUN apt-get update && \
+          apt-get install -y --no-install-recommends \
+            bind9 \
+            bind9-utils \
+            dnsutils && \
+          apt-get clean && \
+          rm -rf /var/lib/apt/lists/*
+
+      # Expose DNS ports
+      EXPOSE 53/tcp 53/udp
+
+      # Run named in foreground
+      CMD ["/usr/sbin/named", "-g", "-c", "/etc/bind/named.conf", "-u", "bind"]
     
   pre_tasks:
     - name: Verify required variables are defined
@@ -66,7 +85,47 @@
             name: "{{ dns_namespace }}"
             labels:
               name: "{{ dns_namespace }}"
-              
+
+    # Build BIND9 container image
+    - name: Install podman
+      ansible.builtin.apt:
+        name: podman
+        state: present
+        update_cache: yes
+
+    - name: Create build directory
+      ansible.builtin.file:
+        path: "{{ bind9_build_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create Containerfile
+      ansible.builtin.copy:
+        content: "{{ bind9_containerfile }}"
+        dest: "{{ bind9_build_dir }}/Containerfile"
+        mode: '0644'
+
+    - name: Build BIND9 image with podman
+      ansible.builtin.command:
+        cmd: podman build -t {{ bind9_image_name }} {{ bind9_build_dir }}
+      register: podman_build
+      changed_when: true
+
+    - name: Export image from podman
+      ansible.builtin.command:
+        cmd: podman save -o {{ bind9_build_dir }}/thinkube-bind9.tar {{ bind9_image_name }}
+      changed_when: true
+
+    - name: Import image into containerd
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} ctr images import {{ bind9_build_dir }}/thinkube-bind9.tar
+      changed_when: true
+
+    - name: Clean up build artifacts
+      ansible.builtin.file:
+        path: "{{ bind9_build_dir }}"
+        state: absent
+
     # Create BIND9 configuration files
     - name: Create BIND9 named.conf configuration
       ansible.builtin.set_fact:
@@ -216,7 +275,8 @@
                   kubernetes.io/hostname: "{{ control_plane_hostname }}"
                 containers:
                 - name: bind9
-                  image: cytopia/bind:latest
+                  image: "{{ bind9_image_name }}"
+                  imagePullPolicy: Never
                   ports:
                   - containerPort: 53
                     name: dns-tcp
