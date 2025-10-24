@@ -221,6 +221,71 @@ Expected: `401 Unauthorized` (means DNS and API connectivity work)
 sudo k8s kubectl run test --image=busybox --rm -it --restart=Never -- ping -c 2 8.8.8.8
 ```
 
+## Migrating Existing Playbooks from MicroK8s
+
+### Group Variables Update
+
+**File**: `inventory/group_vars/microk8s.yml`
+
+Update these variables:
+
+```yaml
+# Before (MicroK8s):
+kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
+kubectl_bin: "/snap/bin/microk8s.kubectl"
+helm_bin: "/snap/bin/microk8s.helm3"
+harbor_storage_class: "microk8s-hostpath"
+prometheus_storage_class: "microk8s-hostpath"
+
+# After (k8s-snap):
+kubeconfig: "/etc/kubernetes/admin.conf"
+kubectl_bin: "sudo k8s kubectl"
+helm_bin: "sudo k8s helm"
+harbor_storage_class: "csi-rawfile-default"
+prometheus_storage_class: "csi-rawfile-default"
+```
+
+**Note**: Consider renaming `microk8s.yml` to `k8s.yml` or similar.
+
+### Direct Command Replacements
+
+**165 references** across 40+ playbook files need updating:
+
+```bash
+# Find all references:
+grep -rE "microk8s[\. ]kubectl|microk8s[\. ]helm" ansible/ --include="*.yaml"
+```
+
+**Replace patterns**:
+- `microk8s kubectl` → `sudo k8s kubectl`
+- `microk8s.kubectl` → `sudo k8s kubectl`
+- `microk8s helm3` → `sudo k8s helm`
+- `microk8s.helm3` → `sudo k8s helm`
+
+**Files affected**: All core and optional component playbooks that interact with Kubernetes.
+
+### Storage Class Updates
+
+All references to `microk8s-hostpath` storage class must change to `csi-rawfile-default`:
+
+```bash
+# Find storage class references:
+grep -r "microk8s-hostpath" ansible/ inventory/ --include="*.yaml"
+```
+
+**Known locations**:
+- `inventory/group_vars/microk8s.yml` (harbor_storage_class, prometheus_storage_class)
+- Any PVC/StatefulSet definitions in playbooks
+
+### Kubernetes Module Usage
+
+The `kubernetes.core.*` modules (913 references) use the `kubeconfig` variable - these will work automatically after updating `group_vars`.
+
+**No changes needed** for:
+- `kubernetes.core.k8s`
+- `kubernetes.core.k8s_info`
+- `kubernetes.core.helm`
+
 ## Worker Node Joining
 
 k8s-snap uses a simpler token-based join process compared to MicroK8s.
