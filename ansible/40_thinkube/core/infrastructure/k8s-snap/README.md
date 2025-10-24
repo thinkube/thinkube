@@ -221,22 +221,51 @@ Expected: `401 Unauthorized` (means DNS and API connectivity work)
 sudo k8s kubectl run test --image=busybox --rm -it --restart=Never -- ping -c 2 8.8.8.8
 ```
 
+## Worker Node Joining
+
+k8s-snap uses a simpler token-based join process compared to MicroK8s.
+
+### Process
+
+**1. Generate join token (on control plane)**:
+```bash
+sudo k8s get-join-token <worker-hostname> --worker
+```
+
+This outputs a base64 token.
+
+**2. Join worker to cluster (on worker node)**:
+```bash
+sudo k8s join-cluster <token>
+```
+
+**3. Verify**:
+```bash
+sudo k8s kubectl get nodes
+```
+
+### Prerequisites for Workers
+- k8s-snap installed: `sudo snap install k8s --classic --channel=1.34-classic/stable`
+- Same UFW configuration as control plane
+- Docker stopped/disabled if present
+- Network connectivity to control plane (port 6400)
+
 ## Playbook Requirements
 
 The Ansible playbooks must handle:
 
+### Control Plane (10_install_k8s.yaml)
 1. **UFW Configuration** (critical)
    - Set IP forwarding in sysctl
    - Set forward policy to ACCEPT
    - Add all required port rules
    - Reload UFW
 
-2. **Conflict Detection**
-   - Check for running Docker
-   - Stop/disable if found
+2. **DGX Spark Specific**
+   - Stop and disable pre-installed Docker
 
 3. **Installation**
-   - Install k8s snap from correct channel
+   - Install k8s snap from 1.34-classic/stable channel
    - Bootstrap cluster
    - Wait for ready state
 
@@ -247,9 +276,29 @@ The Ansible playbooks must handle:
 
 5. **GPU Operator** (if GPU present)
    - Verify nvidia-smi works
-   - Install GPU Operator
+   - Install GPU Operator v25.3.4
    - Wait for all pods Running
    - Verify GPU resources advertised
+
+### Worker Nodes (20_join_workers.yaml)
+1. **UFW Configuration** (same as control plane)
+
+2. **DGX Spark Specific**
+   - Stop and disable Docker if present
+
+3. **Installation**
+   - Install k8s snap
+   - Do NOT bootstrap (workers don't bootstrap)
+
+4. **Join Cluster**
+   - Get join token from control plane
+   - Execute join-cluster command
+   - Wait for node to be Ready
+
+5. **Validation**
+   - Verify node appears in cluster
+   - Check node is Ready
+   - Verify system pods running on worker
 
 ## References
 
