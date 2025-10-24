@@ -1,0 +1,284 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Test playbook for k8s-snap worker nodes
+# Description:
+#   Verifies worker node installation and cluster membership
+#   Tests include:
+#   - k8s-snap installation
+#   - Node presence in cluster
+#   - Node Ready status
+#   - Pod scheduling on worker
+#   - Alias system integration
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/k8s-snap/28_test_worker.yaml
+
+- name: Test k8s-snap Worker Nodes
+  hosts: k8s_workers
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    control_plane_host: "{{ groups['k8s_control_plane'][0] }}"
+
+    # Alias file paths
+    kubectl_aliases_file: "{{ user_home }}/.thinkube_shared_shell/aliases/kubectl_aliases.json"
+    helm_aliases_file: "{{ user_home }}/.thinkube_shared_shell/aliases/helm_aliases.json"
+    k8s_aliases_sh: "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh"
+
+  tasks:
+    - name: Check if k8s-snap is installed
+      ansible.builtin.command: snap list k8s
+      register: k8s_snap
+      changed_when: false
+      failed_when: k8s_snap.rc != 0
+
+    - name: Verify k8s-snap version
+      ansible.builtin.assert:
+        that:
+          - "'k8s' in k8s_snap.stdout"
+        fail_msg: "k8s-snap is not installed on worker"
+        success_msg: "k8s-snap is installed on worker"
+
+    - name: Verify kubectl wrapper exists
+      ansible.builtin.stat:
+        path: "{{ user_home }}/.local/bin/kubectl"
+      register: kubectl_wrapper
+      failed_when: not kubectl_wrapper.stat.exists
+
+    - name: Verify helm wrapper exists
+      ansible.builtin.stat:
+        path: "{{ user_home }}/.local/bin/helm"
+      register: helm_wrapper
+      failed_when: not helm_wrapper.stat.exists
+
+    - name: Check if worker node is in cluster
+      ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }}
+      delegate_to: "{{ control_plane_host }}"
+      register: node_in_cluster
+      changed_when: false
+      failed_when: node_in_cluster.rc != 0
+      become: true
+
+    - name: Verify worker node exists in cluster
+      ansible.builtin.assert:
+        that:
+          - node_in_cluster.rc == 0
+          - inventory_hostname in node_in_cluster.stdout
+        fail_msg: "Worker node {{ inventory_hostname }} not found in cluster"
+        success_msg: "Worker node {{ inventory_hostname }} is in cluster"
+
+    - name: Check worker node status
+      ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      delegate_to: "{{ control_plane_host }}"
+      register: node_ready_status
+      changed_when: false
+      become: true
+
+    - name: Verify worker node is Ready
+      ansible.builtin.assert:
+        that:
+          - node_ready_status.stdout == 'True'
+        fail_msg: "Worker node {{ inventory_hostname }} is not Ready"
+        success_msg: "Worker node {{ inventory_hostname }} is Ready"
+
+    - name: Check worker node role label
+      ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }} -o jsonpath='{.metadata.labels}'
+      delegate_to: "{{ control_plane_host }}"
+      register: node_labels
+      changed_when: false
+      become: true
+
+    - name: Display worker node labels
+      ansible.builtin.debug:
+        msg: "Worker {{ inventory_hostname }} labels: {{ node_labels.stdout }}"
+
+    - name: Check Cilium agent on worker
+      ansible.builtin.command: k8s kubectl get pods -n kube-system -l k8s-app=cilium --field-selector spec.nodeName={{ inventory_hostname }}
+      delegate_to: "{{ control_plane_host }}"
+      register: cilium_on_worker
+      changed_when: false
+      become: true
+
+    - name: Verify Cilium is running on worker
+      ansible.builtin.assert:
+        that:
+          - "'Running' in cilium_on_worker.stdout"
+        fail_msg: "Cilium is not running on worker {{ inventory_hostname }}"
+        success_msg: "Cilium is running on worker {{ inventory_hostname }}"
+
+    - name: Check kubectl aliases file exists
+      ansible.builtin.stat:
+        path: "{{ kubectl_aliases_file }}"
+      register: kubectl_aliases_stat
+      failed_when: not kubectl_aliases_stat.stat.exists
+
+    - name: Check helm aliases file exists
+      ansible.builtin.stat:
+        path: "{{ helm_aliases_file }}"
+      register: helm_aliases_stat
+      failed_when: not helm_aliases_stat.stat.exists
+
+    - name: Check k8s aliases shell script exists
+      ansible.builtin.stat:
+        path: "{{ k8s_aliases_sh }}"
+      register: k8s_aliases_sh_stat
+      failed_when: not k8s_aliases_sh_stat.stat.exists
+
+    - name: Test kubectl alias in bash
+      ansible.builtin.shell: |
+        if [ -f {{ k8s_aliases_sh }} ]; then
+          source {{ k8s_aliases_sh }}
+          alias k && echo "Alias k exists" || echo "Alias k not found"
+        else
+          echo "K8s aliases file not found"
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      register: bash_alias_test
+      changed_when: false
+      failed_when: "'Alias k not found' in bash_alias_test.stdout or bash_alias_test.rc != 0"
+      become_user: "{{ user }}"
+
+    - name: Verify UFW forward policy is ACCEPT
+      ansible.builtin.command: grep '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw
+      register: ufw_forward_policy
+      changed_when: false
+      become: true
+
+    - name: Check UFW forward policy setting
+      ansible.builtin.assert:
+        that:
+          - "'ACCEPT' in ufw_forward_policy.stdout"
+        fail_msg: "UFW DEFAULT_FORWARD_POLICY is not set to ACCEPT on worker"
+        success_msg: "UFW forward policy is correctly set to ACCEPT on worker"
+
+    - name: Display worker test summary
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "Worker Node Test Results: {{ inventory_hostname }}"
+          - "==============================================="
+          - "k8s-snap Installed: {{ 'PASS' if k8s_snap.rc == 0 else 'FAIL' }}"
+          - "Node in Cluster: {{ 'PASS' if node_in_cluster.rc == 0 else 'FAIL' }}"
+          - "Node Ready: {{ 'PASS' if node_ready_status.stdout == 'True' else 'FAIL' }}"
+          - "Cilium Running: {{ 'PASS' if 'Running' in cilium_on_worker.stdout else 'FAIL' }}"
+          - "Alias System: {{ 'PASS' if kubectl_aliases_stat.stat.exists else 'FAIL' }}"
+          - "Bash Aliases: {{ 'PASS' if bash_alias_test.rc == 0 else 'FAIL' }}"
+          - "UFW Forward Policy: {{ 'PASS' if 'ACCEPT' in ufw_forward_policy.stdout else 'FAIL' }}"
+          - "==============================================="
+
+- name: Test Pod Scheduling on Workers
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: false
+
+  vars:
+    test_namespace: "worker-test"
+
+  tasks:
+    - name: Create test namespace
+      ansible.builtin.command: k8s kubectl create namespace {{ test_namespace }}
+      register: ns_create
+      changed_when: "'created' in ns_create.stdout"
+      failed_when:
+        - ns_create.rc != 0
+        - "'already exists' not in ns_create.stderr"
+
+    - name: Create test deployment for each worker
+      ansible.builtin.shell: |
+        k8s kubectl apply -f - <<EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: test-{{ item }}
+          namespace: {{ test_namespace }}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: test-{{ item }}
+          template:
+            metadata:
+              labels:
+                app: test-{{ item }}
+            spec:
+              nodeSelector:
+                kubernetes.io/hostname: {{ item }}
+              containers:
+              - name: nginx
+                image: nginx:1.27-alpine
+                ports:
+                - containerPort: 80
+                resources:
+                  requests:
+                    memory: "64Mi"
+                    cpu: "100m"
+                  limits:
+                    memory: "128Mi"
+                    cpu: "200m"
+        EOF
+      loop: "{{ groups['k8s_workers'] }}"
+      register: deployment_create
+      changed_when: "'created' in deployment_create.stdout or 'configured' in deployment_create.stdout"
+
+    - name: Wait for test pods to be running
+      ansible.builtin.command: |
+        k8s kubectl wait --for=condition=ready pod -l app=test-{{ item }} -n {{ test_namespace }} --timeout=120s
+      loop: "{{ groups['k8s_workers'] }}"
+      register: pod_ready
+      retries: 3
+      delay: 10
+      until: pod_ready.rc == 0
+      changed_when: false
+
+    - name: Get test pod status
+      ansible.builtin.command: k8s kubectl get pods -n {{ test_namespace }} -o wide
+      register: test_pods
+      changed_when: false
+
+    - name: Display test pod status
+      ansible.builtin.debug:
+        var: test_pods.stdout_lines
+
+    - name: Verify test pods are running on correct workers
+      ansible.builtin.shell: |
+        pod_count=$(k8s kubectl get pods -n {{ test_namespace }} --field-selector spec.nodeName={{ item }},status.phase=Running --no-headers | wc -l)
+        if [ "$pod_count" -ge 1 ]; then
+          echo "PASS: Test pod running on {{ item }}"
+          exit 0
+        else
+          echo "FAIL: No test pod running on {{ item }}"
+          exit 1
+        fi
+      loop: "{{ groups['k8s_workers'] }}"
+      register: pod_verification
+      changed_when: false
+
+    - name: Display pod scheduling verification
+      ansible.builtin.debug:
+        msg: "{{ item.stdout }}"
+      loop: "{{ pod_verification.results }}"
+
+    - name: Clean up test namespace
+      ansible.builtin.command: k8s kubectl delete namespace {{ test_namespace }}
+      register: ns_delete
+      changed_when: "'deleted' in ns_delete.stdout"
+      failed_when: false
+
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "Worker Node Testing Complete"
+          - "==============================================="
+          - "All workers successfully tested:"
+          - "  - Workers are in cluster and Ready"
+          - "  - Cilium CNI running on all workers"
+          - "  - Pods can be scheduled on all workers"
+          - "  - Alias system configured on all workers"
+          - "==============================================="

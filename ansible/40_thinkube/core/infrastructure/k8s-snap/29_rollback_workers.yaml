@@ -1,0 +1,275 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Rollback playbook for k8s-snap worker nodes
+# Description:
+#   Removes worker nodes from the k8s cluster and cleans up k8s-snap installation
+#   WARNING: This will remove workers from the cluster and delete all local data
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/k8s-snap/29_rollback_workers.yaml
+
+- name: Drain and Remove Workers from Cluster
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: false
+
+  vars:
+    drain_timeout: "300s"
+
+  tasks:
+    - name: Confirm worker removal
+      ansible.builtin.pause:
+        prompt: |
+          !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+          WARNING: This will remove the following worker nodes from
+          the k8s cluster and clean up their k8s-snap installations:
+
+          {{ groups['k8s_workers'] | join('\n  ') }}
+
+          All pods on these workers will be evicted and local data
+          will be deleted.
+
+          Are you absolutely sure you want to continue? (yes/no)
+          !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+      register: rollback_confirm
+      when: rollback_workers_confirmed is not defined
+
+    - name: Verify confirmation
+      ansible.builtin.fail:
+        msg: "Worker rollback cancelled by user"
+      when:
+        - rollback_workers_confirmed is not defined
+        - rollback_confirm.user_input | lower != 'yes'
+
+    - name: Check if workers exist in cluster
+      ansible.builtin.command: k8s kubectl get node {{ item }}
+      loop: "{{ groups['k8s_workers'] }}"
+      register: worker_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Drain worker nodes
+      ansible.builtin.command: |
+        k8s kubectl drain {{ item.item }} --ignore-daemonsets --delete-emptydir-data --timeout={{ drain_timeout }} --force
+      loop: "{{ worker_exists.results }}"
+      when: item.rc == 0
+      register: drain_result
+      failed_when: false
+      changed_when: drain_result.rc == 0
+
+    - name: Display drain results
+      ansible.builtin.debug:
+        msg: "Drained {{ item.item.item }}: {{ 'SUCCESS' if item.rc == 0 else 'FAILED or SKIPPED' }}"
+      loop: "{{ drain_result.results }}"
+      when: drain_result is defined and drain_result.results is defined
+
+    - name: Wait for pods to be evicted
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting for pods to be evicted from workers..."
+      when: drain_result is changed
+
+    - name: Delete worker nodes from cluster
+      ansible.builtin.command: k8s kubectl delete node {{ item.item }}
+      loop: "{{ worker_exists.results }}"
+      when: item.rc == 0
+      register: delete_result
+      changed_when: "'deleted' in delete_result.stdout"
+      failed_when: false
+
+    - name: Display node deletion results
+      ansible.builtin.debug:
+        msg: "Deleted {{ item.item.item }}: {{ 'SUCCESS' if item.changed else 'FAILED or SKIPPED' }}"
+      loop: "{{ delete_result.results }}"
+      when: delete_result is defined and delete_result.results is defined
+
+    - name: Verify workers are removed from cluster
+      ansible.builtin.command: k8s kubectl get nodes
+      register: remaining_nodes
+      changed_when: false
+
+    - name: Display remaining cluster nodes
+      ansible.builtin.debug:
+        var: remaining_nodes.stdout_lines
+
+- name: Clean Up Worker Nodes
+  hosts: k8s_workers
+  become: true
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    kubectl_wrapper_path: "{{ user_home }}/.local/bin/kubectl"
+    helm_wrapper_path: "{{ user_home }}/.local/bin/helm"
+
+  tasks:
+    # ===========================
+    # Stop k8s Services on Worker
+    # ===========================
+    - name: Check if k8s-snap is installed
+      ansible.builtin.command: snap list k8s
+      register: k8s_snap_check
+      failed_when: false
+      changed_when: false
+
+    - name: Stop k8s services (if installed)
+      ansible.builtin.command: k8s stop
+      register: k8s_stop
+      failed_when: false
+      changed_when: k8s_stop.rc == 0
+      when: k8s_snap_check.rc == 0
+
+    - name: Wait for k8s services to stop
+      ansible.builtin.pause:
+        seconds: 10
+      when: k8s_stop is changed
+
+    # ===========================
+    # Remove k8s-snap
+    # ===========================
+    - name: Remove k8s-snap
+      community.general.snap:
+        name: k8s
+        state: absent
+      when: k8s_snap_check.rc == 0
+      register: snap_removal
+
+    - name: Purge k8s-snap data
+      ansible.builtin.command: snap remove --purge k8s
+      when:
+        - k8s_snap_check.rc == 0
+        - snap_removal is changed
+      failed_when: false
+      changed_when: true
+
+    # ===========================
+    # Clean Up Wrapper Scripts
+    # ===========================
+    - name: Remove kubectl wrapper script
+      ansible.builtin.file:
+        path: "{{ kubectl_wrapper_path }}"
+        state: absent
+
+    - name: Remove helm wrapper script
+      ansible.builtin.file:
+        path: "{{ helm_wrapper_path }}"
+        state: absent
+
+    # ===========================
+    # Clean Up Alias System
+    # ===========================
+    - name: Check if thinkube_shared_shell directory exists
+      ansible.builtin.stat:
+        path: "{{ user_home }}/.thinkube_shared_shell"
+      register: shared_shell_dir
+
+    - name: Remove k8s alias files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ user_home }}/.thinkube_shared_shell/aliases/kubectl_aliases.json"
+        - "{{ user_home }}/.thinkube_shared_shell/aliases/helm_aliases.json"
+        - "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh"
+        - "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.fish"
+      when: shared_shell_dir.stat.exists
+
+    # ===========================
+    # Clean Up Kubeconfig
+    # ===========================
+    - name: Remove user .kube directory
+      ansible.builtin.file:
+        path: "{{ user_home }}/.kube"
+        state: absent
+      become_user: "{{ user }}"
+
+    # ===========================
+    # Clean Up Data Directories
+    # ===========================
+    - name: Remove k8s data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/snap/k8s/common
+        - /var/lib/k8s-dqlite
+        - /var/lib/rawfile-localpv
+      failed_when: false
+
+    # ===========================
+    # Clean Up CNI Interfaces (Cilium)
+    # ===========================
+    - name: Get list of Cilium network interfaces
+      ansible.builtin.shell: |
+        ip link show | grep -E 'cilium|lxc' | awk -F: '{print $2}' | sed 's/^ //' || true
+      register: cilium_interfaces
+      changed_when: false
+
+    - name: Remove Cilium network interfaces
+      ansible.builtin.command: ip link delete {{ item }}
+      loop: "{{ cilium_interfaces.stdout_lines }}"
+      when: cilium_interfaces.stdout_lines | length > 0
+      failed_when: false
+      changed_when: true
+
+    # ===========================
+    # Optional: Reboot to Clean State
+    # ===========================
+    - name: Check if reboot is needed
+      ansible.builtin.pause:
+        prompt: "Reboot worker {{ inventory_hostname }} to ensure clean state? (yes/no, default: no)"
+      register: reboot_confirm
+      when: reboot_workers_after_rollback is not defined
+
+    - name: Reboot worker
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        msg: "Rebooting to clean k8s-snap state"
+      when:
+        - reboot_workers_after_rollback is defined and reboot_workers_after_rollback | bool
+        - reboot_confirm is defined and reboot_confirm.user_input | lower == 'yes'
+
+  post_tasks:
+    - name: Display worker cleanup summary
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "Worker Node Cleanup Complete: {{ inventory_hostname }}"
+          - "==============================================="
+          - "Removed:"
+          - "  - k8s-snap package and data"
+          - "  - kubectl and helm wrappers"
+          - "  - k8s alias files"
+          - "  - Kubeconfig files"
+          - "  - Cilium network interfaces"
+          - "  - k8s data directories"
+          - "==============================================="
+
+- name: Final Verification
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Get final cluster node count
+      ansible.builtin.shell: k8s kubectl get nodes --no-headers | wc -l
+      register: final_node_count
+      changed_when: false
+
+    - name: Display final cluster status
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "Worker Rollback Summary"
+          - "==============================================="
+          - "Workers removed: {{ groups['k8s_workers'] | length }}"
+          - "Remaining nodes in cluster: {{ final_node_count.stdout }}"
+          - "==============================================="
+          - "Manual cleanup (if needed):"
+          - "  1. Check UFW rules on workers: sudo ufw status"
+          - "  2. Check network interfaces on workers: ip link show"
+          - "  3. Verify no k8s processes: ps aux | grep k8s"
+          - "==============================================="

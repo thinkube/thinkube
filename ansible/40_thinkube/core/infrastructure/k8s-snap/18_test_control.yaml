@@ -1,0 +1,262 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Test playbook for k8s-snap control node installation
+# Description:
+#   Verifies k8s-snap installation and configuration on control node
+#   Tests include:
+#   - k8s-snap service status
+#   - kubectl accessibility
+#   - Node readiness
+#   - CoreDNS functionality
+#   - Cilium CNI status
+#   - Storage class availability
+#   - Alias functionality across shells
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/k8s-snap/18_test_control.yaml
+
+- name: Test k8s-snap Control Node Installation
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+
+    # Alias file paths
+    kubectl_aliases_file: "{{ user_home }}/.thinkube_shared_shell/aliases/kubectl_aliases.json"
+    helm_aliases_file: "{{ user_home }}/.thinkube_shared_shell/aliases/helm_aliases.json"
+    k8s_aliases_sh: "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh"
+    k8s_aliases_fish: "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.fish"
+
+  tasks:
+    - name: Check if k8s-snap is installed
+      ansible.builtin.command: snap list k8s
+      register: k8s_snap
+      changed_when: false
+      failed_when: k8s_snap.rc != 0
+
+    - name: Verify k8s-snap version
+      ansible.builtin.assert:
+        that:
+          - "'k8s' in k8s_snap.stdout"
+        fail_msg: "k8s-snap is not installed"
+        success_msg: "k8s-snap is installed"
+
+    - name: Check k8s cluster status
+      ansible.builtin.command: k8s status
+      register: k8s_status
+      changed_when: false
+      become: true
+
+    - name: Verify cluster is ready
+      ansible.builtin.assert:
+        that:
+          - "'cluster status:' in k8s_status.stdout"
+          - "'ready' in k8s_status.stdout"
+        fail_msg: "Cluster is not ready"
+        success_msg: "Cluster is ready"
+
+    - name: Verify kubectl wrapper exists
+      ansible.builtin.stat:
+        path: "{{ user_home }}/.local/bin/kubectl"
+      register: kubectl_wrapper
+      failed_when: not kubectl_wrapper.stat.exists
+
+    - name: Verify helm wrapper exists
+      ansible.builtin.stat:
+        path: "{{ user_home }}/.local/bin/helm"
+      register: helm_wrapper
+      failed_when: not helm_wrapper.stat.exists
+
+    - name: Check kubectl functionality
+      ansible.builtin.command: k8s kubectl get nodes
+      register: kubectl_nodes
+      changed_when: false
+      failed_when: kubectl_nodes.rc != 0
+      become: true
+
+    - name: Verify node is Ready
+      ansible.builtin.assert:
+        that:
+          - "'Ready' in kubectl_nodes.stdout"
+        fail_msg: "Node is not in Ready state"
+        success_msg: "Node is Ready"
+
+    - name: Check CoreDNS pods
+      ansible.builtin.command: k8s kubectl get pods -n kube-system -l k8s-app=kube-dns
+      register: coredns_pods
+      changed_when: false
+      become: true
+
+    - name: Verify CoreDNS is running
+      ansible.builtin.assert:
+        that:
+          - "'Running' in coredns_pods.stdout or 'Succeeded' in coredns_pods.stdout"
+        fail_msg: "CoreDNS is not running"
+        success_msg: "CoreDNS is running"
+
+    - name: Check Cilium pods
+      ansible.builtin.command: k8s kubectl get pods -n kube-system -l k8s-app=cilium
+      register: cilium_pods
+      changed_when: false
+      become: true
+
+    - name: Verify Cilium is running
+      ansible.builtin.assert:
+        that:
+          - "'Running' in cilium_pods.stdout"
+        fail_msg: "Cilium CNI is not running"
+        success_msg: "Cilium CNI is running"
+
+    - name: Check storage classes
+      ansible.builtin.command: k8s kubectl get storageclass
+      register: storage_classes
+      changed_when: false
+      become: true
+
+    - name: Verify csi-rawfile-default storage class exists
+      ansible.builtin.assert:
+        that:
+          - "'csi-rawfile-default' in storage_classes.stdout"
+        fail_msg: "csi-rawfile-default storage class not found"
+        success_msg: "csi-rawfile-default storage class is available"
+
+    - name: Check nvidia RuntimeClass
+      ansible.builtin.command: k8s kubectl get runtimeclass nvidia
+      register: nvidia_runtimeclass
+      changed_when: false
+      failed_when: false
+      become: true
+
+    - name: Verify nvidia RuntimeClass exists
+      ansible.builtin.assert:
+        that:
+          - nvidia_runtimeclass.rc == 0
+          - "'nvidia' in nvidia_runtimeclass.stdout"
+        fail_msg: "nvidia RuntimeClass not found (required for GPU workloads)"
+        success_msg: "nvidia RuntimeClass is configured"
+
+    - name: Test DNS resolution
+      ansible.builtin.command: |
+        k8s kubectl run -it --rm --restart=Never --image=busybox:1.36 dns-test --command -- nslookup kubernetes.default
+      register: dns_test
+      changed_when: false
+      failed_when: false
+      become: true
+      timeout: 30
+
+    - name: Verify DNS resolution works
+      ansible.builtin.assert:
+        that:
+          - dns_test.rc == 0 or 'kubernetes.default' in dns_test.stdout
+        fail_msg: "DNS resolution test failed"
+        success_msg: "DNS resolution is working"
+      when: dns_test.rc is defined
+
+    - name: Check kubectl aliases file exists
+      ansible.builtin.stat:
+        path: "{{ kubectl_aliases_file }}"
+      register: kubectl_aliases_stat
+      failed_when: not kubectl_aliases_stat.stat.exists
+
+    - name: Check helm aliases file exists
+      ansible.builtin.stat:
+        path: "{{ helm_aliases_file }}"
+      register: helm_aliases_stat
+      failed_when: not helm_aliases_stat.stat.exists
+
+    - name: Check k8s aliases shell script exists
+      ansible.builtin.stat:
+        path: "{{ k8s_aliases_sh }}"
+      register: k8s_aliases_sh_stat
+      failed_when: not k8s_aliases_sh_stat.stat.exists
+
+    - name: Test kubectl alias in bash
+      ansible.builtin.shell: |
+        # Test k8s aliases directly
+        if [ -f {{ k8s_aliases_sh }} ]; then
+          source {{ k8s_aliases_sh }}
+          alias k && echo "Alias k exists" || echo "Alias k not found"
+        else
+          echo "K8s aliases file not found"
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      register: bash_alias_test
+      changed_when: false
+      failed_when: "'Alias k not found' in bash_alias_test.stdout or bash_alias_test.rc != 0"
+      become_user: "{{ user }}"
+
+    - name: Test kubectl alias in zsh (if available)
+      ansible.builtin.shell: |
+        source ~/.zshrc
+        type k >/dev/null 2>&1
+      args:
+        executable: /usr/bin/zsh
+      register: zsh_alias_test
+      changed_when: false
+      failed_when: false
+      become_user: "{{ user }}"
+      when: ansible_facts.packages is defined and 'zsh' in ansible_facts.packages
+
+    - name: Test kubectl alias in fish (if available)
+      ansible.builtin.shell: |
+        type k >/dev/null 2>&1
+      args:
+        executable: /usr/bin/fish
+      register: fish_alias_test
+      changed_when: false
+      failed_when: false
+      become_user: "{{ user }}"
+      when: ansible_facts.packages is defined and 'fish' in ansible_facts.packages
+
+    - name: Verify UFW forward policy is ACCEPT
+      ansible.builtin.command: grep '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw
+      register: ufw_forward_policy
+      changed_when: false
+
+    - name: Check UFW forward policy setting
+      ansible.builtin.assert:
+        that:
+          - "'ACCEPT' in ufw_forward_policy.stdout"
+        fail_msg: "UFW DEFAULT_FORWARD_POLICY is not set to ACCEPT (required for k8s)"
+        success_msg: "UFW forward policy is correctly set to ACCEPT"
+
+    - name: Check required UFW rules exist
+      ansible.builtin.command: ufw status numbered
+      register: ufw_status
+      changed_when: false
+      become: true
+
+    - name: Verify k8s required ports are allowed
+      ansible.builtin.assert:
+        that:
+          - "'6443' in ufw_status.stdout"
+          - "'6400' in ufw_status.stdout"
+          - "'10250' in ufw_status.stdout"
+        fail_msg: "Required k8s ports are not allowed in UFW"
+        success_msg: "Required k8s ports are allowed in UFW"
+
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "k8s-snap Control Node Test Results"
+          - "==============================================="
+          - "k8s-snap Installed: {{ 'PASS' if k8s_snap.rc == 0 else 'FAIL' }}"
+          - "Cluster Ready: {{ 'PASS' if 'ready' in k8s_status.stdout else 'FAIL' }}"
+          - "kubectl Accessible: {{ 'PASS' if kubectl_nodes.rc == 0 else 'FAIL' }}"
+          - "Node Ready: {{ 'PASS' if 'Ready' in kubectl_nodes.stdout else 'FAIL' }}"
+          - "CoreDNS Running: {{ 'PASS' if 'Running' in coredns_pods.stdout else 'FAIL' }}"
+          - "Cilium Running: {{ 'PASS' if 'Running' in cilium_pods.stdout else 'FAIL' }}"
+          - "Storage Class Available: {{ 'PASS' if 'csi-rawfile-default' in storage_classes.stdout else 'FAIL' }}"
+          - "nvidia RuntimeClass: {{ 'PASS' if nvidia_runtimeclass.rc == 0 else 'FAIL' }}"
+          - "DNS Resolution: {{ 'PASS' if dns_test.rc == 0 else 'FAIL' }}"
+          - "Alias System Integrated: {{ 'PASS' if kubectl_aliases_stat.stat.exists else 'FAIL' }}"
+          - "Bash Aliases: {{ 'PASS' if bash_alias_test.rc == 0 else 'FAIL' }}"
+          - "UFW Forward Policy: {{ 'PASS' if 'ACCEPT' in ufw_forward_policy.stdout else 'FAIL' }}"
+          - "==============================================="

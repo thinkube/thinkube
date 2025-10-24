@@ -1,0 +1,461 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/k8s-snap/10_install_k8s.yaml
+# Description:
+#   Installs and configures Canonical Kubernetes (k8s-snap) on control plane node
+#
+# Requirements:
+#   - Ubuntu 24.04 LTS
+#   - 16 cores minimum
+#   - 64GB RAM minimum
+#   - 1TB disk minimum
+#   - UFW firewall enabled
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s-snap/10_install_k8s.yaml
+#
+# Variables from inventory:
+#   - system_username: User to configure kubectl/helm wrappers for
+#   - domain_name: Domain name for services
+#   - zerotier_subnet_prefix: ZeroTier network subnet prefix
+#
+# 🤖 [AI-assisted]
+
+- name: Install Canonical Kubernetes (k8s-snap) Control Plane
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: true
+
+  vars:
+    k8s_channel: "1.34-classic/stable"
+    k8s_version: "1.34.0"
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    kubectl_wrapper_path: "{{ user_home }}/.local/bin/kubectl"
+    helm_wrapper_path: "{{ user_home }}/.local/bin/helm"
+
+  pre_tasks:
+    - name: Verify required variables exist
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: vars[item] is not defined
+      loop:
+        - system_username
+        - domain_name
+        - zerotier_subnet_prefix
+
+    - name: Verify OS is Ubuntu 24.04
+      ansible.builtin.fail:
+        msg: "This playbook requires Ubuntu 24.04 LTS (found {{ ansible_distribution }} {{ ansible_distribution_version }})"
+      when: ansible_distribution != 'Ubuntu' or ansible_distribution_version != '24.04'
+
+    - name: Verify minimum CPU cores
+      ansible.builtin.fail:
+        msg: "Minimum 16 CPU cores required (found {{ ansible_processor_vcpus }})"
+      when: ansible_processor_vcpus | int < 16
+
+    - name: Verify minimum RAM
+      ansible.builtin.fail:
+        msg: "Minimum 64GB RAM required (found {{ (ansible_memtotal_mb / 1024) | round(1) }}GB)"
+      when: (ansible_memtotal_mb / 1024) | int < 64
+
+  tasks:
+    # ===========================
+    # DGX Spark Specific: Disable Docker
+    # ===========================
+    - name: Check if Docker is installed (DGX Spark specific)
+      ansible.builtin.systemd:
+        name: docker
+      register: docker_service
+      failed_when: false
+      changed_when: false
+
+    - name: Stop and disable Docker (DGX Spark ships with Docker pre-installed)
+      ansible.builtin.systemd:
+        name: docker
+        state: stopped
+        enabled: false
+      when: docker_service.status is defined and docker_service.status.LoadState == 'loaded'
+
+    # ===========================
+    # UFW Firewall Configuration (CRITICAL for CoreDNS)
+    # ===========================
+    - name: Ensure UFW is installed
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: true
+
+    - name: Configure UFW default forward policy to ACCEPT (required for k8s networking)
+      ansible.builtin.lineinfile:
+        path: /etc/default/ufw
+        regexp: '^DEFAULT_FORWARD_POLICY='
+        line: 'DEFAULT_FORWARD_POLICY="ACCEPT"'
+        backup: true
+      notify: reload_ufw
+
+    - name: Allow k8s API server port (6443/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '6443'
+        proto: tcp
+        comment: 'k8s API server'
+
+    - name: Allow k8s cluster daemon port (6400/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '6400'
+        proto: tcp
+        comment: 'k8s cluster daemon'
+
+    - name: Allow kubelet API port (10250/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '10250'
+        proto: tcp
+        comment: 'k8s kubelet'
+
+    - name: Allow Cilium health port (4240/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '4240'
+        proto: tcp
+        comment: 'Cilium networking'
+
+    - name: Allow Cilium VXLAN port (8472/udp)
+      community.general.ufw:
+        rule: allow
+        port: '8472'
+        proto: udp
+        comment: 'Cilium VXLAN'
+
+    - name: Allow traffic on cilium_host interface
+      community.general.ufw:
+        rule: allow
+        interface: cilium_host
+        direction: in
+
+    - name: Allow outbound traffic on cilium_host interface
+      community.general.ufw:
+        rule: allow
+        interface: cilium_host
+        direction: out
+
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled
+
+    - name: Reload UFW to apply forward policy
+      ansible.builtin.command: ufw reload
+      changed_when: true
+      when: ufw_forward_policy_changed | default(false)
+
+    # ===========================
+    # k8s-snap Installation
+    # ===========================
+    - name: Check if k8s-snap is already installed
+      ansible.builtin.command: snap list k8s
+      register: k8s_snap_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install k8s-snap
+      community.general.snap:
+        name: k8s
+        classic: true
+        channel: "{{ k8s_channel }}"
+        state: present
+      when: k8s_snap_check.rc != 0
+
+    - name: Bootstrap k8s cluster
+      ansible.builtin.command: k8s bootstrap
+      register: bootstrap_result
+      changed_when: "'Bootstrapped' in bootstrap_result.stdout or 'already bootstrapped' not in bootstrap_result.stderr"
+      failed_when:
+        - bootstrap_result.rc != 0
+        - "'already bootstrapped' not in bootstrap_result.stderr"
+
+    - name: Wait for k8s cluster to be ready
+      ansible.builtin.command: k8s status --wait-ready
+      register: k8s_status
+      retries: 30
+      delay: 10
+      until: k8s_status.rc == 0
+      changed_when: false
+
+    - name: Verify cluster status
+      ansible.builtin.command: k8s status
+      register: cluster_status
+      changed_when: false
+
+    - name: Display cluster status
+      ansible.builtin.debug:
+        var: cluster_status.stdout_lines
+
+    # ===========================
+    # Verify Core Components
+    # ===========================
+    - name: Wait for CoreDNS to be ready
+      ansible.builtin.command: k8s kubectl wait --for=condition=ready pod -l k8s-app=kube-dns -n kube-system --timeout=300s
+      register: coredns_wait
+      retries: 3
+      delay: 10
+      until: coredns_wait.rc == 0
+      changed_when: false
+
+    - name: Wait for Cilium to be ready
+      ansible.builtin.command: k8s kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=300s
+      register: cilium_wait
+      retries: 3
+      delay: 10
+      until: cilium_wait.rc == 0
+      changed_when: false
+
+    - name: Verify node is ready
+      ansible.builtin.command: k8s kubectl get nodes
+      register: nodes_status
+      changed_when: false
+
+    - name: Check that node is in Ready state
+      ansible.builtin.assert:
+        that:
+          - "'Ready' in nodes_status.stdout"
+        fail_msg: "Node is not in Ready state"
+        success_msg: "Node is Ready"
+
+    # ===========================
+    # Verify Storage Class
+    # ===========================
+    - name: Get storage classes
+      ansible.builtin.command: k8s kubectl get storageclass
+      register: storage_classes
+      changed_when: false
+
+    - name: Verify csi-rawfile-default storage class exists
+      ansible.builtin.assert:
+        that:
+          - "'csi-rawfile-default' in storage_classes.stdout"
+        fail_msg: "csi-rawfile-default storage class not found"
+        success_msg: "Storage class csi-rawfile-default is available"
+
+    # ===========================
+    # kubectl and helm Wrapper Scripts
+    # ===========================
+    - name: Create .local/bin directory for user
+      ansible.builtin.file:
+        path: "{{ user_home }}/.local/bin"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: '0755'
+      become_user: "{{ user }}"
+
+    - name: Create kubectl wrapper script
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          # kubectl wrapper for k8s-snap
+          exec sudo k8s kubectl "$@"
+        dest: "{{ kubectl_wrapper_path }}"
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: '0755'
+      become_user: "{{ user }}"
+
+    - name: Create helm wrapper script
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          # helm wrapper for k8s-snap
+          exec sudo k8s helm "$@"
+        dest: "{{ helm_wrapper_path }}"
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: '0755'
+      become_user: "{{ user }}"
+
+    # ===========================
+    # Thinkube Shared Shell Alias System Integration
+    # ===========================
+    - name: Check if thinkube_shared_shell directory exists
+      ansible.builtin.stat:
+        path: "{{ user_home }}/.thinkube_shared_shell"
+      register: shared_shell_dir
+
+    - name: Integrate kubectl aliases into thinkube_shared_shell
+      when: shared_shell_dir.stat.exists
+      block:
+        - name: Ensure aliases directory exists
+          ansible.builtin.file:
+            path: "{{ user_home }}/.thinkube_shared_shell/aliases"
+            state: directory
+            owner: "{{ user }}"
+            group: "{{ user }}"
+            mode: '0755'
+
+        - name: Create kubectl aliases JSON file
+          ansible.builtin.copy:
+            content: |
+              {
+                "k": "kubectl",
+                "kg": "kubectl get",
+                "kd": "kubectl describe",
+                "kdel": "kubectl delete",
+                "kl": "kubectl logs",
+                "ke": "kubectl edit",
+                "kex": "kubectl exec -it",
+                "kgp": "kubectl get pods",
+                "kgn": "kubectl get nodes",
+                "kgs": "kubectl get svc",
+                "kgd": "kubectl get deployments",
+                "kga": "kubectl get all",
+                "kgpa": "kubectl get pods -A",
+                "kgna": "kubectl get nodes -o wide",
+                "kaf": "kubectl apply -f",
+                "kdf": "kubectl delete -f"
+              }
+            dest: "{{ user_home }}/.thinkube_shared_shell/aliases/kubectl_aliases.json"
+            owner: "{{ user }}"
+            group: "{{ user }}"
+            mode: '0644'
+
+        - name: Create helm aliases JSON file
+          ansible.builtin.copy:
+            content: |
+              {
+                "h": "helm",
+                "hl": "helm list",
+                "hla": "helm list -A",
+                "hi": "helm install",
+                "hu": "helm upgrade",
+                "hd": "helm delete",
+                "hs": "helm status",
+                "hh": "helm history"
+              }
+            dest: "{{ user_home }}/.thinkube_shared_shell/aliases/helm_aliases.json"
+            owner: "{{ user }}"
+            group: "{{ user }}"
+            mode: '0644'
+
+        - name: Create k8s aliases shell script for bash/zsh
+          ansible.builtin.copy:
+            content: |
+              #!/bin/bash
+              # k8s-snap kubectl and helm aliases for bash/zsh
+              # Source this file in your shell rc file
+
+              # kubectl aliases
+              alias k='kubectl'
+              alias kg='kubectl get'
+              alias kd='kubectl describe'
+              alias kdel='kubectl delete'
+              alias kl='kubectl logs'
+              alias ke='kubectl edit'
+              alias kex='kubectl exec -it'
+              alias kgp='kubectl get pods'
+              alias kgn='kubectl get nodes'
+              alias kgs='kubectl get svc'
+              alias kgd='kubectl get deployments'
+              alias kga='kubectl get all'
+              alias kgpa='kubectl get pods -A'
+              alias kgna='kubectl get nodes -o wide'
+              alias kaf='kubectl apply -f'
+              alias kdf='kubectl delete -f'
+
+              # helm aliases
+              alias h='helm'
+              alias hl='helm list'
+              alias hla='helm list -A'
+              alias hi='helm install'
+              alias hu='helm upgrade'
+              alias hd='helm delete'
+              alias hs='helm status'
+              alias hh='helm history'
+            dest: "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh"
+            owner: "{{ user }}"
+            group: "{{ user }}"
+            mode: '0644'
+
+        - name: Create k8s aliases for fish shell
+          ansible.builtin.copy:
+            content: |
+              # k8s-snap kubectl and helm aliases for fish
+              # Source this file in your fish config
+
+              # kubectl aliases
+              abbr -a k kubectl
+              abbr -a kg kubectl get
+              abbr -a kd kubectl describe
+              abbr -a kdel kubectl delete
+              abbr -a kl kubectl logs
+              abbr -a ke kubectl edit
+              abbr -a kex kubectl exec -it
+              abbr -a kgp kubectl get pods
+              abbr -a kgn kubectl get nodes
+              abbr -a kgs kubectl get svc
+              abbr -a kgd kubectl get deployments
+              abbr -a kga kubectl get all
+              abbr -a kgpa kubectl get pods -A
+              abbr -a kgna kubectl get nodes -o wide
+              abbr -a kaf kubectl apply -f
+              abbr -a kdf kubectl delete -f
+
+              # helm aliases
+              abbr -a h helm
+              abbr -a hl helm list
+              abbr -a hla helm list -A
+              abbr -a hi helm install
+              abbr -a hu helm upgrade
+              abbr -a hd helm delete
+              abbr -a hs helm status
+              abbr -a hh helm history
+            dest: "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.fish"
+            owner: "{{ user }}"
+            group: "{{ user }}"
+            mode: '0644'
+
+    # ===========================
+    # RuntimeClass for GPU Workloads
+    # ===========================
+    - name: Create nvidia RuntimeClass for GPU workloads
+      ansible.builtin.shell: |
+        k8s kubectl apply -f - <<EOF
+        apiVersion: node.k8s.io/v1
+        kind: RuntimeClass
+        metadata:
+          name: nvidia
+        handler: nvidia
+        EOF
+      register: runtimeclass_result
+      changed_when: "'created' in runtimeclass_result.stdout or 'configured' in runtimeclass_result.stdout"
+      failed_when:
+        - runtimeclass_result.rc != 0
+        - "'already exists' not in runtimeclass_result.stderr"
+
+  handlers:
+    - name: reload_ufw
+      ansible.builtin.command: ufw reload
+      listen: reload_ufw
+      changed_when: true
+
+  post_tasks:
+    - name: Display installation summary
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "Canonical Kubernetes (k8s-snap) Installation Complete"
+          - "==============================================="
+          - "Version: {{ k8s_version }}"
+          - "Channel: {{ k8s_channel }}"
+          - "Node Status: {{ 'Ready' if 'Ready' in nodes_status.stdout else 'Not Ready' }}"
+          - "CoreDNS: {{ 'Running' if coredns_wait.rc == 0 else 'Not Ready' }}"
+          - "Cilium CNI: {{ 'Running' if cilium_wait.rc == 0 else 'Not Ready' }}"
+          - "Storage Class: csi-rawfile-default"
+          - "==============================================="
+          - "Next Steps:"
+          - "1. Join worker nodes: ansible/40_thinkube/core/infrastructure/k8s-snap/20_join_workers.yaml"
+          - "2. Install GPU Operator: ansible/40_thinkube/core/infrastructure/gpu_operator/10_deploy.yaml"
+          - "==============================================="

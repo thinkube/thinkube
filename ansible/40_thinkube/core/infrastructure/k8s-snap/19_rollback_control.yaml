@@ -1,0 +1,258 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Rollback playbook for k8s-snap control node
+# Description:
+#   Completely removes k8s-snap installation and associated configuration
+#   WARNING: This will destroy the Kubernetes cluster and all resources
+#
+# Usage:
+#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/k8s-snap/19_rollback_control.yaml
+
+- name: Rollback k8s-snap Control Node Installation
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    kubectl_wrapper_path: "{{ user_home }}/.local/bin/kubectl"
+    helm_wrapper_path: "{{ user_home }}/.local/bin/helm"
+
+  tasks:
+    - name: Confirm rollback
+      ansible.builtin.pause:
+        prompt: |
+          !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+          WARNING: This will completely remove k8s-snap and destroy
+          the Kubernetes cluster including all resources and data.
+
+          Are you absolutely sure you want to continue? (yes/no)
+          !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+      register: rollback_confirm
+      when: rollback_confirmed is not defined
+
+    - name: Verify confirmation
+      ansible.builtin.fail:
+        msg: "Rollback cancelled by user"
+      when:
+        - rollback_confirmed is not defined
+        - rollback_confirm.user_input | lower != 'yes'
+
+    # ===========================
+    # Stop k8s Cluster
+    # ===========================
+    - name: Check if k8s-snap is installed
+      ansible.builtin.command: snap list k8s
+      register: k8s_snap_check
+      failed_when: false
+      changed_when: false
+
+    - name: Stop k8s cluster (if installed)
+      ansible.builtin.command: k8s stop
+      register: k8s_stop
+      failed_when: false
+      changed_when: k8s_stop.rc == 0
+      when: k8s_snap_check.rc == 0
+
+    - name: Wait for k8s services to stop
+      ansible.builtin.pause:
+        seconds: 10
+      when: k8s_stop is changed
+
+    # ===========================
+    # Remove k8s-snap
+    # ===========================
+    - name: Remove k8s-snap
+      community.general.snap:
+        name: k8s
+        state: absent
+      when: k8s_snap_check.rc == 0
+      register: snap_removal
+
+    - name: Purge k8s-snap data
+      ansible.builtin.command: snap remove --purge k8s
+      when:
+        - k8s_snap_check.rc == 0
+        - snap_removal is changed
+      failed_when: false
+      changed_when: true
+
+    # ===========================
+    # Clean Up Wrapper Scripts
+    # ===========================
+    - name: Remove kubectl wrapper script
+      ansible.builtin.file:
+        path: "{{ kubectl_wrapper_path }}"
+        state: absent
+
+    - name: Remove helm wrapper script
+      ansible.builtin.file:
+        path: "{{ helm_wrapper_path }}"
+        state: absent
+
+    # ===========================
+    # Clean Up Alias System
+    # ===========================
+    - name: Check if thinkube_shared_shell directory exists
+      ansible.builtin.stat:
+        path: "{{ user_home }}/.thinkube_shared_shell"
+      register: shared_shell_dir
+
+    - name: Remove k8s alias files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ user_home }}/.thinkube_shared_shell/aliases/kubectl_aliases.json"
+        - "{{ user_home }}/.thinkube_shared_shell/aliases/helm_aliases.json"
+        - "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh"
+        - "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.fish"
+      when: shared_shell_dir.stat.exists
+
+    # ===========================
+    # Clean Up Kubeconfig
+    # ===========================
+    - name: Remove k8s kubeconfig
+      ansible.builtin.file:
+        path: /etc/kubernetes/admin.conf
+        state: absent
+
+    - name: Remove k8s configuration directory
+      ansible.builtin.file:
+        path: /etc/kubernetes
+        state: absent
+
+    - name: Remove user .kube directory
+      ansible.builtin.file:
+        path: "{{ user_home }}/.kube"
+        state: absent
+      become_user: "{{ user }}"
+
+    # ===========================
+    # Clean Up Data Directories
+    # ===========================
+    - name: Remove k8s data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/snap/k8s/common
+        - /var/lib/k8s-dqlite
+        - /var/lib/rawfile-localpv
+      failed_when: false
+
+    # ===========================
+    # Clean Up CNI Interfaces (Cilium)
+    # ===========================
+    - name: Get list of Cilium network interfaces
+      ansible.builtin.shell: |
+        ip link show | grep -E 'cilium|lxc' | awk -F: '{print $2}' | sed 's/^ //' || true
+      register: cilium_interfaces
+      changed_when: false
+
+    - name: Remove Cilium network interfaces
+      ansible.builtin.command: ip link delete {{ item }}
+      loop: "{{ cilium_interfaces.stdout_lines }}"
+      when: cilium_interfaces.stdout_lines | length > 0
+      failed_when: false
+      changed_when: true
+
+    # ===========================
+    # Optional: Reset UFW Rules
+    # ===========================
+    - name: Check if UFW k8s rules should be removed
+      ansible.builtin.pause:
+        prompt: "Remove k8s-specific UFW firewall rules? (yes/no, default: no)"
+      register: ufw_cleanup_confirm
+      when: ufw_cleanup is not defined
+
+    - name: Remove k8s UFW rules
+      block:
+        - name: Remove k8s API server port rule
+          community.general.ufw:
+            rule: allow
+            port: '6443'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove k8s cluster daemon port rule
+          community.general.ufw:
+            rule: allow
+            port: '6400'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove kubelet API port rule
+          community.general.ufw:
+            rule: allow
+            port: '10250'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove Cilium health port rule
+          community.general.ufw:
+            rule: allow
+            port: '4240'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove Cilium VXLAN port rule
+          community.general.ufw:
+            rule: allow
+            port: '8472'
+            proto: udp
+            delete: true
+          failed_when: false
+
+        - name: Reload UFW
+          ansible.builtin.command: ufw reload
+          changed_when: true
+      when:
+        - ufw_cleanup is defined and ufw_cleanup | bool
+        - ufw_cleanup_confirm is defined and ufw_cleanup_confirm.user_input | lower == 'yes'
+
+    # ===========================
+    # Optional: Reboot to Clean State
+    # ===========================
+    - name: Check if reboot is needed
+      ansible.builtin.pause:
+        prompt: "Reboot server to ensure clean state? (yes/no, default: no)"
+      register: reboot_confirm
+      when: reboot_after_rollback is not defined
+
+    - name: Reboot server
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        msg: "Rebooting to clean k8s-snap state"
+      when:
+        - reboot_after_rollback is defined and reboot_after_rollback | bool
+        - reboot_confirm is defined and reboot_confirm.user_input | lower == 'yes'
+
+  post_tasks:
+    - name: Display rollback summary
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "k8s-snap Control Node Rollback Complete"
+          - "==============================================="
+          - "Removed:"
+          - "  - k8s-snap package and data"
+          - "  - kubectl and helm wrappers"
+          - "  - k8s alias files"
+          - "  - Kubeconfig files"
+          - "  - Cilium network interfaces"
+          - "  - k8s data directories"
+          - "==============================================="
+          - "Manual cleanup (if needed):"
+          - "  1. Check UFW rules: sudo ufw status"
+          - "  2. Check network interfaces: ip link show"
+          - "  3. Check for remaining k8s processes: ps aux | grep k8s"
+          - "  4. Review /etc/default/ufw (DEFAULT_FORWARD_POLICY)"
+          - "==============================================="
