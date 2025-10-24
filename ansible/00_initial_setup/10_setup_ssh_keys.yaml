@@ -93,6 +93,22 @@
         state: restarted
 
   tasks:
+    # Debug connection information
+    - name: Debug - Show connection information
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+          SSH Connection Debug Information
+          ═══════════════════════════════════════════════════════════
+          Inventory Hostname: {{ inventory_hostname }}
+          Target IP (ansible_host): {{ ansible_host }}
+          SSH User (ansible_user): {{ ansible_user | default('NOT SET') }}
+          SSH Password Set: {{ 'YES' if ansible_ssh_pass is defined and ansible_ssh_pass else 'NO' }}
+          Become Password Set: {{ 'YES' if ansible_become_pass is defined and ansible_become_pass else 'NO' }}
+          SSH Common Args: {{ ansible_ssh_common_args }}
+          ═══════════════════════════════════════════════════════════
+      run_once: true
+
     # Remove old SSH keys from previous installations first
     - name: Remove old thinkube cluster keys from authorized_keys
       ansible.builtin.raw: |
@@ -382,11 +398,23 @@
         state: absent
       when: ssh_config_stat.stat.exists
 
+    - name: Debug - Show SSH test configuration
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+          About to test SSH connections
+          ═══════════════════════════════════════════════════════════
+          From: {{ inventory_hostname }}
+          SSH Key: {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}
+          Targets: {{ groups['baremetal'] }}
+          ═══════════════════════════════════════════════════════════
+      run_once: true
+
     - name: Test SSH connection to other hosts
       ansible.builtin.shell: |
         if [ "{{ item }}" != "{{ inventory_hostname }}" ]; then
           echo "Testing SSH connection to {{ item }} at IP {{ hostvars[item]['ansible_host'] }}..."
-          ssh -i {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }} -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ hostvars[item]['ansible_host'] }} "echo Successfully connected from {{ inventory_hostname }} to {{ item }}"
+          ssh -v -i {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }} -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ hostvars[item]['ansible_host'] }} "echo Successfully connected from {{ inventory_hostname }} to {{ item }}" 2>&1
           exit $?
         else
           echo "Skipping test to self ({{ inventory_hostname }})"
@@ -396,6 +424,18 @@
       changed_when: false
       failed_when: "ssh_test.rc != 0"
       loop: "{{ groups['baremetal'] }}"
+
+    - name: Debug - Show SSH test results
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+          SSH Test Result for {{ item.item }}
+          ═══════════════════════════════════════════════════════════
+          Return Code: {{ item.rc }}
+          Output: {{ item.stdout }}
+          ═══════════════════════════════════════════════════════════
+      loop: "{{ ssh_test.results }}"
+      when: ssh_test.results is defined
 
     - name: Display successful setup message
       ansible.builtin.debug:
