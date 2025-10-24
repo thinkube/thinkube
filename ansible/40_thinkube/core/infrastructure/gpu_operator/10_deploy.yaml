@@ -137,38 +137,25 @@
 
     - name: Wait for nvidia-container-toolkit to configure containerd
       ansible.builtin.shell: |
-        # Wait for the toolkit daemonset to be running
+        # Wait for the toolkit daemonset to be running and to configure containerd
         i=1
-        while [ $i -le 30 ]; do
+        while [ $i -le 60 ]; do
           count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -l app=nvidia-container-toolkit-daemonset --field-selector=status.phase=Running -o json | jq '.items | length')
           if [ "$count" -ge 1 ]; then
-            echo "✓ nvidia-container-toolkit daemonset is running"
-            exit 0
+            # Check if nvidia runtime is configured
+            if grep -q 'default_runtime_name = "nvidia"' /var/snap/microk8s/current/args/containerd-template.toml 2>/dev/null; then
+              echo "✓ nvidia-container-toolkit daemonset is running and containerd is configured"
+              exit 0
+            fi
           fi
-          echo "Waiting for nvidia-container-toolkit-daemonset... (attempt $i/30)"
+          echo "Waiting for nvidia-container-toolkit to configure containerd... (attempt $i/60)"
           sleep 5
           i=$((i + 1))
         done
-        echo "WARNING: nvidia-container-toolkit-daemonset not ready yet"
+        echo "WARNING: nvidia-container-toolkit-daemonset not fully configured yet, continuing anyway"
         exit 0
       register: toolkit_wait
       changed_when: false
-
-    - name: Restart MicroK8s to pick up nvidia runtime
-      ansible.builtin.shell: |
-        microk8s stop
-        sleep 5
-        microk8s start
-      become: true
-      register: microk8s_restart
-      changed_when: true
-
-    - name: Wait for MicroK8s to be ready after restart
-      ansible.builtin.command: microk8s status --wait-ready
-      changed_when: false
-      become: true
-      retries: 10
-      delay: 10
 
     - name: Check GPU operator deployment status
       ansible.builtin.shell: |
