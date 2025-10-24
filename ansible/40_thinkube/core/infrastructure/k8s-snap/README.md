@@ -223,6 +223,45 @@ sudo k8s kubectl run test --image=busybox --rm -it --restart=Never -- ping -c 2 
 
 ## Migrating Existing Playbooks from MicroK8s
 
+### Thinkube Installer Updates
+
+**Critical**: The thinkube-installer must be updated to call k8s-snap playbooks instead of MicroK8s playbooks.
+
+**Files to update**:
+- `frontend/src-tauri/backend/app/services/ansible_executor.py` - Playbook paths
+- `frontend/src-tauri/backend/app/api/playbooks.py` - Playbook execution logic
+- Inventory generation - Use k8s groups instead of microk8s groups
+
+**Playbook path changes**:
+```python
+# Before:
+"ansible/40_thinkube/core/infrastructure/microk8s/10_install_microk8s.yaml"
+"ansible/40_thinkube/core/infrastructure/microk8s/20_join_workers.yaml"
+
+# After:
+"ansible/40_thinkube/core/infrastructure/k8s-snap/10_install_k8s.yaml"
+"ansible/40_thinkube/core/infrastructure/k8s-snap/20_join_workers.yaml"
+```
+
+**Inventory group changes**:
+```yaml
+# Before:
+microk8s:
+  children:
+    microk8s_control_plane:
+    microk8s_workers:
+
+# After:
+k8s:
+  children:
+    k8s_control_plane:
+    k8s_workers:
+```
+
+**UI/Display text updates**:
+- "MicroK8s" → "Canonical Kubernetes" or "k8s-snap"
+- Update any progress messages, logs, error messages
+
 ### Group Variables Update
 
 **File**: `inventory/group_vars/microk8s.yml`
@@ -339,13 +378,7 @@ Following the same structure as MicroK8s playbooks, we need 6 playbooks:
    - Verify CoreDNS is 1/1 Ready
    - Test pod connectivity
 
-5. **GPU Operator** (if GPU present)
-   - Verify nvidia-smi works
-   - Install GPU Operator v25.3.4
-   - Wait for all pods Running
-   - Verify GPU resources advertised
-
-6. **Create Wrappers**
+5. **Create Wrappers**
    - kubectl wrapper at ~/.local/bin/kubectl
    - helm wrapper at ~/.local/bin/helm
    - Thinkube alias integration
@@ -362,10 +395,6 @@ Following the same structure as MicroK8s playbooks, we need 6 playbooks:
 3. **Network Testing**
    - Test pod-to-pod connectivity
    - Test external connectivity
-
-4. **GPU Testing** (if GPU present)
-   - Verify GPU resources advertised
-   - Test GPU allocation
 
 ### Control Plane Rollback (19_rollback_control.yaml)
 1. **Remove k8s-snap**
@@ -411,10 +440,6 @@ Following the same structure as MicroK8s playbooks, we need 6 playbooks:
    - Verify system pods on worker
    - Test pod scheduling to worker
 
-3. **GPU Testing** (if GPU present)
-   - Verify GPU resources advertised on worker
-   - Test GPU workload scheduling
-
 ### Worker Node Rollback (29_rollback_workers.yaml)
 1. **Remove from Cluster** (from control plane)
    - Drain node
@@ -432,6 +457,21 @@ Following the same structure as MicroK8s playbooks, we need 6 playbooks:
 5. **Verification**
    - Confirm node removed from cluster
    - Verify snap removed from worker
+
+## GPU Operator
+
+GPU Operator has its own separate playbook set under `ansible/40_thinkube/core/infrastructure/gpu_operator/`:
+- `10_deploy.yaml` - Deploy GPU Operator
+- `17_configure_discovery.yaml` - Configure GPU discovery
+- `18_test.yaml` - Test GPU functionality
+- `19_rollback.yaml` - Remove GPU Operator
+
+**These should be run AFTER the k8s-snap cluster is fully installed and tested.**
+
+GPU Operator installation is documented in `gpu_operator/README.md` and requires:
+- NVIDIA drivers pre-installed on nodes
+- Working k8s cluster with kubectl access
+- GPU nodes labeled appropriately
 
 ## References
 
