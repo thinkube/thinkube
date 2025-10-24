@@ -135,6 +135,36 @@
         seconds: 30
         prompt: "Waiting for GPU operator to initialize pods..."
 
+    - name: Wait for nvidia-container-toolkit to configure containerd
+      ansible.builtin.shell: |
+        # Wait for the toolkit daemonset to be running
+        i=1
+        while [ $i -le 30 ]; do
+          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -l app=nvidia-container-toolkit-daemonset --field-selector=status.phase=Running -o json | jq '.items | length')
+          if [ "$count" -ge 1 ]; then
+            echo "✓ nvidia-container-toolkit daemonset is running"
+            exit 0
+          fi
+          echo "Waiting for nvidia-container-toolkit-daemonset... (attempt $i/30)"
+          sleep 5
+          i=$((i + 1))
+        done
+        echo "WARNING: nvidia-container-toolkit-daemonset not ready yet"
+        exit 0
+      register: toolkit_wait
+      changed_when: false
+
+    - name: Restart containerd to pick up nvidia runtime
+      ansible.builtin.systemd:
+        name: snap.microk8s.daemon-containerd.service
+        state: restarted
+      become: true
+
+    - name: Wait for containerd to be ready
+      ansible.builtin.pause:
+        seconds: 10
+        prompt: "Waiting for containerd to restart..."
+
     - name: Check GPU operator deployment status
       ansible.builtin.shell: |
         {{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -o wide
