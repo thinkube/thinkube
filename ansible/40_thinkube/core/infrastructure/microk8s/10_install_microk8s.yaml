@@ -355,21 +355,26 @@
         - addons
 
     - name: Wait for MetalLB pods to be ready
-      kubernetes.core.k8s_info:
-        kubeconfig: /var/snap/microk8s/current/credentials/client.config
-        api_version: v1
-        kind: Pod
-        namespace: metallb-system
-        label_selectors:
-          - app=metallb
-      register: metallb_pods
-      until: >
-        metallb_pods.resources is defined and
-        metallb_pods.resources | length > 0 and
-        metallb_pods.resources | map(attribute='status.phase') | select('equalto', 'Running') | list | length == metallb_pods.resources | length
+      ansible.builtin.shell: |
+        # Get MetalLB pods and check if all are Running
+        PODS=$(microk8s kubectl get pods -n metallb-system -l app=metallb -o jsonpath='{.items[*].status.phase}')
+        if [ -z "$PODS" ]; then
+          echo "No MetalLB pods found"
+          exit 1
+        fi
+        # Check if all pods are Running
+        for phase in $PODS; do
+          if [ "$phase" != "Running" ]; then
+            echo "Pod not ready: $phase"
+            exit 1
+          fi
+        done
+        echo "All MetalLB pods are running"
+      register: metallb_check
+      until: metallb_check.rc == 0
       retries: 30
       delay: 10
-      become: true
+      changed_when: false
       tags:
         - metallb
         - verify
