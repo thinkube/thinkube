@@ -230,44 +230,43 @@
         - "fullchain.cer"
       when: needs_renewal
 
-    - name: Read certificate content
-      ansible.builtin.slurp:
-        src: "{{ tls_crt_path }}"
-      register: cert_content
+    - name: Delete existing TLS secret if present (for update)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete secret {{ domain_name | replace('.', '-') }}-tls -n default --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: delete_secret
+      changed_when: "'deleted' in delete_secret.stdout"
 
-    - name: Read key content
-      ansible.builtin.slurp:
-        src: "{{ tls_key_path }}"
-      register: key_content
+    - name: Create/Update Kubernetes TLS secret using kubectl
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} create secret tls {{ domain_name | replace('.', '-') }}-tls \
+          --cert={{ tls_crt_path }} \
+          --key={{ tls_key_path }} \
+          -n default
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: create_secret
+      changed_when: true
 
-    - name: Create/Update Kubernetes TLS secret (cert-manager compatible)
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        validate_certs: false
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: "{{ domain_name | replace('.', '-') }}-tls"
-            namespace: default
-            labels:
-              app.kubernetes.io/managed-by: "acme.sh"
-              app.kubernetes.io/name: "wildcard-certificate"
-          type: kubernetes.io/tls
-          data:
-            tls.crt: "{{ cert_content.content }}"
-            tls.key: "{{ key_content.content }}"
+    - name: Label the TLS secret
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} label secret {{ domain_name | replace('.', '-') }}-tls \
+          -n default \
+          app.kubernetes.io/managed-by=acme.sh \
+          app.kubernetes.io/name=wildcard-certificate \
+          --overwrite
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
 
     - name: Verify secret was created
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        validate_certs: false
-        api_version: v1
-        kind: Secret
-        name: "{{ domain_name | replace('.', '-') }}-tls"
-        namespace: default
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name | replace('.', '-') }}-tls -n default
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       register: secret_check
+      changed_when: false
 
     - name: Display certificate information
       ansible.builtin.debug:
@@ -275,7 +274,7 @@
           - "Certificate domains: {{ certificate_domains | join(', ') }}"
           - "Certificate location: {{ cert_dir }}/{{ domain_name }}/"
           - "Kubernetes secret: default/{{ domain_name | replace('.', '-') }}-tls"
-          - "Secret created: {{ secret_check.resources | length > 0 }}"
+          - "Secret created: {{ secret_check.rc == 0 }}"
 
     # GitHub Backup Block - Optional certificate backup to user's GitHub repository
     - name: Set backup variables
