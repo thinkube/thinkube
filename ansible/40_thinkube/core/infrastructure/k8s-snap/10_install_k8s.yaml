@@ -435,6 +435,69 @@
         - runtimeclass_result.rc != 0
         - "'already exists' not in runtimeclass_result.stderr"
 
+    # ===========================
+    # MetalLB Load Balancer
+    # ===========================
+    - name: Add MetalLB Helm repository
+      ansible.builtin.command: "{{ helm_bin }} repo add metallb https://metallb.github.io/metallb --force-update"
+      changed_when: false
+
+    - name: Update Helm repositories
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+      changed_when: false
+
+    - name: Install MetalLB via Helm
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        name: metallb
+        chart_ref: metallb/metallb
+        release_namespace: metallb-system
+        create_namespace: true
+        wait: true
+        wait_timeout: "5m0s"
+
+    - name: Wait for MetalLB controller to be ready
+      ansible.builtin.command: "k8s kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=controller -n metallb-system --timeout=300s"
+      register: metallb_controller_wait
+      retries: 3
+      delay: 10
+      until: metallb_controller_wait.rc == 0
+      changed_when: false
+
+    - name: Configure MetalLB IP address pool
+      ansible.builtin.shell: |
+        k8s kubectl apply -f - <<EOF
+        apiVersion: metallb.io/v1beta1
+        kind: IPAddressPool
+        metadata:
+          name: default-pool
+          namespace: metallb-system
+        spec:
+          addresses:
+          - {{ metallb_ip_range_start }}-{{ metallb_ip_range_end }}
+        EOF
+      register: metallb_pool_result
+      changed_when: "'created' in metallb_pool_result.stdout or 'configured' in metallb_pool_result.stdout"
+
+    - name: Configure MetalLB L2 advertisement
+      ansible.builtin.shell: |
+        k8s kubectl apply -f - <<EOF
+        apiVersion: metallb.io/v1beta1
+        kind: L2Advertisement
+        metadata:
+          name: default-l2
+          namespace: metallb-system
+        spec:
+          ipAddressPools:
+          - default-pool
+        EOF
+      register: metallb_l2_result
+      changed_when: "'created' in metallb_l2_result.stdout or 'configured' in metallb_l2_result.stdout"
+
+    - name: Show MetalLB status
+      ansible.builtin.debug:
+        msg: "MetalLB is deployed with IP range {{ metallb_ip_range_start }}-{{ metallb_ip_range_end }}"
+
   handlers:
     - name: reload_ufw
       ansible.builtin.command: ufw reload
