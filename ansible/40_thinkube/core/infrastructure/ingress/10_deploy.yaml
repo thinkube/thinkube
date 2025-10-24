@@ -41,19 +41,23 @@
     # Determine subnet prefix based on network mode
     subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     # Build the required variables from inventory
-    metallb_ip_range: "{{ subnet_prefix }}{{ metallb_ip_start_octet }}-{{ subnet_prefix }}{{ metallb_ip_end_octet }}"
+    metallb_ip_range_start: "{{ subnet_prefix }}{{ metallb_ip_start_octet }}"
+    metallb_ip_range_end: "{{ subnet_prefix }}{{ metallb_ip_end_octet }}"
     primary_ingress_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
-    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
-    kubectl_bin: "/snap/bin/microk8s.kubectl"
-    helm_bin: "/snap/bin/microk8s.helm3"
+    # kubectl_bin, helm_bin, kubeconfig inherited from group_vars
 
   pre_tasks:
+    - name: Add MetalLB Helm repository
+      ansible.builtin.command: "{{ helm_bin }} repo add metallb https://metallb.github.io/metallb --force-update"
+      changed_when: false
+
     - name: Add ingress-nginx Helm repository
       ansible.builtin.command: "{{ helm_bin }} repo add ingress-nginx https://kubernetes.github.io/ingress-nginx --force-update"
-      ignore_errors: yes
+      changed_when: false
 
     - name: Update Helm repositories
       ansible.builtin.command: "{{ helm_bin }} repo update"
+      changed_when: false
 
   tasks:
     - name: Debug Python interpreter path
@@ -89,38 +93,62 @@
           - "subnet_prefix: {{ subnet_prefix }}"
           - "metallb_ip_start_octet: {{ metallb_ip_start_octet }}"
           - "metallb_ip_end_octet: {{ metallb_ip_end_octet }}"
-          - "metallb_ip_range: {{ metallb_ip_range }}"
+          - "metallb_ip_range: {{ metallb_ip_range_start }}-{{ metallb_ip_range_end }}"
           - "primary_ingress_ip_octet: {{ primary_ingress_ip_octet }}"
           - "primary_ingress_ip: {{ primary_ingress_ip }}"
 
-    - name: Disable MicroK8s ingress addon (if enabled)
-      ansible.builtin.command: microk8s disable ingress
-      ignore_errors: yes
+    # Deploy MetalLB Load Balancer
+    - name: Install MetalLB via Helm
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        name: metallb
+        chart_ref: metallb/metallb
+        release_namespace: metallb-system
+        create_namespace: true
+        wait: true
+        wait_timeout: "5m0s"
 
-    # MetalLB is already enabled by CoreDNS deployment
-    - name: Verify MetalLB is enabled
-      ansible.builtin.command: microk8s status --addon metallb
-      register: metallb_status
+    - name: Wait for MetalLB controller to be ready
+      ansible.builtin.command: "{{ kubectl_bin }} wait --for=condition=ready pod -l app.kubernetes.io/component=controller -n metallb-system --timeout=300s"
+      register: metallb_controller_wait
+      retries: 3
+      delay: 10
+      until: metallb_controller_wait.rc == 0
       changed_when: false
-      failed_when: metallb_status.rc != 0 or 'enabled' not in metallb_status.stdout
+
+    - name: Configure MetalLB IP address pool
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: metallb.io/v1beta1
+        kind: IPAddressPool
+        metadata:
+          name: default-pool
+          namespace: metallb-system
+        spec:
+          addresses:
+          - {{ metallb_ip_range_start }}-{{ metallb_ip_range_end }}
+        EOF
+      register: metallb_pool_result
+      changed_when: "'created' in metallb_pool_result.stdout or 'configured' in metallb_pool_result.stdout"
+
+    - name: Configure MetalLB L2 advertisement
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: metallb.io/v1beta1
+        kind: L2Advertisement
+        metadata:
+          name: default-l2
+          namespace: metallb-system
+        spec:
+          ipAddressPools:
+          - default-pool
+        EOF
+      register: metallb_l2_result
+      changed_when: "'created' in metallb_l2_result.stdout or 'configured' in metallb_l2_result.stdout"
 
     - name: Show MetalLB status
       ansible.builtin.debug:
-        msg: "MetalLB is enabled with range {{ metallb_ip_range }}"
-
-    - name: Check MetalLB ConfigMap
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: ConfigMap
-        name: config
-        namespace: metallb-system
-      register: metallb_config
-      ignore_errors: yes
-
-    - name: Show MetalLB configuration
-      ansible.builtin.debug:
-        msg: "{{ metallb_config.resources[0].data if metallb_config.resources is defined and metallb_config.resources|length > 0 else 'MetalLB config not found' }}"
+        msg: "MetalLB is deployed with IP range {{ metallb_ip_range_start }}-{{ metallb_ip_range_end }}"
 
     - name: Create primary ingress namespace if not exists
       kubernetes.core.k8s:
@@ -240,9 +268,7 @@
     # Use the same subnet prefix as primary ingress
     subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     secondary_ingress_ip: "{{ subnet_prefix }}{{ secondary_ingress_ip_octet }}"
-    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
-    kubectl_bin: "/snap/bin/microk8s.kubectl"
-    helm_bin: "/snap/bin/microk8s.helm3"
+    # kubectl_bin, helm_bin, kubeconfig inherited from group_vars
   tasks:
     - name: Create secondary ingress namespace if not exists
       kubernetes.core.k8s:
@@ -335,9 +361,7 @@
 - name: Copy wildcard certificates to ingress namespaces
   hosts: k8s_control_plane
   become: true
-  vars:
-    kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
-    kubectl_bin: "/snap/bin/microk8s.kubectl"
+  # kubectl_bin and kubeconfig inherited from group_vars
   tasks:
     - name: Get wildcard certificate from default namespace
       kubernetes.core.k8s_info:
