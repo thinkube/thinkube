@@ -28,18 +28,18 @@
     coredns_cluster_ip: "10.152.183.10"  # Standard CoreDNS cluster IP
     
   tasks:
-    # Get CoreDNS IP from MicroK8s
+    # Get CoreDNS IP from Kubernetes
     - name: Get CoreDNS service IP
       ansible.builtin.command: |
-        microk8s kubectl get svc -n kube-system kube-dns -o jsonpath='{.spec.clusterIP}'
+        k8s kubectl get svc -n kube-system kube-dns -o jsonpath='{.spec.clusterIP}'
       register: coredns_ip
-      when: inventory_hostname in groups['microk8s_control_plane']
+      when: inventory_hostname in groups['k8s_control_plane']
       ignore_errors: true
       
     - name: Share CoreDNS IP with all nodes
       ansible.builtin.set_fact:
-        cluster_dns_ip: "{{ hostvars[groups['microk8s_control_plane'][0]]['coredns_ip']['stdout'] | default('10.152.183.10') }}"
-      when: groups['microk8s_control_plane'][0] is defined and groups['microk8s_control_plane'][0] in hostvars
+        cluster_dns_ip: "{{ hostvars[groups['k8s_control_plane'][0]]['coredns_ip']['stdout'] | default('10.152.183.10') }}"
+      when: groups['k8s_control_plane'][0] is defined and groups['k8s_control_plane'][0] in hostvars
       
     # Create systemd-resolved directory for drop-in configs
     - name: Create systemd-resolved directory
@@ -57,11 +57,11 @@
         state: absent
       notify: restart systemd-resolved
       
-    # Configure MicroK8s nodes
-    - name: Configure systemd-resolved for MicroK8s nodes
+    # Configure Kubernetes nodes
+    - name: Configure systemd-resolved for Kubernetes nodes
       ansible.builtin.copy:
         content: |
-          # DNS configuration for MicroK8s nodes
+          # DNS configuration for Kubernetes nodes
           [Resolve]
           # Primary DNS: BIND9 for network and domain resolution
           DNS={{ coredns_external_ip }}
@@ -74,21 +74,21 @@
         owner: root
         group: root
         mode: '0644'
-      when: inventory_hostname in groups['microk8s']
+      when: inventory_hostname in groups['k8s']
       notify: restart systemd-resolved
         
-    # Configure non-MicroK8s nodes (management controllers, etc)
-    - name: Remove conflicting DNS configuration for non-MicroK8s nodes
+    # Configure non-Kubernetes nodes (management controllers, etc)
+    - name: Remove conflicting DNS configuration for non-Kubernetes nodes
       ansible.builtin.file:
         path: /etc/systemd/resolved.conf.d/dns.conf
         state: absent
-      when: "inventory_hostname not in groups['microk8s']"
+      when: "inventory_hostname not in groups['k8s']"
       notify: restart systemd-resolved
       
-    - name: Configure systemd-resolved for non-MicroK8s nodes
+    - name: Configure systemd-resolved for non-Kubernetes nodes
       ansible.builtin.copy:
         content: |
-          # DNS configuration for non-MicroK8s nodes
+          # DNS configuration for non-Kubernetes nodes
           [Resolve]
           # Primary DNS: BIND9 for network and domain resolution
           DNS={{ coredns_external_ip }}
@@ -101,13 +101,13 @@
         owner: root
         group: root
         mode: '0644'
-      when: "inventory_hostname not in groups['microk8s']"
+      when: "inventory_hostname not in groups['k8s']"
       notify: restart systemd-resolved
       
-    # Configure MicroK8s DNS settings for Kubernetes pods
-    - name: Configure MicroK8s DNS settings for Kubernetes pods
+    # Configure Kubernetes DNS settings for Kubernetes pods
+    - name: Configure Kubernetes DNS settings for Kubernetes pods
       kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig | default('/var/snap/microk8s/current/credentials/client.config') }}"
+        kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
           apiVersion: v1
@@ -120,7 +120,7 @@
               nameserver {{ cluster_dns_ip | default('10.152.183.10') }}
               search default.svc.{{ k8s_cluster_domain }} svc.{{ k8s_cluster_domain }} {{ k8s_cluster_domain }}
               options ndots:5
-      when: inventory_hostname in groups['microk8s_control_plane']
+      when: inventory_hostname in groups['k8s_control_plane']
       run_once: true
       ignore_errors: true
       
@@ -145,7 +145,7 @@
         state: absent
       when: 
         - netplan_config.stat.exists
-        - inventory_hostname in groups['microk8s']
+        - inventory_hostname in groups['k8s']
       
     - name: Update netplan DNS configuration for nodes
       ansible.builtin.replace:
@@ -154,7 +154,7 @@
         replace: "addresses: ['{{ coredns_external_ip }}', '8.8.8.8']"
       when: 
         - netplan_config.stat.exists
-        - inventory_hostname in groups['microk8s']
+        - inventory_hostname in groups['k8s']
       notify: apply netplan
       
     # Create a systemd service to ensure DNS is configured after network is up
@@ -203,7 +203,7 @@
       register: internal_dns_test
       changed_when: false
       failed_when: false
-      when: inventory_hostname in groups['microk8s']
+      when: inventory_hostname in groups['k8s']
       
     - name: Test DNS resolution for external domain
       ansible.builtin.command: nslookup {{ item }}
@@ -229,7 +229,7 @@
         msg: |
           Node: {{ inventory_hostname }}
           
-          {% if inventory_hostname in groups['microk8s'] %}
+          {% if inventory_hostname in groups['k8s'] %}
           Internal DNS (cluster.local): {{ 'SUCCESS' if internal_dns_test.rc == 0 else 'FAILED' }}
           {% endif %}
           
