@@ -4,8 +4,7 @@
 ---
 # Deploy Ingress Controllers
 #
-# This playbook disables the MicroK8s built‑in ingress addon and deploys two separate ingress
-# controllers via Helm:
+# This playbook deploys two separate ingress controllers via Helm:
 #
 #     1. Primary Ingress Controller (for general services)
 #        - Namespace: ingress
@@ -20,9 +19,8 @@
 #        - IngressClass: "nginx-kn"
 #
 # Requirements:
-#   - MicroK8s is installed on the target host.
-#   - MetalLB is already enabled by MicroK8s installation.
-#   - The kubernetes.core collection is installed.
+#   - Canonical k8s-snap is installed on the target host.
+#   - MetalLB is already enabled by k8s-snap installation.
 #   - acme-certificates must be deployed first to create the wildcard certificate
 #
 # This playbook also copies the wildcard certificate to the ingress namespaces after the controllers
@@ -32,7 +30,7 @@
 #   Run from ansible root directory:
 #   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/ingress/10_deploy.yaml
 
-- name: Disable MicroK8s Ingress Addon and Deploy Primary Ingress Controller
+- name: Deploy Primary Ingress Controller
   hosts: k8s_control_plane
   become: true
   vars:
@@ -54,37 +52,13 @@
       changed_when: false
 
   tasks:
-    - name: Debug Python interpreter path
-      ansible.builtin.debug:
-        msg:
-          - "ansible_python_interpreter: {{ ansible_python_interpreter }}"
-          - "Test kubernetes import:"
-      
-    - name: Test kubernetes module import
-      ansible.builtin.command: "{{ ansible_python_interpreter }} -c 'import kubernetes; print(kubernetes.__version__)'"
-      register: k8s_test
-      failed_when: false
-      changed_when: false
-      
-    - name: Install kubernetes module if missing
-      ansible.builtin.pip:
-        name: 
-          - kubernetes>=26.1.0
-          - pyyaml>=6.0
-        executable: "{{ ansible_python_interpreter | dirname }}/pip"
-      when: k8s_test.rc != 0
-      become: false
-      
-    - name: Show kubernetes module version
-      ansible.builtin.debug:
-        var: k8s_test.stdout
-      when: k8s_test.rc == 0
-        
     - name: Verify MetalLB is installed
       ansible.builtin.command: "{{ kubectl_bin }} get namespace metallb-system"
       register: metallb_check
       failed_when: false
       changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
 
     - name: Fail if MetalLB is not installed
       ansible.builtin.fail:
@@ -92,28 +66,18 @@
       when: metallb_check.rc != 0
 
     - name: Create primary ingress namespace if not exists
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        validate_certs: false
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Namespace
-          metadata:
-            name: "{{ ingress_namespace }}"
-    
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} create namespace {{ ingress_namespace }} --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: create_primary_ns
+      changed_when: "'created' in create_primary_ns.stdout or 'configured' in create_primary_ns.stdout"
+
     # TCP services ConfigMap is created automatically by Helm chart when tcp values are provided
 
-    - name: Deploy Primary Ingress Controller via Helm
-      kubernetes.core.helm:
-        state: present
-        binary_path: "{{ helm_bin }}"
-        name: "{{ primary_release }}"
-        chart_ref: ingress-nginx/ingress-nginx
-        release_namespace: "{{ ingress_namespace }}"
-        create_namespace: false
-        wait: true
-        values:
+    - name: Create Helm values file for Primary Ingress
+      ansible.builtin.copy:
+        content: |
           controller:
             electionID: "primary-ingress-ingress-nginx-leader"
             ingressClass: "{{ primary_ingress_class }}"
@@ -145,60 +109,81 @@
                 annotations:
                   prometheus.io/scrape: "true"
                   prometheus.io/port: "10254"
-          # TCP services configuration - Helm will create ConfigMap and configure controller
           tcp:
-            # PostgreSQL (if exposed)
             5432: "postgres/postgresql-official:5432"
-            # Gitea SSH (when deployed)
             2222: "gitea/gitea:22"
+        dest: /tmp/primary-ingress-values.yaml
+        mode: '0644'
+
+    - name: Deploy Primary Ingress Controller via Helm
+      ansible.builtin.shell: |
+        {{ helm_bin }} upgrade --install {{ primary_release }} ingress-nginx/ingress-nginx \
+          --namespace {{ ingress_namespace }} \
+          --values /tmp/primary-ingress-values.yaml \
+          --wait \
+          --timeout 10m
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: helm_primary_deploy
+      changed_when: "'has been upgraded' in helm_primary_deploy.stdout or 'has been installed' in helm_primary_deploy.stdout"
 
     - name: Get Primary Ingress Service Info
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        validate_certs: false
-        api_version: v1
-        kind: Service
-        namespace: "{{ ingress_namespace }}"
-        name: "{{ primary_ingress_service }}"
-      register: svc_info
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get svc {{ primary_ingress_service }} -n {{ ingress_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: svc_info_raw
+      changed_when: false
+      failed_when: false
 
     - name: Debug Primary Ingress Service Data
       ansible.builtin.debug:
-        var: svc_info
+        msg: "{{ svc_info_raw.stdout | from_json if svc_info_raw.rc == 0 else 'Service not found' }}"
 
     - name: Wait for Primary Ingress Service External IP Assignment
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        validate_certs: false
-        api_version: v1
-        kind: Service
-        namespace: "{{ ingress_namespace }}"
-        name: "{{ primary_ingress_service }}"
-      register: svc_info
-      until: (svc_info.resources | length > 0) and
-             (svc_info.resources[0].status.loadBalancer is defined) and
-             (svc_info.resources[0].status.loadBalancer.ingress is defined) and
-             (svc_info.resources[0].status.loadBalancer.ingress[0].ip == primary_ingress_ip)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get svc {{ primary_ingress_service }} -n {{ ingress_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: svc_check
+      until: >
+        svc_check.rc == 0 and
+        (svc_check.stdout | from_json).status.loadBalancer.ingress is defined and
+        (svc_check.stdout | from_json).status.loadBalancer.ingress | length > 0 and
+        (svc_check.stdout | from_json).status.loadBalancer.ingress[0].ip == primary_ingress_ip
       retries: 20
       delay: 3
+      changed_when: false
 
     - name: Delete extra IngressClass 'public' (if exists) to avoid conflicts
       ansible.builtin.shell: "{{ kubectl_bin }} delete ingressclass public"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       ignore_errors: yes
+      changed_when: false
 
     - name: Patch IngressClass '{{ primary_ingress_class }}' to be default
       ansible.builtin.shell: >
         {{ kubectl_bin }} patch ingressclass {{ primary_ingress_class }} --type=json -p='[{"op":"add","path":"/metadata/annotations","value":{"ingressclass.kubernetes.io/is-default-class":"true"}}]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       ignore_errors: yes
+      changed_when: false
 
     - name: Patch primary ingress controller to publish its service IP
       ansible.builtin.shell: >
         {{ kubectl_bin }} patch deployment {{ primary_ingress_service }} -n {{ ingress_namespace }} --type='json'
         -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--publish-service={{ ingress_namespace }}/{{ primary_ingress_service }}"}]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       register: patch_primary_ds
+      changed_when: "'patched' in patch_primary_ds.stdout"
 
     - name: Restart primary ingress controller pods to pick up new args
       ansible.builtin.shell: "{{ kubectl_bin }} rollout restart deployment {{ primary_ingress_service }} -n {{ ingress_namespace }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
 
 - name: Deploy Secondary Ingress Controller via Helm (for specialized workloads)
   hosts: k8s_control_plane
@@ -212,28 +197,16 @@
     # kubectl_bin, helm_bin, kubeconfig inherited from group_vars
   tasks:
     - name: Create secondary ingress namespace if not exists
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        validate_certs: false
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Namespace
-          metadata:
-            name: "{{ ingress_kn_namespace }}"
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} create namespace {{ ingress_kn_namespace }} --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: create_secondary_ns
+      changed_when: "'created' in create_secondary_ns.stdout or 'configured' in create_secondary_ns.stdout"
 
-    - name: Deploy Secondary Ingress Controller via Helm
-      kubernetes.core.helm:
-        state: present
-        binary_path: "{{ helm_bin }}"
-        name: "{{ secondary_release }}"
-        chart_ref: ingress-nginx/ingress-nginx
-        release_namespace: "{{ ingress_kn_namespace }}"
-        create_namespace: false
-        wait: true
-        force: true
-        update_repo_cache: true
-        values:
+    - name: Create Helm values file for Secondary Ingress
+      ansible.builtin.copy:
+        content: |
           controller:
             electionID: "secondary-ingress-ingress-nginx-leader"
             ingressClass: "{{ secondary_ingress_class }}"
@@ -259,45 +232,64 @@
                 annotations:
                   prometheus.io/scrape: "true"
                   prometheus.io/port: "10254"
+        dest: /tmp/secondary-ingress-values.yaml
+        mode: '0644'
+
+    - name: Deploy Secondary Ingress Controller via Helm
+      ansible.builtin.shell: |
+        {{ helm_bin }} upgrade --install {{ secondary_release }} ingress-nginx/ingress-nginx \
+          --namespace {{ ingress_kn_namespace }} \
+          --values /tmp/secondary-ingress-values.yaml \
+          --wait \
+          --timeout 10m \
+          --force
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: helm_secondary_deploy
+      changed_when: "'has been upgraded' in helm_secondary_deploy.stdout or 'has been installed' in helm_secondary_deploy.stdout"
 
     - name: Get Secondary Ingress Service Info
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        validate_certs: false
-        api_version: v1
-        kind: Service
-        namespace: "{{ ingress_kn_namespace }}"
-        name: "{{ secondary_release }}-ingress-nginx-controller"
-      register: svc_info_kn
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get svc {{ secondary_release }}-ingress-nginx-controller -n {{ ingress_kn_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: svc_info_kn_raw
+      changed_when: false
+      failed_when: false
 
     - name: Debug Secondary Ingress Service Data
       ansible.builtin.debug:
-        var: svc_info_kn
+        msg: "{{ svc_info_kn_raw.stdout | from_json if svc_info_kn_raw.rc == 0 else 'Service not found' }}"
 
     - name: Wait for Secondary Ingress Service External IP Assignment
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        validate_certs: false
-        api_version: v1
-        kind: Service
-        namespace: "{{ ingress_kn_namespace }}"
-        name: "{{ secondary_release }}-ingress-nginx-controller"
-      register: svc_info_kn
-      until: (svc_info_kn.resources | length > 0) and
-             (svc_info_kn.resources[0].status.loadBalancer is defined) and
-             (svc_info_kn.resources[0].status.loadBalancer.ingress is defined) and
-             (svc_info_kn.resources[0].status.loadBalancer.ingress[0].ip == secondary_ingress_ip)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get svc {{ secondary_release }}-ingress-nginx-controller -n {{ ingress_kn_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: svc_check_kn
+      until: >
+        svc_check_kn.rc == 0 and
+        (svc_check_kn.stdout | from_json).status.loadBalancer.ingress is defined and
+        (svc_check_kn.stdout | from_json).status.loadBalancer.ingress | length > 0 and
+        (svc_check_kn.stdout | from_json).status.loadBalancer.ingress[0].ip == secondary_ingress_ip
       retries: 20
       delay: 3
+      changed_when: false
 
     - name: Patch secondary ingress controller to publish its service IP
       ansible.builtin.shell: >
         {{ kubectl_bin }} patch deployment {{ secondary_release }}-ingress-nginx-controller -n {{ ingress_kn_namespace }} --type='json'
         -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--publish-service={{ ingress_kn_namespace }}/{{ secondary_release }}-ingress-nginx-controller"}]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       register: patch_secondary_ds
+      changed_when: "'patched' in patch_secondary_ds.stdout"
 
     - name: Restart secondary ingress controller pods to pick up new args
       ansible.builtin.shell: "{{ kubectl_bin }} rollout restart deployment {{ secondary_release }}-ingress-nginx-controller -n {{ ingress_kn_namespace }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
 
 - name: Copy wildcard certificates to ingress namespaces
   hosts: k8s_control_plane
@@ -305,52 +297,71 @@
   # kubectl_bin and kubeconfig inherited from group_vars
   tasks:
     - name: Get wildcard certificate from default namespace
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: default
-        name: "{{ domain_name | replace('.', '-') }}-tls"
-      register: wildcard_cert
-      failed_when: wildcard_cert.resources | length == 0
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name | replace('.', '-') }}-tls -n default -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wildcard_cert_raw
+      failed_when: wildcard_cert_raw.rc != 0
+      changed_when: false
 
-    - name: Copy wildcard certificate to primary ingress namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
+    - name: Parse wildcard certificate
+      ansible.builtin.set_fact:
+        wildcard_cert_data: "{{ wildcard_cert_raw.stdout | from_json }}"
+
+    - name: Create certificate secret YAML for primary ingress namespace
+      ansible.builtin.copy:
+        content: |
           apiVersion: v1
           kind: Secret
           metadata:
-            name: "{{ ingress_namespace }}-tls-secret"
-            namespace: "{{ ingress_namespace }}"
+            name: {{ ingress_namespace }}-tls-secret
+            namespace: {{ ingress_namespace }}
             labels:
               app.kubernetes.io/name: "wildcard-certificate"
               app.kubernetes.io/instance: "ingress"
           type: kubernetes.io/tls
           data:
-            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
-            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+            tls.crt: {{ wildcard_cert_data.data['tls.crt'] }}
+            tls.key: {{ wildcard_cert_data.data['tls.key'] }}
+        dest: /tmp/primary-ingress-tls-secret.yaml
+        mode: '0644'
+
+    - name: Copy wildcard certificate to primary ingress namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/primary-ingress-tls-secret.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: primary_cert_copy
+      changed_when: "'created' in primary_cert_copy.stdout or 'configured' in primary_cert_copy.stdout"
       tags:
         - certificate
 
-    - name: Copy wildcard certificate to secondary ingress namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
+    - name: Create certificate secret YAML for secondary ingress namespace
+      ansible.builtin.copy:
+        content: |
           apiVersion: v1
           kind: Secret
           metadata:
-            name: "{{ ingress_kn_namespace }}-tls-secret"
-            namespace: "{{ ingress_kn_namespace }}"
+            name: {{ ingress_kn_namespace }}-tls-secret
+            namespace: {{ ingress_kn_namespace }}
             labels:
               app.kubernetes.io/name: "wildcard-certificate"
               app.kubernetes.io/instance: "ingress-kn"
           type: kubernetes.io/tls
           data:
-            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
-            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+            tls.crt: {{ wildcard_cert_data.data['tls.crt'] }}
+            tls.key: {{ wildcard_cert_data.data['tls.key'] }}
+        dest: /tmp/secondary-ingress-tls-secret.yaml
+        mode: '0644'
+
+    - name: Copy wildcard certificate to secondary ingress namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/secondary-ingress-tls-secret.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: secondary_cert_copy
+      changed_when: "'created' in secondary_cert_copy.stdout or 'configured' in secondary_cert_copy.stdout"
       tags:
         - certificate
 
