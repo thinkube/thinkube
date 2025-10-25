@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-# ansible/40_thinkube/core/infrastructure/k8s-snap/10_install_k8s.yaml
+# ansible/40_thinkube/core/infrastructure/k8s/10_install_k8s.yaml
 # Description:
-#   Installs and configures Canonical Kubernetes (k8s-snap) on control plane node
+#   Installs and configures Canonical Kubernetes (via k8s-snap) on control plane node
+#   - Installs k8s snap package
+#   - Installs kubectl and helm binaries (no sudo required)
+#   - Creates k8s-hostpath StorageClass (alias to csi-rawfile-default)
+#   - Configures MetalLB load balancer
 #
 # Requirements:
 #   - Ubuntu 24.04 LTS
@@ -15,16 +19,16 @@
 #
 # Usage:
 #   cd ~/thinkube
-#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s-snap/10_install_k8s.yaml
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s/10_install_k8s.yaml
 #
 # Variables from inventory:
-#   - system_username: User to configure kubectl/helm wrappers for
+#   - system_username: User to install kubectl/helm for
 #   - domain_name: Domain name for services
 #   - zerotier_subnet_prefix: ZeroTier network subnet prefix
 #
 # 🤖 [AI-assisted]
 
-- name: Install Canonical Kubernetes (k8s-snap) Control Plane
+- name: Install Canonical Kubernetes Control Plane
   hosts: k8s_control_plane
   become: true
   gather_facts: true
@@ -242,7 +246,7 @@
         success_msg: "Storage class csi-rawfile-default is available"
 
     # ===========================
-    # kubectl and helm Wrapper Scripts
+    # Install kubectl and helm Binaries (No Sudo Required)
     # ===========================
     - name: Create .local/bin directory for user
       ansible.builtin.file:
@@ -253,29 +257,42 @@
         mode: '0755'
       become_user: "{{ user }}"
 
-    - name: Create kubectl wrapper script
-      ansible.builtin.copy:
-        content: |
-          #!/bin/bash
-          # kubectl wrapper for k8s-snap
-          exec sudo k8s kubectl "$@"
+    - name: Detect system architecture
+      ansible.builtin.set_fact:
+        system_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+
+    - name: Download kubectl binary
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/release/v{{ k8s_version }}/bin/linux/{{ system_arch }}/kubectl"
         dest: "{{ kubectl_wrapper_path }}"
+        mode: '0755'
         owner: "{{ user }}"
         group: "{{ user }}"
-        mode: '0755'
       become_user: "{{ user }}"
 
-    - name: Create helm wrapper script
-      ansible.builtin.copy:
-        content: |
-          #!/bin/bash
-          # helm wrapper for k8s-snap
-          exec sudo k8s helm "$@"
-        dest: "{{ helm_wrapper_path }}"
+    - name: Download helm installer
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3"
+        dest: "/tmp/get-helm-3.sh"
+        mode: '0755'
+
+    - name: Install helm binary
+      ansible.builtin.shell: |
+        export HELM_INSTALL_DIR="{{ user_home }}/.local/bin"
+        export USE_SUDO=false
+        /tmp/get-helm-3.sh
+      args:
+        creates: "{{ helm_wrapper_path }}"
+      environment:
+        PATH: "{{ user_home }}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      become_user: "{{ user }}"
+
+    - name: Set helm binary ownership
+      ansible.builtin.file:
+        path: "{{ helm_wrapper_path }}"
         owner: "{{ user }}"
         group: "{{ user }}"
         mode: '0755'
-      become_user: "{{ user }}"
 
     # ===========================
     # Create kubeconfig for user
@@ -302,6 +319,30 @@
         group: "{{ user }}"
         mode: '0600'
       become: false
+
+    # ===========================
+    # Deploy k8s-hostpath StorageClass
+    # ===========================
+    - name: Copy k8s-hostpath StorageClass manifest
+      ansible.builtin.copy:
+        src: files/k8s-hostpath-storageclass.yaml
+        dest: /tmp/k8s-hostpath-storageclass.yaml
+        mode: '0644'
+
+    - name: Deploy k8s-hostpath StorageClass
+      ansible.builtin.shell: |
+        k8s kubectl apply -f /tmp/k8s-hostpath-storageclass.yaml
+      register: storageclass_result
+      changed_when: "'created' in storageclass_result.stdout or 'configured' in storageclass_result.stdout"
+
+    - name: Verify k8s-hostpath StorageClass exists
+      ansible.builtin.command: k8s kubectl get storageclass k8s-hostpath
+      register: k8s_hostpath_sc
+      changed_when: false
+
+    - name: Display StorageClass status
+      ansible.builtin.debug:
+        msg: "k8s-hostpath StorageClass deployed successfully (using rawfile.csi.openebs.io provisioner)"
 
     # ===========================
     # Thinkube Shared Shell Alias System Integration
@@ -547,9 +588,11 @@
           - "Node Status: {{ 'Ready' if 'Ready' in nodes_status.stdout else 'Not Ready' }}"
           - "CoreDNS: {{ 'Running' if coredns_wait.rc == 0 else 'Not Ready' }}"
           - "Cilium CNI: {{ 'Running' if cilium_wait.rc == 0 else 'Not Ready' }}"
-          - "Storage Class: csi-rawfile-default"
+          - "Storage Classes: csi-rawfile-default (default), k8s-hostpath"
+          - "kubectl: Installed at {{ kubectl_wrapper_path }} (no sudo required)"
+          - "helm: Installed at {{ helm_wrapper_path }} (no sudo required)"
           - "==============================================="
           - "Next Steps:"
-          - "1. Join worker nodes: ansible/40_thinkube/core/infrastructure/k8s-snap/20_join_workers.yaml"
+          - "1. Join worker nodes: ansible/40_thinkube/core/infrastructure/k8s/20_join_workers.yaml"
           - "2. Install GPU Operator: ansible/40_thinkube/core/infrastructure/gpu_operator/10_deploy.yaml"
           - "==============================================="
