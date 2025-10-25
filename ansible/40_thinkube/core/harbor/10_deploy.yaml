@@ -77,9 +77,12 @@
         - { source: "harbor-portal", dest: "tk-harbor-harbor-portal" }
         - { source: "harbor-registryctl", dest: "tk-harbor-harbor-registryctl" }
         - { source: "registry-harbor", dest: "tk-harbor-registry-photon" }
-        - { source: "redis-photon", dest: "tk-harbor-redis-photon" }
-        - { source: "trivy-adapter-photon", dest: "tk-harbor-trivy-adapter-photon" }
       register: pull_result
+      changed_when: true
+
+    - name: Pull Valkey image for Redis replacement (BSD license, Apache compatible)
+      ansible.builtin.command:
+        cmd: "podman pull docker.io/valkey/valkey:latest"
       changed_when: true
 
     - name: Tag Harbor images with tk-harbor prefix
@@ -92,52 +95,52 @@
         - { source: "harbor-portal", dest: "tk-harbor-harbor-portal" }
         - { source: "harbor-registryctl", dest: "tk-harbor-harbor-registryctl" }
         - { source: "registry-harbor", dest: "tk-harbor-registry-photon" }
-        - { source: "redis-photon", dest: "tk-harbor-redis-photon" }
-        - { source: "trivy-adapter-photon", dest: "tk-harbor-trivy-adapter-photon" }
+      changed_when: true
+
+    - name: Tag Valkey image for Harbor use
+      ansible.builtin.command:
+        cmd: "podman tag docker.io/valkey/valkey:latest tk-harbor-redis-photon:v2.14.0"
       changed_when: true
 
     - name: Save Harbor images to tar files
       ansible.builtin.command:
-        cmd: "podman save -o /tmp/tk-harbor-{{ item.dest }}.tar {{ item.dest }}:v2.14.0"
+        cmd: "podman save -o /tmp/tk-harbor-{{ item }}.tar tk-harbor-{{ item }}:v2.14.0"
       loop:
-        - { source: "harbor-core", dest: "tk-harbor-harbor-core" }
-        - { source: "harbor-db", dest: "tk-harbor-harbor-db" }
-        - { source: "jobservice-harbor", dest: "tk-harbor-harbor-jobservice" }
-        - { source: "harbor-portal", dest: "tk-harbor-harbor-portal" }
-        - { source: "harbor-registryctl", dest: "tk-harbor-harbor-registryctl" }
-        - { source: "registry-harbor", dest: "tk-harbor-registry-photon" }
-        - { source: "redis-photon", dest: "tk-harbor-redis-photon" }
-        - { source: "trivy-adapter-photon", dest: "tk-harbor-trivy-adapter-photon" }
+        - harbor-core
+        - harbor-db
+        - harbor-jobservice
+        - harbor-portal
+        - harbor-registryctl
+        - registry-photon
+        - redis-photon
       changed_when: true
 
     - name: Import Harbor images into containerd
       ansible.builtin.shell: |
         sudo /snap/k8s/current/bin/ctr --address /run/containerd/containerd.sock \
-          --namespace k8s.io images import /tmp/tk-harbor-{{ item.dest }}.tar
+          --namespace k8s.io images import /tmp/tk-harbor-{{ item }}.tar
       loop:
-        - { source: "harbor-core", dest: "tk-harbor-harbor-core" }
-        - { source: "harbor-db", dest: "tk-harbor-harbor-db" }
-        - { source: "jobservice-harbor", dest: "tk-harbor-harbor-jobservice" }
-        - { source: "harbor-portal", dest: "tk-harbor-harbor-portal" }
-        - { source: "harbor-registryctl", dest: "tk-harbor-harbor-registryctl" }
-        - { source: "registry-harbor", dest: "tk-harbor-registry-photon" }
-        - { source: "redis-photon", dest: "tk-harbor-redis-photon" }
-        - { source: "trivy-adapter-photon", dest: "tk-harbor-trivy-adapter-photon" }
+        - harbor-core
+        - harbor-db
+        - harbor-jobservice
+        - harbor-portal
+        - harbor-registryctl
+        - registry-photon
+        - redis-photon
       changed_when: true
 
     - name: Clean up tar files
       ansible.builtin.file:
-        path: "/tmp/tk-harbor-{{ item.dest }}.tar"
+        path: "/tmp/tk-harbor-{{ item }}.tar"
         state: absent
       loop:
-        - { source: "harbor-core", dest: "tk-harbor-harbor-core" }
-        - { source: "harbor-db", dest: "tk-harbor-harbor-db" }
-        - { source: "jobservice-harbor", dest: "tk-harbor-harbor-jobservice" }
-        - { source: "harbor-portal", dest: "tk-harbor-harbor-portal" }
-        - { source: "harbor-registryctl", dest: "tk-harbor-harbor-registryctl" }
-        - { source: "registry-harbor", dest: "tk-harbor-registry-photon" }
-        - { source: "redis-photon", dest: "tk-harbor-redis-photon" }
-        - { source: "trivy-adapter-photon", dest: "tk-harbor-trivy-adapter-photon" }
+        - harbor-core
+        - harbor-db
+        - harbor-jobservice
+        - harbor-portal
+        - harbor-registryctl
+        - registry-photon
+        - redis-photon
 
     - name: Get control plane hostname for nodeSelector
       ansible.builtin.set_fact:
@@ -509,11 +512,7 @@
                 kubernetes.io/hostname: {{ control_plane_hostname }}
 
           trivy:
-            image:
-              repository: tk-harbor-trivy-adapter-photon
-              tag: v2.14.0
-            nodeSelector:
-              kubernetes.io/hostname: {{ control_plane_hostname }}
+            enabled: false  # Disabled - no ARM64 image available for trivy-adapter-photon
 
           persistence:
             enabled: true
@@ -536,10 +535,6 @@
                 storageClass: "k8s-hostpath"
                 accessMode: ReadWriteOnce
                 size: 2Gi
-              trivy:
-                storageClass: "k8s-hostpath"
-                accessMode: ReadWriteOnce
-                size: 10Gi
 
     - name: Deploy Harbor using Helm
       ansible.builtin.command:
