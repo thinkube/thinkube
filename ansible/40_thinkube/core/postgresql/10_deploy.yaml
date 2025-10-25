@@ -32,6 +32,7 @@
 - name: Deploy PostgreSQL using Quay.io container image
   hosts: k8s_control_plane  # Use k8s_control_plane (NOT k8s-control-node or gato-p)
   gather_facts: true
+  become: false
   vars:
     ###########################################################################
     # 1) Basic Postgres Info
@@ -93,14 +94,12 @@
         if ! {{ kubectl_bin }} get namespace {{ postgres_namespace }}; then
           {{ kubectl_bin }} create namespace {{ postgres_namespace }}
         fi
-      become: true
       register: ensure_ns
       changed_when: ensure_ns.stdout != ""
 
     - name: Get wildcard certificate from default namespace
       ansible.builtin.shell: |
         {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
-      become: true
       register: wildcard_cert_raw
       failed_when: wildcard_cert_raw.rc != 0
 
@@ -113,7 +112,6 @@
     - name: Check if TLS secret already exists in PostgreSQL namespace
       ansible.builtin.shell: |
         {{ kubectl_bin }} get secret {{ postgres_tls_secret_name }} -n {{ postgres_namespace }} -o json
-      become: true
       register: existing_cert_check_raw
       failed_when: false
       changed_when: false
@@ -137,19 +135,16 @@
             tls.key: {{ wildcard_cert.resources[0].data['tls.key'] }}
         dest: /tmp/postgres-tls-secret.yaml
         mode: '0600'
-      become: true
 
     - name: Copy wildcard certificate to PostgreSQL namespace
       ansible.builtin.shell: |
         {{ kubectl_bin }} apply -f /tmp/postgres-tls-secret.yaml
-      become: true
       register: cert_copy
       changed_when: "'created' in cert_copy.stdout or 'configured' in cert_copy.stdout"
       
     - name: Verify TLS secret exists
       ansible.builtin.shell: |
         {{ kubectl_bin }} get secret {{ postgres_tls_secret_name }} -n {{ postgres_namespace }} -o json
-      become: true
       register: cert_check_raw
       failed_when: cert_check_raw.rc != 0
 
@@ -186,12 +181,10 @@
                 storage: {{ postgres_persistence_size }}
         dest: /tmp/postgres-pvc.yaml
         mode: '0644'
-      become: true
 
     - name: Create PVC for PostgreSQL data
       ansible.builtin.shell: |
         {{ kubectl_bin }} apply -f /tmp/postgres-pvc.yaml
-      become: true
       register: pvc_create
       changed_when: "'created' in pvc_create.stdout or 'configured' in pvc_create.stdout"
 
@@ -256,12 +249,10 @@
                       storage: {{ postgres_persistence_size }}
         dest: /tmp/postgres-statefulset.yaml
         mode: '0644'
-      become: true
 
     - name: Deploy PostgreSQL StatefulSet
       ansible.builtin.shell: |
         {{ kubectl_bin }} apply -f /tmp/postgres-statefulset.yaml
-      become: true
       register: statefulset_deploy
       changed_when: "'created' in statefulset_deploy.stdout or 'configured' in statefulset_deploy.stdout"
 
@@ -287,12 +278,10 @@
                 targetPort: 5432
         dest: /tmp/postgres-service.yaml
         mode: '0644'
-      become: true
 
     - name: Create Service for PostgreSQL
       ansible.builtin.shell: |
         {{ kubectl_bin }} apply -f /tmp/postgres-service.yaml
-      become: true
       register: service_create
       changed_when: "'created' in service_create.stdout or 'configured' in service_create.stdout"
 
@@ -326,7 +315,6 @@
         done
         echo "Timeout waiting for pod to be ready"
         exit 1
-      become: true
       register: wait_for_pg
       failed_when: wait_for_pg.rc != 0
 
@@ -340,7 +328,6 @@
     - name: Display NGINX Ingress TCP ConfigMap (non-fatal)
       ansible.builtin.shell: |
         {{ kubectl_bin }} get configmap {{ ingress_tcp_configmap_name }} -n {{ ingress_namespace }} -o yaml || echo "ConfigMap not found yet"
-      become: true
       register: current_ingress_map
       failed_when: false
       ignore_errors: true
@@ -371,12 +358,10 @@
             "{{ postgres_tcp_port }}": "{{ postgres_namespace }}/{{ postgres_release_name }}:{{ postgres_tcp_port }}"
         dest: /tmp/nginx-tcp-configmap.yaml
         mode: '0644'
-      become: true
 
     - name: Create or update NGINX Ingress TCP ConfigMap for PostgreSQL
       ansible.builtin.shell: |
         {{ kubectl_bin }} apply -f /tmp/nginx-tcp-configmap.yaml
-      become: true
       register: configmap_update
       changed_when: "'created' in configmap_update.stdout or 'configured' in configmap_update.stdout"
 
@@ -384,21 +369,18 @@
     - name: Restart NGINX Ingress controller to pick up TCP config changes
       ansible.builtin.shell: |
         {{ kubectl_bin }} rollout restart deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }}
-      become: true
       register: rollout_restart
       ignore_errors: false
 
     - name: Wait for Ingress controller to restart
       ansible.builtin.shell: |
         {{ kubectl_bin }} rollout status deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }} --timeout=60s
-      become: true
       register: rollout_status
       failed_when: rollout_status.rc != 0
 
     - name: Check if PostgreSQL port is already exposed in Ingress
       ansible.builtin.shell: |
         {{ kubectl_bin }} get deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.template.spec.containers[0].ports[*].containerPort}' | grep -q "{{ postgres_tcp_port }}"
-      become: true
       register: port_check
       changed_when: false
       failed_when: false
@@ -420,7 +402,6 @@
               }
             }
           ]'
-      become: true
       register: patch_deploy
       changed_when: "'patched' in patch_deploy.stdout or patch_deploy.rc == 0"
       when: port_check.rc != 0
@@ -429,7 +410,6 @@
     - name: Check if PostgreSQL port is already exposed in Ingress Service
       ansible.builtin.shell: |
         {{ kubectl_bin }} get service -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.ports[*].port}' | grep -q "{{ postgres_tcp_port }}"
-      become: true
       register: service_port_check
       changed_when: false
       failed_when: false
@@ -450,7 +430,6 @@
               }
             }
           ]'
-      become: true
       register: patch_service
       changed_when: "'patched' in patch_service.stdout or patch_service.rc == 0"
       when: service_port_check.rc != 0
