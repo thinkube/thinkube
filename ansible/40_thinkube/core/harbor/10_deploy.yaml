@@ -503,9 +503,6 @@
             image:
               repository: localhost/tk-harbor-harbor-portal
               tag: v2.14.0
-            # Fix ranichowdary image bug: both Entrypoint and Cmd are set to same value
-            # Override command to prevent duplication
-            command: ["nginx", "-g", "daemon off;"]
             nodeSelector:
               kubernetes.io/hostname: {{ control_plane_hostname }}
 
@@ -521,9 +518,6 @@
               image:
                 repository: localhost/tk-harbor-registry-photon
                 tag: v2.14.0
-              # Fix ranichowdary image bug: no Entrypoint or Cmd set
-              # Override command to run entrypoint script that starts registry daemon
-              command: ["/home/harbor/entrypoint.sh"]
             controller:
               image:
                 repository: localhost/tk-harbor-harbor-registryctl
@@ -580,12 +574,46 @@
           --namespace {{ harbor_namespace }}
           --create-namespace=false
           --values {{ harbor_values }}
-          --wait
+          --wait=false
           --timeout 600s
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: helm_install
       changed_when: "'deployed' in helm_install.stdout or 'upgraded' in helm_install.stdout"
+
+    - name: Patch harbor-portal deployment to fix command duplication
+      ansible.builtin.command:
+        cmd: >
+          {{ kubectl_bin }} patch deployment harbor-portal
+          -n {{ harbor_namespace }}
+          --type=json
+          -p='[{"op": "add", "path": "/spec/template/spec/containers/0/command", "value": ["nginx", "-g", "daemon off;"]}]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+
+    - name: Patch harbor-registry deployment to fix missing entrypoint
+      ansible.builtin.command:
+        cmd: >
+          {{ kubectl_bin }} patch deployment harbor-registry
+          -n {{ harbor_namespace }}
+          --type=json
+          -p='[{"op": "add", "path": "/spec/template/spec/containers/0/command", "value": ["/home/harbor/entrypoint.sh"]}]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+
+    - name: Wait for Harbor pods to be ready
+      ansible.builtin.command:
+        cmd: >
+          {{ kubectl_bin }} wait --for=condition=Ready pod
+          --selector app=harbor
+          -n {{ harbor_namespace }}
+          --timeout=600s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wait_result
+      changed_when: false
 
     - name: Wait for Harbor pods readiness
       ansible.builtin.command:
