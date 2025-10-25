@@ -30,7 +30,7 @@
 
 - name: Install Canonical Kubernetes Control Plane
   hosts: k8s_control_plane
-  become: true
+  become: false
   gather_facts: true
 
   vars:
@@ -73,6 +73,7 @@
     - name: Check if Docker is installed (DGX Spark specific)
       ansible.builtin.systemd:
         name: docker
+      become: true
       register: docker_service
       failed_when: false
       changed_when: false
@@ -82,6 +83,7 @@
         name: docker
         state: stopped
         enabled: false
+      become: true
       when: docker_service.status is defined and docker_service.status.LoadState == 'loaded'
 
     # ===========================
@@ -92,6 +94,7 @@
         name: ufw
         state: present
         update_cache: true
+      become: true
 
     - name: Configure UFW default forward policy to ACCEPT (required for k8s networking)
       ansible.builtin.lineinfile:
@@ -99,6 +102,7 @@
         regexp: '^DEFAULT_FORWARD_POLICY='
         line: 'DEFAULT_FORWARD_POLICY="ACCEPT"'
         backup: true
+      become: true
       notify: reload_ufw
 
     - name: Allow k8s API server port (6443/tcp)
@@ -107,6 +111,7 @@
         port: '6443'
         proto: tcp
         comment: 'k8s API server'
+      become: true
 
     - name: Allow k8s cluster daemon port (6400/tcp)
       community.general.ufw:
@@ -114,6 +119,7 @@
         port: '6400'
         proto: tcp
         comment: 'k8s cluster daemon'
+      become: true
 
     - name: Allow kubelet API port (10250/tcp)
       community.general.ufw:
@@ -121,6 +127,7 @@
         port: '10250'
         proto: tcp
         comment: 'k8s kubelet'
+      become: true
 
     - name: Allow Cilium health port (4240/tcp)
       community.general.ufw:
@@ -128,6 +135,7 @@
         port: '4240'
         proto: tcp
         comment: 'Cilium networking'
+      become: true
 
     - name: Allow Cilium VXLAN port (8472/udp)
       community.general.ufw:
@@ -135,25 +143,30 @@
         port: '8472'
         proto: udp
         comment: 'Cilium VXLAN'
+      become: true
 
     - name: Allow traffic on cilium_host interface
       community.general.ufw:
         rule: allow
         interface: cilium_host
         direction: in
+      become: true
 
     - name: Allow outbound traffic on cilium_host interface
       community.general.ufw:
         rule: allow
         interface: cilium_host
         direction: out
+      become: true
 
     - name: Enable UFW
       community.general.ufw:
         state: enabled
+      become: true
 
     - name: Reload UFW to apply forward policy
       ansible.builtin.command: ufw reload
+      become: true
       changed_when: true
       when: ufw_forward_policy_changed | default(false)
 
@@ -162,6 +175,7 @@
     # ===========================
     - name: Check if k8s-snap is already installed
       ansible.builtin.command: snap list k8s
+      become: true
       register: k8s_snap_check
       failed_when: false
       changed_when: false
@@ -172,10 +186,12 @@
         classic: true
         channel: "{{ k8s_channel }}"
         state: present
+      become: true
       when: k8s_snap_check.rc != 0
 
     - name: Bootstrap k8s cluster
       ansible.builtin.command: k8s bootstrap
+      become: true
       register: bootstrap_result
       changed_when: "'Bootstrapped' in bootstrap_result.stdout or 'already bootstrapped' not in bootstrap_result.stderr"
       failed_when:
@@ -184,6 +200,7 @@
 
     - name: Wait for k8s cluster to be ready
       ansible.builtin.command: k8s status --wait-ready
+      become: true
       register: k8s_status
       retries: 30
       delay: 10
@@ -192,6 +209,7 @@
 
     - name: Verify cluster status
       ansible.builtin.command: k8s status
+      become: true
       register: cluster_status
       changed_when: false
 
@@ -204,6 +222,7 @@
     # ===========================
     - name: Wait for CoreDNS to be ready
       ansible.builtin.command: k8s kubectl wait --for=condition=ready pod -l k8s-app=coredns -n kube-system --timeout=300s
+      become: true
       register: coredns_wait
       retries: 3
       delay: 10
@@ -212,6 +231,7 @@
 
     - name: Wait for Cilium to be ready
       ansible.builtin.command: k8s kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=300s
+      become: true
       register: cilium_wait
       retries: 3
       delay: 10
@@ -220,6 +240,7 @@
 
     - name: Verify node is ready
       ansible.builtin.command: k8s kubectl get nodes
+      become: true
       register: nodes_status
       changed_when: false
 
@@ -235,6 +256,7 @@
     # ===========================
     - name: Get storage classes
       ansible.builtin.command: k8s kubectl get storageclass
+      become: true
       register: storage_classes
       changed_when: false
 
@@ -309,6 +331,7 @@
     - name: Generate kubeconfig file
       ansible.builtin.shell: |
         k8s config > {{ user_home }}/.kube/config
+      become: true
       args:
         creates: "{{ user_home }}/.kube/config"
 
@@ -318,6 +341,7 @@
         owner: "{{ user }}"
         group: "{{ user }}"
         mode: '0600'
+      become: true
 
     # ===========================
     # Deploy k8s-hostpath StorageClass
@@ -331,11 +355,13 @@
     - name: Deploy k8s-hostpath StorageClass
       ansible.builtin.shell: |
         k8s kubectl apply -f /tmp/k8s-hostpath-storageclass.yaml
+      become: true
       register: storageclass_result
       changed_when: "'created' in storageclass_result.stdout or 'configured' in storageclass_result.stdout"
 
     - name: Verify k8s-hostpath StorageClass exists
       ansible.builtin.command: k8s kubectl get storageclass k8s-hostpath
+      become: true
       register: k8s_hostpath_sc
       changed_when: false
 
@@ -495,6 +521,7 @@
           name: nvidia
         handler: nvidia
         EOF
+      become: true
       register: runtimeclass_result
       changed_when: "'created' in runtimeclass_result.stdout or 'configured' in runtimeclass_result.stdout"
       failed_when:
@@ -506,10 +533,12 @@
     # ===========================
     - name: Add MetalLB Helm repository
       ansible.builtin.command: "{{ helm_bin }} repo add metallb https://metallb.github.io/metallb --force-update"
+      become_user: "{{ user }}"
       changed_when: false
 
     - name: Update Helm repositories
       ansible.builtin.command: "{{ helm_bin }} repo update"
+      become_user: "{{ user }}"
       changed_when: false
 
     - name: Install MetalLB via Helm
@@ -519,11 +548,13 @@
           --create-namespace \
           --wait \
           --timeout 5m
+      become_user: "{{ user }}"
       register: metallb_install
       changed_when: "'STATUS: deployed' in metallb_install.stdout or 'has been upgraded' in metallb_install.stdout"
 
     - name: Wait for MetalLB controller to be ready
       ansible.builtin.command: "k8s kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=controller -n metallb-system --timeout=300s"
+      become: true
       register: metallb_controller_wait
       retries: 3
       delay: 10
@@ -547,6 +578,7 @@
           addresses:
           - {{ metallb_ip_range_start }}-{{ metallb_ip_range_end }}
         EOF
+      become: true
       register: metallb_pool_result
       changed_when: "'created' in metallb_pool_result.stdout or 'configured' in metallb_pool_result.stdout"
 
@@ -562,6 +594,7 @@
           ipAddressPools:
           - default-pool
         EOF
+      become: true
       register: metallb_l2_result
       changed_when: "'created' in metallb_l2_result.stdout or 'configured' in metallb_l2_result.stdout"
 
@@ -572,6 +605,7 @@
   handlers:
     - name: reload_ufw
       ansible.builtin.command: ufw reload
+      become: true
       listen: reload_ufw
       changed_when: true
 
