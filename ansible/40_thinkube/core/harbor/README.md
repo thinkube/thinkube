@@ -185,6 +185,49 @@ This will:
 - Delete the namespace
 - Clean up temporary files
 
+## ARM64 Support
+
+Harbor v2.14.0 does not provide official ARM64 container images. Thinkube builds custom images using a multi-architecture branch:
+
+### Image Build Process
+
+The deployment playbook (`10_deploy.yaml`) automatically:
+1. Clones Harbor source from https://github.com/ranimandepudi/harbor (multiarch-platform-support branch)
+2. Installs build dependencies (golang, make, git, podman)
+3. Builds Harbor images for the host architecture using `make package_online`
+4. Tags images with `tk-harbor-*` prefix
+5. Imports images into containerd on the control plane node
+
+### Architecture Pinning
+
+**IMPORTANT**: All Harbor components are pinned to the k8s_control_plane node using nodeSelector.
+
+**Why?**
+- Images are built only on the control plane node
+- Images match the control plane's architecture (ARM64 or AMD64)
+- Prevents "exec format error" when pods schedule on nodes with different architectures
+
+**Limitation**: In multi-architecture clusters (e.g., ARM64 control plane + AMD64 workers), Harbor will only run on the control plane node.
+
+**Future Enhancement**: To support multi-architecture clusters, we could:
+- Build multi-arch images using podman buildx with QEMU emulation
+- Build and import images on all nodes (one build per architecture)
+- Wait for official Harbor ARM64 support (https://github.com/goharbor/harbor/pull/21825)
+
+### Custom Image Names
+
+All Harbor images use the `tk-harbor-` prefix:
+- `tk-harbor-harbor-core:v2.14.0`
+- `tk-harbor-harbor-db:v2.14.0`
+- `tk-harbor-harbor-jobservice:v2.14.0`
+- `tk-harbor-harbor-portal:v2.14.0`
+- `tk-harbor-harbor-registryctl:v2.14.0`
+- `tk-harbor-registry-photon:v2.14.0`
+- `tk-harbor-redis-photon:v2.14.0`
+- `tk-harbor-trivy-adapter-photon:v2.14.0`
+
+The Helm values are configured with `imagePullPolicy: Never` to use local images.
+
 ## Notes
 
 - Harbor includes its own PostgreSQL database and Redis instance
@@ -194,5 +237,6 @@ This will:
 - Robot accounts are used for automated registry operations
 - All installation-specific values must be defined in inventory
 - Environment variables follow the project standard: ADMIN_PASSWORD, AUTH_REALM_PASSWORD
+- **Harbor components are pinned to the control plane node** (see ARM64 Support section)
 
 🤖 [AI-assisted]

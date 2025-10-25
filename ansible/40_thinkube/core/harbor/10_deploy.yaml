@@ -61,7 +61,115 @@
 
   tasks:
     ########################################################################
-    # 1. Keycloak OIDC Client, Scope Setup, harbor-admins Group
+    # 1. Build Harbor ARM64/AMD64 Images
+    ########################################################################
+    # Harbor v2.14.0 doesn't provide official ARM64 images, so we build our own
+    # using the multi-arch branch from https://github.com/ranimandepudi/harbor
+    # Images are built on the control plane node and Harbor is pinned there
+    # to ensure architecture compatibility.
+
+    - name: Check if Harbor source already exists
+      ansible.builtin.stat:
+        path: /tmp/harbor-build
+      register: harbor_src
+
+    - name: Remove existing Harbor source if present
+      ansible.builtin.file:
+        path: /tmp/harbor-build
+        state: absent
+      when: harbor_src.stat.exists
+
+    - name: Clone Harbor repository with multi-arch support
+      ansible.builtin.git:
+        repo: "https://github.com/ranimandepudi/harbor.git"
+        dest: /tmp/harbor-build
+        version: "multiarch-platform-support"
+        depth: 1
+
+    - name: Install build dependencies
+      ansible.builtin.package:
+        name:
+          - golang
+          - make
+          - git
+          - podman
+        state: present
+      become: true
+
+    - name: Build Harbor images for host architecture
+      ansible.builtin.shell: |
+        cd /tmp/harbor-build
+        make package_online GOBUILDTAGS="include_oss include_gcs" VERSIONTAG=v2.14.0 PKGVERSIONTAG=v2.14.0
+      register: harbor_build
+      changed_when: true
+      async: 3600
+      poll: 60
+
+    - name: Tag Harbor images with tk-harbor prefix
+      ansible.builtin.command:
+        cmd: "podman tag goharbor/{{ item }}:v2.14.0 tk-harbor-{{ item }}:v2.14.0"
+      loop:
+        - harbor-core
+        - harbor-db
+        - harbor-jobservice
+        - harbor-portal
+        - harbor-registryctl
+        - registry-photon
+        - redis-photon
+        - trivy-adapter-photon
+      register: tag_result
+      changed_when: true
+      failed_when: false
+
+    - name: Save Harbor images to tar files
+      ansible.builtin.command:
+        cmd: "podman save -o /tmp/harbor-build/tk-harbor-{{ item }}.tar tk-harbor-{{ item }}:v2.14.0"
+      loop:
+        - harbor-core
+        - harbor-db
+        - harbor-jobservice
+        - harbor-portal
+        - harbor-registryctl
+        - registry-photon
+        - redis-photon
+        - trivy-adapter-photon
+      changed_when: true
+
+    - name: Import Harbor images into containerd
+      ansible.builtin.shell: |
+        sudo /snap/k8s/current/bin/ctr --address /run/containerd/containerd.sock \
+          --namespace k8s.io images import /tmp/harbor-build/tk-harbor-{{ item }}.tar
+      loop:
+        - harbor-core
+        - harbor-db
+        - harbor-jobservice
+        - harbor-portal
+        - harbor-registryctl
+        - registry-photon
+        - redis-photon
+        - trivy-adapter-photon
+      changed_when: true
+
+    - name: Clean up tar files
+      ansible.builtin.file:
+        path: "/tmp/harbor-build/tk-harbor-{{ item }}.tar"
+        state: absent
+      loop:
+        - harbor-core
+        - harbor-db
+        - harbor-jobservice
+        - harbor-portal
+        - harbor-registryctl
+        - registry-photon
+        - redis-photon
+        - trivy-adapter-photon
+
+    - name: Get control plane hostname for nodeSelector
+      ansible.builtin.set_fact:
+        control_plane_hostname: "{{ inventory_hostname }}"
+
+    ########################################################################
+    # 2. Keycloak OIDC Client, Scope Setup, harbor-admins Group
     ########################################################################
 
     - name: Get Keycloak admin token
@@ -370,6 +478,67 @@
                 secretName: harbor-tls-secret
 
           externalURL: https://{{ harbor_registry }}
+
+          # Use custom-built tk-harbor images (built on control plane)
+          # Harbor v2.14.0 doesn't provide official ARM64 images
+          # All components pinned to control plane where images are built
+          imagePullPolicy: Never
+
+          core:
+            image:
+              repository: tk-harbor-harbor-core
+              tag: v2.14.0
+            nodeSelector:
+              kubernetes.io/hostname: {{ control_plane_hostname }}
+
+          portal:
+            image:
+              repository: tk-harbor-harbor-portal
+              tag: v2.14.0
+            nodeSelector:
+              kubernetes.io/hostname: {{ control_plane_hostname }}
+
+          jobservice:
+            image:
+              repository: tk-harbor-harbor-jobservice
+              tag: v2.14.0
+            nodeSelector:
+              kubernetes.io/hostname: {{ control_plane_hostname }}
+
+          registry:
+            registry:
+              image:
+                repository: tk-harbor-registry-photon
+                tag: v2.14.0
+            controller:
+              image:
+                repository: tk-harbor-harbor-registryctl
+                tag: v2.14.0
+            nodeSelector:
+              kubernetes.io/hostname: {{ control_plane_hostname }}
+
+          database:
+            internal:
+              image:
+                repository: tk-harbor-harbor-db
+                tag: v2.14.0
+              nodeSelector:
+                kubernetes.io/hostname: {{ control_plane_hostname }}
+
+          redis:
+            internal:
+              image:
+                repository: tk-harbor-redis-photon
+                tag: v2.14.0
+              nodeSelector:
+                kubernetes.io/hostname: {{ control_plane_hostname }}
+
+          trivy:
+            image:
+              repository: tk-harbor-trivy-adapter-photon
+              tag: v2.14.0
+            nodeSelector:
+              kubernetes.io/hostname: {{ control_plane_hostname }}
 
           persistence:
             enabled: true
