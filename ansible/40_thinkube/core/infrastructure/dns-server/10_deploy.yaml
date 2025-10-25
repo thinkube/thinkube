@@ -223,20 +223,25 @@
           *       IN      A       {{ secondary_ingress_ip }}
 
     # Create ConfigMaps for BIND9 configuration
+    - name: Create temporary named.conf file
+      ansible.builtin.copy:
+        content: "{{ named_conf }}"
+        dest: "/tmp/bind9-named.conf"
+        mode: '0644'
+
+    - name: Create temporary zones.conf file
+      ansible.builtin.copy:
+        content: "{{ zones_conf }}"
+        dest: "/tmp/bind9-zones.conf"
+        mode: '0644'
+
     - name: Create ConfigMap for BIND9 configuration
       ansible.builtin.shell: |
-        cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: v1
-        kind: ConfigMap
-        metadata:
-          name: bind9-config
-          namespace: {{ dns_namespace }}
-        data:
-          named.conf: |
-        {{ named_conf | indent(4, True) }}
-          zones.conf: |
-        {{ zones_conf | indent(4, True) }}
-        EOF
+        {{ kubectl_bin }} create configmap bind9-config \
+          --from-file=named.conf=/tmp/bind9-named.conf \
+          --from-file=zones.conf=/tmp/bind9-zones.conf \
+          -n {{ dns_namespace }} \
+          --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
       register: create_bind9_config
       changed_when: "'created' in create_bind9_config.stdout or 'configured' in create_bind9_config.stdout"
 
@@ -245,20 +250,25 @@
         zone_file_main: "db.{{ domain_name }}"
         zone_file_kn: "db.kn.{{ domain_name }}"
 
+    - name: Create temporary zone file for main domain
+      ansible.builtin.copy:
+        content: "{{ zone_main }}"
+        dest: "/tmp/{{ zone_file_main }}"
+        mode: '0644'
+
+    - name: Create temporary zone file for Knative domain
+      ansible.builtin.copy:
+        content: "{{ zone_kn }}"
+        dest: "/tmp/{{ zone_file_kn }}"
+        mode: '0644'
+
     - name: Create ConfigMap for zone files
       ansible.builtin.shell: |
-        cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: v1
-        kind: ConfigMap
-        metadata:
-          name: bind9-zones
-          namespace: {{ dns_namespace }}
-        data:
-          {{ zone_file_main }}: |
-        {{ zone_main | indent(4, True) }}
-          {{ zone_file_kn }}: |
-        {{ zone_kn | indent(4, True) }}
-        EOF
+        {{ kubectl_bin }} create configmap bind9-zones \
+          --from-file={{ zone_file_main }}=/tmp/{{ zone_file_main }} \
+          --from-file={{ zone_file_kn }}=/tmp/{{ zone_file_kn }} \
+          -n {{ dns_namespace }} \
+          --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
       register: create_bind9_zones
       changed_when: "'created' in create_bind9_zones.stdout or 'configured' in create_bind9_zones.stdout"
 
@@ -442,6 +452,16 @@
     - name: Display DNS test result
       ansible.builtin.debug:
         msg: "DNS resolution test for google.com: {{ dns_test.stdout }}"
+
+    - name: Clean up temporary configuration files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/bind9-named.conf"
+        - "/tmp/bind9-zones.conf"
+        - "/tmp/{{ zone_file_main }}"
+        - "/tmp/{{ zone_file_kn }}"
 
     - name: Display summary message
       ansible.builtin.debug:
