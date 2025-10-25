@@ -187,36 +187,48 @@ This will:
 
 ## ARM64 Support
 
-Harbor v2.14.0 does not provide official ARM64 container images. Thinkube builds custom images using a multi-architecture branch:
+Harbor v2.14.0 does not provide official ARM64 container images. Thinkube uses pre-built multi-architecture images from ranichowdary:
 
-### Image Build Process
+### Image Source
+
+Pre-built images from https://hub.docker.com/u/ranichowdary (author of Harbor's multiarch-platform-support branch):
+- `ranichowdary/harbor-core:latest`
+- `ranichowdary/harbor-db:latest`
+- `ranichowdary/jobservice-harbor:latest`
+- `ranichowdary/harbor-portal:latest`
+- `ranichowdary/harbor-registryctl:latest`
+- `ranichowdary/registry-harbor:latest`
+- `ranichowdary/redis-photon:latest`
+- `ranichowdary/trivy-adapter-photon:latest`
+
+These images support both ARM64 and AMD64 architectures.
+
+### Deployment Process
 
 The deployment playbook (`10_deploy.yaml`) automatically:
-1. Clones Harbor source from https://github.com/ranimandepudi/harbor (multiarch-platform-support branch)
-2. Installs build dependencies (golang, make, git, podman)
-3. Builds Harbor images for the host architecture using `make package_online`
-4. Tags images with `tk-harbor-*` prefix
-5. Imports images into containerd on the control plane node
+1. Pulls pre-built Harbor images from ranichowdary's Docker Hub repository
+2. Tags images with `tk-harbor-*` prefix for consistency
+3. Imports images into containerd on the control plane node
+4. Deploys Harbor using Helm with architecture-pinned nodeSelector
 
 ### Architecture Pinning
 
 **IMPORTANT**: All Harbor components are pinned to the k8s_control_plane node using nodeSelector.
 
 **Why?**
-- Images are built only on the control plane node
-- Images match the control plane's architecture (ARM64 or AMD64)
-- Prevents "exec format error" when pods schedule on nodes with different architectures
+- Images are imported only on the control plane node
+- Simplifies deployment (no need to import on all nodes)
+- Prevents scheduling issues when images aren't available on worker nodes
 
-**Limitation**: In multi-architecture clusters (e.g., ARM64 control plane + AMD64 workers), Harbor will only run on the control plane node.
+**Limitation**: In multi-node clusters, Harbor will only run on the control plane node.
 
-**Future Enhancement**: To support multi-architecture clusters, we could:
-- Build multi-arch images using podman buildx with QEMU emulation
-- Build and import images on all nodes (one build per architecture)
-- Wait for official Harbor ARM64 support (https://github.com/goharbor/harbor/pull/21825)
+**Future Enhancement**: To support multi-node scheduling:
+- Import images on all nodes during deployment
+- Or configure Harbor to use a container registry instead of local images
 
 ### Custom Image Names
 
-All Harbor images use the `tk-harbor-` prefix:
+All Harbor images are tagged with the `tk-harbor-` prefix for local use:
 - `tk-harbor-harbor-core:v2.14.0`
 - `tk-harbor-harbor-db:v2.14.0`
 - `tk-harbor-harbor-jobservice:v2.14.0`
@@ -226,7 +238,7 @@ All Harbor images use the `tk-harbor-` prefix:
 - `tk-harbor-redis-photon:v2.14.0`
 - `tk-harbor-trivy-adapter-photon:v2.14.0`
 
-The Helm values are configured with `imagePullPolicy: Never` to use local images.
+The Helm values are configured with `imagePullPolicy: Never` to use locally imported images.
 
 ## Notes
 
