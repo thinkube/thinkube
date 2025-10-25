@@ -5,10 +5,10 @@
 # Test Ingress Controllers deployment
 #
 # This playbook tests that the ingress controllers are correctly deployed
-# and configured in the MicroK8s cluster.
+# and configured in the k8s-snap cluster.
 #
 # Requirements:
-#   - MicroK8s cluster running
+#   - k8s-snap cluster running
 #   - Ingress controllers deployed (10_deploy.yaml)
 #
 # Usage:
@@ -27,112 +27,127 @@
 
   tasks:
     - name: Verify MetalLB is enabled
-      ansible.builtin.command: microk8s status --wait-ready
-      become: true
-      register: microk8s_status
-      failed_when: "'metallb' not in microk8s_status.stdout"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Deployment
+        namespace: kube-system
+        name: controller
+        label_selectors:
+          - app=metallb
+      register: metallb_check
+      failed_when: metallb_check.resources | length == 0
       tags:
         - test
 
     - name: Test - Primary ingress namespace exists
-      ansible.builtin.command: microk8s kubectl get namespace {{ primary_namespace }}
-      become: true
+      ansible.builtin.command: "{{ kubectl_bin }} get namespace {{ primary_namespace }}"
       register: primary_ns_check
       failed_when: primary_ns_check.rc != 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       tags:
         - test
 
     - name: Test - Secondary ingress namespace exists
-      ansible.builtin.command: microk8s kubectl get namespace {{ secondary_namespace }}
-      become: true
+      ansible.builtin.command: "{{ kubectl_bin }} get namespace {{ secondary_namespace }}"
       register: secondary_ns_check
       failed_when: secondary_ns_check.rc != 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       tags:
         - test
 
     - name: Test - Primary ingress controller pods are running
       ansible.builtin.command: >
-        microk8s kubectl get pods -n {{ primary_namespace }}
+        {{ kubectl_bin }} get pods -n {{ primary_namespace }}
         -l app.kubernetes.io/name=ingress-nginx
         -o jsonpath='{.items[*].status.phase}'
-      become: true
       register: primary_pods_status
       failed_when: "'Running' not in primary_pods_status.stdout"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       tags:
         - test
 
     - name: Test - Secondary ingress controller pods are running
       ansible.builtin.command: >
-        microk8s kubectl get pods -n {{ secondary_namespace }}
+        {{ kubectl_bin }} get pods -n {{ secondary_namespace }}
         -l app.kubernetes.io/name=ingress-nginx
         -o jsonpath='{.items[*].status.phase}'
-      become: true
       register: secondary_pods_status
       failed_when: "'Running' not in secondary_pods_status.stdout"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       tags:
         - test
 
     - name: Test - Primary ingress service has correct external IP
       ansible.builtin.command: >
-        microk8s kubectl get service -n {{ primary_namespace }}
+        {{ kubectl_bin }} get service -n {{ primary_namespace }}
         -l app.kubernetes.io/name=ingress-nginx
         -o jsonpath='{.items[*].status.loadBalancer.ingress[0].ip}'
-      become: true
       register: primary_service_ip
       failed_when: primary_service_ip.stdout != primary_ip
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       tags:
         - test
 
     - name: Test - Secondary ingress service has correct external IP
       ansible.builtin.command: >
-        microk8s kubectl get service -n {{ secondary_namespace }}
+        {{ kubectl_bin }} get service -n {{ secondary_namespace }}
         -l app.kubernetes.io/name=ingress-nginx
         -o jsonpath='{.items[*].status.loadBalancer.ingress[0].ip}'
-      become: true
       register: secondary_service_ip
       failed_when: secondary_service_ip.stdout != secondary_ip
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       tags:
         - test
 
     - name: Test - Primary IngressClass exists and is default
       ansible.builtin.command: >
-        microk8s kubectl get ingressclass {{ primary_class }}
+        {{ kubectl_bin }} get ingressclass {{ primary_class }}
         -o jsonpath='{.metadata.annotations.ingressclass\.kubernetes\.io/is-default-class}'
-      become: true
       register: primary_class_check
       failed_when: primary_class_check.stdout != "true"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       tags:
         - test
 
     - name: Test - Secondary IngressClass exists
-      ansible.builtin.command: microk8s kubectl get ingressclass {{ secondary_class }}
-      become: true
+      ansible.builtin.command: "{{ kubectl_bin }} get ingressclass {{ secondary_class }}"
       register: secondary_class_check
       failed_when: secondary_class_check.rc != 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       tags:
         - test
-        
+
     - name: Test - Primary ingress controller has default SSL certificate configured
       ansible.builtin.command: >
-        microk8s kubectl get deployment -n {{ primary_namespace }} 
+        {{ kubectl_bin }} get deployment -n {{ primary_namespace }}
         -l app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.template.spec.containers[0].args}'
-      become: true
       register: primary_args
       vars:
         cert_path_string: "--default-ssl-certificate={{ primary_namespace }}/{{ primary_namespace }}-tls-secret"
       failed_when: cert_path_string not in primary_args.stdout
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       tags:
         - test
-        
+
     - name: Test - Secondary ingress controller has default SSL certificate configured
       ansible.builtin.command: >
-        microk8s kubectl get deployment -n {{ secondary_namespace }} 
+        {{ kubectl_bin }} get deployment -n {{ secondary_namespace }}
         -l app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.template.spec.containers[0].args}'
-      become: true
       register: secondary_args
       vars:
         cert_path_string: "--default-ssl-certificate={{ secondary_namespace }}/{{ secondary_namespace }}-tls-secret"
       failed_when: cert_path_string not in secondary_args.stdout
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       tags:
         - test
 

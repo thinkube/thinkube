@@ -7,7 +7,7 @@
 #   Deploy Code Server on Kubernetes with Keycloak authentication via OAuth2 Proxy
 #
 # Requirements:
-#   - MicroK8s must be installed
+#   - Canonical k8s-snap must be installed
 #   - Keycloak instance running and accessible
 #   - ADMIN_PASSWORD environment variable set
 #   - Wildcard TLS certificate in default namespace
@@ -47,7 +47,7 @@
     code_server_tls_secret_name: "code-server-tls-secret"
     
     # Kubernetes configuration
-    kubectl_bin: "microk8s.kubectl"
+    kubectl_bin: "k8s kubectl"
     
     # Keycloak connection info
     keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
@@ -382,55 +382,59 @@
     # 3) Create Namespace, TLS Secret and code-server OAuth secret
     ###################################################################
     - name: Create namespace for code-server
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Namespace
-          metadata:
-            name: "{{ code_server_namespace }}"
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get namespace {{ code_server_namespace }} > /dev/null 2>&1 || \
+        {{ kubectl_bin }} create namespace {{ code_server_namespace }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+      failed_when: false
 
     - name: Create code-server OAuth client secret in Kubernetes
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ code_server_namespace }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: code-server-oauth-secret
-          type: Opaque
-          stringData:
-            client_id: "{{ code_server_client_id }}"
-            client_secret: "{{ code_server_client_secret }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: code-server-oauth-secret
+        type: Opaque
+        stringData:
+          client_id: "{{ code_server_client_id }}"
+          client_secret: "{{ code_server_client_secret }}"
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       when: code_server_client_secret is defined
+      changed_when: false
 
     - name: Get wildcard certificate from default namespace
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: default
-        name: "{{ domain_name.replace('.', '-') }}-tls"
-      register: wildcard_cert
-      failed_when: wildcard_cert.resources | length == 0
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wildcard_cert_json
+      failed_when: wildcard_cert_json.rc != 0
+      changed_when: false
+
+    - name: Parse wildcard certificate JSON
+      ansible.builtin.set_fact:
+        wildcard_cert: "{{ wildcard_cert_json.stdout | from_json }}"
 
     - name: Copy wildcard certificate to code-server namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: "{{ code_server_tls_secret_name }}"
-            namespace: "{{ code_server_namespace }}"
-          type: kubernetes.io/tls
-          data:
-            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
-            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: {{ code_server_tls_secret_name }}
+        type: kubernetes.io/tls
+        data:
+          tls.crt: {{ wildcard_cert.data['tls.crt'] }}
+          tls.key: {{ wildcard_cert.data['tls.key'] }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     ###################################################################
     # 4) Setup SSH keys and config on the host (will be available in container via mount)
@@ -493,7 +497,7 @@
           {% endfor %}
 
           # Kubernetes Control Plane
-          {% for host in groups['microk8s_control_plane'] %}
+          {% for host in groups['k8s_control_plane'] %}
           Host {{ host }} {{ host }}.{{ domain_name }}
               HostName {{ hostvars[host]['zerotier_ip'] }}
               User {{ system_username }}
@@ -645,98 +649,104 @@
     # 5) Create ConfigMap for code‑server (we'll use hostPath instead of PVC)
     ###################################################################
     - name: Create ConfigMap for code-server configuration
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ code_server_namespace }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: code-server-config
-          data:
-            config.yaml: |
-              auth: none
-              bind-addr: 0.0.0.0:8080
-              disable-telemetry: true
-              cert: false
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: code-server-config
+        data:
+          config.yaml: |
+            auth: none
+            bind-addr: 0.0.0.0:8080
+            disable-telemetry: true
+            cert: false
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     - name: Create code-server default settings ConfigMap
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ code_server_namespace }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: code-server-default-settings
-          data:
-            settings.json: |
-              {
-                "terminal.integrated.fontFamily": "'FiraCode Nerd Font', 'JetBrainsMono Nerd Font', 'Hack Nerd Font', monospace",
-                "terminal.integrated.fontSize": 14,
-                "terminal.integrated.fontWeight": "400",
-                "terminal.integrated.letterSpacing": 0,
-                "editor.fontFamily": "'FiraCode Nerd Font', 'JetBrainsMono Nerd Font', Consolas, 'Courier New', monospace",
-                "editor.fontSize": 14,
-                "editor.fontLigatures": true
-              }
+      ansible.builtin.shell: |
+        cat <<'EOF' | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: code-server-default-settings
+        data:
+          settings.json: |
+            {
+              "terminal.integrated.fontFamily": "'FiraCode Nerd Font', 'JetBrainsMono Nerd Font', 'Hack Nerd Font', monospace",
+              "terminal.integrated.fontSize": 14,
+              "terminal.integrated.fontWeight": "400",
+              "terminal.integrated.letterSpacing": 0,
+              "editor.fontFamily": "'FiraCode Nerd Font', 'JetBrainsMono Nerd Font', Consolas, 'Courier New', monospace",
+              "editor.fontSize": 14,
+              "editor.fontLigatures": true
+            }
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     ###################################################################
     # 5a) Create ServiceAccount and RBAC for CI/CD monitoring
     ###################################################################
     - name: Create ServiceAccount for code-server
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ code_server_namespace }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ServiceAccount
-          metadata:
-            name: code-server
-            namespace: "{{ code_server_namespace }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: code-server
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     - name: Create ClusterRole for CI/CD monitoring
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: rbac.authorization.k8s.io/v1
-          kind: ClusterRole
-          metadata:
-            name: thinkube-cicd-monitor
-          rules:
-            # Read ConfigMaps in any namespace for pipeline events
-            - apiGroups: [""]
-              resources: ["configmaps"]
-              verbs: ["get", "list", "watch"]
-            # Read pods and deployments for monitoring
-            - apiGroups: [""]
-              resources: ["pods", "services"]
-              verbs: ["get", "list"]
-            - apiGroups: ["apps"]
-              resources: ["deployments", "replicasets"]
-              verbs: ["get", "list"]
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: thinkube-cicd-monitor
+        rules:
+          # Read ConfigMaps in any namespace for pipeline events
+          - apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "list", "watch"]
+          # Read pods and deployments for monitoring
+          - apiGroups: [""]
+            resources: ["pods", "services"]
+            verbs: ["get", "list"]
+          - apiGroups: ["apps"]
+            resources: ["deployments", "replicasets"]
+            verbs: ["get", "list"]
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     - name: Create ClusterRoleBinding for code-server
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: rbac.authorization.k8s.io/v1
-          kind: ClusterRoleBinding
-          metadata:
-            name: code-server-cicd-monitor
-          roleRef:
-            apiGroup: rbac.authorization.k8s.io
-            kind: ClusterRole
-            name: thinkube-cicd-monitor
-          subjects:
-            - kind: ServiceAccount
-              name: code-server
-              namespace: "{{ code_server_namespace }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: code-server-cicd-monitor
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: thinkube-cicd-monitor
+        subjects:
+          - kind: ServiceAccount
+            name: code-server
+            namespace: {{ code_server_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
 
     ###################################################################
@@ -750,222 +760,227 @@
     # 5b) Deploy code-server with hostPath volume and node affinity
     ###################################################################
     - name: Deploy code-server Deployment with hostPath and node affinity
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ code_server_namespace }}"
-        state: present
-        definition:
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: code-server
-            labels:
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: code-server
+          labels:
+            app: code-server
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
               app: code-server
-          spec:
-            replicas: 1
-            selector:
-              matchLabels:
+          template:
+            metadata:
+              labels:
                 app: code-server
-            template:
-              metadata:
-                labels:
-                  app: code-server
-              spec:
-                serviceAccountName: code-server
-                # Schedule pod on the control node
-                nodeSelector:
-                  kubernetes.io/hostname: "{{ k8s_controller_node }}"
-                # Ensure the pod is scheduled on the control node (required)
-                affinity:
-                  nodeAffinity:
-                    requiredDuringSchedulingIgnoredDuringExecution:
-                      nodeSelectorTerms:
-                      - matchExpressions:
-                        - key: kubernetes.io/hostname
-                          operator: In
-                          values:
-                          - "{{ k8s_controller_node }}"
-                securityContext:
-                  fsGroup: 1000
-                  runAsUser: 1000
-                  runAsGroup: 1000
-                containers:
-                  - name: code-server
-                    image: "{{ harbor_registry }}/library/code-server-dev:latest"
-                    imagePullPolicy: Always
-                    ports:
-                      - name: http
-                        containerPort: 8080
-                        protocol: TCP
-                    env:
-                      - name: TZ
-                        value: UTC
-                      - name: CS_DISABLE_GETTING_STARTED_OVERRIDE
-                        value: "true"
-                    command: ["code-server"]
-                    args:
-                      - "--auth=none"
-                      - "--config=/config/config.yaml"
-                      - "--proxy-domain={{ code_server_hostname }}"
-                      - "."
-                    resources:
-                      requests:
-                        cpu: 1
-                        memory: 4Gi
-                      limits:
-                        cpu: 4
-                        memory: 8Gi
-                    readinessProbe:
-                      httpGet:
-                        path: /
-                        port: http
-                      initialDelaySeconds: 30
-                      periodSeconds: 5
-                    volumeMounts:
-                      - name: host-data
-                        mountPath: /home/thinkube
-                      - name: config
-                        mountPath: /config
-                      - name: thinkube-ssh
-                        mountPath: /host-ssh
-                        readOnly: true
-                volumes:
-                  - name: host-data
-                    hostPath:
-                      path: "{{ code_source_path }}"
-                      type: Directory
-                  - name: config
-                    configMap:
-                      name: code-server-config
-                      defaultMode: 0755
-                  - name: thinkube-ssh
-                    hostPath:
-                      path: "{{ ansible_env.HOME }}/.ssh"
-                      type: Directory
-                  - name: vscode-settings
-                    configMap:
-                      name: code-server-default-settings
+            spec:
+              serviceAccountName: code-server
+              # Schedule pod on the control node
+              nodeSelector:
+                kubernetes.io/hostname: "{{ k8s_controller_node }}"
+              # Ensure the pod is scheduled on the control node (required)
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                    - matchExpressions:
+                      - key: kubernetes.io/hostname
+                        operator: In
+                        values:
+                        - "{{ k8s_controller_node }}"
+              securityContext:
+                fsGroup: 1000
+                runAsUser: 1000
+                runAsGroup: 1000
+              containers:
+                - name: code-server
+                  image: "{{ harbor_registry }}/library/code-server-dev:latest"
+                  imagePullPolicy: Always
+                  ports:
+                    - name: http
+                      containerPort: 8080
+                      protocol: TCP
+                  env:
+                    - name: TZ
+                      value: UTC
+                    - name: CS_DISABLE_GETTING_STARTED_OVERRIDE
+                      value: "true"
+                  command: ["code-server"]
+                  args:
+                    - "--auth=none"
+                    - "--config=/config/config.yaml"
+                    - "--proxy-domain={{ code_server_hostname }}"
+                    - "."
+                  resources:
+                    requests:
+                      cpu: 1
+                      memory: 4Gi
+                    limits:
+                      cpu: 4
+                      memory: 8Gi
+                  readinessProbe:
+                    httpGet:
+                      path: /
+                      port: http
+                    initialDelaySeconds: 30
+                    periodSeconds: 5
+                  volumeMounts:
+                    - name: host-data
+                      mountPath: /home/thinkube
+                    - name: config
+                      mountPath: /config
+                    - name: thinkube-ssh
+                      mountPath: /host-ssh
+                      readOnly: true
+              volumes:
+                - name: host-data
+                  hostPath:
+                    path: "{{ code_source_path }}"
+                    type: Directory
+                - name: config
+                  configMap:
+                    name: code-server-config
+                    defaultMode: 0755
+                - name: thinkube-ssh
+                  hostPath:
+                    path: "{{ ansible_env.HOME }}/.ssh"
+                    type: Directory
+                - name: vscode-settings
+                  configMap:
+                    name: code-server-default-settings
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     ###################################################################
     # 6) Create code‑server Service and Ingress (secured via oauth2‑proxy)
     ###################################################################
     - name: Create code-server Service
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ code_server_namespace }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: code-server
-            labels:
-              app: code-server
-          spec:
-            type: ClusterIP
-            ports:
-              - port: 8080
-                targetPort: http
-                protocol: TCP
-                name: http
-            selector:
-              app: code-server
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: code-server
+          labels:
+            app: code-server
+        spec:
+          type: ClusterIP
+          ports:
+            - port: 8080
+              targetPort: http
+              protocol: TCP
+              name: http
+          selector:
+            app: code-server
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     - name: Create code-server Ingress (secured with oauth2-proxy)
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ code_server_namespace }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: code-server
-            annotations:
-              kubernetes.io/ingress.class: nginx
-              nginx.ingress.kubernetes.io/ssl-redirect: "true"
-              nginx.ingress.kubernetes.io/proxy-body-size: "0"
-              nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-              nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-              nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
-              nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$escaped_request_uri"
-          spec:
-            tls:
-              - hosts:
-                  - "{{ code_server_hostname }}"
-                secretName: "{{ code_server_tls_secret_name }}"
-            rules:
-              - host: "{{ code_server_hostname }}"
-                http:
-                  paths:
-                    - path: /
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: code-server
-                          port:
-                            number: 8080
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: code-server
+          annotations:
+            kubernetes.io/ingress.class: nginx
+            nginx.ingress.kubernetes.io/ssl-redirect: "true"
+            nginx.ingress.kubernetes.io/proxy-body-size: "0"
+            nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+            nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+            nginx.ingress.kubernetes.io/auth-url: "https://\$host/oauth2/auth"
+            nginx.ingress.kubernetes.io/auth-signin: "https://\$host/oauth2/start?rd=\$escaped_request_uri"
+        spec:
+          tls:
+            - hosts:
+                - "{{ code_server_hostname }}"
+              secretName: "{{ code_server_tls_secret_name }}"
+          rules:
+            - host: "{{ code_server_hostname }}"
+              http:
+                paths:
+                  - path: /
+                    pathType: Prefix
+                    backend:
+                      service:
+                        name: code-server
+                        port:
+                          number: 8080
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     ###################################################################
     # 7) Deploy ephemeral Valkey for oauth2-proxy session storage
     ###################################################################
     - name: Deploy ephemeral Valkey (Deployment) in "{{ code_server_namespace }}"
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ code_server_namespace }}"
-        state: present
-        definition:
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: ephemeral-valkey
-            labels:
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ephemeral-valkey
+          labels:
+            app: ephemeral-valkey
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
               app: ephemeral-valkey
-          spec:
-            replicas: 1
-            selector:
-              matchLabels:
+          template:
+            metadata:
+              labels:
                 app: ephemeral-valkey
-            template:
-              metadata:
-                labels:
-                  app: ephemeral-valkey
-              spec:
-                containers:
-                  - name: valkey
-                    image: "{{ harbor_registry }}/library/valkey:7.2-alpine"
-                    command: ["valkey-server", "--save", "", "--appendonly", "no"]
-                    ports:
-                      - containerPort: 6379
-                        name: valkey
-                    resources:
-                      requests:
-                        cpu: 50m
-                        memory: 64Mi
-                      limits:
-                        cpu: 200m
-                        memory: 256Mi
+            spec:
+              containers:
+                - name: valkey
+                  image: "{{ harbor_registry }}/library/valkey:7.2-alpine"
+                  command: ["valkey-server", "--save", "", "--appendonly", "no"]
+                  ports:
+                    - containerPort: 6379
+                      name: valkey
+                  resources:
+                    requests:
+                      cpu: 50m
+                      memory: 64Mi
+                    limits:
+                      cpu: 200m
+                      memory: 256Mi
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     - name: Deploy ephemeral Valkey (Service) in "{{ code_server_namespace }}"
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ code_server_namespace }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: ephemeral-valkey
-            labels:
-              app: ephemeral-valkey
-          spec:
-            type: ClusterIP
-            selector:
-              app: ephemeral-valkey
-            ports:
-              - name: valkey
-                port: 6379
-                targetPort: 6379
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ephemeral-valkey
+          labels:
+            app: ephemeral-valkey
+        spec:
+          type: ClusterIP
+          selector:
+            app: ephemeral-valkey
+          ports:
+            - name: valkey
+              port: 6379
+              targetPort: 6379
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     ###################################################################
     # 8) Deploy oauth2-proxy via Helm (using Valkey for session storage)
@@ -1017,71 +1032,80 @@
     # 9) Create oauth2-proxy Ingress for /oauth2 routing
     ###################################################################
     - name: Create oauth2-proxy Ingress for /oauth2
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        namespace: "{{ code_server_namespace }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: oauth2-proxy
-            annotations:
-              kubernetes.io/ingress.class: "nginx"
-              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-          spec:
-            tls:
-              - hosts:
-                  - "{{ code_server_hostname }}"
-                secretName: "{{ code_server_tls_secret_name }}"
-            rules:
-              - host: "{{ code_server_hostname }}"
-                http:
-                  paths:
-                    - path: /oauth2
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: oauth2-proxy
-                          port:
-                            number: 80
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: oauth2-proxy
+          annotations:
+            kubernetes.io/ingress.class: "nginx"
+            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+        spec:
+          tls:
+            - hosts:
+                - "{{ code_server_hostname }}"
+              secretName: "{{ code_server_tls_secret_name }}"
+          rules:
+            - host: "{{ code_server_hostname }}"
+              http:
+                paths:
+                  - path: /oauth2
+                    pathType: Prefix
+                    backend:
+                      service:
+                        name: oauth2-proxy
+                        port:
+                          number: 80
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
 
     ###################################################################
     # 10) Force restart: Verify ConfigMap and delete code-server pods
     ###################################################################
     - name: Verify code-server ConfigMap (ensure auth is set to "none")
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        kind: ConfigMap
-        namespace: "{{ code_server_namespace }}"
-        name: code-server-config
-      register: configmap_info
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get configmap code-server-config -n {{ code_server_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: configmap_info_json
       failed_when: false
+      changed_when: false
+
+    - name: Parse ConfigMap JSON
+      ansible.builtin.set_fact:
+        configmap_info: "{{ configmap_info_json.stdout | from_json }}"
+      when: configmap_info_json.rc == 0
 
     - name: Debug ConfigMap content
       ansible.builtin.debug:
-        msg: "{{ configmap_info.resources[0].data['config.yaml'] }}"
-      when: configmap_info.resources is defined and configmap_info.resources | length > 0
+        msg: "{{ configmap_info.data['config.yaml'] }}"
+      when: configmap_info is defined and configmap_info.data is defined
 
     - name: Get code-server pods to force restart
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        kind: Pod
-        namespace: "{{ code_server_namespace }}"
-        label_selectors:
-          - "app=code-server"
-      register: code_server_pods
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} -l app=code-server -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: code_server_pods_json
       failed_when: false
+      changed_when: false
+
+    - name: Parse code-server pods JSON
+      ansible.builtin.set_fact:
+        code_server_pods: "{{ code_server_pods_json.stdout | from_json }}"
+      when: code_server_pods_json.rc == 0
 
     - name: Delete code-server pods to force restart with updated configuration
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        kind: Pod
-        namespace: "{{ code_server_namespace }}"
-        name: "{{ item.metadata.name }}"
-        state: absent
-      loop: "{{ code_server_pods.resources | default([]) }}"
-      when: code_server_pods.resources is defined and code_server_pods.resources | length > 0
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pod {{ item.metadata.name }} -n {{ code_server_namespace }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ code_server_pods.items | default([]) }}"
+      when: code_server_pods is defined and code_server_pods.items is defined and code_server_pods.items | length > 0
+      changed_when: false
 
     ###################################################################
     # 11) Configure VS Code tasks for Claude Code

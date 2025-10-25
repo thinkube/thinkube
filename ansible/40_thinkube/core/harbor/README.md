@@ -30,7 +30,7 @@ Post-deployment configuration that:
 
 ### 16_configure_default_registry.yaml
 Registry configuration that:
-- Updates MicroK8s default registry settings
+- Updates k8s-snap default registry settings
 - Configures Harbor as the default container registry
 - Creates ConfigMap for registry hosting
 
@@ -56,8 +56,8 @@ Cleanup playbook that:
 
 ## Dependencies
 
-- **CORE-001**: MicroK8s Control Node
-- **CORE-002**: MicroK8s Worker Nodes  
+- **CORE-001**: k8s-snap Control Node
+- **CORE-002**: k8s-snap Worker Nodes
 - **CORE-003**: Cert-Manager (for TLS)
 - **CORE-004**: Keycloak (for SSO)
 
@@ -73,7 +73,7 @@ harbor_release: "harbor"
 harbor_project: "thinkube"
 
 # Storage configuration
-harbor_storage_class: "microk8s-hostpath"
+harbor_storage_class: "k8s-hostpath"
 harbor_registry_size: "50Gi"
 harbor_database_size: "10Gi"
 
@@ -105,6 +105,7 @@ admin_username: "tkadmin"
    ```bash
    ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/16_configure_default_registry.yaml
    ```
+   Note: This configures Harbor as the default container registry for k8s-snap.
 
 4. (Optional) Mirror public images:
    ```bash

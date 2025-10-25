@@ -59,7 +59,7 @@ ArgoCD enables declarative, Git-based management of Kubernetes resources. It is 
 
 ## Dependencies
 
-- CORE-001: MicroK8s Control Node
+- CORE-001: k8s-snap Control Node
 - CORE-003: Cert-Manager (for TLS certificates)
 - CORE-004: Keycloak (for authentication)
 

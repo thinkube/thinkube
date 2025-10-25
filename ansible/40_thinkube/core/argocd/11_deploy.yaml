@@ -7,7 +7,7 @@
 #   Deploy ArgoCD using Helm with Ingress, TLS, and Keycloak OIDC integration
 #
 # Requirements:
-#   - MicroK8s Kubernetes cluster
+#   - Canonical k8s-snap Kubernetes cluster
 #   - Keycloak instance running with ArgoCD client configured (run 10_configure_keycloak.yaml first)
 #   - Cert-Manager deployed (CORE-003)
 #   - ADMIN_PASSWORD environment variable set for Keycloak admin access
@@ -17,7 +17,7 @@
 #   ./scripts/run_ansible.sh ansible/40_thinkube/core/argocd/11_deploy.yaml
 #
 # Variables from inventory:
-#   - domain_name: Domain name for all services 
+#   - domain_name: Domain name for all services
 #   - keycloak_url: URL to Keycloak instance
 #   - keycloak_realm: Keycloak realm name
 #   - admin_username: Administrator username (consistent across all components)
@@ -26,7 +26,7 @@
 #   - kubeconfig: Path to Kubernetes configuration file
 #
 # Dependencies:
-#   - CORE-001: MicroK8s Control Node
+#   - CORE-001: Canonical k8s-snap Control Node
 #   - CORE-003: Cert-Manager (for TLS)
 #   - CORE-004: Keycloak (for SSO)
 
@@ -38,14 +38,14 @@
   vars:
     # ArgoCD values file path (temporary, not from inventory)
     argocd_values_file: "/tmp/argocd-values.yaml"
-    
+
     # TLS secret name for ArgoCD
     argocd_tls_secret_name: "argocd-tls-secret"
-    
+
     # Keycloak admin credentials
     keycloak_admin_user: "{{ admin_username }}"
     keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
-    
+
   tasks:
     #######################################################################
     # (A) Retrieve existing Keycloak client secret (no creation).
@@ -118,29 +118,35 @@
 
     # --- Get wildcard TLS certificate from default namespace ---
     - name: Get wildcard certificate from default namespace
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: default
-        name: "{{ domain_name.replace('.', '-') }}-tls"
-      register: wildcard_cert
-      failed_when: wildcard_cert.resources | length == 0
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wildcard_cert_result
+      failed_when: wildcard_cert_result.rc != 0
+
+    - name: Parse wildcard certificate JSON
+      ansible.builtin.set_fact:
+        wildcard_cert: "{{ wildcard_cert_result.stdout | from_json }}"
 
     - name: Copy wildcard certificate to argocd namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: "{{ argocd_tls_secret_name }}"
-            namespace: "{{ argocd_namespace }}"
-          type: kubernetes.io/tls
-          data:
-            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
-            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: {{ argocd_tls_secret_name }}
+          namespace: {{ argocd_namespace }}
+        type: kubernetes.io/tls
+        data:
+          tls.crt: {{ wildcard_cert.data['tls.crt'] }}
+          tls.key: {{ wildcard_cert.data['tls.key'] }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: copy_cert_result
+      changed_when: "'created' in copy_cert_result.stdout or 'configured' in copy_cert_result.stdout"
+      failed_when: copy_cert_result.rc != 0
 
     - name: Add ArgoCD Helm repository if not present
       ansible.builtin.shell: |
@@ -249,80 +255,88 @@
     #######################################################################
 
     - name: Remove existing Ingress resources (if any)
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: absent
-        kind: Ingress
-        name: "{{ item }}"
-        namespace: "{{ argocd_namespace }}"
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete ingress {{ item }} -n {{ argocd_namespace }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       loop:
         - argocd-grpc-ingress
         - argocd-http-ingress
         - argocd-ingress
-      failed_when: false
+      register: delete_ingress_result
+      changed_when: "'deleted' in delete_ingress_result.stdout"
+      failed_when: delete_ingress_result.rc != 0
 
     - name: Create gRPC Ingress for ArgoCD
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: argocd-grpc-ingress
-            namespace: "{{ argocd_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
-              nginx.ingress.kubernetes.io/enable-http2: "true"
-          spec:
-            ingressClassName: nginx
-            tls:
-            - hosts:
-                - "{{ argocd_grpc_hostname }}"
-              secretName: "{{ argocd_tls_secret_name }}"
-            rules:
-            - host: "{{ argocd_grpc_hostname }}"
-              http:
-                paths:
-                - path: /
-                  pathType: ImplementationSpecific
-                  backend:
-                    service:
-                      name: argocd-server
-                      port:
-                        number: 8080
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: argocd-grpc-ingress
+          namespace: {{ argocd_namespace }}
+          annotations:
+            nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+            nginx.ingress.kubernetes.io/enable-http2: "true"
+        spec:
+          ingressClassName: nginx
+          tls:
+          - hosts:
+              - {{ argocd_grpc_hostname }}
+            secretName: {{ argocd_tls_secret_name }}
+          rules:
+          - host: {{ argocd_grpc_hostname }}
+            http:
+              paths:
+              - path: /
+                pathType: ImplementationSpecific
+                backend:
+                  service:
+                    name: argocd-server
+                    port:
+                      number: 8080
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: grpc_ingress_result
+      changed_when: "'created' in grpc_ingress_result.stdout or 'configured' in grpc_ingress_result.stdout"
+      failed_when: grpc_ingress_result.rc != 0
 
     - name: Create HTTP Ingress for ArgoCD
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: argocd-http-ingress
-            namespace: "{{ argocd_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
-              nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
-              nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
-          spec:
-            ingressClassName: nginx
-            tls:
-            - hosts:
-                - "{{ argocd_hostname }}"
-              secretName: "{{ argocd_tls_secret_name }}"
-            rules:
-            - host: "{{ argocd_hostname }}"
-              http:
-                paths:
-                - path: /
-                  pathType: ImplementationSpecific
-                  backend:
-                    service:
-                      name: argocd-server
-                      port:
-                        number: 80
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: argocd-http-ingress
+          namespace: {{ argocd_namespace }}
+          annotations:
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+            nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+            nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+        spec:
+          ingressClassName: nginx
+          tls:
+          - hosts:
+              - {{ argocd_hostname }}
+            secretName: {{ argocd_tls_secret_name }}
+          rules:
+          - host: {{ argocd_hostname }}
+            http:
+              paths:
+              - path: /
+                pathType: ImplementationSpecific
+                backend:
+                  service:
+                    name: argocd-server
+                    port:
+                      number: 80
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: http_ingress_result
+      changed_when: "'created' in http_ingress_result.stdout or 'configured' in http_ingress_result.stdout"
+      failed_when: http_ingress_result.rc != 0
 
     - name: Display ArgoCD Ingress details
       ansible.builtin.shell: "{{ kubectl_bin }} get ingress -n {{ argocd_namespace }} -o yaml"
@@ -339,59 +353,71 @@
     #######################################################################
 
     - name: Configure ArgoCD with OIDC and group mapping
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: argocd-cm
-            namespace: "{{ argocd_namespace }}"
-          data:
-            url: "https://{{ argocd_hostname }}"
-            # Simple OIDC config with standard scopes only
-            oidc.config: |-
-              name: Keycloak
-              issuer: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
-              clientID: "{{ argocd_client_id }}"
-              clientSecret: "{{ argocd_client_secret }}"
-              requestedScopes: ["openid", "profile", "email"]
-              claimMappings:
-                groups: "groups"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: argocd-cm
+          namespace: {{ argocd_namespace }}
+        data:
+          url: "https://{{ argocd_hostname }}"
+          # Simple OIDC config with standard scopes only
+          oidc.config: |-
+            name: Keycloak
+            issuer: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+            clientID: "{{ argocd_client_id }}"
+            clientSecret: "{{ argocd_client_secret }}"
+            requestedScopes: ["openid", "profile", "email"]
+            claimMappings:
+              groups: "groups"
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: oidc_config_result
+      changed_when: "'created' in oidc_config_result.stdout or 'configured' in oidc_config_result.stdout"
+      failed_when: oidc_config_result.rc != 0
 
     - name: Configure ArgoCD RBAC for group-based admin access
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: argocd-rbac-cm
-            namespace: "{{ argocd_namespace }}"
-          data:
-            # Map the argocd-admins group to the admin role
-            policy.csv: |
-              g, argocd-admins, role:admin
-            # Set default policy for other users
-            policy.default: role:readonly
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: argocd-rbac-cm
+          namespace: {{ argocd_namespace }}
+        data:
+          # Map the argocd-admins group to the admin role
+          policy.csv: |
+            g, argocd-admins, role:admin
+          # Set default policy for other users
+          policy.default: role:readonly
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: rbac_config_result
+      changed_when: "'created' in rbac_config_result.stdout or 'configured' in rbac_config_result.stdout"
+      failed_when: rbac_config_result.rc != 0
 
     - name: Restart ArgoCD server to pick up OIDC and RBAC changes
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: argocd-server
-            namespace: "{{ argocd_namespace }}"
-          spec:
-            template:
-              metadata:
-                annotations:
-                  kubectl.kubernetes.io/restartedAt: "{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: argocd-server
+          namespace: {{ argocd_namespace }}
+        spec:
+          template:
+            metadata:
+              annotations:
+                kubectl.kubernetes.io/restartedAt: "{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}"
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: restart_result
+      changed_when: "'configured' in restart_result.stdout"
+      failed_when: restart_result.rc != 0
 
     - name: Wait for ArgoCD server to restart
       ansible.builtin.shell: |

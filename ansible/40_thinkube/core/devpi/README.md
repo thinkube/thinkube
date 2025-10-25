@@ -31,7 +31,7 @@ This deployment provides:
 
 ## Prerequisites
 
-- MicroK8s cluster (CORE-001, CORE-002)
+- Canonical k8s-snap cluster (CORE-001, CORE-002)
 - Cert-Manager (CORE-003)
 - Keycloak (CORE-004)
 - Harbor Registry (CORE-005)

@@ -1,6 +1,6 @@
 # NVIDIA GPU Operator
 
-This component deploys the NVIDIA GPU Operator in the MicroK8s cluster, enabling GPU support for containerized workloads.
+This component deploys the NVIDIA GPU Operator in the k8s-snap cluster, enabling GPU support for containerized workloads.
 
 ## Description
 
@@ -13,7 +13,7 @@ The NVIDIA GPU Operator is a Kubernetes operator that automates the management o
 
 ## Requirements
 
-- MicroK8s cluster with at least one GPU-equipped node
+- k8s-snap cluster with at least one GPU-equipped node
 - NVIDIA drivers installed on the host systems
 - Helm 3.x installed
 - kubernetes.core collection >= 2.3.0
@@ -57,15 +57,15 @@ The 18_test.yaml playbook tests all aspects of the GPU Operator:
 If the deployment fails, check the following:
 
 1. Ensure NVIDIA drivers are correctly installed on the host system
-2. Check for errors in the GPU operator pods: 
+2. Check for errors in the GPU operator pods:
    ```
-   microk8s kubectl get pods -n gpu-operator
+   kubectl get pods -n gpu-operator
    ```
 3. Examine logs of any pods in error state:
    ```
-   microk8s kubectl logs -n gpu-operator <pod-name>
+   kubectl logs -n gpu-operator <pod-name>
    ```
-4. Verify containerd configuration in MicroK8s:
+4. Verify containerd configuration in k8s-snap:
    ```
-   cat /var/snap/microk8s/current/args/containerd-template.toml
+   cat /var/snap/k8s/current/args/containerd
    ```

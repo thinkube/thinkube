@@ -56,7 +56,7 @@ cd ~/thinkube
 
 3. Verify the secret was created:
    ```bash
-   microk8s kubectl get secret -n default thinkube-com-tls
+   kubectl get secret -n default thinkube-com-tls
    ```
 
 4. Remove cert-manager (optional):

@@ -33,13 +33,13 @@ This component deploys and configures Keycloak as the identity provider for the 
 
 ## Requirements
 
-- MicroK8s cluster with ingress controller
+- Canonical k8s-snap cluster with ingress controller
 - Cert-Manager deployed (CORE-003)
 - Environment variable: `ADMIN_PASSWORD`
 
 ## Variables Required
 
-From `inventory/group_vars/microk8s.yml`:
+From `inventory/group_vars/k8s.yml`:
 - `domain_name`: Base domain for services
 - `keycloak_hostname`: Full hostname for auth service (e.g., auth.thinkube.com)
 - `keycloak_url`: Full URL to Keycloak instance

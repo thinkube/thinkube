@@ -9,7 +9,7 @@ The Thinkube platform uses two separate DNS systems:
 1. **CoreDNS** (Kubernetes internal)
    - Handles `*.cluster.local` domains
    - Provides service discovery for pods
-   - Runs as part of MicroK8s DNS addon
+   - Runs as part of k8s-snap DNS
    - ClusterIP: 10.152.183.10
 
 2. **BIND9** (Network DNS) - THIS COMPONENT

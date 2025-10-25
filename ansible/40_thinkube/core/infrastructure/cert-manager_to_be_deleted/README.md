@@ -1,6 +1,6 @@
 # Cert-Manager Component
 
-This directory contains Ansible playbooks for deploying and managing cert-manager on MicroK8s with an improved workflow that uses Let's Encrypt staging certificates from the start.
+This directory contains Ansible playbooks for deploying and managing cert-manager on k8s-snap with an improved workflow that uses Let's Encrypt staging certificates from the start.
 
 ## Overview
 
@@ -21,7 +21,7 @@ Cert-manager automatically issues and renews SSL certificates from Let's Encrypt
 
 ## Prerequisites
 
-- MicroK8s control and worker nodes (CORE-001, CORE-002)
+- k8s-snap control and worker nodes (CORE-001, CORE-002)
 - Cloudflare API token with DNS edit permissions
 - DNS zones configured in Cloudflare
 

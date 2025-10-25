@@ -10,13 +10,13 @@
 #   - Creates custom administrator account and removes default admin
 #
 # Requirements:
-#   - MicroK8s installed with ingress addon enabled
+#   - Canonical k8s-snap installed with ingress addon enabled
 #   - kubernetes.core collection (included in Ansible 6+)
 #   - Cert-Manager deployed (CORE-003)
 #   - Python requests module for API interactions
 #   - ADMIN_PASSWORD environment variable set
 #
-# Variables used from inventory/group_vars/microk8s.yml:
+# Variables used from inventory/group_vars/k8s.yml:
 #   - domain_name: Base domain name 
 #   - k8s_domain: Kubernetes subdomain
 #   - admin_email: Email address for admin account
@@ -49,55 +49,52 @@
 
   tasks:
     - name: Ensure keycloak namespace exists
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Namespace
-          metadata:
-            name: "{{ keycloak_namespace }}"
+      ansible.builtin.shell: |
+        k8s kubectl --kubeconfig="{{ kubeconfig }}" create namespace "{{ keycloak_namespace }}" --dry-run=client -o yaml | \
+        k8s kubectl --kubeconfig="{{ kubeconfig }}" apply -f -
+      changed_when: true
 
     - name: Get wildcard certificate from default namespace
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: default
-        name: "{{ domain_name.replace('.', '-') }}-tls"
-      register: wildcard_cert
-      failed_when: wildcard_cert.resources | length == 0
+      ansible.builtin.shell: |
+        k8s kubectl --kubeconfig="{{ kubeconfig }}" get secret "{{ domain_name.replace('.', '-') }}-tls" -n default -o json
+      register: wildcard_cert_raw
+      changed_when: false
+
+    - name: Parse wildcard certificate
+      ansible.builtin.set_fact:
+        wildcard_cert: "{{ {'resources': [wildcard_cert_raw.stdout | from_json]} }}"
 
     - name: Copy wildcard certificate to keycloak namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: keycloak-tls-secret
-            namespace: "{{ keycloak_namespace }}"
-            annotations:
-              cert-manager.io/certificate-name: "keycloak-tls-secret"
-              cert-manager.io/common-name: "*.{{ domain_name }}"
-              cert-manager.io/issuer-kind: "ClusterIssuer"
-              cert-manager.io/issuer-name: "selfsigned-issuer"
-          type: kubernetes.io/tls
-          data:
-            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
-            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
-            ca.crt: "{{ wildcard_cert.resources[0].data.get('ca.crt', wildcard_cert.resources[0].data['tls.crt']) }}"
+      ansible.builtin.shell: |
+        cat <<EOF | k8s kubectl --kubeconfig="{{ kubeconfig }}" apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: keycloak-tls-secret
+          namespace: {{ keycloak_namespace }}
+          annotations:
+            cert-manager.io/certificate-name: "keycloak-tls-secret"
+            cert-manager.io/common-name: "*.{{ domain_name }}"
+            cert-manager.io/issuer-kind: "ClusterIssuer"
+            cert-manager.io/issuer-name: "selfsigned-issuer"
+        type: kubernetes.io/tls
+        data:
+          tls.crt: {{ wildcard_cert.resources[0].data['tls.crt'] }}
+          tls.key: {{ wildcard_cert.resources[0].data['tls.key'] }}
+          ca.crt: {{ wildcard_cert.resources[0].data.get('ca.crt', wildcard_cert.resources[0].data['tls.crt']) }}
+        EOF
+      changed_when: true
       
     - name: Check if secret already exists
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: "{{ keycloak_namespace }}"
-        name: keycloak-tls-secret
-      register: cert_check
-      
+      ansible.builtin.shell: |
+        k8s kubectl --kubeconfig="{{ kubeconfig }}" get secret keycloak-tls-secret -n "{{ keycloak_namespace }}" -o json
+      register: cert_check_raw
+      changed_when: false
+
+    - name: Parse secret check result
+      ansible.builtin.set_fact:
+        cert_check: "{{ {'resources': [cert_check_raw.stdout | from_json]} }}"
+
     - name: Verify TLS secret exists
       ansible.builtin.assert:
         that:
@@ -131,157 +128,157 @@
           coredns_external_ip: {{ zerotier_subnet_prefix }}12  # CoreDNS LoadBalancer IP
 
     - name: Create Keycloak service
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: keycloak
-            namespace: "{{ keycloak_namespace }}"
-            labels:
-              app: keycloak
-          spec:
-            ports:
-              - name: http
-                port: 8080
-                targetPort: 8080
-              - name: health
-                port: 9000
-                targetPort: 9000
-            selector:
-              app: keycloak
-            type: ClusterIP
+      ansible.builtin.shell: |
+        cat <<EOF | k8s kubectl --kubeconfig="{{ kubeconfig }}" apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: keycloak
+          namespace: {{ keycloak_namespace }}
+          labels:
+            app: keycloak
+        spec:
+          ports:
+            - name: http
+              port: 8080
+              targetPort: 8080
+            - name: health
+              port: 9000
+              targetPort: 9000
+          selector:
+            app: keycloak
+          type: ClusterIP
+        EOF
+      changed_when: true
 
     - name: Create Keycloak deployment
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: keycloak
-            namespace: "{{ keycloak_namespace }}"
-            labels:
+      ansible.builtin.shell: |
+        cat <<EOF | k8s kubectl --kubeconfig="{{ kubeconfig }}" apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: keycloak
+          namespace: {{ keycloak_namespace }}
+          labels:
+            app: keycloak
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
               app: keycloak
-          spec:
-            replicas: 1
-            selector:
-              matchLabels:
+          template:
+            metadata:
+              labels:
                 app: keycloak
-            template:
-              metadata:
-                labels:
-                  app: keycloak
-              spec:
-                hostAliases:
-                  - ip: "{{ zerotier_subnet_prefix }}{{ primary_ingress_ip_octet }}"  # Using inventory variables
-                    hostnames:
-                      - "{{ keycloak_hostname }}"
-                containers:
-                  - name: keycloak
-                    image: quay.io/keycloak/keycloak:26.1.0
-                    args: ["start"]
-                    env:
-                      - name: KC_BOOTSTRAP_ADMIN_USERNAME
-                        value: "admin"
-                      - name: KC_BOOTSTRAP_ADMIN_PASSWORD
-                        value: "{{ admin_password }}"
-                      - name: KC_PROXY
-                        value: "edge"
-                      - name: KC_HOSTNAME
-                        value: "{{ keycloak_hostname }}"
-                      - name: KC_HOSTNAME_STRICT
-                        value: "true"
-                      - name: KC_HTTP_ENABLED
-                        value: "true"
-                      - name: KC_PROXY_HEADERS
-                        value: "xforwarded"
-                      - name: KC_HEALTH_ENABLED
-                        value: "true"
-                      - name: QUARKUS_HTTP_PROXY_ADDRESS_FORWARDING
-                        value: "true"
-                      # PostgreSQL database configuration
-                      - name: KC_DB
-                        value: "postgres"
-                      - name: KC_DB_URL
-                        value: "jdbc:postgresql://postgresql-official.postgres.svc.cluster.local:5432/keycloak"
-                      - name: KC_DB_USERNAME
-                        value: "{{ admin_username }}"
-                      - name: KC_DB_PASSWORD
-                        value: "{{ admin_password }}"
-                    ports:
-                      - name: http
-                        containerPort: 8080
-                      - name: health
-                        containerPort: 9000
-                    readinessProbe:
-                      httpGet:
-                        path: /health/ready
-                        port: 9000
-                      initialDelaySeconds: 30
-                      periodSeconds: 10
-                      timeoutSeconds: 5
-                    livenessProbe:
-                      httpGet:
-                        path: /health/live
-                        port: 9000
-                      initialDelaySeconds: 60
-                      periodSeconds: 30
-                      timeoutSeconds: 5
+            spec:
+              hostAliases:
+                - ip: "{{ zerotier_subnet_prefix }}{{ primary_ingress_ip_octet }}"
+                  hostnames:
+                    - "{{ keycloak_hostname }}"
+              containers:
+                - name: keycloak
+                  image: quay.io/keycloak/keycloak:26.1.0
+                  args: ["start"]
+                  env:
+                    - name: KC_BOOTSTRAP_ADMIN_USERNAME
+                      value: "admin"
+                    - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+                      value: "{{ admin_password }}"
+                    - name: KC_PROXY
+                      value: "edge"
+                    - name: KC_HOSTNAME
+                      value: "{{ keycloak_hostname }}"
+                    - name: KC_HOSTNAME_STRICT
+                      value: "true"
+                    - name: KC_HTTP_ENABLED
+                      value: "true"
+                    - name: KC_PROXY_HEADERS
+                      value: "xforwarded"
+                    - name: KC_HEALTH_ENABLED
+                      value: "true"
+                    - name: QUARKUS_HTTP_PROXY_ADDRESS_FORWARDING
+                      value: "true"
+                    - name: KC_DB
+                      value: "postgres"
+                    - name: KC_DB_URL
+                      value: "jdbc:postgresql://postgresql-official.postgres.svc.cluster.local:5432/keycloak"
+                    - name: KC_DB_USERNAME
+                      value: "{{ admin_username }}"
+                    - name: KC_DB_PASSWORD
+                      value: "{{ admin_password }}"
+                  ports:
+                    - name: http
+                      containerPort: 8080
+                    - name: health
+                      containerPort: 9000
+                  readinessProbe:
+                    httpGet:
+                      path: /health/ready
+                      port: 9000
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                  livenessProbe:
+                    httpGet:
+                      path: /health/live
+                      port: 9000
+                    initialDelaySeconds: 60
+                    periodSeconds: 30
+                    timeoutSeconds: 5
+        EOF
+      changed_when: true
 
     - name: Create Keycloak ingress
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: keycloak
-            namespace: "{{ keycloak_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/proxy-body-size: "2500m"
-              nginx.ingress.kubernetes.io/proxy-buffer-size: "12k"
-              nginx.ingress.kubernetes.io/proxy-busy-buffers-size: "24k"
-              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
-              nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
-              nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
-          spec:
-            ingressClassName: nginx
-            tls:
-              - hosts:
-                  - "{{ keycloak_hostname }}"
-                secretName: keycloak-tls-secret
-            rules:
-              - host: "{{ keycloak_hostname }}"
-                http:
-                  paths:
-                    - path: /
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: keycloak
-                          port:
-                            number: 8080
+      ansible.builtin.shell: |
+        cat <<EOF | k8s kubectl --kubeconfig="{{ kubeconfig }}" apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: keycloak
+          namespace: {{ keycloak_namespace }}
+          annotations:
+            nginx.ingress.kubernetes.io/proxy-body-size: "2500m"
+            nginx.ingress.kubernetes.io/proxy-buffer-size: "12k"
+            nginx.ingress.kubernetes.io/proxy-busy-buffers-size: "24k"
+            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+            nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+            nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+        spec:
+          ingressClassName: nginx
+          tls:
+            - hosts:
+                - "{{ keycloak_hostname }}"
+              secretName: keycloak-tls-secret
+          rules:
+            - host: "{{ keycloak_hostname }}"
+              http:
+                paths:
+                  - path: /
+                    pathType: Prefix
+                    backend:
+                      service:
+                        name: keycloak
+                        port:
+                          number: 8080
+        EOF
+      changed_when: true
 
     - name: Wait for Keycloak pod to be ready
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        kind: Pod
-        namespace: "{{ keycloak_namespace }}"
-        label_selectors:
-          - app=keycloak
-      register: keycloak_pod
-      until: 
-        - keycloak_pod.resources | length > 0 
-        - keycloak_pod.resources[0].status.phase == "Running"
-        - keycloak_pod.resources[0].status.containerStatuses[0].ready | default(false)
+      ansible.builtin.shell: |
+        k8s kubectl --kubeconfig="{{ kubeconfig }}" get pods -n "{{ keycloak_namespace }}" -l app=keycloak -o json
+      register: keycloak_pod_raw
+      changed_when: false
+      until:
+        - (keycloak_pod_raw.stdout | from_json).items | length > 0
+        - (keycloak_pod_raw.stdout | from_json).items[0].status.phase == "Running"
+        - (keycloak_pod_raw.stdout | from_json).items[0].status.containerStatuses[0].ready | default(false)
       retries: 30
       delay: 10
+
+    - name: Parse Keycloak pod info
+      ansible.builtin.set_fact:
+        keycloak_pod: "{{ {'resources': (keycloak_pod_raw.stdout | from_json).items} }}"
 
     # User Management Tasks
     - name: Debug keycloak hostname and DNS resolution

@@ -27,8 +27,8 @@ Both controllers use NGINX Ingress Controller deployed via Helm with MetalLB for
 
 ## Prerequisites
 
-1. MicroK8s cluster deployed and running
-2. Control plane and worker nodes joined  
+1. k8s-snap cluster deployed and running
+2. Control plane and worker nodes joined
 3. CoreDNS configured for proper DNS resolution
 4. Cert-manager installed (required for TLS certificate creation)
 5. MetalLB addon available
@@ -38,7 +38,6 @@ Both controllers use NGINX Ingress Controller deployed via Helm with MetalLB for
 
 ### 10_deploy.yaml
 Deploys both ingress controllers with the following configuration:
-- Disables MicroK8s built-in ingress addon
 - Enables MetalLB with configured IP range
 - Deploys primary ingress controller in `ingress` namespace
 - Deploys secondary ingress controller in `ingress-kn` namespace
@@ -58,7 +57,6 @@ Removes the deployed ingress controllers:
 - Uninstalls Helm releases
 - Deletes IngressClass resources
 - Removes namespaces
-- Optionally re-enables built-in ingress
 
 ## Configuration
 
@@ -112,33 +110,33 @@ The ingress controllers are configured to work with cert-manager:
 
 ### Check Pod Status
 ```bash
-microk8s kubectl get pods -n ingress
-microk8s kubectl get pods -n ingress-kn
+kubectl get pods -n ingress
+kubectl get pods -n ingress-kn
 ```
 
 ### View Service External IPs
 ```bash
-microk8s kubectl get svc -n ingress
-microk8s kubectl get svc -n ingress-kn
+kubectl get svc -n ingress
+kubectl get svc -n ingress-kn
 ```
 
 ### Check IngressClass Configuration
 ```bash
-microk8s kubectl get ingressclass
+kubectl get ingressclass
 ```
 
 ### View Controller Logs
 ```bash
 # Primary controller
-microk8s kubectl logs -n ingress -l app.kubernetes.io/name=ingress-nginx
+kubectl logs -n ingress -l app.kubernetes.io/name=ingress-nginx
 
 # Secondary controller
-microk8s kubectl logs -n ingress-kn -l app.kubernetes.io/name=ingress-nginx
+kubectl logs -n ingress-kn -l app.kubernetes.io/name=ingress-nginx
 ```
 
 ### Verify MetalLB Configuration
 ```bash
-microk8s kubectl get configmap -n metallb-system config -o yaml
+kubectl get configmap -n metallb-system config -o yaml
 ```
 
 ## Next Steps
@@ -152,7 +150,7 @@ After successful deployment:
 ## Migration Notes
 
 This component migrates from `thinkube-core/playbooks/core/40_setup_ingress.yaml` with:
-- Updated to use MicroK8s kubectl and helm binaries
+- Updated to use k8s-snap kubectl and helm binaries
 - Removed hardcoded IPs and domains
 - Simplified configuration using inventory variables
 - Removed cert validation dependencies (handled by cert-manager)

@@ -8,7 +8,7 @@
 #   Provides S3-compatible distributed storage system
 #
 # Requirements:
-#   - MicroK8s cluster must be running
+#   - Canonical k8s-snap cluster must be running
 #   - Helm must be installed
 #   - kubectl access configured
 #
@@ -46,37 +46,44 @@
 
   tasks:
     - name: Ensure application namespace exists
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        name: "{{ seaweedfs_namespace }}"
-        api_version: v1
-        kind: Namespace
-        state: present
+      ansible.builtin.shell: |
+        if ! {{ kubectl_bin }} get namespace {{ seaweedfs_namespace }} &>/dev/null; then
+          {{ kubectl_bin }} create namespace {{ seaweedfs_namespace }}
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: namespace_result
+      changed_when: "'created' in namespace_result.stdout"
 
     - name: Get wildcard certificate from default namespace
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: default
-        name: "{{ domain_name.replace('.', '-') }}-tls"
-      register: wildcard_cert
-      failed_when: wildcard_cert.resources | length == 0
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wildcard_cert_raw
+      failed_when: wildcard_cert_raw.rc != 0
+
+    - name: Parse wildcard certificate JSON
+      ansible.builtin.set_fact:
+        wildcard_cert: "{{ wildcard_cert_raw.stdout | from_json }}"
 
     - name: Copy wildcard certificate to SeaweedFS namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: "{{ tls_secret_name }}"
-            namespace: "{{ seaweedfs_namespace }}"
-          type: kubernetes.io/tls
-          data:
-            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
-            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: {{ tls_secret_name }}
+          namespace: {{ seaweedfs_namespace }}
+        type: kubernetes.io/tls
+        data:
+          tls.crt: {{ wildcard_cert.data['tls.crt'] }}
+          tls.key: {{ wildcard_cert.data['tls.key'] }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: cert_copy_result
+      changed_when: "'created' in cert_copy_result.stdout or 'configured' in cert_copy_result.stdout"
 
     - name: Add SeaweedFS Helm repository
       ansible.builtin.command:
@@ -116,20 +123,24 @@
                 - Tagging
 
     - name: Create S3 configuration secret
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: seaweedfs-s3-config
-            namespace: "{{ seaweedfs_namespace }}"
-          type: Opaque
-          stringData:
-            s3-config.json: "{{ s3_auth_config | to_nice_json }}"
-            access_key: "{{ s3_access_key }}"
-            secret_key: "{{ s3_secret_key }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: seaweedfs-s3-config
+          namespace: {{ seaweedfs_namespace }}
+        type: Opaque
+        stringData:
+          s3-config.json: |
+            {{ s3_auth_config | to_nice_json | indent(8) }}
+          access_key: {{ s3_access_key }}
+          secret_key: {{ s3_secret_key }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: s3_config_result
+      changed_when: "'created' in s3_config_result.stdout or 'configured' in s3_config_result.stdout"
 
     - name: Create Helm values for SeaweedFS
       ansible.builtin.set_fact:
@@ -201,15 +212,14 @@
         state: absent
 
     - name: Wait for SeaweedFS components to be ready
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Pod
-        namespace: "{{ seaweedfs_namespace }}"
-        label_selectors:
-          - app.kubernetes.io/name=seaweedfs
-      register: seaweedfs_pods
-      until: seaweedfs_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length >= 3
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ seaweedfs_namespace }} -l app.kubernetes.io/name=seaweedfs -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: seaweedfs_pods_raw
+      until: >
+        (seaweedfs_pods_raw.stdout | from_json).items |
+        selectattr('status.phase', 'equalto', 'Running') | list | length >= 3
       retries: 60
       delay: 10
 
@@ -247,51 +257,63 @@
       register: mount_exists
 
     - name: Apply patch to add S3 config volume
-      kubernetes.core.k8s_json_patch:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: StatefulSet
-        name: seaweedfs-filer
-        namespace: "{{ seaweedfs_namespace }}"
-        patch:
-          - op: add
-            path: /spec/template/spec/volumes/-
-            value:
-              name: s3-config
-              secret:
-                secretName: seaweedfs-s3-config
-                items:
-                  - key: s3-config.json
-                    path: s3-config.json
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch statefulset seaweedfs-filer -n {{ seaweedfs_namespace }} --type=json -p='[
+          {
+            "op": "add",
+            "path": "/spec/template/spec/volumes/-",
+            "value": {
+              "name": "s3-config",
+              "secret": {
+                "secretName": "seaweedfs-s3-config",
+                "items": [
+                  {
+                    "key": "s3-config.json",
+                    "path": "s3-config.json"
+                  }
+                ]
+              }
+            }
+          }
+        ]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: volume_patch_result
+      changed_when: "'patched' in volume_patch_result.stdout"
       when: volume_exists.stdout | int == 0
 
     - name: Apply patch to add volume mount
-      kubernetes.core.k8s_json_patch:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: StatefulSet
-        name: seaweedfs-filer
-        namespace: "{{ seaweedfs_namespace }}"
-        patch:
-          - op: add
-            path: /spec/template/spec/containers/0/volumeMounts/-
-            value:
-              name: s3-config
-              mountPath: /etc/seaweedfs
-              readOnly: true
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch statefulset seaweedfs-filer -n {{ seaweedfs_namespace }} --type=json -p='[
+          {
+            "op": "add",
+            "path": "/spec/template/spec/containers/0/volumeMounts/-",
+            "value": {
+              "name": "s3-config",
+              "mountPath": "/etc/seaweedfs",
+              "readOnly": true
+            }
+          }
+        ]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: mount_patch_result
+      changed_when: "'patched' in mount_patch_result.stdout"
       when: mount_exists.stdout | int == 0
 
     - name: Apply patch to update command
-      kubernetes.core.k8s_json_patch:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: StatefulSet
-        name: seaweedfs-filer
-        namespace: "{{ seaweedfs_namespace }}"
-        patch:
-          - op: replace
-            path: /spec/template/spec/containers/0/command/2
-            value: "{{ modified_command }}"
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch statefulset seaweedfs-filer -n {{ seaweedfs_namespace }} --type=json -p='[
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/containers/0/command/2",
+            "value": "{{ modified_command }}"
+          }
+        ]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: command_patch_result
+      changed_when: "'patched' in command_patch_result.stdout"
 
     - name: Wait for filer rollout to complete
       ansible.builtin.shell: |
@@ -334,99 +356,110 @@
       when: oauth2_proxy_enabled
 
     - name: Wait for OAuth2 Proxy to be ready
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Pod
-        namespace: "{{ seaweedfs_namespace }}"
-        label_selectors:
-          - app.kubernetes.io/name=oauth2-proxy
-      register: oauth2_pods
-      until: oauth2_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ seaweedfs_namespace }} -l app.kubernetes.io/name=oauth2-proxy -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: oauth2_pods_raw
+      until: >
+        (oauth2_pods_raw.stdout | from_json).items |
+        selectattr('status.phase', 'equalto', 'Running') | list | length > 0
       retries: 30
       delay: 10
       when: oauth2_proxy_enabled
 
     - name: Create SeaweedFS UI Ingress (with OAuth2)
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: seaweedfs-ui-ingress
-            namespace: "{{ seaweedfs_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/auth-url: "http://oauth2-proxy.{{ seaweedfs_namespace }}.svc.cluster.local/oauth2/auth"
-              nginx.ingress.kubernetes.io/auth-signin: "https://{{ seaweedfs_ui_hostname }}/oauth2/start?rd=$escaped_request_uri"
-              nginx.ingress.kubernetes.io/auth-request-redirect: "$scheme://$best_http_host$request_uri"
-              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-              nginx.ingress.kubernetes.io/proxy-body-size: "0"
-              nginx.ingress.kubernetes.io/proxy-buffering: "off"
-              nginx.ingress.kubernetes.io/client-body-buffer-size: "1m"
-              nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
-          spec:
-            ingressClassName: nginx
-            tls:
-            - hosts:
-              - "{{ seaweedfs_ui_hostname }}"
-              secretName: "{{ tls_secret_name }}"
-            rules:
-            - host: "{{ seaweedfs_ui_hostname }}"
-              http:
-                paths:
-                - path: /
-                  pathType: Prefix
-                  backend:
-                    service:
-                      name: seaweedfs-filer
-                      port:
-                        number: 8888
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: seaweedfs-ui-ingress
+          namespace: {{ seaweedfs_namespace }}
+          annotations:
+            nginx.ingress.kubernetes.io/auth-url: "http://oauth2-proxy.{{ seaweedfs_namespace }}.svc.cluster.local/oauth2/auth"
+            nginx.ingress.kubernetes.io/auth-signin: "https://{{ seaweedfs_ui_hostname }}/oauth2/start?rd=\$escaped_request_uri"
+            nginx.ingress.kubernetes.io/auth-request-redirect: "\$scheme://\$best_http_host\$request_uri"
+            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+            nginx.ingress.kubernetes.io/proxy-body-size: "0"
+            nginx.ingress.kubernetes.io/proxy-buffering: "off"
+            nginx.ingress.kubernetes.io/client-body-buffer-size: "1m"
+            nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+        spec:
+          ingressClassName: nginx
+          tls:
+          - hosts:
+            - {{ seaweedfs_ui_hostname }}
+            secretName: {{ tls_secret_name }}
+          rules:
+          - host: {{ seaweedfs_ui_hostname }}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: seaweedfs-filer
+                    port:
+                      number: 8888
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: ui_ingress_result
+      changed_when: "'created' in ui_ingress_result.stdout or 'configured' in ui_ingress_result.stdout"
       when: oauth2_proxy_enabled
 
     - name: Create S3 API Ingress (without auth)
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: seaweedfs-s3-ingress
-            namespace: "{{ seaweedfs_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/proxy-body-size: "0"
-              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-              nginx.ingress.kubernetes.io/proxy-buffering: "off"
-          spec:
-            ingressClassName: nginx
-            tls:
-            - hosts:
-              - "{{ seaweedfs_s3_hostname }}"
-              secretName: "{{ tls_secret_name }}"
-            rules:
-            - host: "{{ seaweedfs_s3_hostname }}"
-              http:
-                paths:
-                - path: /
-                  pathType: Prefix
-                  backend:
-                    service:
-                      name: seaweedfs-s3
-                      port:
-                        number: 8333
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: seaweedfs-s3-ingress
+          namespace: {{ seaweedfs_namespace }}
+          annotations:
+            nginx.ingress.kubernetes.io/proxy-body-size: "0"
+            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+            nginx.ingress.kubernetes.io/proxy-buffering: "off"
+        spec:
+          ingressClassName: nginx
+          tls:
+          - hosts:
+            - {{ seaweedfs_s3_hostname }}
+            secretName: {{ tls_secret_name }}
+          rules:
+          - host: {{ seaweedfs_s3_hostname }}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: seaweedfs-s3
+                    port:
+                      number: 8333
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: s3_ingress_result
+      changed_when: "'created' in s3_ingress_result.stdout or 'configured' in s3_ingress_result.stdout"
 
     - name: Verify all ingresses are created
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: networking.k8s.io/v1
-        kind: Ingress
-        namespace: "{{ seaweedfs_namespace }}"
-      register: ingress_check
-      failed_when: 
-        - oauth2_proxy_enabled and ingress_check.resources | length < 3  # UI, S3, and OAuth2 proxy
-        - not oauth2_proxy_enabled and ingress_check.resources | length < 1  # Just S3
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get ingress -n {{ seaweedfs_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: ingress_check_raw
+
+    - name: Parse and verify ingress count
+      ansible.builtin.set_fact:
+        ingress_count: "{{ (ingress_check_raw.stdout | from_json).items | length }}"
+
+    - name: Fail if expected ingresses not created
+      ansible.builtin.fail:
+        msg: "Expected ingresses not found. Found {{ ingress_count }}, expected {{ '3 (UI, S3, OAuth2)' if oauth2_proxy_enabled else '1 (S3)' }}"
+      when:
+        - (oauth2_proxy_enabled and ingress_count | int < 3) or (not oauth2_proxy_enabled and ingress_count | int < 1)
 
     - name: Display deployment summary
       ansible.builtin.debug:

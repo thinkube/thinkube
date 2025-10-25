@@ -4,7 +4,7 @@ This component configures CoreDNS to properly handle ingress hostnames, Knative 
 
 ## Overview
 
-The CoreDNS configuration:
+The CoreDNS configuration for k8s-snap:
 - Enables hairpin routing for ingress controllers with ZeroTier
 - Handles internal Kubernetes service resolution
 - Routes Knative service domains to the secondary ingress controller
@@ -31,11 +31,11 @@ coredns/
 - `dns1`: DNS server host (ZeroTier IP is used as DNS server)
 - `zerotier_subnet_prefix`: ZeroTier network prefix
 - `secondary_ingress_ip_octet`: Last octet for secondary ingress IP
-- `microk8s_workers`: Group containing worker nodes
+- `k8s_workers`: Group containing worker nodes
 
 ### Dependencies
 
-- MicroK8s must be installed and running
+- k8s-snap must be installed and running
 - Ingress controllers should be deployed
 - ZeroTier DNS should be configured
 

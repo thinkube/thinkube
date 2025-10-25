@@ -7,7 +7,7 @@
 #   Deploy PostgreSQL database using Quay.io container image with SSL support
 #
 # Requirements:
-#   - Kubernetes cluster with MicroK8s
+#   - Kubernetes cluster with Canonical k8s-snap
 #   - TLS certificates available at specified path
 #   - NGINX Ingress Controller configured for TCP passthrough
 #
@@ -25,9 +25,9 @@
 #   - kubectl_bin: Path to kubectl binary
 #
 # Dependencies:
-#   - CORE-001: MicroK8s Control Node
-#   - CORE-002: MicroK8s Worker Nodes
-#   - Storage class available (microk8s-hostpath)
+#   - CORE-001: k8s-snap Control Node
+#   - CORE-002: k8s-snap Worker Nodes
+#   - Storage class available (k8s-hostpath)
 
 - name: Deploy PostgreSQL using Quay.io container image
   hosts: k8s_control_plane  # Use k8s_control_plane (NOT k8s-control-node or gato-p)
@@ -37,7 +37,7 @@
     # 1) Basic Postgres Info
     ###########################################################################
     postgres_release_name: "postgresql-official"
-    postgres_storage_class: "microk8s-hostpath"
+    postgres_storage_class: "k8s-hostpath"
     postgres_persistence_size: "10Gi"
 
     # Database config
@@ -61,9 +61,9 @@
     postgres_tcp_port: 5432
 
     ###########################################################################
-    # 3) NGINX Ingress (TCP) 
+    # 3) NGINX Ingress (TCP)
     ###########################################################################
-    ingress_tcp_configmap_name: "nginx-ingress-tcp-microk8s-conf"
+    ingress_tcp_configmap_name: "nginx-ingress-tcp-k8s-conf"
 
   pre_tasks:
     - name: Verify admin password available
@@ -98,48 +98,65 @@
       changed_when: ensure_ns.stdout != ""
 
     - name: Get wildcard certificate from default namespace
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: default
-        name: "{{ domain_name.replace('.', '-') }}-tls"
-      register: wildcard_cert
-      failed_when: wildcard_cert.resources | length == 0
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
+      become: true
+      register: wildcard_cert_raw
+      failed_when: wildcard_cert_raw.rc != 0
+
+    - name: Parse wildcard certificate JSON
+      ansible.builtin.set_fact:
+        wildcard_cert:
+          resources:
+            - "{{ wildcard_cert_raw.stdout | from_json }}"
     
     - name: Check if TLS secret already exists in PostgreSQL namespace
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: "{{ postgres_namespace }}"
-        name: "{{ postgres_tls_secret_name }}"
-      register: existing_cert_check
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ postgres_tls_secret_name }} -n {{ postgres_namespace }} -o json
+      become: true
+      register: existing_cert_check_raw
+      failed_when: false
+      changed_when: false
+
+    - name: Parse existing certificate check JSON
+      ansible.builtin.set_fact:
+        existing_cert_check:
+          resources: "{{ [existing_cert_check_raw.stdout | from_json] if existing_cert_check_raw.rc == 0 else [] }}"
     
-    - name: Copy wildcard certificate to PostgreSQL namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
+    - name: Create temporary manifest for TLS secret
+      ansible.builtin.copy:
+        content: |
           apiVersion: v1
           kind: Secret
           metadata:
-            name: "{{ postgres_tls_secret_name }}"
-            namespace: "{{ postgres_namespace }}"
+            name: {{ postgres_tls_secret_name }}
+            namespace: {{ postgres_namespace }}
           type: kubernetes.io/tls
           data:
-            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
-            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+            tls.crt: {{ wildcard_cert.resources[0].data['tls.crt'] }}
+            tls.key: {{ wildcard_cert.resources[0].data['tls.key'] }}
+        dest: /tmp/postgres-tls-secret.yaml
+        mode: '0600'
+      become: true
+
+    - name: Copy wildcard certificate to PostgreSQL namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/postgres-tls-secret.yaml
+      become: true
       register: cert_copy
+      changed_when: "'created' in cert_copy.stdout or 'configured' in cert_copy.stdout"
       
     - name: Verify TLS secret exists
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: "{{ postgres_namespace }}"
-        name: "{{ postgres_tls_secret_name }}"
-      register: cert_check
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ postgres_tls_secret_name }} -n {{ postgres_namespace }} -o json
+      become: true
+      register: cert_check_raw
+      failed_when: cert_check_raw.rc != 0
+
+    - name: Parse certificate check JSON
+      ansible.builtin.set_fact:
+        cert_check:
+          resources: "{{ [cert_check_raw.stdout | from_json] }}"
       
     - name: Verify TLS secret was created successfully
       ansible.builtin.assert:
@@ -153,64 +170,67 @@
     ###########################################################################
 
     # 2.1) Create a PersistentVolumeClaim for data:
-    - name: Create PVC for PostgreSQL data
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
+    - name: Create temporary manifest for PostgreSQL PVC
+      ansible.builtin.copy:
+        content: |
           apiVersion: v1
           kind: PersistentVolumeClaim
           metadata:
-            name: "{{ postgres_data_volume_name }}"
-            namespace: "{{ postgres_namespace }}"
+            name: {{ postgres_data_volume_name }}
+            namespace: {{ postgres_namespace }}
           spec:
             accessModes: ["ReadWriteOnce"]
-            storageClassName: "{{ postgres_storage_class }}"
+            storageClassName: {{ postgres_storage_class }}
             resources:
               requests:
-                storage: "{{ postgres_persistence_size }}"
+                storage: {{ postgres_persistence_size }}
+        dest: /tmp/postgres-pvc.yaml
+        mode: '0644'
+      become: true
+
+    - name: Create PVC for PostgreSQL data
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/postgres-pvc.yaml
+      become: true
+      register: pvc_create
+      changed_when: "'created' in pvc_create.stdout or 'configured' in pvc_create.stdout"
 
     ###########################################################################
     # Task 3) DEPLOY POSTGRESQL (StatefulSet)
     ###########################################################################
-    - name: Deploy PostgreSQL StatefulSet
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
+    - name: Create temporary manifest for PostgreSQL StatefulSet
+      ansible.builtin.copy:
+        content: |
           apiVersion: apps/v1
           kind: StatefulSet
           metadata:
-            name: "{{ postgres_release_name }}"
-            namespace: "{{ postgres_namespace }}"
+            name: {{ postgres_release_name }}
+            namespace: {{ postgres_namespace }}
             labels:
-              app: "postgres-official"
+              app: postgres-official
           spec:
-            # Fix 1: Ensure service name matches the name we create below
-            serviceName: "{{ postgres_release_name }}"
+            serviceName: {{ postgres_release_name }}
             replicas: 1
             selector:
               matchLabels:
-                app: "postgres-official"
+                app: postgres-official
             template:
               metadata:
                 labels:
-                  app: "postgres-official"
+                  app: postgres-official
               spec:
                 securityContext:
-                  fsGroup: 999  # Standard PostgreSQL UID
+                  fsGroup: 999
                 containers:
                   - name: postgres
-                    image: "{{ postgres_image }}"
+                    image: {{ postgres_image }}
                     env:
-                      # Standard PostgreSQL environment variables
-                      # The POSTGRES_USER will be created as a superuser by default
                       - name: POSTGRES_USER
-                        value: "{{ admin_username }}"
+                        value: {{ admin_username }}
                       - name: POSTGRES_PASSWORD
-                        value: "{{ admin_password }}"
+                        value: {{ admin_password }}
                       - name: POSTGRES_DB
-                        value: "{{ postgres_database }}"
+                        value: {{ postgres_database }}
                     ports:
                       - containerPort: 5432
                         name: postgres
@@ -219,44 +239,62 @@
                         mountPath: /var/lib/postgresql/data
                     resources:
                       requests:
-                        cpu: "250m"
-                        memory: "256Mi"
+                        cpu: 250m
+                        memory: 256Mi
                       limits:
-                        cpu: "1000m"
-                        memory: "1Gi"
+                        cpu: 1000m
+                        memory: 1Gi
                 volumes: []
             volumeClaimTemplates:
               - metadata:
                   name: data
                 spec:
                   accessModes: ["ReadWriteOnce"]
-                  storageClassName: "{{ postgres_storage_class }}"
+                  storageClassName: {{ postgres_storage_class }}
                   resources:
                     requests:
-                      storage: "{{ postgres_persistence_size }}"
+                      storage: {{ postgres_persistence_size }}
+        dest: /tmp/postgres-statefulset.yaml
+        mode: '0644'
+      become: true
+
+    - name: Deploy PostgreSQL StatefulSet
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/postgres-statefulset.yaml
+      become: true
+      register: statefulset_deploy
+      changed_when: "'created' in statefulset_deploy.stdout or 'configured' in statefulset_deploy.stdout"
 
     ###########################################################################
     # Task 4) CREATE SERVICE for PostgreSQL
     ###########################################################################
-    - name: Create Service for PostgreSQL
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
+    - name: Create temporary manifest for PostgreSQL Service
+      ansible.builtin.copy:
+        content: |
           apiVersion: v1
           kind: Service
           metadata:
-            name: "{{ postgres_release_name }}"
-            namespace: "{{ postgres_namespace }}"
+            name: {{ postgres_release_name }}
+            namespace: {{ postgres_namespace }}
             labels:
-              app: "postgres-official"
+              app: postgres-official
           spec:
             selector:
-              app: "postgres-official"
+              app: postgres-official
             ports:
               - protocol: TCP
                 port: 5432
                 targetPort: 5432
+        dest: /tmp/postgres-service.yaml
+        mode: '0644'
+      become: true
+
+    - name: Create Service for PostgreSQL
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/postgres-service.yaml
+      become: true
+      register: service_create
+      changed_when: "'created' in service_create.stdout or 'configured' in service_create.stdout"
 
     ###########################################################################
     # Task 5) WAIT for Postgres Pod
@@ -321,19 +359,26 @@
             }
           }}
 
-    - name: Create or update NGINX Ingress TCP ConfigMap for PostgreSQL
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        merge_type: strategic-merge
-        definition:
+    - name: Create temporary manifest for NGINX Ingress TCP ConfigMap
+      ansible.builtin.copy:
+        content: |
           apiVersion: v1
           kind: ConfigMap
           metadata:
-            name: "{{ ingress_tcp_configmap_name }}"
-            namespace: "{{ ingress_namespace }}"
-          data: "{{ postgres_tcp_map_data }}"
+            name: {{ ingress_tcp_configmap_name }}
+            namespace: {{ ingress_namespace }}
+          data:
+            "{{ postgres_tcp_port }}": "{{ postgres_namespace }}/{{ postgres_release_name }}:{{ postgres_tcp_port }}"
+        dest: /tmp/nginx-tcp-configmap.yaml
+        mode: '0644'
       become: true
+
+    - name: Create or update NGINX Ingress TCP ConfigMap for PostgreSQL
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/nginx-tcp-configmap.yaml
+      become: true
+      register: configmap_update
+      changed_when: "'created' in configmap_update.stdout or 'configured' in configmap_update.stdout"
 
     # Fix 2: Force restart the ingress controller to ensure ConfigMap is reloaded
     - name: Restart NGINX Ingress controller to pick up TCP config changes

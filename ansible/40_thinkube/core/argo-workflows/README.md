@@ -13,7 +13,7 @@ This component deploys [Argo Workflows](https://argoproj.github.io/workflows/) a
 
 ## Prerequisites
 
-- MicroK8s Kubernetes cluster (CORE-001 and CORE-002)
+- Canonical k8s-snap Kubernetes cluster (CORE-001 and CORE-002)
 - Cert-Manager (CORE-003) for TLS certificates
 - Keycloak (CORE-004) for SSO authentication
 - S3-compatible storage (SeaweedFS) for artifact storage
@@ -143,9 +143,9 @@ The following variables are used:
 | `auth_realm_username` | Realm username for SSO | `thinkube` |
 | `argo_namespace` | Kubernetes namespace | `argo` |
 | `seaweedfs_s3_hostname` | S3 API hostname | `s3.thinkube.com` |
-| `kubeconfig` | Kubernetes config path | `/var/snap/microk8s/current/credentials/client.config` |
-| `kubectl_bin` | Path to kubectl binary | `/snap/bin/microk8s.kubectl` |
-| `helm_bin` | Path to helm binary | `/snap/bin/microk8s.helm3` |
+| `kubeconfig` | Kubernetes config path | `/etc/kubernetes/admin.conf` |
+| `kubectl_bin` | Path to kubectl binary | `kubectl` |
+| `helm_bin` | Path to helm binary | `helm` |
 
 ## Environment Variables
 
@@ -161,7 +161,7 @@ These environment variables are required:
 
 1. **OIDC Login Failure**: Verify Keycloak client configuration and redirect URIs
    ```bash
-   ./scripts/run_ssh_command.sh tkc "microk8s.kubectl get secret -n argo argo-server-sso -o yaml"
+   ./scripts/run_ssh_command.sh tkc "kubectl get secret -n argo argo-server-sso -o yaml"
    ```
 
 2. **Artifact Storage Issues**: Check S3 storage connectivity
@@ -172,8 +172,8 @@ These environment variables are required:
 
 3. **Pod Startup Issues**: Check events and logs
    ```bash
-   ./scripts/run_ssh_command.sh tkc "microk8s.kubectl get events -n argo"
-   ./scripts/run_ssh_command.sh tkc "microk8s.kubectl logs -n argo deploy/argo-workflows-server -c argo-workflows-server"
+   ./scripts/run_ssh_command.sh tkc "kubectl get events -n argo"
+   ./scripts/run_ssh_command.sh tkc "kubectl logs -n argo deploy/argo-workflows-server -c argo-workflows-server"
    ```
 
 ## References

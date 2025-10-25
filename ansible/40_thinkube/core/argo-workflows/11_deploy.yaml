@@ -7,7 +7,7 @@
 #   Deploy Argo Workflows and Argo Events with OIDC authentication and TLS Ingress
 #
 # Requirements:
-#   - MicroK8s Kubernetes cluster
+#   - Canonical k8s-snap Kubernetes cluster
 #   - Keycloak instance running with Argo client configured (run 10_configure_keycloak.yaml first)
 #   - Cert-Manager deployed and configured with wildcard certificate (CORE-003)
 #   - ADMIN_PASSWORD environment variable set for Keycloak admin access
@@ -26,8 +26,8 @@
 #   - helm_bin: Path to helm binary
 #
 # Dependencies:
-#   - CORE-001: MicroK8s Control Node
-#   - CORE-002: MicroK8s Worker Nodes
+#   - CORE-001: k8s-snap Control Node
+#   - CORE-002: k8s-snap Worker Nodes
 #   - CORE-003: Cert-Manager (for TLS)
 #   - CORE-004: Keycloak (for SSO)
 
@@ -38,14 +38,14 @@
     # Temporary file paths (not from inventory)
     argo_values_file: "/tmp/argo-values.yaml"
     argo_events_values_file: "/tmp/argo-events-values.yaml"
-    
+
     # TLS secret name
     argo_tls_secret_name: "{{ argo_namespace }}-tls-secret"
-    
+
     # Keycloak admin credentials
     keycloak_admin_user: "{{ admin_username }}"
     keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
-    
+
     # OIDC URLs constructed from inventory variables
     argo_oidc_redirect_uri: "https://{{ argo_domain }}/oauth2/callback"
     argo_oidc_web_origins:
@@ -53,7 +53,7 @@
     argo_redirect_uris:
       - "https://{{ argo_domain }}/oauth2/callback"
       - "https://{{ argo_domain }}/*"
-    
+
     # OIDC configuration for Argo Server console
     oidc_enabled: true
     oidc_issuer: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
@@ -203,29 +203,35 @@
 
     # --- Get wildcard TLS certificate from default namespace ---
     - name: Get wildcard certificate from default namespace
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: default
-        name: "{{ domain_name.replace('.', '-') }}-tls"
-      register: wildcard_cert
-      failed_when: wildcard_cert.resources | length == 0
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wildcard_cert_json
+      changed_when: false
+      failed_when: wildcard_cert_json.rc != 0
+
+    - name: Parse wildcard certificate JSON
+      ansible.builtin.set_fact:
+        wildcard_cert: "{{ wildcard_cert_json.stdout | from_json }}"
 
     - name: Copy wildcard certificate to argo namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: "{{ argo_tls_secret_name }}"
-            namespace: "{{ argo_namespace }}"
-          type: kubernetes.io/tls
-          data:
-            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
-            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: {{ argo_tls_secret_name }}
+          namespace: {{ argo_namespace }}
+        type: kubernetes.io/tls
+        data:
+          tls.crt: {{ wildcard_cert.data['tls.crt'] }}
+          tls.key: {{ wildcard_cert.data['tls.key'] }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: copy_cert_result
+      changed_when: "'configured' in copy_cert_result.stdout or 'created' in copy_cert_result.stdout"
 
     - name: Add official Argo helm repository if not present
       ansible.builtin.shell: |
@@ -242,19 +248,22 @@
       failed_when: false
 
     - name: Create Argo SSO secret
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: argo-server-sso
-            namespace: "{{ argo_namespace }}"
-          type: Opaque
-          stringData:
-            clientId: "{{ oidc_client_id }}"
-            clientSecret: "{{ oidc_client_secret }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: argo-server-sso
+          namespace: {{ argo_namespace }}
+        type: Opaque
+        stringData:
+          clientId: {{ oidc_client_id }}
+          clientSecret: {{ oidc_client_secret }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: sso_secret_result
+      changed_when: "'configured' in sso_secret_result.stdout or 'created' in sso_secret_result.stdout"
 
     - name: Create Argo Workflows values file with OIDC configuration
       ansible.builtin.copy:
@@ -384,66 +393,72 @@
     # (1) HTTP/HTTPS UI Ingress at 'argo_domain'
     ##############################################################################
     - name: Create Ingress for Argo Workflows (UI)
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: argo-ingress
-            namespace: "{{ argo_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/ssl-redirect: "true"
-          spec:
-            tls:
-              - hosts:
-                  - "{{ argo_domain }}"
-                secretName: "{{ argo_tls_secret_name }}"
-            rules:
-              - host: "{{ argo_domain }}"
-                http:
-                  paths:
-                    - path: /
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: "{{ argo_release_name }}-server"
-                          port:
-                            number: 2746
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: argo-ingress
+          namespace: {{ argo_namespace }}
+          annotations:
+            nginx.ingress.kubernetes.io/ssl-redirect: "true"
+        spec:
+          tls:
+            - hosts:
+                - {{ argo_domain }}
+              secretName: {{ argo_tls_secret_name }}
+          rules:
+            - host: {{ argo_domain }}
+              http:
+                paths:
+                  - path: /
+                    pathType: Prefix
+                    backend:
+                      service:
+                        name: {{ argo_release_name }}-server
+                        port:
+                          number: 2746
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: ui_ingress_result
+      changed_when: "'configured' in ui_ingress_result.stdout or 'created' in ui_ingress_result.stdout"
 
     ##############################################################################
     # (2) gRPC Ingress at 'argo_grpc_domain'
     ##############################################################################
     - name: Create gRPC Ingress for Argo Workflows
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: argo-grpc-ingress
-            namespace: "{{ argo_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
-              nginx.ingress.kubernetes.io/enable-http2: "true"
-          spec:
-            tls:
-              - hosts:
-                  - "{{ argo_grpc_domain }}"
-                secretName: "{{ argo_tls_secret_name }}"
-            rules:
-              - host: "{{ argo_grpc_domain }}"
-                http:
-                  paths:
-                    - path: /
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: "{{ argo_release_name }}-server"
-                          port:
-                            number: 2746
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: argo-grpc-ingress
+          namespace: {{ argo_namespace }}
+          annotations:
+            nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+            nginx.ingress.kubernetes.io/enable-http2: "true"
+        spec:
+          tls:
+            - hosts:
+                - {{ argo_grpc_domain }}
+              secretName: {{ argo_tls_secret_name }}
+          rules:
+            - host: {{ argo_grpc_domain }}
+              http:
+                paths:
+                  - path: /
+                    pathType: Prefix
+                    backend:
+                      service:
+                        name: {{ argo_release_name }}-server
+                        port:
+                          number: 2746
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: grpc_ingress_result
+      changed_when: "'configured' in grpc_ingress_result.stdout or 'created' in grpc_ingress_result.stdout"
 
     - name: Display Argo Workflows and Events installation details
       ansible.builtin.shell: |
