@@ -49,12 +49,14 @@
         mode: '0755'
         owner: root
         group: root
-        
+      become: true
+
     # Remove any conflicting DNS configuration files first
     - name: Remove conflicting DNS configuration files
       ansible.builtin.file:
         path: /etc/systemd/resolved.conf.d/dns.conf
         state: absent
+      become: true
       notify: restart systemd-resolved
       
     # Configure Kubernetes nodes
@@ -74,6 +76,7 @@
         owner: root
         group: root
         mode: '0644'
+      become: true
       when: inventory_hostname in groups['k8s']
       notify: restart systemd-resolved
         
@@ -82,9 +85,10 @@
       ansible.builtin.file:
         path: /etc/systemd/resolved.conf.d/dns.conf
         state: absent
+      become: true
       when: "inventory_hostname not in groups['k8s']"
       notify: restart systemd-resolved
-      
+
     - name: Configure systemd-resolved for non-Kubernetes nodes
       ansible.builtin.copy:
         content: |
@@ -101,6 +105,7 @@
         owner: root
         group: root
         mode: '0644'
+      become: true
       when: "inventory_hostname not in groups['k8s']"
       notify: restart systemd-resolved
       
@@ -131,6 +136,7 @@
         enabled: yes
         state: started
         daemon_reload: yes
+      become: true
       
     # For LXD VMs, also configure netplan to preserve DNS settings
     - name: Check if netplan config exists
@@ -143,16 +149,18 @@
         path: /etc/netplan/50-cloud-init.yaml
         marker: "            # {mark} ANSIBLE MANAGED BLOCK - DNS Configuration"
         state: absent
-      when: 
+      become: true
+      when:
         - netplan_config.stat.exists
         - inventory_hostname in groups['k8s']
-      
+
     - name: Update netplan DNS configuration for nodes
       ansible.builtin.replace:
         path: /etc/netplan/50-cloud-init.yaml
         regexp: "addresses: \\['8.8.8.8', '8.8.4.4'\\]"
         replace: "addresses: ['{{ coredns_external_ip }}', '8.8.8.8']"
-      when: 
+      become: true
+      when:
         - netplan_config.stat.exists
         - inventory_hostname in groups['k8s']
       notify: apply netplan
@@ -165,19 +173,20 @@
           Description=Verify DNS Configuration after network is online
           After=network-online.target systemd-resolved.service
           Wants=network-online.target
-          
+
           [Service]
           Type=oneshot
           RemainAfterExit=yes
           ExecStartPre=/bin/sleep 5
           ExecStart=/bin/systemctl restart systemd-resolved
-          
+
           [Install]
           WantedBy=multi-user.target
         dest: /etc/systemd/system/dns-config-verify.service
         owner: root
         group: root
         mode: '0644'
+      become: true
       notify: enable dns verify service
       
   handlers:
@@ -186,15 +195,18 @@
         name: systemd-resolved
         state: restarted
         daemon_reload: true
-        
+      become: true
+
     - name: apply netplan
       ansible.builtin.command: netplan apply
-      
+      become: true
+
     - name: enable dns verify service
       ansible.builtin.systemd:
         name: dns-config-verify
         enabled: yes
         daemon_reload: yes
+      become: true
         
   post_tasks:
     # Test DNS resolution to verify configuration
