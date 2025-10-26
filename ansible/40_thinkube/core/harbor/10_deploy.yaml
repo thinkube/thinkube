@@ -7,7 +7,7 @@
 #   Deploys Harbor container registry with OIDC authentication via Keycloak
 #   Creates Keycloak client, configures OIDC scopes, and sets up harbor-admins group
 #   Uses Helm chart for deployment with ingress exposure
-#
+#   
 #   EXCEPTION: Harbor's built-in admin username cannot be changed from "admin"
 #   We change its password to our standard admin_password for consistency
 #
@@ -16,6 +16,10 @@
 #   - Keycloak must be deployed and accessible
 #   - Wildcard TLS certificate available in default namespace
 #   - KEYCLOAK_ADMIN_PASSWORD environment variable set
+#
+# Architecture Support:
+#   - AMD64: Uses official Harbor images from goharbor
+#   - ARM64: Uses patched images from ghcr.io/thinkube/thinkube-harbor-arm64
 #
 # Usage:
 #   cd ~/thinkube
@@ -40,18 +44,18 @@
 
 - name: Deploy Harbor with LoadBalancer Exposure and OIDC Authentication
   hosts: k8s_control_plane
-  gather_facts: false
+  gather_facts: true
   vars:
     harbor_values: "/tmp/harbor-values.yaml"
     harbor_admin_user: "admin"  # Harbor's built-in admin user (EXCEPTION: Cannot be changed)
     admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
-
-    # OIDC configuration
+    
+    # OIDC configuration  
     oidc_client_id: "harbor"
     oidc_group_claim: "groups"
     oidc_admin_group: "harbor-admins"
     oidc_scopes: "openid,profile,email,groups"
-
+    
   pre_tasks:
     - name: Verify admin password available
       ansible.builtin.assert:
@@ -59,126 +63,19 @@
         fail_msg: "ADMIN_PASSWORD environment variable must be set"
         success_msg: "Required environment variables are set"
 
+    - name: Detect control plane architecture
+      ansible.builtin.set_fact:
+        is_arm64: "{{ ansible_architecture == 'aarch64' }}"
+
+    - name: Display detected architecture
+      ansible.builtin.debug:
+        msg: "Detected architecture: {{ ansible_architecture }} (ARM64: {{ is_arm64 }})"
+
   tasks:
     ########################################################################
-    # 1. Pull Pre-built Harbor ARM64 Images
+    # 1. Keycloak OIDC Client, Scope Setup, harbor-admins Group
     ########################################################################
-    # Harbor v2.14.0 doesn't provide official ARM64 images
-    # Using pre-built multi-arch images from ranichowdary (multiarch-platform-support branch author)
-    # Images are pulled to control plane and Harbor pods are pinned there for architecture consistency
-
-    - name: Pull pre-built Harbor ARM64 images from ranichowdary
-      ansible.builtin.command:
-        cmd: "podman pull docker.io/ranichowdary/{{ item.source }}:latest"
-      loop:
-        - { source: "harbor-core", dest: "tk-harbor-harbor-core" }
-        - { source: "harbor-db", dest: "tk-harbor-harbor-db" }
-        - { source: "jobservice-harbor", dest: "tk-harbor-harbor-jobservice" }
-        - { source: "harbor-portal", dest: "tk-harbor-harbor-portal" }
-        - { source: "harbor-registryctl", dest: "tk-harbor-harbor-registryctl" }
-        - { source: "registry-harbor", dest: "tk-harbor-registry-photon" }
-      register: pull_result
-      changed_when: true
-
-    - name: Pull Valkey image for Redis replacement (BSD license, Apache compatible)
-      ansible.builtin.command:
-        cmd: "podman pull docker.io/valkey/valkey:latest"
-      changed_when: true
-
-    - name: Tag Harbor images with tk-harbor prefix
-      ansible.builtin.command:
-        cmd: "podman tag docker.io/ranichowdary/{{ item.source }}:latest {{ item.dest }}:v2.14.0"
-      loop:
-        - { source: "harbor-core", dest: "tk-harbor-harbor-core" }
-        - { source: "harbor-db", dest: "tk-harbor-harbor-db" }
-        - { source: "jobservice-harbor", dest: "tk-harbor-harbor-jobservice" }
-        - { source: "harbor-portal", dest: "tk-harbor-harbor-portal" }
-        - { source: "harbor-registryctl", dest: "tk-harbor-harbor-registryctl" }
-        - { source: "registry-harbor", dest: "tk-harbor-registry-photon" }
-      changed_when: true
-
-    - name: Tag Valkey image for Harbor use
-      ansible.builtin.command:
-        cmd: "podman tag docker.io/valkey/valkey:latest tk-harbor-redis-photon:v2.14.0"
-      changed_when: true
-
-    - name: Clean up old Harbor tar files
-      ansible.builtin.file:
-        path: "/tmp/tk-harbor-{{ item }}.tar"
-        state: absent
-      loop:
-        - harbor-core
-        - harbor-db
-        - harbor-jobservice
-        - harbor-portal
-        - harbor-registryctl
-        - registry-photon
-        - redis-photon
-
-    - name: Save Harbor images to tar files
-      ansible.builtin.command:
-        cmd: "podman save -o /tmp/tk-harbor-{{ item }}.tar tk-harbor-{{ item }}:v2.14.0"
-      loop:
-        - harbor-core
-        - harbor-db
-        - harbor-jobservice
-        - harbor-portal
-        - harbor-registryctl
-        - registry-photon
-        - redis-photon
-      changed_when: true
-
-    - name: Import Harbor images into containerd
-      ansible.builtin.shell: |
-        sudo /snap/k8s/current/bin/ctr --address /run/containerd/containerd.sock \
-          --namespace k8s.io images import /tmp/tk-harbor-{{ item }}.tar
-      loop:
-        - harbor-core
-        - harbor-db
-        - harbor-jobservice
-        - harbor-portal
-        - harbor-registryctl
-        - registry-photon
-        - redis-photon
-      changed_when: true
-
-    - name: Tag images with docker.io/library prefix for Kubernetes
-      ansible.builtin.shell: |
-        sudo /snap/k8s/current/bin/ctr --address /run/containerd/containerd.sock \
-          --namespace k8s.io images tag \
-          localhost/tk-harbor-{{ item }}:v2.14.0 \
-          docker.io/library/tk-harbor-{{ item }}:v2.14.0 || true
-      loop:
-        - harbor-core
-        - harbor-db
-        - harbor-jobservice
-        - harbor-portal
-        - harbor-registryctl
-        - registry-photon
-        - redis-photon
-      changed_when: false  # Idempotent - ignore "already exists" errors
-
-    - name: Clean up tar files
-      ansible.builtin.file:
-        path: "/tmp/tk-harbor-{{ item }}.tar"
-        state: absent
-      loop:
-        - harbor-core
-        - harbor-db
-        - harbor-jobservice
-        - harbor-portal
-        - harbor-registryctl
-        - registry-photon
-        - redis-photon
-
-    - name: Get control plane hostname for nodeSelector
-      ansible.builtin.set_fact:
-        control_plane_hostname: "{{ inventory_hostname }}"
-
-    ########################################################################
-    # 2. Keycloak OIDC Client, Scope Setup, harbor-admins Group
-    ########################################################################
-
+    
     - name: Get Keycloak admin token
       ansible.builtin.uri:
         url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
@@ -331,7 +228,7 @@
         validate_certs: false  # Self-signed certificate during initial deployment
       register: groups_response
       no_log: false
-
+        
     # Add auth realm user to harbor-admins group
     - name: Get auth realm user info
       ansible.builtin.uri:
@@ -343,7 +240,7 @@
         validate_certs: false  # Self-signed certificate during initial deployment
       register: auth_realm_user_response
       no_log: false
-
+      
     - name: Add '{{ auth_realm_username }}' user to 'harbor-admins' group if it exists
       ansible.builtin.uri:
         url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/{{ auth_realm_user_response.json[0].id }}/groups/{{ groups_response.json | selectattr('name', 'equalto', oidc_admin_group) | map(attribute='id') | first }}"
@@ -353,7 +250,7 @@
           Content-Type: "application/json"
         status_code: 204
         validate_certs: false  # Self-signed certificate during initial deployment
-      when:
+      when: 
         - auth_realm_user_response.json | length > 0
         - groups_response.json | selectattr('name', 'equalto', oidc_admin_group) | list | length > 0
 
@@ -380,83 +277,72 @@
     ########################################################################
 
     - name: Ensure Harbor namespace exists
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} apply -f -"
-        stdin: |
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
           apiVersion: v1
           kind: Namespace
           metadata:
-            name: {{ harbor_namespace }}
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: namespace_result
-      changed_when: "'created' in namespace_result.stdout or 'configured' in namespace_result.stdout"
+            name: "{{ harbor_namespace }}"
 
     - name: Check if wildcard certificate exists in default namespace
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
       register: wildcard_cert
-      changed_when: false
-      failed_when: wildcard_cert.rc != 0
-
-    - name: Parse wildcard certificate JSON
-      ansible.builtin.set_fact:
-        wildcard_cert_json: "{{ wildcard_cert.stdout | from_json }}"
+      failed_when: wildcard_cert.resources | length == 0
 
     - name: Check if TLS secret already exists in harbor namespace
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} get secret harbor-tls-secret -n {{ harbor_namespace }} -o json"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ harbor_namespace }}"
+        name: harbor-tls-secret
       register: existing_cert_check
-      changed_when: false
-      failed_when: false
 
     - name: Delete existing TLS secret if it exists
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} delete secret harbor-tls-secret -n {{ harbor_namespace }}"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      when: existing_cert_check.rc == 0
-      changed_when: true
-
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Secret
+        namespace: "{{ harbor_namespace }}"
+        name: harbor-tls-secret
+      when: existing_cert_check.resources | length > 0
+      
     - name: Copy wildcard certificate from default namespace
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} apply -f -"
-        stdin: "{{ lookup('template', 'templates/harbor-tls-secret.yaml.j2') }}"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition: "{{ lookup('template', 'templates/harbor-tls-secret.yaml.j2') | from_yaml }}"
       register: copy_cert
-      changed_when: "'created' in copy_cert.stdout or 'configured' in copy_cert.stdout"
-
+      
     - name: Check if TLS secret was created
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} get secret harbor-tls-secret -n {{ harbor_namespace }} -o json"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ harbor_namespace }}"
+        name: harbor-tls-secret
       register: cert_check
-      changed_when: false
-
-    - name: Parse TLS secret JSON
-      ansible.builtin.set_fact:
-        cert_check_json: "{{ cert_check.stdout | from_json }}"
-
+      
     - name: Verify TLS secret exists
       ansible.builtin.assert:
         that:
-          - cert_check_json is defined
-          - cert_check_json.metadata is defined
-          - cert_check_json.metadata.name == 'harbor-tls-secret'
+          - cert_check.resources | length > 0
         fail_msg: "Failed to copy wildcard certificate"
 
     - name: Add Harbor Helm repository
-      ansible.builtin.command:
-        cmd: "{{ helm_bin }} repo add harbor https://helm.goharbor.io"
-      register: helm_repo_add
-      changed_when: "'already exists' not in helm_repo_add.stderr"
-      failed_when: helm_repo_add.rc != 0 and 'already exists' not in helm_repo_add.stderr
+      kubernetes.core.helm_repository:
+        binary_path: "{{ helm_bin }}"
+        name: harbor
+        repo_url: https://helm.goharbor.io
+        repo_state: present
 
     - name: Update Helm repositories
       ansible.builtin.command: "{{ helm_bin }} repo update"
@@ -486,64 +372,6 @@
 
           externalURL: https://{{ harbor_registry }}
 
-          # Use pre-built Harbor ARM64 images imported into containerd
-          # Harbor v2.14.0 doesn't provide official ARM64 images
-          # Images imported with ctr get localhost/ prefix automatically
-          # All components pinned to control plane where images are imported
-          imagePullPolicy: Never
-
-          core:
-            image:
-              repository: localhost/tk-harbor-harbor-core
-              tag: v2.14.0
-            nodeSelector:
-              kubernetes.io/hostname: {{ control_plane_hostname }}
-
-          portal:
-            image:
-              repository: localhost/tk-harbor-harbor-portal
-              tag: v2.14.0
-            nodeSelector:
-              kubernetes.io/hostname: {{ control_plane_hostname }}
-
-          jobservice:
-            image:
-              repository: localhost/tk-harbor-harbor-jobservice
-              tag: v2.14.0
-            nodeSelector:
-              kubernetes.io/hostname: {{ control_plane_hostname }}
-
-          registry:
-            registry:
-              image:
-                repository: localhost/tk-harbor-registry-photon
-                tag: v2.14.0
-            controller:
-              image:
-                repository: localhost/tk-harbor-harbor-registryctl
-                tag: v2.14.0
-            nodeSelector:
-              kubernetes.io/hostname: {{ control_plane_hostname }}
-
-          database:
-            internal:
-              image:
-                repository: localhost/tk-harbor-harbor-db
-                tag: v2.14.0
-              nodeSelector:
-                kubernetes.io/hostname: {{ control_plane_hostname }}
-
-          redis:
-            internal:
-              image:
-                repository: localhost/tk-harbor-redis-photon
-                tag: v2.14.0
-              nodeSelector:
-                kubernetes.io/hostname: {{ control_plane_hostname }}
-
-          trivy:
-            enabled: false  # Disabled - no ARM64 image available for trivy-adapter-photon
-
           persistence:
             enabled: true
             resourcePolicy: "keep"
@@ -565,97 +393,77 @@
                 storageClass: "k8s-hostpath"
                 accessMode: ReadWriteOnce
                 size: 2Gi
+              trivy:
+                storageClass: "k8s-hostpath"
+                accessMode: ReadWriteOnce
+                size: 10Gi
+
+          {% if is_arm64 %}
+          # ARM64 image overrides - using patched images from ghcr.io/thinkube/thinkube-harbor-arm64
+          registry:
+            registry:
+              image:
+                repository: ghcr.io/thinkube/thinkube-harbor-arm64/harbor-registry-arm64
+                tag: v2.14.0
+
+          trivy:
+            enabled: true
+            image:
+              repository: ghcr.io/thinkube/thinkube-harbor-arm64/harbor-trivy-adapter-arm64
+              tag: v2.14.0
+          {% endif %}
 
     - name: Deploy Harbor using Helm
-      ansible.builtin.command:
-        cmd: >
-          {{ helm_bin }} upgrade --install {{ harbor_release }}
-          harbor/harbor
-          --namespace {{ harbor_namespace }}
-          --create-namespace=false
-          --values {{ harbor_values }}
-          --wait=false
-          --timeout 600s
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: helm_install
-      changed_when: "'deployed' in helm_install.stdout or 'upgraded' in helm_install.stdout"
-
-    - name: Patch harbor-portal deployment to fix command duplication
-      ansible.builtin.command:
-        cmd: >
-          {{ kubectl_bin }} patch deployment harbor-portal
-          -n {{ harbor_namespace }}
-          --type=json
-          -p='[{"op": "add", "path": "/spec/template/spec/containers/0/command", "value": ["nginx", "-g", "daemon off;"]}]'
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: true
-
-    - name: Patch harbor-registry deployment to fix missing entrypoint
-      ansible.builtin.command:
-        cmd: >
-          {{ kubectl_bin }} patch deployment harbor-registry
-          -n {{ harbor_namespace }}
-          --type=json
-          -p='[{"op": "add", "path": "/spec/template/spec/containers/0/command", "value": ["/home/harbor/entrypoint.sh"]}]'
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: true
-
-    - name: Wait for Harbor pods to be ready
-      ansible.builtin.command:
-        cmd: >
-          {{ kubectl_bin }} wait --for=condition=Ready pod
-          --selector app=harbor
-          -n {{ harbor_namespace }}
-          --timeout=600s
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: wait_result
-      changed_when: false
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ harbor_release }}"
+        chart_ref: harbor/harbor
+        release_namespace: "{{ harbor_namespace }}"
+        create_namespace: false
+        values_files:
+          - "{{ harbor_values }}"
+        wait: true
+        wait_timeout: "600s"
 
     - name: Wait for Harbor pods readiness
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} get pods -n {{ harbor_namespace }} -l app.kubernetes.io/instance={{ harbor_release }} -o json"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ harbor_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/instance={{ harbor_release }}"
       register: harbor_pods
       until: >
-        (harbor_pods.stdout | from_json).items | length > 0 and
-        ((harbor_pods.stdout | from_json).items | map(attribute='status.phase') | list | unique == ['Running'])
+        harbor_pods.resources | length > 0 and
+        (harbor_pods.resources | map(attribute='status.phase') | list | unique == ['Running'])
       retries: 30
       delay: 10
-      changed_when: false
 
     - name: Get Harbor admin password
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} get secret harbor-core -n {{ harbor_namespace }} -o json"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ harbor_namespace }}"
+        name: harbor-core
       register: harbor_secret
-      until: (harbor_secret.stdout | from_json) is defined
+      until: harbor_secret.resources | length > 0
       retries: 30
       delay: 10
-      changed_when: false
-
-    - name: Parse Harbor secret JSON
-      ansible.builtin.set_fact:
-        harbor_secret_json: "{{ harbor_secret.stdout | from_json }}"
 
     - name: Get Harbor generated password
       ansible.builtin.set_fact:
-        harbor_generated_password: "{{ harbor_secret_json.data.HARBOR_ADMIN_PASSWORD | b64decode }}"
-      when:
-        - harbor_secret_json is defined
-        - harbor_secret_json.data is defined
-        - harbor_secret_json.data.HARBOR_ADMIN_PASSWORD is defined
-
+        harbor_generated_password: "{{ harbor_secret.resources[0].data.HARBOR_ADMIN_PASSWORD | b64decode }}"
+      when: 
+        - harbor_secret.resources is defined
+        - harbor_secret.resources | length > 0
+        
     - name: Fail if Harbor password secret not found
       ansible.builtin.fail:
         msg: "Harbor admin password secret not found. Harbor may not be properly deployed."
-      when:
-        - harbor_secret_json is not defined or harbor_secret_json.data is not defined or harbor_secret_json.data.HARBOR_ADMIN_PASSWORD is not defined
+      when: 
+        - harbor_secret.resources is not defined or harbor_secret.resources | length == 0
 
     - name: Read OIDC secret - Checking if file exists first
       ansible.builtin.stat:
@@ -718,7 +526,7 @@
         validate_certs: false
         status_code: 200
       when: harbor_api_standard_pass.status == 401
-
+        
     # Verify Harbor admin password is now set correctly
     - name: Verify Harbor API access with admin password
       ansible.builtin.uri:
@@ -732,7 +540,7 @@
       retries: 3
       delay: 5
       until: harbor_api_verify.status == 200
-
+        
     # Refresh Keycloak token before verifying group
     - name: Refresh Keycloak admin token
       ansible.builtin.uri:
@@ -748,11 +556,11 @@
         status_code: [200, 201]
       register: keycloak_token_refresh
       no_log: true
-
+      
     - name: Update token variable
       ansible.builtin.set_fact:
         keycloak_token: "{{ keycloak_token_refresh }}"
-
+        
     - name: Verify that harbor-admins group exists in Keycloak
       ansible.builtin.uri:
         url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/groups?search={{ oidc_admin_group }}"
@@ -762,7 +570,7 @@
         status_code: 200
         validate_certs: false  # Self-signed certificate during initial deployment
       register: verify_admin_group
-
+      
     - name: Verify admin group exists
       ansible.builtin.assert:
         that: verify_admin_group.json | selectattr('name', 'equalto', oidc_admin_group) | list | length > 0
@@ -797,8 +605,6 @@
         {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/{{ domain_name.replace('.', '-') }}.crt
       args:
         executable: /bin/bash
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
       changed_when: true
 
     - name: Get the intermediate certificate chain for Let's Encrypt
@@ -820,21 +626,18 @@
       register: chain_content
 
     - name: Create a ConfigMap with the certificates
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} apply -f -"
-        stdin: |
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
           apiVersion: v1
           kind: ConfigMap
           metadata:
             name: trusted-ca-bundle
-            namespace: {{ harbor_namespace }}
+            namespace: "{{ harbor_namespace }}"
           data:
-            ca-certificates.crt: {{ cert_content.content | b64decode | to_json }}
-            lets-encrypt-chain.pem: {{ chain_content.content | b64decode | to_json }}
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: configmap_result
-      changed_when: "'created' in configmap_result.stdout or 'configured' in configmap_result.stdout"
+            ca-certificates.crt: "{{ cert_content.content | b64decode }}"
+            lets-encrypt-chain.pem: "{{ chain_content.content | b64decode }}"
 
     - name: Patch Harbor core deployment to mount the ConfigMap
       ansible.builtin.shell: |
@@ -844,8 +647,6 @@
         ]'
       args:
         executable: /bin/bash
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
       changed_when: true
       ignore_errors: true  # In case the volume already exists
 
@@ -854,8 +655,6 @@
         {{ kubectl_bin }} rollout restart deployment harbor-core -n {{ harbor_namespace }}
       args:
         executable: /bin/bash
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
       changed_when: true
 
     - name: Wait for Harbor core to be ready
@@ -863,8 +662,6 @@
         {{ kubectl_bin }} rollout status deployment harbor-core -n {{ harbor_namespace }} --timeout=120s
       args:
         executable: /bin/bash
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
       changed_when: false
 
     - name: Verify Harbor authentication configuration
@@ -879,14 +676,14 @@
       until: final_config.status == 200
       retries: 10
       delay: 10
-
+      
     - name: Verify auth mode is OIDC
       ansible.builtin.assert:
         that:
           - final_config.json.auth_mode == 'oidc_auth'
         fail_msg: "Harbor auth mode is not OIDC: {{ final_config.json.auth_mode | default('unknown') }}"
         success_msg: "Harbor is configured for OIDC authentication"
-
+      
     - name: Verify OIDC configuration
       ansible.builtin.uri:
         url: "https://{{ harbor_registry }}/api/v2.0/configurations"
@@ -899,57 +696,14 @@
       until: harbor_config.status == 200
       retries: 5
       delay: 5
-
+      
     - name: Display OIDC configuration
       ansible.builtin.debug:
-        msg:
+        msg: 
           - "Auth Mode: {{ harbor_config.json.auth_mode.value }}"
           - "OIDC Admin Group: {{ harbor_config.json.oidc_admin_group.value }}"
           - "OIDC Auto Onboard: {{ harbor_config.json.oidc_auto_onboard.value }}"
           - "OIDC Groups Claim: {{ harbor_config.json.oidc_groups_claim.value }}"
-
-    - name: Check if local-registry-hosting ConfigMap exists
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} get configmap local-registry-hosting -n kube-public -o json"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: configmap_check
-      changed_when: false
-      failed_when: false
-
-    - name: Create or update local-registry-hosting ConfigMap
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} apply -f -"
-        stdin: |
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: local-registry-hosting
-            namespace: kube-public
-          data:
-            localRegistryHosting.v1: |
-              help: "https://documentation.ubuntu.com/canonical-kubernetes/latest/snap/howto/registry/"
-              host: "{{ harbor_registry }}"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: configmap_create
-      changed_when: "'created' in configmap_create.stdout or 'configured' in configmap_create.stdout"
-
-    - name: Restart k8s to apply registry changes
-      ansible.builtin.shell: |
-        k8s stop && k8s start
-      become: true
-      when: configmap_check.rc != 0
-
-    - name: Wait for k8s to be ready
-      ansible.builtin.shell: |
-        k8s status --wait-ready
-      become: true
-      register: k8s_status
-      retries: 30
-      delay: 10
-      until: k8s_status.rc == 0
-      when: configmap_check.rc != 0
 
     - name: Display deployment status
       ansible.builtin.debug:
@@ -960,5 +714,4 @@
           - "Admin group: {{ oidc_admin_group }}"
           - "Harbor admin password set to standard (user: admin)"
           - "SSO user '{{ auth_realm_username }}' added to harbor-admins group"
-          - "Default registry configured: {{ harbor_registry }}"
-          - "Registry ConfigMap: {{ 'Created' if configmap_check.rc != 0 else 'Already exists' }}"
+
