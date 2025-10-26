@@ -243,104 +243,39 @@
       retries: 2
       delay: 10
 
-    # AI Inference Base Image - Architecture-Specific Builds
-    # NGC PyTorch containers are architecture-specific, not multi-arch manifests
-    # - AMD64 uses nvcr.io/nvidia/pytorch:25.09-py3
-    # - ARM64 uses nvcr.io/nvidia/pytorch:25.09-py3-igpu (for DGX Spark, Jetson)
+    # AI Inference Base Image - vLLM-based Multi-Arch Build
+    # Uses NGC vLLM container which IS a multi-arch manifest (AMD64 + ARM64)
+    # - Includes vLLM 0.10.1.1 pre-compiled by NVIDIA
+    # - Upgrades to vLLM 0.11.0 for latest model support (DeepSeek-V3, Qwen3-VL, etc.)
+    # - DGX Spark and Jetson supported (ARM64 with iGPU)
 
-    - name: Template AI inference AMD64 Containerfile
+    - name: Template AI inference vLLM Containerfile
       ansible.builtin.template:
-        src: "{{ local_base_images_dir }}/ai-inference-base-amd64.Containerfile.j2"
-        dest: "{{ temp_containerfiles_dir.path }}/ai-inference-base-amd64.Containerfile"
-      when: "'linux/amd64' in container_build_platforms"
+        src: "{{ local_base_images_dir }}/ai-inference-base-vllm.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/ai-inference-base-vllm.Containerfile"
 
-    - name: Template AI inference ARM64 Containerfile
-      ansible.builtin.template:
-        src: "{{ local_base_images_dir }}/ai-inference-base-arm64.Containerfile.j2"
-        dest: "{{ temp_containerfiles_dir.path }}/ai-inference-base-arm64.Containerfile"
-      when: "'linux/arm64' in container_build_platforms"
-
-    - name: Build AI inference AMD64 image
+    - name: Build AI inference base image (vLLM)
       ansible.builtin.shell: |
-        podman build --platform linux/amd64 \
+        podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
                      --tls-verify=true \
-                     -t {{ harbor_registry }}/library/ai-inference-base:12.4-ubuntu24.04-amd64 \
-                     -t {{ harbor_registry }}/library/ai-inference-base:latest-amd64 \
-                     -f {{ temp_containerfiles_dir.path }}/ai-inference-base-amd64.Containerfile \
+                     -t {{ harbor_registry }}/library/ai-inference-base:vllm-0.11.0 \
+                     -t {{ harbor_registry }}/library/ai-inference-base:latest \
+                     -f {{ temp_containerfiles_dir.path }}/ai-inference-base-vllm.Containerfile \
                      {{ base_images_dir }}
-      register: ai_inference_amd64_build
+      register: ai_inference_vllm_build
       changed_when: true
-      when: "'linux/amd64' in container_build_platforms"
 
-    - name: Build AI inference ARM64 image
-      ansible.builtin.shell: |
-        podman build --platform linux/arm64 \
-                     --tls-verify=true \
-                     -t {{ harbor_registry }}/library/ai-inference-base:12.4-ubuntu24.04-arm64 \
-                     -t {{ harbor_registry }}/library/ai-inference-base:latest-arm64 \
-                     -f {{ temp_containerfiles_dir.path }}/ai-inference-base-arm64.Containerfile \
-                     {{ base_images_dir }}
-      register: ai_inference_arm64_build
-      changed_when: true
-      when: "'linux/arm64' in container_build_platforms"
-
-    - name: Push AI inference AMD64 images
+    - name: Push AI inference base images (vLLM)
       ansible.builtin.shell: |
         podman push --tls-verify=true {{ harbor_registry }}/library/ai-inference-base:{{ item }}
       loop:
-        - "12.4-ubuntu24.04-amd64"
-        - "latest-amd64"
-      register: ai_inference_amd64_push
-      changed_when: ai_inference_amd64_push.rc == 0
-      failed_when: ai_inference_amd64_push.rc != 0
-      retries: 2
-      delay: 10
-      when: "'linux/amd64' in container_build_platforms"
-
-    - name: Push AI inference ARM64 images
-      ansible.builtin.shell: |
-        podman push --tls-verify=true {{ harbor_registry }}/library/ai-inference-base:{{ item }}
-      loop:
-        - "12.4-ubuntu24.04-arm64"
-        - "latest-arm64"
-      register: ai_inference_arm64_push
-      changed_when: ai_inference_arm64_push.rc == 0
-      failed_when: ai_inference_arm64_push.rc != 0
-      retries: 2
-      delay: 10
-      when: "'linux/arm64' in container_build_platforms"
-
-    # Create multi-arch manifest if both architectures were built
-    - name: Create AI inference multi-arch manifest for latest tag
-      ansible.builtin.shell: |
-        podman manifest create {{ harbor_registry }}/library/ai-inference-base:latest \
-          {{ harbor_registry }}/library/ai-inference-base:latest-amd64 \
-          {{ harbor_registry }}/library/ai-inference-base:latest-arm64
-      when: "'linux/amd64' in container_build_platforms and 'linux/arm64' in container_build_platforms"
-      register: ai_inference_manifest_latest
-      changed_when: true
-
-    - name: Create AI inference multi-arch manifest for versioned tag
-      ansible.builtin.shell: |
-        podman manifest create {{ harbor_registry }}/library/ai-inference-base:12.4-ubuntu24.04 \
-          {{ harbor_registry }}/library/ai-inference-base:12.4-ubuntu24.04-amd64 \
-          {{ harbor_registry }}/library/ai-inference-base:12.4-ubuntu24.04-arm64
-      when: "'linux/amd64' in container_build_platforms and 'linux/arm64' in container_build_platforms"
-      register: ai_inference_manifest_versioned
-      changed_when: true
-
-    - name: Push AI inference multi-arch manifests
-      ansible.builtin.shell: |
-        podman manifest push --tls-verify=true {{ harbor_registry }}/library/ai-inference-base:{{ item }}
-      loop:
-        - "12.4-ubuntu24.04"
+        - "vllm-0.11.0"
         - "latest"
-      register: ai_inference_manifest_push
-      changed_when: ai_inference_manifest_push.rc == 0
-      failed_when: ai_inference_manifest_push.rc != 0
+      register: ai_inference_vllm_push
+      changed_when: ai_inference_vllm_push.rc == 0
+      failed_when: ai_inference_vllm_push.rc != 0
       retries: 2
       delay: 10
-      when: "'linux/amd64' in container_build_platforms and 'linux/arm64' in container_build_platforms"
 
     - name: Template MLflow Dockerfile
       ansible.builtin.template:
