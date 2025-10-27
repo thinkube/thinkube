@@ -141,6 +141,17 @@
       register: s3_config_result
       changed_when: "'created' in s3_config_result.stdout or 'configured' in s3_config_result.stdout"
 
+    - name: Get node architecture
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get nodes -o jsonpath='{.items[0].metadata.labels.kubernetes\.io/arch}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: node_arch_result
+
+    - name: Set node architecture variable
+      ansible.builtin.set_fact:
+        node_architecture: "{{ node_arch_result.stdout }}"
+
     - name: Create Helm values for SeaweedFS
       ansible.builtin.set_fact:
         seaweedfs_values:
@@ -149,7 +160,8 @@
             replicas: 1
             port: 9333
             grpcPort: 19333
-            nodeSelector: {}  # Allow scheduling on any architecture (AMD64/ARM64)
+            nodeSelector:
+              kubernetes.io/arch: "{{ node_architecture }}"
             persistence:
               enabled: true
               size: 10Gi
@@ -159,7 +171,8 @@
             replicas: 1
             port: 8080
             grpcPort: 18080
-            nodeSelector: {}  # Allow scheduling on any architecture (AMD64/ARM64)
+            nodeSelector:
+              kubernetes.io/arch: "{{ node_architecture }}"
             persistence:
               enabled: true
               size: 100Gi
@@ -169,7 +182,8 @@
             replicas: 1
             port: 8888
             grpcPort: 18888
-            nodeSelector: {}  # Allow scheduling on any architecture (AMD64/ARM64)
+            nodeSelector:
+              kubernetes.io/arch: "{{ node_architecture }}"
             s3:
               enabled: true
               port: 8333
@@ -215,15 +229,11 @@
 
     - name: Wait for SeaweedFS components to be ready
       ansible.builtin.shell: |
-        {{ kubectl_bin }} get pods -n {{ seaweedfs_namespace }} -l app.kubernetes.io/name=seaweedfs -o json
+        {{ kubectl_bin }} wait --for=condition=Ready pod -l app.kubernetes.io/name=seaweedfs -n {{ seaweedfs_namespace }} --timeout=600s
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: seaweedfs_pods_raw
-      until: >
-        (seaweedfs_pods_raw.stdout | from_json).items |
-        selectattr('status.phase', 'equalto', 'Running') | list | length >= 3
-      retries: 60
-      delay: 10
+      register: wait_result
+      failed_when: false
 
     - name: Get current filer command
       ansible.builtin.shell: |
