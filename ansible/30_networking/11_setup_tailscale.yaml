@@ -1,0 +1,198 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 11_setup_tailscale.yaml - Configure Tailscale overlay network for Thinkube nodes
+#
+# Purpose:
+#   Installs and configures Tailscale on all nodes requiring overlay networking
+#   Joins nodes to the tailnet for remote access
+#   Configures subnet routing on control plane for MetalLB IP range via API
+#   Auto-approves routes using Tailscale API (no manual intervention)
+#
+# Key Architecture:
+#   - Each node gets automatic IP from 100.x.x.x range
+#   - Control plane advertises MetalLB subnet (e.g., 192.168.191.50/27)
+#   - Tailscale API auto-approves the subnet route
+#   - Worker nodes route MetalLB traffic through control plane
+#
+# Requirements:
+#   - SSH access to all nodes
+#   - tailscale_auth_key: Auth key for joining tailnet
+#   - tailscale_api_token: API token for auto-approving routes
+#   - metallb_ip_start_octet, metallb_ip_end_octet: MetalLB IP range
+#   - zerotier_subnet_prefix: Network prefix (used for overlay CIDR)
+#
+# Run with:
+#   ./scripts/run_ansible.sh ansible/30_networking/11_setup_tailscale.yaml
+
+- name: Configure Tailscale Networking
+  hosts: overlay_nodes
+  gather_facts: true
+  become: true
+  serial: 1  # Process one host at a time
+
+  vars:
+    tailscale_api_url: "https://api.tailscale.com/api/v2"
+
+  tasks:
+    # Phase 1: Verify Tailscale credentials
+    - name: Debug Tailscale configuration
+      ansible.builtin.debug:
+        msg: |
+          Tailscale Auth Key: {{ tailscale_auth_key | regex_replace('^(tskey-auth-.{4}).*(.{4})$', '\\1****\\2') }}
+          Tailscale API Token: {{ tailscale_api_token | regex_replace('^(tskey-api-.{4}).*(.{4})$', '\\1****\\2') }}
+      no_log: false
+
+    - name: Verify Tailscale auth key
+      ansible.builtin.fail:
+        msg: "Tailscale auth key not found. Please define tailscale_auth_key in inventory."
+      when: tailscale_auth_key is not defined or tailscale_auth_key == ""
+
+    - name: Verify Tailscale API token
+      ansible.builtin.fail:
+        msg: "Tailscale API token not found. Please define tailscale_api_token in inventory."
+      when: tailscale_api_token is not defined or tailscale_api_token == ""
+
+    # Phase 2: Install Tailscale
+    - name: Check if Tailscale is already installed
+      ansible.builtin.command: which tailscale
+      register: tailscale_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Tailscale dependencies
+      ansible.builtin.apt:
+        name:
+          - curl
+          - gnupg
+        state: present
+        update_cache: yes
+      when: tailscale_check.rc != 0
+
+    - name: Add Tailscale GPG key
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+      args:
+        creates: /usr/share/keyrings/tailscale-archive-keyring.gpg
+      when: tailscale_check.rc != 0
+
+    - name: Add Tailscale repository
+      ansible.builtin.shell: |
+        echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main" | tee /etc/apt/sources.list.d/tailscale.list
+      args:
+        creates: /etc/apt/sources.list.d/tailscale.list
+      when: tailscale_check.rc != 0
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+      when: tailscale_check.rc != 0
+
+    - name: Install Tailscale
+      ansible.builtin.apt:
+        name: tailscale
+        state: present
+      when: tailscale_check.rc != 0
+
+    # Phase 3: Calculate MetalLB CIDR for control plane
+    - name: Calculate MetalLB subnet CIDR
+      ansible.builtin.set_fact:
+        metallb_cidr: "{{ zerotier_subnet_prefix }}{{ metallb_ip_start_octet }}/27"
+      when: inventory_hostname in groups['k8s_control_plane'] | default([])
+
+    # Phase 4: Join tailnet
+    - name: Check if already connected to tailnet
+      ansible.builtin.command: tailscale status
+      register: tailscale_status
+      changed_when: false
+      failed_when: false
+
+    - name: Join tailnet (control plane with subnet advertising)
+      ansible.builtin.command: >
+        tailscale up
+        --authkey={{ tailscale_auth_key }}
+        --advertise-routes={{ metallb_cidr }}
+        --accept-routes
+        --hostname={{ inventory_hostname }}
+      when:
+        - inventory_hostname in groups['k8s_control_plane'] | default([])
+        - "'Logged out' in tailscale_status.stdout or tailscale_status.rc != 0"
+      register: tailscale_up_control
+      changed_when: true
+
+    - name: Join tailnet (worker nodes)
+      ansible.builtin.command: >
+        tailscale up
+        --authkey={{ tailscale_auth_key }}
+        --accept-routes
+        --hostname={{ inventory_hostname }}
+      when:
+        - inventory_hostname not in groups['k8s_control_plane'] | default([])
+        - "'Logged out' in tailscale_status.stdout or tailscale_status.rc != 0"
+      register: tailscale_up_worker
+      changed_when: true
+
+    - name: Wait for Tailscale connection to establish
+      ansible.builtin.pause:
+        seconds: 10
+      when: tailscale_up_control is changed or tailscale_up_worker is changed
+
+    # Phase 5: Get device ID and auto-approve routes via API (control plane only)
+    - name: Get Tailscale device ID
+      ansible.builtin.command: tailscale status --json
+      register: tailscale_status_json
+      changed_when: false
+
+    - name: Parse Tailscale device ID
+      ansible.builtin.set_fact:
+        tailscale_device_id: "{{ (tailscale_status_json.stdout | from_json).Self.ID }}"
+        tailscale_ip: "{{ (tailscale_status_json.stdout | from_json).Self.TailscaleIPs[0] }}"
+
+    - name: Auto-approve subnet routes via Tailscale API (control plane)
+      ansible.builtin.uri:
+        url: "{{ tailscale_api_url }}/device/{{ tailscale_device_id }}/routes"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ tailscale_api_token }}"
+          Content-Type: "application/json"
+        body:
+          routes:
+            - "{{ metallb_cidr }}"
+        body_format: json
+        status_code: [200, 201]
+        validate_certs: yes
+      register: route_approval
+      delegate_to: localhost
+      when: inventory_hostname in groups['k8s_control_plane'] | default([])
+
+    # Phase 6: Configure IP forwarding on control plane
+    - name: Enable IP forwarding
+      ansible.builtin.sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+      when: inventory_hostname in groups['k8s_control_plane'] | default([])
+
+    # Phase 7: Display status
+    - name: Display Tailscale configuration
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          Tailscale Configuration ({{ inventory_hostname }})
+          ════════════════════════════════════════════════════════
+
+          Tailscale IP: {{ tailscale_ip }}
+          Device ID: {{ tailscale_device_id }}
+          {% if inventory_hostname in groups['k8s_control_plane'] | default([]) %}
+
+          Control Plane Status:
+          - Advertising subnet: {{ metallb_cidr }}
+          - Route approval: {% if route_approval.status == 200 or route_approval.status == 201 %}✅ Auto-approved via API{% else %}❌ Failed{% endif %}
+          - IP forwarding: Enabled
+          {% endif %}
+
+          ════════════════════════════════════════════════════════
