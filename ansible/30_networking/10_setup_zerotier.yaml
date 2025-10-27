@@ -246,11 +246,17 @@
         base_ip_assignments: ["{{ hostvars[inventory_hostname]['zerotier_ip'] }}"]
         additional_ips: []
         
-    # For the controller node, add additional IPs for MetalLB if it's in the microk8s_control_plane group
-    - name: Add MetalLB IPs for controller node
+    # For the control plane node, add full MetalLB IP range
+    - name: Generate MetalLB IP range for control plane
       ansible.builtin.set_fact:
-        additional_ips: "{{ additional_ips + ['{{ zerotier_subnet_prefix }}{{ primary_ingress_ip_octet }}', '{{ zerotier_subnet_prefix }}{{ secondary_ingress_ip_octet }}', '{{ zerotier_subnet_prefix }}{{ dns_external_ip_octet }}'] }}"
-      when: inventory_hostname in groups['microk8s_control_plane'] | default([])
+        metallb_ips: "{{ metallb_ips | default([]) + [zerotier_subnet_prefix ~ item | string] }}"
+      loop: "{{ range(metallb_ip_start_octet | int, metallb_ip_end_octet | int + 1) | list }}"
+      when: inventory_hostname in groups['k8s_control_plane'] | default([])
+
+    - name: Add MetalLB IPs to additional_ips
+      ansible.builtin.set_fact:
+        additional_ips: "{{ additional_ips + (metallb_ips | default([])) }}"
+      when: inventory_hostname in groups['k8s_control_plane'] | default([])
       
     # Generate the full list of IP assignments
     - name: Set final IP assignments
