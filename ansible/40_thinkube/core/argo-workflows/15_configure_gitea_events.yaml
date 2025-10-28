@@ -248,7 +248,71 @@
                         number: 12000  # Use direct integer value
 
     ###################################################################
-    # 6) Create Sensor to trigger Argo Workflows
+    # 6) Create RBAC for Sensor to create Workflows
+    ###################################################################
+    - name: Create ServiceAccount for Sensor
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: argo-events-sensor
+            namespace: "{{ argo_namespace }}"
+
+    - name: Create Role for Sensor to create Workflows
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: argo-events-sensor-role
+            namespace: "{{ argo_namespace }}"
+          rules:
+          - apiGroups:
+            - argoproj.io
+            resources:
+            - workflows
+            - workflowtemplates
+            verbs:
+            - get
+            - list
+            - create
+            - watch
+          - apiGroups:
+            - ""
+            resources:
+            - pods
+            - pods/log
+            verbs:
+            - get
+            - list
+            - watch
+
+    - name: Create RoleBinding for Sensor ServiceAccount
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: argo-events-sensor-rolebinding
+            namespace: "{{ argo_namespace }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: argo-events-sensor-role
+          subjects:
+          - kind: ServiceAccount
+            name: argo-events-sensor
+            namespace: "{{ argo_namespace }}"
+
+    ###################################################################
+    # 7) Create Sensor to trigger Argo Workflows
     ###################################################################
     - name: Create Sensor for Gitea push events
       kubernetes.core.k8s:
@@ -261,6 +325,7 @@
             name: "{{ sensor_name }}"
             namespace: "{{ argo_namespace }}"
           spec:
+            serviceAccountName: argo-events-sensor
             eventBusName: "{{ eventbus_name }}"
             dependencies:
             - name: gitea-push
