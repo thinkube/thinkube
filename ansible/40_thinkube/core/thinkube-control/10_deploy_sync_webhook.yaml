@@ -71,8 +71,8 @@
           stringData:
             # Use existing secret or newly generated one
             webhook_secret: "{{ webhook_secret_value }}"
-            # Store ArgoCD server URL (internal service) with explicit port 80
-            argocd_server: "argocd-server.{{ sync_namespace }}.svc.cluster.local:80"
+            # Use gRPC ingress endpoint for CLI access (not internal service)
+            argocd_server: "argocd-grpc.{{ domain_name }}"
 
     - name: Create sync webhook ConfigMap with Python script
       kubernetes.core.k8s:
@@ -100,7 +100,7 @@
               logger = logging.getLogger(__name__)
               
               WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')
-              ARGOCD_SERVER = os.environ.get('ARGOCD_SERVER', 'argocd-server.argocd.svc.cluster.local:80')
+              ARGOCD_SERVER = os.environ.get('ARGOCD_SERVER', 'argocd-grpc.{{ domain_name }}')
               ARGOCD_PASSWORD = os.environ.get('ARGOCD_PASSWORD', '')
               PORT = int(os.environ.get('PORT', '8080'))
               
@@ -131,14 +131,12 @@
                       return _auth_token
                   
                   try:
-                      # Login to get auth token
+                      # Login via gRPC ingress with TLS
                       login_cmd = [
                           'argocd', 'login', ARGOCD_SERVER,
                           '--username', 'admin',
                           '--password', ARGOCD_PASSWORD,
-                          '--grpc-web',
-                          '--plaintext',  # Use plaintext for internal service
-                          '--skip-test-tls'
+                          '--insecure'  # Skip cert verification for internal use
                       ]
                       
                       login_result = subprocess.run(login_cmd, capture_output=True, text=True, 
@@ -171,12 +169,11 @@
                       if not get_argocd_auth_token():
                           return False, "Failed to authenticate with ArgoCD"
                       
-                      # Now trigger sync using existing auth
+                      # Trigger sync via gRPC ingress
                       cmd = [
                           'argocd', 'app', 'sync', app_name,
                           '--server', ARGOCD_SERVER,
-                          '--grpc-web',
-                          '--plaintext',  # Use plaintext for internal service
+                          '--insecure',
                           '--async'  # Don't wait for sync to complete
                       ]
                       
