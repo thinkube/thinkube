@@ -68,23 +68,15 @@
 
   tasks:
     # ===========================
-    # DGX Spark Specific: Disable Docker
+    # DGX Spark Specific: Docker Coexistence
     # ===========================
-    - name: Check if Docker is installed (DGX Spark specific)
-      ansible.builtin.systemd:
-        name: docker
-      become: true
-      register: docker_service
-      failed_when: false
-      changed_when: false
-
-    - name: Stop and disable Docker (DGX Spark ships with Docker pre-installed)
-      ansible.builtin.systemd:
-        name: docker
-        state: stopped
-        enabled: false
-      become: true
-      when: docker_service.status is defined and docker_service.status.LoadState == 'loaded'
+    # Note: DGX Spark ships with Docker pre-installed and enabled.
+    # We configure k8s-snap to use a custom containerd base directory (/var/lib/k8s-containerd)
+    # to allow Docker and k8s-snap to coexist without conflicts.
+    # This enables users to use Docker for other DGX Spark capabilities while running Kubernetes.
+    #
+    # Docker uses: /run/containerd, /var/lib/containerd
+    # k8s-snap uses: /var/lib/k8s-containerd (custom base directory)
 
     # ===========================
     # UFW Firewall Configuration (CRITICAL for CoreDNS)
@@ -189,8 +181,24 @@
       become: true
       when: k8s_snap_check.rc != 0
 
-    - name: Bootstrap k8s cluster
-      ansible.builtin.command: k8s bootstrap
+    - name: Create k8s bootstrap configuration with custom containerd base directory
+      ansible.builtin.copy:
+        content: |
+          containerd-base-dir: /var/lib/k8s-containerd
+          cluster-config:
+            network:
+              enabled: true
+            dns:
+              enabled: true
+            local-storage:
+              enabled: true
+        dest: /tmp/k8s-bootstrap-config.yaml
+        mode: '0644'
+      become: true
+
+    - name: Bootstrap k8s cluster with custom containerd base directory
+      ansible.builtin.shell: |
+        k8s bootstrap --file /tmp/k8s-bootstrap-config.yaml
       become: true
       register: bootstrap_result
       changed_when: "'Bootstrapped' in bootstrap_result.stdout"
