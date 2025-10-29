@@ -17,7 +17,8 @@ echo "  2. Delete ~/.kube/config"
 echo "  3. Remove all k8s-related directories"
 echo "  4. Remove pip configuration (devpi)"
 echo "  5. Remove Python virtual environment (~/.venv)"
-echo "  6. Remove temporary thinkube files"
+echo "  6. Remove thinkube installer state (~/.thinkube-installer)"
+echo "  7. Remove temporary thinkube files"
 echo ""
 echo "Step 1: Removing k8s-snap with --purge..."
 sudo snap remove k8s --purge || echo "k8s-snap not installed or already removed"
@@ -49,7 +50,12 @@ rm -rf ~/.venv || true
 echo "Python venv removed"
 
 echo ""
-echo "Step 6: Removing temporary thinkube files..."
+echo "Step 6: Removing thinkube installer state..."
+rm -rf ~/.thinkube-installer || true
+echo "Thinkube installer state removed"
+
+echo ""
+echo "Step 7: Removing temporary thinkube files..."
 rm -rf /tmp/think* || true
 
 echo ""
