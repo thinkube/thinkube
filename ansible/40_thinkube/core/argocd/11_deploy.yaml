@@ -208,11 +208,9 @@
           global:
             additionalLabels: {}
           server:
-            # Run in insecure mode when using separate ingresses for HTTP/gRPC
-            # This is required by ArgoCD when using separate Ingress resources for HTTP and gRPC
+            # Use SSL-passthrough approach (recommended by ArgoCD docs)
+            # ArgoCD server handles TLS and auto-detects HTTP vs gRPC protocols
             # See: https://argo-cd.readthedocs.io/en/stable/operator-manual/ingress/
-            extraArgs:
-              - --insecure
             service:
               type: ClusterIP
             config:
@@ -267,77 +265,36 @@
       changed_when: "'deleted' in delete_ingress_result.stdout"
       failed_when: delete_ingress_result.rc != 0
 
-    - name: Create gRPC Ingress for ArgoCD
+    - name: Create SSL-passthrough Ingress for ArgoCD (recommended approach)
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
         apiVersion: networking.k8s.io/v1
         kind: Ingress
         metadata:
-          name: argocd-grpc-ingress
+          name: argocd-ingress
           namespace: {{ argocd_namespace }}
           annotations:
-            nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
-            nginx.ingress.kubernetes.io/grpc-backend: "true"
-            nginx.ingress.kubernetes.io/enable-http2: "true"
+            nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
         spec:
           ingressClassName: nginx
-          tls:
-          - hosts:
-              - {{ argocd_grpc_hostname }}
-            secretName: {{ argocd_tls_secret_name }}
-          rules:
-          - host: {{ argocd_grpc_hostname }}
-            http:
-              paths:
-              - path: /
-                pathType: ImplementationSpecific
-                backend:
-                  service:
-                    name: argocd-server
-                    port:
-                      number: 80
-        EOF
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: grpc_ingress_result
-      changed_when: "'created' in grpc_ingress_result.stdout or 'configured' in grpc_ingress_result.stdout"
-      failed_when: grpc_ingress_result.rc != 0
-
-    - name: Create HTTP Ingress for ArgoCD
-      ansible.builtin.shell: |
-        cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
-        metadata:
-          name: argocd-http-ingress
-          namespace: {{ argocd_namespace }}
-          annotations:
-            nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
-            nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
-            nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
-        spec:
-          ingressClassName: nginx
-          tls:
-          - hosts:
-              - {{ argocd_hostname }}
-            secretName: {{ argocd_tls_secret_name }}
           rules:
           - host: {{ argocd_hostname }}
             http:
               paths:
               - path: /
-                pathType: ImplementationSpecific
+                pathType: Prefix
                 backend:
                   service:
                     name: argocd-server
                     port:
-                      number: 80
+                      number: 443
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: http_ingress_result
-      changed_when: "'created' in http_ingress_result.stdout or 'configured' in http_ingress_result.stdout"
-      failed_when: http_ingress_result.rc != 0
+      register: ingress_result
+      changed_when: "'created' in ingress_result.stdout or 'configured' in ingress_result.stdout"
+      failed_when: ingress_result.rc != 0
 
     - name: Display ArgoCD Ingress details
       ansible.builtin.shell: "{{ kubectl_bin }} get ingress -n {{ argocd_namespace }} -o yaml"
