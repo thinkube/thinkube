@@ -19,6 +19,7 @@ echo "  4. Remove pip configuration (devpi)"
 echo "  5. Remove Python virtual environment (~/.venv)"
 echo "  6. Remove thinkube installer state (~/.thinkube-installer)"
 echo "  7. Remove temporary thinkube files"
+echo "  8. Clear Tauri installer localStorage (deployment state)"
 echo ""
 echo "Step 1: Removing k8s-snap with --purge..."
 sudo snap remove k8s --purge || echo "k8s-snap not installed or already removed"
@@ -57,6 +58,16 @@ echo "Thinkube installer state removed"
 echo ""
 echo "Step 7: Removing temporary thinkube files..."
 rm -rf /tmp/think* || true
+
+echo ""
+echo "Step 8: Clearing Tauri installer localStorage (deployment state)..."
+LOCALSTORAGE_DB="$HOME/.local/share/org.thinkube.installer/localstorage/tauri_localhost_0.localstorage"
+if [ -f "$LOCALSTORAGE_DB" ]; then
+  sqlite3 "$LOCALSTORAGE_DB" "DELETE FROM ItemTable WHERE key IN ('thinkube-deployment-state-v2', 'thinkubeInstaller', 'thinkube-session-backup');" 2>/dev/null || true
+  echo "Cleared stale deployment state from localStorage"
+else
+  echo "No localStorage database found (installer not yet run)"
+fi
 
 echo ""
 echo "=================================================="
