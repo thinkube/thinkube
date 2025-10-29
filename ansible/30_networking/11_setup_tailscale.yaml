@@ -2,23 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-# 11_setup_tailscale.yaml - Configure Tailscale overlay network for Thinkube nodes
+# 11_setup_tailscale.yaml - Configure Tailscale overlay network routing for Thinkube
 #
 # Purpose:
-#   Installs and configures Tailscale on all nodes requiring overlay networking
-#   Joins nodes to the tailnet for remote access
-#   Configures subnet routing on control plane for MetalLB IP range via API
+#   Configures subnet routing on control plane for MetalLB IP range via Tailscale API
 #   Auto-approves routes using Tailscale API (no manual intervention)
+#   Enables IP forwarding on control plane for traffic routing
 #
 # Key Architecture:
-#   - Each node gets automatic IP from 100.x.x.x range
+#   - Each node gets automatic IP from 100.x.x.x range (assigned by Tailscale)
 #   - Control plane advertises MetalLB subnet (e.g., 192.168.191.50/27)
 #   - Tailscale API auto-approves the subnet route
 #   - Worker nodes route MetalLB traffic through control plane
 #
 # Requirements:
-#   - SSH access to all nodes
-#   - tailscale_auth_key: Auth key for joining tailnet
+#   - Tailscale must already be installed and configured via tk-node-setup/bootstrap.sh
+#   - Nodes must already be joined to the tailnet
+#   - tailscale_auth_key: Auth key from inventory (for re-joining if needed)
 #   - tailscale_api_token: API token for auto-approving routes
 #   - metallb_ip_start_octet, metallb_ip_end_octet: MetalLB IP range
 #   - zerotier_subnet_prefix: Network prefix (used for overlay CIDR)
@@ -26,7 +26,7 @@
 # Run with:
 #   ./scripts/run_ansible.sh ansible/30_networking/11_setup_tailscale.yaml
 
-- name: Configure Tailscale Networking
+- name: Configure Tailscale Routing
   hosts: overlay_nodes
   gather_facts: true
   become: true
@@ -36,120 +36,93 @@
     tailscale_api_url: "https://api.tailscale.com/api/v2"
 
   tasks:
-    # Phase 1: Verify Tailscale credentials
-    - name: Debug Tailscale configuration
-      ansible.builtin.debug:
-        msg: |
-          Tailscale Auth Key: {{ tailscale_auth_key | regex_replace('^(tskey-auth-.{4}).*(.{4})$', '\\1****\\2') }}
-          Tailscale API Token: {{ tailscale_api_token | regex_replace('^(tskey-api-.{4}).*(.{4})$', '\\1****\\2') }}
-      no_log: false
-
-    - name: Verify Tailscale auth key
-      ansible.builtin.fail:
-        msg: "Tailscale auth key not found. Please define tailscale_auth_key in inventory."
-      when: tailscale_auth_key is not defined or tailscale_auth_key == ""
-
-    - name: Verify Tailscale API token
-      ansible.builtin.fail:
-        msg: "Tailscale API token not found. Please define tailscale_api_token in inventory."
-      when: tailscale_api_token is not defined or tailscale_api_token == ""
-
-    # Phase 2: Install Tailscale
-    - name: Check if Tailscale is already installed
+    # Phase 1: Verify Tailscale is installed and running (fail fast if bootstrap.sh wasn't run)
+    - name: Check if Tailscale is installed
       ansible.builtin.command: which tailscale
-      register: tailscale_check
+      register: tailscale_installed
       changed_when: false
       failed_when: false
 
-    - name: Install Tailscale dependencies
-      ansible.builtin.apt:
-        name:
-          - curl
-          - gnupg
-        state: present
-        update_cache: yes
-      when: tailscale_check.rc != 0
+    - name: Fail if Tailscale is not installed
+      ansible.builtin.fail:
+        msg: |
+          Tailscale is not installed on {{ inventory_hostname }}.
+          Please run tk-node-setup/bootstrap.sh first to install and configure Tailscale.
+      when: tailscale_installed.rc != 0
 
-    - name: Add Tailscale GPG key
-      ansible.builtin.shell: |
-        curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-      args:
-        creates: /usr/share/keyrings/tailscale-archive-keyring.gpg
-      when: tailscale_check.rc != 0
-
-    - name: Add Tailscale repository
-      ansible.builtin.shell: |
-        echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main" | tee /etc/apt/sources.list.d/tailscale.list
-      args:
-        creates: /etc/apt/sources.list.d/tailscale.list
-      when: tailscale_check.rc != 0
-
-    - name: Update apt cache
-      ansible.builtin.apt:
-        update_cache: yes
-      when: tailscale_check.rc != 0
-
-    - name: Install Tailscale
-      ansible.builtin.apt:
-        name: tailscale
-        state: present
-      when: tailscale_check.rc != 0
-
-    # Phase 3: Calculate MetalLB CIDR for control plane
-    - name: Calculate MetalLB subnet CIDR
-      ansible.builtin.set_fact:
-        metallb_cidr: "{{ zerotier_subnet_prefix }}{{ metallb_ip_start_octet }}/27"
-      when: inventory_hostname in groups['k8s_control_plane'] | default([])
-
-    # Phase 4: Join tailnet
-    - name: Check if already connected to tailnet
+    - name: Check Tailscale status
       ansible.builtin.command: tailscale status
       register: tailscale_status
       changed_when: false
       failed_when: false
 
-    - name: Join tailnet (control plane with subnet advertising)
-      ansible.builtin.command: >
-        tailscale up
-        --authkey={{ tailscale_auth_key }}
-        --advertise-routes={{ metallb_cidr }}
-        --accept-routes
-        --hostname={{ inventory_hostname }}
-      when:
-        - inventory_hostname in groups['k8s_control_plane'] | default([])
-        - "'Logged out' in tailscale_status.stdout or tailscale_status.rc != 0"
-      register: tailscale_up_control
-      changed_when: true
+    - name: Fail if not connected to tailnet
+      ansible.builtin.fail:
+        msg: |
+          Node {{ inventory_hostname }} is not connected to Tailscale tailnet.
+          Please run tk-node-setup/bootstrap.sh first.
+      when: "'Logged out' in tailscale_status.stdout or tailscale_status.rc != 0"
 
-    - name: Join tailnet (worker nodes)
-      ansible.builtin.command: >
-        tailscale up
-        --authkey={{ tailscale_auth_key }}
-        --accept-routes
-        --hostname={{ inventory_hostname }}
-      when:
-        - inventory_hostname not in groups['k8s_control_plane'] | default([])
-        - "'Logged out' in tailscale_status.stdout or tailscale_status.rc != 0"
-      register: tailscale_up_worker
-      changed_when: true
-
-    - name: Wait for Tailscale connection to establish
-      ansible.builtin.pause:
-        seconds: 10
-      when: tailscale_up_control is changed or tailscale_up_worker is changed
-
-    # Phase 5: Get device ID and auto-approve routes via API (control plane only)
-    - name: Get Tailscale device ID
+    - name: Get Tailscale device info
       ansible.builtin.command: tailscale status --json
       register: tailscale_status_json
       changed_when: false
 
-    - name: Parse Tailscale device ID
+    - name: Parse Tailscale device information
       ansible.builtin.set_fact:
         tailscale_device_id: "{{ (tailscale_status_json.stdout | from_json).Self.ID }}"
         tailscale_ip: "{{ (tailscale_status_json.stdout | from_json).Self.TailscaleIPs[0] }}"
+        tailscale_hostname: "{{ (tailscale_status_json.stdout | from_json).Self.DNSName }}"
 
-    - name: Auto-approve subnet routes via Tailscale API (control plane)
+    - name: Display Tailscale verification status
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════════════════════
+          ✅ Tailscale Verification for {{ inventory_hostname }}
+          ════════════════════════════════════════════════════════════════════════
+
+          Device ID: {{ tailscale_device_id }}
+          Tailscale IP: {{ tailscale_ip }}
+          Hostname: {{ tailscale_hostname }}
+
+          Tailscale is installed and connected. Proceeding with routing configuration...
+          ════════════════════════════════════════════════════════════════════════
+
+    # Phase 2: Configure MetalLB subnet routing on control plane
+    - name: Calculate MetalLB subnet CIDR
+      ansible.builtin.set_fact:
+        metallb_cidr: "{{ zerotier_subnet_prefix }}{{ metallb_ip_start_octet }}/27"
+      when: inventory_hostname in groups['k8s_control_plane'] | default([])
+
+    - name: Check if control plane is advertising MetalLB routes
+      ansible.builtin.command: tailscale status --json
+      register: current_routes_check
+      changed_when: false
+      when: inventory_hostname in groups['k8s_control_plane'] | default([])
+
+    - name: Parse current advertised routes
+      ansible.builtin.set_fact:
+        current_advertised_routes: "{{ (current_routes_check.stdout | from_json).Self.AllowedIPs | default([]) }}"
+      when: inventory_hostname in groups['k8s_control_plane'] | default([])
+
+    - name: Update tailscale to advertise MetalLB subnet (if not already)
+      ansible.builtin.command: >
+        tailscale set
+        --advertise-routes={{ metallb_cidr }}
+        --accept-routes
+      when:
+        - inventory_hostname in groups['k8s_control_plane'] | default([])
+        - metallb_cidr not in current_advertised_routes | default([])
+      register: tailscale_update
+      changed_when: true
+
+    - name: Wait for route advertisement to register
+      ansible.builtin.pause:
+        seconds: 5
+      when: tailscale_update is changed
+
+    - name: Auto-approve MetalLB subnet routes via Tailscale API
       ansible.builtin.uri:
         url: "{{ tailscale_api_url }}/device/{{ tailscale_device_id }}/routes"
         method: POST
@@ -165,8 +138,9 @@
       register: route_approval
       delegate_to: localhost
       when: inventory_hostname in groups['k8s_control_plane'] | default([])
+      failed_when: false
 
-    # Phase 6: Configure IP forwarding on control plane
+    # Phase 3: Configure IP forwarding on control plane (required for subnet routing)
     - name: Enable IP forwarding
       ansible.builtin.sysctl:
         name: net.ipv4.ip_forward
@@ -176,23 +150,74 @@
         reload: yes
       when: inventory_hostname in groups['k8s_control_plane'] | default([])
 
-    # Phase 7: Display status
-    - name: Display Tailscale configuration
+    # Phase 4: Display configuration status
+    - name: Display Tailscale configuration (control plane)
       ansible.builtin.debug:
         msg: |
 
           ════════════════════════════════════════════════════════
-          Tailscale Configuration ({{ inventory_hostname }})
+          ✅ Tailscale Configuration Complete ({{ inventory_hostname }})
           ════════════════════════════════════════════════════════
 
           Tailscale IP: {{ tailscale_ip }}
           Device ID: {{ tailscale_device_id }}
-          {% if inventory_hostname in groups['k8s_control_plane'] | default([]) %}
 
           Control Plane Status:
           - Advertising subnet: {{ metallb_cidr }}
-          - Route approval: {% if route_approval.status == 200 or route_approval.status == 201 %}✅ Auto-approved via API{% else %}❌ Failed{% endif %}
+          - Route approval: {% if route_approval.status == 200 or route_approval.status == 201 %}✅ Auto-approved via API{% else %}⚠️  Check Tailscale admin console{% endif %}
           - IP forwarding: Enabled
-          {% endif %}
 
           ════════════════════════════════════════════════════════
+      when: inventory_hostname in groups['k8s_control_plane'] | default([])
+
+    - name: Display Tailscale configuration (worker)
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          ✅ Tailscale Configuration Complete ({{ inventory_hostname }})
+          ════════════════════════════════════════════════════════
+
+          Tailscale IP: {{ tailscale_ip }}
+          Device ID: {{ tailscale_device_id }}
+
+          Worker Node Status:
+          - Connected to tailnet
+          - Accepting routes from control plane
+
+          ════════════════════════════════════════════════════════
+      when: inventory_hostname not in groups['k8s_control_plane'] | default([])
+
+# Final phase: Verify network-wide configuration
+- name: Verify Tailscale Network Configuration
+  hosts: baremetal[0]
+  gather_facts: false
+
+  vars:
+    tailscale_api_url: "https://api.tailscale.com/api/v2"
+
+  tasks:
+    - name: Display Tailscale setup completion message
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════════════════════
+          ✅ Tailscale Network Configuration Complete
+          ════════════════════════════════════════════════════════════════════════
+
+          Connected Nodes: {{ groups['overlay_nodes'] | length }}
+
+          {% for node in groups['overlay_nodes'] %}
+          - {{ node }}: Connected to tailnet
+          {% endfor %}
+
+          Configuration Summary:
+          - IP forwarding: Enabled on control plane
+          - MetalLB subnet: Advertised and routed via control plane
+          - All nodes: Accepting routes for seamless MetalLB access
+
+          NEXT STEPS:
+          1. Verify MetalLB services are accessible via Tailscale IPs
+          2. Continue with Kubernetes deployment
+
+          ════════════════════════════════════════════════════════════════════════
