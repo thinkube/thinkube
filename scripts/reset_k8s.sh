@@ -15,15 +15,9 @@ echo "This script will:"
 echo "  1. Remove k8s-snap with --purge"
 echo "  2. Delete ~/.kube/config"
 echo "  3. Remove all k8s-related directories"
-echo "  4. Remove temporary thinkube files"
-echo ""
-read -p "Continue? (y/N) " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Aborted."
-    exit 1
-fi
-
+echo "  4. Remove pip configuration (devpi)"
+echo "  5. Remove Python virtual environment (~/.venv)"
+echo "  6. Remove temporary thinkube files"
 echo ""
 echo "Step 1: Removing k8s-snap with --purge..."
 sudo snap remove k8s --purge || echo "k8s-snap not installed or already removed"
@@ -44,7 +38,18 @@ sudo rm -rf /opt/cni || true
 sudo rm -rf /var/lib/cni || true
 
 echo ""
-echo "Step 4: Removing temporary thinkube files..."
+echo "Step 4: Removing pip configuration (devpi)..."
+rm -f ~/.pip/pip.conf || true
+rm -f ~/.config/pip/pip.conf || true
+echo "Pip configuration removed"
+
+echo ""
+echo "Step 5: Removing Python virtual environment..."
+rm -rf ~/.venv || true
+echo "Python venv removed"
+
+echo ""
+echo "Step 6: Removing temporary thinkube files..."
 rm -rf /tmp/think* || true
 
 echo ""

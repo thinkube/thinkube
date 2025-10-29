@@ -181,14 +181,19 @@ See: https://docs.nvidia.com/dgx/dgx-spark/known-issues.html
 
 ## Key Paths
 
+**Custom Containerd Configuration** (for Docker coexistence on DGX):
+
 ```
-Containerd socket:     /run/containerd/containerd.sock
-Containerd config:     /etc/containerd/config.toml
-Kubeconfig:           /etc/kubernetes/admin.conf
-kubectl:              sudo k8s kubectl
-helm:                 sudo k8s helm
+Containerd base dir:   /var/lib/k8s-containerd
+Containerd socket:     /var/lib/k8s-containerd/k8s-containerd/run/containerd/containerd.sock
+Containerd config:     /var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml
+Kubeconfig:           ~/.kube/config
+kubectl:              ~/.local/bin/kubectl (or sudo k8s kubectl)
+helm:                 ~/.local/bin/helm (or sudo k8s helm)
 Local storage:        /var/snap/k8s/common/rawfile-storage
 ```
+
+**Note**: The custom `containerd-base-dir: /var/lib/k8s-containerd` is configured to allow Docker and k8s-snap to coexist without conflicts. This is particularly important for DGX systems where Docker is needed for standard DGX functionality.
 
 ## Troubleshooting
 
