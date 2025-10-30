@@ -105,20 +105,31 @@
         - gpu_pods.resources | default([]) | length > 0
       changed_when: false
 
-    - name: Delete GPU Operator namespace
+    - name: Force delete GPU Operator namespace with finalizer removal
       ansible.builtin.shell: |
-        {{ kubectl_bin }} delete namespace {{ gpu_operator_namespace }} --force --grace-period=0
-      register: delete_namespace
-      changed_when: delete_namespace.rc == 0
-      failed_when: false
-      timeout: 30
+        # Start namespace deletion in background
+        {{ kubectl_bin }} delete namespace {{ gpu_operator_namespace }} --force --grace-period=0 &
 
-    - name: Remove namespace finalizers if stuck
-      ansible.builtin.shell: |
+        # Wait a moment for deletion to start
+        sleep 2
+
+        # Remove finalizers to unblock deletion
         {{ kubectl_bin }} get namespace {{ gpu_operator_namespace }} -o json 2>/dev/null | \
         jq '.spec.finalizers = []' | \
         {{ kubectl_bin }} replace --raw /api/v1/namespaces/{{ gpu_operator_namespace }}/finalize -f - || true
-      when: delete_namespace is defined
+
+        # Wait up to 20 seconds for namespace to be gone
+        for i in {1..20}; do
+          if ! {{ kubectl_bin }} get namespace {{ gpu_operator_namespace }} 2>/dev/null; then
+            echo "✓ Namespace deleted successfully"
+            exit 0
+          fi
+          sleep 1
+        done
+
+        echo "⚠ Namespace may still be terminating, but continuing..."
+        exit 0
+      register: delete_namespace
       changed_when: false
       failed_when: false
       
