@@ -50,7 +50,7 @@
         namespace: "{{ cuda_test_namespace }}"
       register: test_pod_check
       failed_when: false
-      
+
     - name: Remove CUDA test pod if it exists
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -59,19 +59,32 @@
         name: "{{ cuda_test_pod_name }}"
         namespace: "{{ cuda_test_namespace }}"
       when: test_pod_check.resources | length > 0
-    
+
+    - name: Check if GPU Operator namespace exists
+      ansible.builtin.command: "{{ kubectl_bin }} get namespace {{ gpu_operator_namespace }}"
+      register: gpu_ns_check
+      changed_when: false
+      failed_when: false
+
+    - name: Force delete any stuck jobs in GPU operator namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete jobs --all -n {{ gpu_operator_namespace }} --force --grace-period=0 || true
+      when: gpu_ns_check.rc == 0
+      changed_when: false
+
     - name: Check if GPU Operator is installed via Helm
       ansible.builtin.command: "{{ helm_bin }} status gpu-operator -n {{ gpu_operator_namespace }}"
       register: helm_status
       changed_when: false
       failed_when: false
-      
-    - name: Uninstall GPU Operator via Helm
-      ansible.builtin.command: "{{ helm_bin }} uninstall gpu-operator -n {{ gpu_operator_namespace }}"
+
+    - name: Uninstall GPU Operator via Helm (fast mode - no hooks, no wait)
+      ansible.builtin.command: "{{ helm_bin }} uninstall gpu-operator -n {{ gpu_operator_namespace }} --no-hooks --wait=false"
       when: helm_status.rc == 0
       register: helm_uninstall
       changed_when: helm_uninstall.rc == 0
-      
+      timeout: 60
+
     - name: Wait for pods to be terminated
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
@@ -79,19 +92,35 @@
         namespace: "{{ gpu_operator_namespace }}"
       register: gpu_pods
       until: gpu_pods.resources | length == 0
-      retries: 30
+      retries: 12
       delay: 5
       when: helm_uninstall is defined and helm_uninstall.rc == 0
       failed_when: false
-      
+
+    - name: Force delete all remaining pods if they didn't terminate
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pods --all -n {{ gpu_operator_namespace }} --force --grace-period=0 || true
+      when:
+        - helm_uninstall is defined and helm_uninstall.rc == 0
+        - gpu_pods is defined and gpu_pods.resources | length > 0
+      changed_when: false
+
     - name: Delete GPU Operator namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: absent
-        kind: Namespace
-        name: "{{ gpu_operator_namespace }}"
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete namespace {{ gpu_operator_namespace }} --force --grace-period=0
       register: delete_namespace
-      changed_when: delete_namespace is changed
+      changed_when: delete_namespace.rc == 0
+      failed_when: false
+      timeout: 30
+
+    - name: Remove namespace finalizers if stuck
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get namespace {{ gpu_operator_namespace }} -o json 2>/dev/null | \
+        jq '.spec.finalizers = []' | \
+        {{ kubectl_bin }} replace --raw /api/v1/namespaces/{{ gpu_operator_namespace }}/finalize -f - || true
+      when: delete_namespace is defined
+      changed_when: false
+      failed_when: false
       
     - name: Display rollback status
       ansible.builtin.debug:
