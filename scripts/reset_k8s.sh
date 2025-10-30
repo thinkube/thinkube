@@ -35,6 +35,7 @@ sudo rm -rf /root/snap/k8s || true
 sudo rm -rf /etc/kubernetes || true
 sudo rm -rf /var/lib/kubelet || true
 sudo rm -rf /var/lib/k8s-dqlite || true
+sudo rm -rf /var/lib/k8s-containerd || true
 sudo rm -rf /etc/cni || true
 sudo rm -rf /opt/cni || true
 sudo rm -rf /var/lib/cni || true
