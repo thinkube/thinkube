@@ -118,13 +118,13 @@
         while [ $i -le 60 ]; do
           count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -l app=nvidia-container-toolkit-daemonset --field-selector=status.phase=Running -o json | jq '.items | length')
           if [ "$count" -ge 1 ]; then
-            # Check if nvidia runtime is configured
-            if sudo grep -q 'nvidia' /etc/containerd/config.toml 2>/dev/null; then
-              echo "✓ nvidia-container-toolkit daemonset is running and containerd is configured"
+            # Check if nvidia runtime is configured in k8s-snap containerd
+            if sudo grep -q 'nvidia' /var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml 2>/dev/null; then
+              echo "✓ nvidia-container-toolkit daemonset is running and k8s-snap containerd is configured"
               exit 0
             fi
           fi
-          echo "Waiting for nvidia-container-toolkit to configure containerd... (attempt $i/60)"
+          echo "Waiting for nvidia-container-toolkit to configure k8s-snap containerd... (attempt $i/60)"
           sleep 5
           i=$((i + 1))
         done
@@ -132,6 +132,16 @@
         exit 0
       register: toolkit_wait
       changed_when: false
+
+    - name: Restart k8s-snap to pick up nvidia runtime configuration
+      ansible.builtin.command: sudo snap restart k8s
+      become: true
+      when: toolkit_wait.rc == 0
+
+    - name: Wait for k8s-snap services to be ready after restart
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting for k8s-snap services to restart..."
 
     - name: Check GPU operator deployment status
       ansible.builtin.shell: |
