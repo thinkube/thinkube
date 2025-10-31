@@ -59,6 +59,7 @@
       ansible.builtin.package:
         name: apache2-utils
         state: present
+      become: true
 
     - name: Verify required passwords are set
       ansible.builtin.fail:
@@ -204,23 +205,27 @@
         path: /tmp/ssl-convert
         state: directory
         mode: '0700'
+      become: true
 
     - name: Write certificate to temporary file
       ansible.builtin.copy:
         content: "{{ wildcard_cert.resources[0].data['tls.crt'] | b64decode }}"
         dest: /tmp/ssl-convert/tls.crt.orig
         mode: '0600'
+      become: true
 
     - name: Write key to temporary file
       ansible.builtin.copy:
         content: "{{ wildcard_cert.resources[0].data['tls.key'] | b64decode }}"
         dest: /tmp/ssl-convert/tls.key.orig
         mode: '0600'
+      become: true
 
     - name: Convert certificate to PEM format
       ansible.builtin.shell: "openssl x509 -in /tmp/ssl-convert/tls.crt.orig -outform PEM -out /tmp/ssl-convert/tls.crt"
       args:
         executable: /bin/bash
+      become: true
 
     - name: Convert private key to PKCS8 format (required by OpenSearch)
       ansible.builtin.shell: |
@@ -231,6 +236,7 @@
         executable: /bin/bash
       register: key_conversion
       failed_when: key_conversion.rc != 0
+      become: true
 
     - name: Verify key is in PKCS8 format
       ansible.builtin.shell: |
@@ -238,16 +244,19 @@
         (echo "ERROR: Key not in PKCS8 format" && exit 1)
       args:
         executable: /bin/bash
+      become: true
 
     - name: Read converted certificate file
       ansible.builtin.slurp:
         src: /tmp/ssl-convert/tls.crt
       register: ssl_certificate
+      become: true
 
     - name: Read converted key file
       ansible.builtin.slurp:
         src: /tmp/ssl-convert/tls.key
       register: ssl_key
+      become: true
 
     - name: Create TLS secret for OpenSearch and Dashboards
       kubernetes.core.k8s:
@@ -515,10 +524,12 @@
     - name: Add OpenSearch Helm repository
       ansible.builtin.command: >
         {{ helm_bin }} repo add opensearch https://opensearch-project.github.io/helm-charts/
+      become: true
 
     - name: Update Helm repositories
       ansible.builtin.command: >
         {{ helm_bin }} repo update
+      become: true
 
     ###################################################################
     # 9. Deploy OpenSearch
@@ -528,6 +539,7 @@
         {{ helm_bin }} upgrade --install gato-opensearch opensearch/opensearch
         --namespace {{ namespace }} -f /tmp/opensearch-values.yaml
         --timeout 10m
+      become: true
 
     ###################################################################
     # 10. Wait for OpenSearch deployment and initialize security
@@ -552,6 +564,7 @@
         mode: '0755'
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
+      become: true
 
     - name: Copy security tools and certificates from pod using kubectl exec
       ansible.builtin.shell: |
@@ -567,6 +580,7 @@
       args:
         executable: /bin/bash
       register: copy_result
+      become: true
 
     - name: Make securityadmin executable
       ansible.builtin.file:
@@ -574,6 +588,7 @@
         mode: '0755'
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
+      become: true
 
     - name: Run securityadmin to initialize security
       ansible.builtin.shell: |
@@ -598,6 +613,7 @@
       until: securityadmin_result.rc == 0
       retries: 3
       delay: 10
+      become: true
 
     - name: Display securityadmin output
       ansible.builtin.debug:
@@ -607,6 +623,7 @@
       ansible.builtin.file:
         path: /tmp/opensearch-security
         state: absent
+      become: true
 
     - name: Wait for OpenSearch to be ready
       ansible.builtin.pause:
@@ -624,6 +641,7 @@
       delay: 30
       until: auth_test.rc == 0 and 'Unauthorized' not in auth_test.stdout
       failed_when: "'Unauthorized' in auth_test.stdout"
+      become: true
 
     - name: Display authentication test result
       ansible.builtin.debug:
@@ -774,6 +792,7 @@
       ansible.builtin.command: >
         {{ helm_bin }} upgrade --install gato-opensearch-dashboards opensearch/opensearch-dashboards
         --namespace {{ namespace }} -f /tmp/osd-values.yaml
+      become: true
 
     ###################################################################
     # 16. Create OpenSearch Dashboards Ingress
@@ -825,6 +844,7 @@
         - /tmp/osd-values.yaml
         - /tmp/opensearch-security
         - /tmp/ssl-convert
+      become: true
 
     ###################################################################
     # 18. Configure OpenSearch CLI in code-server
