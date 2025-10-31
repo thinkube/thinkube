@@ -39,7 +39,7 @@ sudo rm -rf /var/lib/k8s-containerd || true
 sudo rm -rf /etc/cni || true
 sudo rm -rf /opt/cni || true
 sudo rm -rf /var/lib/cni || true
-sudo rm -rf /etc/containerd || true
+sudo rm -rf /etc/containerd/conf.d || true
 sudo rm -rf /usr/local/nvidia || true
 sudo rm -rf /run/nvidia || true
 
