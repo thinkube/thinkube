@@ -227,6 +227,43 @@
         var: cluster_status.stdout_lines
 
     # ===========================
+    # Configure containerd for GPU operator
+    # ===========================
+    - name: Create /etc/containerd/conf.d directory for drop-in configs
+      ansible.builtin.file:
+        path: /etc/containerd/conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      become: true
+
+    - name: Add imports support to k8s-snap containerd for GPU operator
+      ansible.builtin.lineinfile:
+        path: /var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml
+        line: 'imports = ["/etc/containerd/conf.d/*.toml"]'
+        insertafter: '^version = 2'
+        state: present
+        create: false
+      become: true
+      register: containerd_imports
+
+    - name: Restart k8s snap to reload containerd configuration
+      ansible.builtin.command: snap restart k8s
+      become: true
+      when: containerd_imports is changed
+
+    - name: Wait for k8s cluster to be ready after containerd restart
+      ansible.builtin.command: k8s status --wait-ready
+      become: true
+      register: k8s_status_after_restart
+      retries: 30
+      delay: 10
+      until: k8s_status_after_restart.rc == 0
+      changed_when: false
+      when: containerd_imports is changed
+
+    # ===========================
     # Verify Core Components
     # ===========================
     - name: Wait for CoreDNS to be ready
@@ -524,25 +561,6 @@
             owner: "{{ user }}"
             group: "{{ user }}"
             mode: '0644'
-
-    # ===========================
-    # RuntimeClass for GPU Workloads
-    # ===========================
-    - name: Create nvidia RuntimeClass for GPU workloads
-      ansible.builtin.shell: |
-        k8s kubectl apply -f - <<EOF
-        apiVersion: node.k8s.io/v1
-        kind: RuntimeClass
-        metadata:
-          name: nvidia
-        handler: nvidia
-        EOF
-      become: true
-      register: runtimeclass_result
-      changed_when: "'created' in runtimeclass_result.stdout or 'configured' in runtimeclass_result.stdout"
-      failed_when:
-        - runtimeclass_result.rc != 0
-        - "'already exists' not in runtimeclass_result.stderr"
 
     # ===========================
     # MetalLB Load Balancer
