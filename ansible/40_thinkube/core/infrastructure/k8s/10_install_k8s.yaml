@@ -8,7 +8,7 @@
 #   - Installs k8s snap package
 #   - Installs kubectl and helm binaries (no sudo required)
 #   - Creates k8s-hostpath StorageClass (alias to csi-rawfile-default)
-#   - Configures MetalLB load balancer
+#   - Enables Cilium load balancer (built-in replacement for MetalLB)
 #
 # Requirements:
 #   - Ubuntu 24.04 LTS
@@ -532,77 +532,33 @@
             mode: '0644'
 
     # ===========================
-    # MetalLB Load Balancer
+    # Cilium Load Balancer (replaces MetalLB)
     # ===========================
-    - name: Add MetalLB Helm repository
-      ansible.builtin.command: "{{ helm_bin }} repo add metallb https://metallb.github.io/metallb --force-update"
-      changed_when: false
-
-    - name: Update Helm repositories
-      ansible.builtin.command: "{{ helm_bin }} repo update"
-      changed_when: false
-
-    - name: Install MetalLB via Helm
-      ansible.builtin.shell: |
-        {{ helm_bin }} upgrade --install metallb metallb/metallb \
-          --namespace metallb-system \
-          --create-namespace \
-          --wait \
-          --timeout 5m
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: metallb_install
-      changed_when: "'STATUS: deployed' in metallb_install.stdout or 'has been upgraded' in metallb_install.stdout"
-
-    - name: Wait for MetalLB controller to be ready
-      ansible.builtin.command: "k8s kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=controller -n metallb-system --timeout=300s"
-      become: true
-      register: metallb_controller_wait
-      retries: 3
-      delay: 10
-      until: metallb_controller_wait.rc == 0
-      changed_when: false
-
-    - name: Build MetalLB IP range variables
+    - name: Build load balancer IP range variables
       ansible.builtin.set_fact:
-        metallb_ip_range_start: "{{ zerotier_subnet_prefix }}{{ metallb_ip_start_octet }}"
-        metallb_ip_range_end: "{{ zerotier_subnet_prefix }}{{ metallb_ip_end_octet }}"
+        lb_ip_range_start: "{{ zerotier_subnet_prefix }}{{ metallb_ip_start_octet }}"
+        lb_ip_range_end: "{{ zerotier_subnet_prefix }}{{ metallb_ip_end_octet }}"
 
-    - name: Configure MetalLB IP address pool
-      ansible.builtin.shell: |
-        k8s kubectl apply -f - <<EOF
-        apiVersion: metallb.io/v1beta1
-        kind: IPAddressPool
-        metadata:
-          name: default-pool
-          namespace: metallb-system
-        spec:
-          addresses:
-          - {{ metallb_ip_range_start }}-{{ metallb_ip_range_end }}
-        EOF
+    - name: Enable Cilium load balancer
+      ansible.builtin.command: k8s enable load-balancer
       become: true
-      register: metallb_pool_result
-      changed_when: "'created' in metallb_pool_result.stdout or 'configured' in metallb_pool_result.stdout"
+      register: lb_enable
+      changed_when: "'Enabled' in lb_enable.stdout or 'enabled' in lb_enable.stdout"
 
-    - name: Configure MetalLB L2 advertisement
-      ansible.builtin.shell: |
-        k8s kubectl apply -f - <<EOF
-        apiVersion: metallb.io/v1beta1
-        kind: L2Advertisement
-        metadata:
-          name: default-l2
-          namespace: metallb-system
-        spec:
-          ipAddressPools:
-          - default-pool
-        EOF
+    - name: Configure Cilium load balancer IP range and L2 mode
+      ansible.builtin.command: k8s set load-balancer.cidrs="{{ lb_ip_range_start }}-{{ lb_ip_range_end }}" load-balancer.l2-mode=true
       become: true
-      register: metallb_l2_result
-      changed_when: "'created' in metallb_l2_result.stdout or 'configured' in metallb_l2_result.stdout"
+      register: lb_config
+      changed_when: true
 
-    - name: Show MetalLB status
+    - name: Wait for load balancer to be ready
+      ansible.builtin.pause:
+        seconds: 10
+        prompt: "Waiting for Cilium load balancer to initialize..."
+
+    - name: Show load balancer status
       ansible.builtin.debug:
-        msg: "MetalLB is deployed with IP range {{ metallb_ip_range_start }}-{{ metallb_ip_range_end }}"
+        msg: "Cilium load balancer is configured with IP range {{ lb_ip_range_start }}-{{ lb_ip_range_end }}"
 
   handlers:
     - name: reload_ufw
