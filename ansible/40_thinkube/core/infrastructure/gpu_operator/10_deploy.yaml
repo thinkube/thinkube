@@ -92,17 +92,7 @@
           --create-namespace \
           --wait \
           --timeout 15m \
-          --set driver.enabled=false \
-          --set toolkit.env[0].name=CONTAINERD_CONFIG \
-          --set toolkit.env[0].value=/var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml \
-          --set toolkit.env[1].name=CONTAINERD_SOCKET \
-          --set toolkit.env[1].value=/var/lib/k8s-containerd/k8s-containerd/run/containerd/containerd.sock \
-          --set toolkit.env[2].name=CONTAINERD_RUNTIME_CLASS \
-          --set toolkit.env[2].value=nvidia \
-          --set toolkit.env[3].name=CONTAINERD_SET_AS_DEFAULT \
-          --set-string toolkit.env[3].value="false" \
-          --set toolkit.env[4].name=RUNTIME_USE_CONFIG_FILE \
-          --set-string toolkit.env[4].value="true"
+          --set driver.enabled=false
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: gpu_operator_install
@@ -113,37 +103,60 @@
         seconds: 30
         prompt: "Waiting for GPU operator to initialize pods..."
 
-    - name: Wait for nvidia-container-toolkit to configure containerd
+    - name: Wait for nvidia-container-toolkit daemonset to be running
       ansible.builtin.shell: |
-        # Wait for the toolkit daemonset to be running and to configure containerd
+        # Wait for the toolkit daemonset to be running
         i=1
         while [ $i -le 60 ]; do
           count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -l app=nvidia-container-toolkit-daemonset --field-selector=status.phase=Running -o json | jq '.items | length')
           if [ "$count" -ge 1 ]; then
-            # Check if nvidia runtime is configured in k8s-snap containerd
-            if sudo grep -q 'nvidia' /var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml 2>/dev/null; then
-              echo "✓ nvidia-container-toolkit daemonset is running and k8s-snap containerd is configured"
-              exit 0
-            fi
+            echo "✓ nvidia-container-toolkit daemonset is running"
+            exit 0
           fi
-          echo "Waiting for nvidia-container-toolkit to configure k8s-snap containerd... (attempt $i/60)"
+          echo "Waiting for nvidia-container-toolkit daemonset... (attempt $i/60)"
           sleep 5
           i=$((i + 1))
         done
-        echo "WARNING: nvidia-container-toolkit-daemonset not fully configured yet, continuing anyway"
-        exit 0
+        echo "ERROR: nvidia-container-toolkit-daemonset not running"
+        exit 1
       register: toolkit_wait
       changed_when: false
+
+    - name: Wait for nvidia-container-toolkit to create drop-in config
+      ansible.builtin.wait_for:
+        path: /etc/containerd/conf.d/99-nvidia.toml
+        state: present
+        timeout: 300
+      become: true
+
+    - name: Merge nvidia runtime into k8s-snap containerd main config
+      ansible.builtin.blockinfile:
+        path: /var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - NVIDIA RUNTIME"
+        insertafter: '^\s+\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]'
+        block: |2
+
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
+                    privileged_without_host_devices = false
+                    runtime_engine = ""
+                    runtime_root = ""
+                    runtime_type = "io.containerd.runc.v2"
+
+                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
+                      BinaryName = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+      become: true
+      register: containerd_config_updated
 
     - name: Restart k8s-snap to pick up nvidia runtime configuration
       ansible.builtin.command: sudo snap restart k8s
       become: true
-      when: toolkit_wait.rc == 0
+      when: containerd_config_updated.changed
 
     - name: Wait for k8s-snap services to be ready after restart
       ansible.builtin.pause:
         seconds: 30
         prompt: "Waiting for k8s-snap services to restart..."
+      when: containerd_config_updated.changed
 
     - name: Check GPU operator deployment status
       ansible.builtin.shell: |
