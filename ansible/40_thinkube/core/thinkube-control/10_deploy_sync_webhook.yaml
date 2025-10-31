@@ -333,6 +333,10 @@
               metadata:
                 labels:
                   app: "{{ sync_service_name }}"
+                annotations:
+                  # Trigger rollout when secret changes
+                  secret-hash/webhook: "{{ webhook_secret_value | hash('sha256') }}"
+                  secret-hash/argocd-password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) | hash('sha256') }}"
               spec:
                 containers:
                 - name: sync-webhook
@@ -420,31 +424,7 @@
         wait_condition:
           type: Progressing
           status: "True"
-        wait_timeout: 300
-
-    - name: Restart sync webhook pods to pick up latest secret
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: "{{ sync_service_name }}"
-            namespace: "{{ sync_namespace }}"
-          spec:
-            template:
-              metadata:
-                annotations:
-                  restartedAt: "{{ ansible_date_time.iso8601 }}"
-
-    - name: Wait for pods to be ready after restart
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} -n {{ sync_namespace }} rollout status deployment/{{ sync_service_name }} --timeout=120s"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: rollout_result
-      changed_when: false
+        wait_timeout: 180
 
     - name: Get webhook secret for configuration
       kubernetes.core.k8s_info:
