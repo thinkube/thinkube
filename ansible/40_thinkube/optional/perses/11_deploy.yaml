@@ -14,7 +14,7 @@
 #   5. Deploys Perses using Helm chart with OIDC authentication
 #
 # Requirements:
-#   - MicroK8s must be installed and running
+#   - Kubernetes (k8s-snap) must be installed and running
 #   - Keycloak deployed and configured (run 10_configure_keycloak.yaml first)
 #   - Wildcard TLS certificate in default namespace
 #
@@ -144,21 +144,30 @@
         mode: '0644'
 
     - name: Add Perses Helm repo
-      ansible.builtin.shell: |
-        microk8s helm3 repo add perses {{ perses_chart_repo }}
-        microk8s helm3 repo update
-      become: true
+      kubernetes.core.helm_repository:
+        binary_path: "{{ helm_bin }}"
+        name: perses
+        repo_url: "{{ perses_chart_repo }}"
+        state: present
+
+    - name: Update Helm repos for Perses
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+      changed_when: false
 
     - name: Deploy Perses with Helm
-      ansible.builtin.shell: |
-        microk8s helm3 upgrade --install {{ perses_release_name }} perses/perses \
-          --namespace {{ perses_namespace }} \
-          {% if perses_chart_version %}--version {{ perses_chart_version }} {% endif %}\
-          --values {{ temp_helm_dir.path }}/values.yaml \
-          --wait \
-          --timeout 10m
-      become: true
-      register: helm_deploy
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ perses_release_name }}"
+        chart_ref: "perses/perses"
+        release_namespace: "{{ perses_namespace }}"
+        create_namespace: false
+        chart_version: "{{ perses_chart_version }}"
+        values_files:
+          - "{{ temp_helm_dir.path }}/values.yaml"
+        wait: true
+        wait_timeout: "10m"
+        update_repo_cache: true
 
     - name: Clean up temp directory
       ansible.builtin.file:
