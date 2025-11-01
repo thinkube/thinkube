@@ -19,7 +19,7 @@ Knative provides serverless capabilities for Kubernetes, including:
 ## Prerequisites
 
 Before deploying Knative, ensure the following components are installed:
-- MicroK8s cluster (CORE-001)
+- Kubernetes (k8s-snap) cluster (CORE-001)
 - Ingress controllers with secondary ingress configured (CORE-002)
 - CoreDNS properly configured (CORE-003)
 - Harbor registry deployed and accessible (CORE-004)

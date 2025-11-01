@@ -88,7 +88,7 @@ All packages are pinned to specific versions for reproducibility:
 ## Prerequisites
 
 1. **Core Components**:
-   - CORE-001: MicroK8s cluster with GPU operator (if using GPUs)
+   - CORE-001: Kubernetes (k8s-snap) cluster with GPU operator (if using GPUs)
    - CORE-002: Keycloak deployed (mandatory for authentication)
    - CORE-004: Harbor registry deployed
    - SeaweedFS deployed with CSI driver
@@ -302,19 +302,19 @@ To remove JupyterHub completely:
 
 ### Check Pod Status
 ```bash
-microk8s.kubectl get pods -n jupyterhub
+kubectl get pods -n jupyterhub
 ```
 
 ### View Logs
 ```bash
 # Hub logs
-microk8s.kubectl logs -n jupyterhub deployment/hub
+kubectl logs -n jupyterhub deployment/hub
 
 # Proxy logs
-microk8s.kubectl logs -n jupyterhub deployment/proxy
+kubectl logs -n jupyterhub deployment/proxy
 
 # User pod logs
-microk8s.kubectl logs -n jupyterhub jupyter-<username>
+kubectl logs -n jupyterhub jupyter-<username>
 ```
 
 ### Common Issues

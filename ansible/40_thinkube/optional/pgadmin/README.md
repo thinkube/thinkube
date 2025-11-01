@@ -20,7 +20,7 @@ PgAdmin is a web-based administration tool for PostgreSQL databases. This deploy
 
 ## Requirements
 
-- MicroK8s cluster with ingress controller
+- Kubernetes (k8s-snap) cluster with ingress controller
 - Cert-manager with wildcard certificate
 - PostgreSQL databases to manage
 - Keycloak instance running and accessible

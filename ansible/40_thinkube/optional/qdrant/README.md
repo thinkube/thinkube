@@ -33,7 +33,7 @@ User → Browser → Qdrant Dashboard → OAuth2 Proxy → Keycloak
 
 ### Prerequisites
 
-1. MicroK8s must be deployed
+1. Kubernetes (k8s-snap) must be deployed
 2. Keycloak must be deployed (CORE-006)
 3. TLS certificates must be configured (CORE-004)
 4. Set environment variable:

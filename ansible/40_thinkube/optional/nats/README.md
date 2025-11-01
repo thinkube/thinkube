@@ -38,7 +38,7 @@ JetStream uses persistent volumes for message storage:
 
 ### Prerequisites
 
-- MicroK8s cluster running
+- Kubernetes (k8s-snap) cluster running
 - Helm installed
 - Harbor registry with NATS images
 

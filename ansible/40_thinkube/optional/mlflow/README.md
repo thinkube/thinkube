@@ -22,7 +22,7 @@ MLflow is an open-source platform for managing the ML lifecycle, including exper
 
 ## Requirements
 
-- MicroK8s cluster with ingress controller
+- Kubernetes (k8s-snap) cluster with ingress controller
 - Cert-manager with wildcard certificate
 - PostgreSQL database (core component)
 - SeaweedFS object storage (core component, Apache 2.0 licensed)

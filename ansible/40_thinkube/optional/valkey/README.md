@@ -22,8 +22,8 @@ Valkey is an open-source, Redis-compatible in-memory data store. This deployment
 
 ## Requirements
 
-- MicroK8s cluster
-- Storage class: `microk8s-hostpath`
+- Kubernetes (k8s-snap) cluster
+- Storage class: `k8s-hostpath`
 - Harbor registry configured (core component)
 - Custom Valkey image built and available in Harbor registry
 - HARBOR_ROBOT_TOKEN in ~/.env (created during Harbor setup)
@@ -72,7 +72,7 @@ Valkey is configured with:
 - **Append-Only File (AOF)**: Enabled for durability
 - **Snapshot saves**: Every 900 seconds if 1+ keys changed
 - **Storage**: 5Gi persistent volume
-- **Storage class**: microk8s-hostpath
+- **Storage class**: k8s-hostpath
 
 ## Resource Limits
 

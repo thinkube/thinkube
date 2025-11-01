@@ -1,6 +1,6 @@
 # OpenSearch Deployment
 
-This directory contains Ansible playbooks for deploying OpenSearch and OpenSearch Dashboards with Keycloak OIDC integration on MicroK8s.
+This directory contains Ansible playbooks for deploying OpenSearch and OpenSearch Dashboards with Keycloak OIDC integration on Kubernetes (k8s-snap).
 
 ## Overview
 
@@ -14,7 +14,7 @@ OpenSearch is an open-source search and analytics engine used for log aggregatio
 
 ## Prerequisites
 
-- MicroK8s cluster deployed and running
+- Kubernetes (k8s-snap) cluster deployed and running
 - Keycloak deployed (CORE-003)
 - TLS certificates available
 - Helm installed on control plane
@@ -159,13 +159,13 @@ curl -u admin:$ADMIN_PASSWORD https://opensearch.<domain_name>/_cluster/health
 
 ```bash
 # Check pod status
-./scripts/run_ssh_command.sh vm-2 "microk8s.kubectl get pods -n opensearch"
+./scripts/run_ssh_command.sh vm-2 "kubectl get pods -n opensearch"
 
 # View OpenSearch logs
-./scripts/run_ssh_command.sh vm-2 "microk8s.kubectl logs -n opensearch deploy/opensearch-cluster-master"
+./scripts/run_ssh_command.sh vm-2 "kubectl logs -n opensearch deploy/opensearch-cluster-master"
 
 # Test internal connectivity
-./scripts/run_ssh_command.sh vm-2 "microk8s.kubectl exec -n opensearch opensearch-cluster-master-0 -- curl -ks https://localhost:9200"
+./scripts/run_ssh_command.sh vm-2 "kubectl exec -n opensearch opensearch-cluster-master-0 -- curl -ks https://localhost:9200"
 ```
 
 ## Data Persistence
@@ -179,7 +179,7 @@ Data persists across pod restarts but is deleted during rollback.
 
 ## Dependencies
 
-- MicroK8s cluster
+- Kubernetes (k8s-snap) cluster
 - Keycloak (for OIDC)
 - Ingress controller
 - Cert-manager (for TLS)

@@ -27,7 +27,7 @@ Weaviate is an open-source vector database designed for AI applications. It prov
 
 ### Prerequisites
 
-- MicroK8s cluster with ingress controller
+- Kubernetes (k8s-snap) cluster with ingress controller
 - DNS configured for the domain
 - `ADMIN_PASSWORD` environment variable set
 
@@ -145,7 +145,7 @@ The deployment sets the following key environment variables:
 ### Storage
 
 - **PVC Size**: 10Gi (configurable in playbook)
-- **Storage Class**: `microk8s-hostpath`
+- **Storage Class**: `k8s-hostpath`
 - **Mount Path**: `/var/lib/weaviate`
 
 ### Resource Limits

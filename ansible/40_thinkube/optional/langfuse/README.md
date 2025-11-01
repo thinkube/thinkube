@@ -31,7 +31,7 @@ Langfuse is an open-source LLM engineering platform for tracing, evaluating, and
 
 ### Prerequisites
 
-- MicroK8s cluster running
+- Kubernetes (k8s-snap) cluster running
 - PostgreSQL deployed (core component)
 - Keycloak deployed (core component)
 - Harbor registry with Langfuse image

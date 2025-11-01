@@ -27,7 +27,7 @@ Chroma is an open-source embedding database designed to make it easy to build LL
 
 ### Prerequisites
 
-- MicroK8s cluster with ingress controller
+- Kubernetes (k8s-snap) cluster with ingress controller
 - DNS configured for the domain
 - `ADMIN_PASSWORD` environment variable set
 
@@ -169,7 +169,7 @@ The deployment sets the following key environment variables:
 ### Storage
 
 - **PVC Size**: 10Gi (configurable in playbook)
-- **Storage Class**: `microk8s-hostpath`
+- **Storage Class**: `k8s-hostpath`
 - **Mount Path**: `/chroma/chroma`
 
 ### Resource Limits
