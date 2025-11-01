@@ -163,6 +163,8 @@
                           port:
                             number: "{{ clickhouse_http_port }}"
 
+    # Note: TCP port 9000 is pre-configured in ingress controller during deployment
+    # We only need to update the ConfigMap to route traffic to ClickHouse service
     - name: Configure NGINX Ingress TCP passthrough for ClickHouse native protocol
       ansible.builtin.shell: |
         {{ kubectl_bin }} patch configmap {{ ingress_tcp_configmap_name }} \
@@ -171,75 +173,6 @@
           -p='{"data":{"{{ clickhouse_native_port }}":"{{ clickhouse_namespace }}/clickhouse-clickhouse:{{ clickhouse_native_port }}"}}'
       register: tcp_passthrough
       changed_when: "'configured' in tcp_passthrough.stdout or tcp_passthrough.rc == 0"
-
-    - name: Restart NGINX Ingress controller to pick up TCP config changes
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout restart deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }}
-      register: rollout_restart
-
-    - name: Wait for Ingress controller to restart
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout status deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }} --timeout=60s
-      register: rollout_status
-      failed_when: rollout_status.rc != 0
-
-    - name: Check if ClickHouse native port is already exposed in Ingress deployment
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.template.spec.containers[0].ports[*].containerPort}' | grep -q "{{ clickhouse_native_port }}"
-      register: port_check
-      changed_when: false
-      failed_when: false
-
-    - name: Patch NGINX Ingress controller deployment to expose ClickHouse native port
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} patch deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} \
-          --type=json \
-          -p='[
-            {
-              "op": "add",
-              "path": "/spec/template/spec/containers/0/ports/-",
-              "value": {
-                "name": "ch-{{ clickhouse_native_port }}",
-                "containerPort": {{ clickhouse_native_port }},
-                "hostPort": {{ clickhouse_native_port }},
-                "protocol": "TCP"
-              }
-            }
-          ]'
-      register: patch_deploy
-      changed_when: "'patched' in patch_deploy.stdout or patch_deploy.rc == 0"
-      when: port_check.rc != 0
-
-    - name: Check if ClickHouse native port is already exposed in Ingress service
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get service -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.ports[*].port}' | grep -q "{{ clickhouse_native_port }}"
-      register: service_port_check
-      changed_when: false
-      failed_when: false
-
-    - name: Patch NGINX Ingress controller service to expose ClickHouse native port
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} patch service -n {{ ingress_namespace }} {{ primary_ingress_service }} \
-          --type=json \
-          -p='[
-            {
-              "op": "add",
-              "path": "/spec/ports/-",
-              "value": {
-                "name": "ch-{{ clickhouse_native_port }}",
-                "port": {{ clickhouse_native_port }},
-                "targetPort": {{ clickhouse_native_port }},
-                "protocol": "TCP"
-              }
-            }
-          ]'
-      register: patch_service
-      changed_when: "'patched' in patch_service.stdout or patch_service.rc == 0"
-      when: service_port_check.rc != 0
-
-    - name: Wait for changes to propagate
-      ansible.builtin.pause:
-        seconds: 15
 
     - name: Create ClickHouse config from template
       ansible.builtin.template:
