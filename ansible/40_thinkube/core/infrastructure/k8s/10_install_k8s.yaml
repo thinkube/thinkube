@@ -286,6 +286,49 @@
         success_msg: "Storage class csi-rawfile-default is available"
 
     # ===========================
+    # Patch rawfile CSI driver for custom kubelet root-dir
+    # ===========================
+    - name: Patch rawfile CSI node daemonset to use correct kubelet paths
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch daemonset ck-storage-rawfile-csi-node -n kube-system --type='json' -p='[
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/volumes/0/hostPath/path",
+            "value": "/var/snap/k8s/common/var/lib/kubelet/plugins_registry"
+          },
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/volumes/1/hostPath/path",
+            "value": "/var/snap/k8s/common/var/lib/kubelet/plugins/rawfile-csi"
+          },
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/volumes/2/hostPath/path",
+            "value": "/var/snap/k8s/common/var/lib/kubelet"
+          },
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/containers/1/env/1/value",
+            "value": "/var/snap/k8s/common/var/lib/kubelet/plugins/rawfile-csi/csi.sock"
+          }
+        ]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: csi_patch_result
+      changed_when: csi_patch_result.rc == 0
+      failed_when: false
+
+    - name: Wait for rawfile CSI node pods to be ready after patch
+      ansible.builtin.command: "{{ kubectl_bin }} wait --for=condition=ready pod -l app.kubernetes.io/name=rawfile-csi -n kube-system --timeout=300s"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: rawfile_csi_wait
+      retries: 3
+      delay: 10
+      until: rawfile_csi_wait.rc == 0
+      changed_when: false
+
+    # ===========================
     # Install kubectl and helm Binaries (No Sudo Required)
     # ===========================
     - name: Create .local/bin directory for user
