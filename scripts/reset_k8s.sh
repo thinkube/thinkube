@@ -34,6 +34,7 @@ echo " 11. Remove Python virtual environment (~/.venv)"
 echo " 12. Remove thinkube installer state (~/.thinkube-installer)"
 echo " 13. Remove temporary thinkube files"
 echo " 14. Clear Tauri installer localStorage (deployment state)"
+echo " 15. Ensure snapd is running and healthy"
 echo ""
 echo "Step 1a: Unmounting kubelet pod volumes..."
 KUBELET_MOUNTS=$(mount | grep '/var/snap/k8s/common/var/lib/kubelet/pods' | awk '{print $3}' || true)
@@ -215,6 +216,31 @@ if [ -f "$LOCALSTORAGE_DB" ]; then
   echo "Cleared stale deployment state from localStorage"
 else
   echo "No localStorage database found (installer not yet run)"
+fi
+
+echo ""
+echo "Step 9: Ensuring snapd is running..."
+# Ensure snapd is running after all cleanup
+if ! systemctl is-active --quiet snapd.service; then
+  echo "Snapd is not running, starting it..."
+  sudo systemctl start snapd.service snapd.socket
+  sleep 3
+  echo "Snapd started"
+else
+  echo "Snapd is already running"
+fi
+
+# Verify snapd is responding
+if snap list &>/dev/null; then
+  echo "✅ Snapd is healthy and responding"
+else
+  echo "⚠️  Snapd is running but not responding yet, waiting..."
+  sleep 5
+  if snap list &>/dev/null; then
+    echo "✅ Snapd is now responding"
+  else
+    echo "❌ Warning: Snapd may need manual attention"
+  fi
 fi
 
 echo ""
