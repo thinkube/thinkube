@@ -20,14 +20,20 @@ echo "K8s-snap Reset Script"
 echo "=================================================="
 echo ""
 echo "This script will:"
-echo "  1. Remove k8s-snap with --purge"
-echo "  2. Delete ~/.kube/config"
-echo "  3. Remove all k8s-related directories"
-echo "  4. Remove pip configuration (devpi)"
-echo "  5. Remove Python virtual environment (~/.venv)"
-echo "  6. Remove thinkube installer state (~/.thinkube-installer)"
-echo "  7. Remove temporary thinkube files"
-echo "  8. Clear Tauri installer localStorage (deployment state)"
+echo "  1. Unmount all kubelet pod volumes"
+echo "  2. Unmount CSI loop device mounts"
+echo "  3. Unmount remaining k8s mounts"
+echo "  4. Stop k8s snap services"
+echo "  5. Kill remaining k8s and containerd processes"
+echo "  6. Detach loop devices"
+echo "  7. Remove k8s-snap with --purge (with 2-minute timeout)"
+echo "  8. Delete ~/.kube/config"
+echo "  9. Remove all k8s-related directories"
+echo " 10. Remove pip configuration (devpi)"
+echo " 11. Remove Python virtual environment (~/.venv)"
+echo " 12. Remove thinkube installer state (~/.thinkube-installer)"
+echo " 13. Remove temporary thinkube files"
+echo " 14. Clear Tauri installer localStorage (deployment state)"
 echo ""
 echo "Step 1a: Unmounting kubelet pod volumes..."
 KUBELET_MOUNTS=$(mount | grep '/var/snap/k8s/common/var/lib/kubelet/pods' | awk '{print $3}' || true)
@@ -65,7 +71,35 @@ else
 fi
 
 echo ""
-echo "Step 1d: Removing k8s-snap with --purge..."
+echo "Step 1d: Stopping k8s snap services..."
+sudo snap stop k8s 2>/dev/null || true
+sleep 2
+echo "k8s snap services stopped"
+
+echo ""
+echo "Step 1e: Killing remaining k8s and containerd processes..."
+# Kill containerd-shim processes
+sudo pkill -9 -f containerd-shim 2>/dev/null || true
+# Kill containerd processes
+sudo pkill -9 -f '/containerd' 2>/dev/null || true
+# Kill any k8s processes
+sudo pkill -9 -f '/snap/k8s' 2>/dev/null || true
+echo "Processes killed"
+
+echo ""
+echo "Step 1f: Detaching loop devices..."
+LOOP_DEVICES=$(losetup -a | grep '/var/snap/k8s' | cut -d: -f1 || true)
+if [ -n "$LOOP_DEVICES" ]; then
+  LOOP_COUNT=$(echo "$LOOP_DEVICES" | wc -l)
+  echo "Found $LOOP_COUNT loop devices to detach"
+  echo "$LOOP_DEVICES" | xargs -I {} sudo losetup -d {} 2>/dev/null || true
+  echo "Loop devices detached"
+else
+  echo "No loop devices found"
+fi
+
+echo ""
+echo "Step 1g: Removing k8s-snap with --purge..."
 # Use timeout to prevent hanging indefinitely
 timeout 120 sudo snap remove k8s --purge || {
   EXIT_CODE=$?
@@ -75,9 +109,29 @@ timeout 120 sudo snap remove k8s --purge || {
 
     # Stop snapd
     sudo systemctl stop snapd.service snapd.socket
+    sleep 1
+
+    # More aggressive process killing
+    echo "Killing any remaining processes..."
+    sudo pkill -9 -f containerd-shim 2>/dev/null || true
+    sudo pkill -9 -f containerd 2>/dev/null || true
+    sudo pkill -9 -f '/snap/k8s' 2>/dev/null || true
+    sleep 1
+
+    # More aggressive unmounting (force unmount everything)
+    echo "Force unmounting all k8s-related mounts..."
+    while mount | grep -q '/var/snap/k8s'; do
+      mount | grep '/var/snap/k8s' | awk '{print $3}' | xargs -I {} sudo umount -f -l {} 2>/dev/null || true
+      sleep 1
+    done
+    echo "All k8s mounts cleared"
+
+    # Detach all loop devices again
+    echo "Detaching loop devices..."
+    losetup -a | grep '/var/snap/k8s' | cut -d: -f1 | xargs -I {} sudo losetup -d {} 2>/dev/null || true
 
     # Find and remove stuck changes
-    STUCK_CHANGES=$(snap changes 2>/dev/null | grep -E "Undo.*Remove.*k8s" | awk '{print $1}' || true)
+    STUCK_CHANGES=$(snap changes 2>/dev/null | grep -E "Do|Doing|Undo|Error" | grep -i "k8s" | awk '{print $1}' || true)
     if [ -n "$STUCK_CHANGES" ]; then
       echo "Removing stuck snap changes from state.json: $STUCK_CHANGES"
       for CHANGE_ID in $STUCK_CHANGES; do
@@ -88,20 +142,23 @@ timeout 120 sudo snap remove k8s --purge || {
 
     # Unmount snap if still mounted
     if mount | grep -q "/snap/k8s"; then
-      SNAP_MOUNT=$(mount | grep "/snap/k8s" | awk '{print $3}' | head -1)
-      sudo umount "$SNAP_MOUNT" 2>/dev/null || true
+      echo "Unmounting /snap/k8s mounts..."
+      mount | grep "/snap/k8s" | awk '{print $3}' | xargs -I {} sudo umount -f -l {} 2>/dev/null || true
     fi
 
     # Remove snap directories
+    echo "Removing snap directories..."
     sudo rm -rf /var/snap/k8s
     sudo rm -rf /snap/k8s
     sudo rm -f /var/lib/snapd/snaps/k8s_*.snap
 
     # Remove k8s snap entry from state.json
+    echo "Removing k8s snap from snapd state..."
     sudo jq 'del(.data.snaps.k8s)' /var/lib/snapd/state.json > /tmp/state.json.new
     sudo mv /tmp/state.json.new /var/lib/snapd/state.json
 
     # Restart snapd
+    echo "Restarting snapd..."
     sudo systemctl start snapd.service snapd.socket
     sleep 2
 
