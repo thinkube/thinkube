@@ -92,7 +92,15 @@
           --create-namespace \
           --wait \
           --timeout 15m \
-          --set driver.enabled=false
+          --set driver.enabled=false \
+          --set toolkit.env[0].name=CONTAINERD_CONFIG \
+          --set toolkit.env[0].value=/var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml \
+          --set toolkit.env[1].name=CONTAINERD_SOCKET \
+          --set toolkit.env[1].value=/var/lib/k8s-containerd/k8s-containerd/run/containerd/containerd.sock \
+          --set toolkit.env[2].name=CONTAINERD_SET_AS_DEFAULT \
+          --set toolkit.env[2].value=true \
+          --set toolkit.env[3].name=RUNTIME_DROP_IN_CONFIG_HOST_PATH \
+          --set toolkit.env[3].value=/var/lib/k8s-containerd/k8s-containerd/etc/containerd/conf.d/99-nvidia.toml
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: gpu_operator_install
@@ -122,41 +130,21 @@
       register: toolkit_wait
       changed_when: false
 
-    - name: Wait for nvidia-container-toolkit to create drop-in config
+    - name: Wait for nvidia-container-toolkit to create drop-in config in k8s-snap containerd
       ansible.builtin.wait_for:
-        path: /etc/containerd/conf.d/99-nvidia.toml
+        path: /var/lib/k8s-containerd/k8s-containerd/etc/containerd/conf.d/99-nvidia.toml
         state: present
         timeout: 300
       become: true
 
-    - name: Merge nvidia runtime into k8s-snap containerd main config
-      ansible.builtin.blockinfile:
-        path: /var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml
-        marker: "# {mark} ANSIBLE MANAGED BLOCK - NVIDIA RUNTIME"
-        insertafter: '^\s+\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]'
-        block: |2
-
-                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
-                    privileged_without_host_devices = false
-                    runtime_engine = ""
-                    runtime_root = ""
-                    runtime_type = "io.containerd.runc.v2"
-
-                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
-                      BinaryName = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+    - name: Restart k8s-snap containerd to pick up nvidia runtime configuration
+      ansible.builtin.command: snap restart k8s.containerd
       become: true
-      register: containerd_config_updated
 
-    - name: Restart k8s-snap to pick up nvidia runtime configuration
-      ansible.builtin.command: sudo snap restart k8s
-      become: true
-      when: containerd_config_updated.changed
-
-    - name: Wait for k8s-snap services to be ready after restart
+    - name: Wait for k8s-snap containerd to be ready after restart
       ansible.builtin.pause:
-        seconds: 30
-        prompt: "Waiting for k8s-snap services to restart..."
-      when: containerd_config_updated.changed
+        seconds: 10
+        prompt: "Waiting for k8s-snap containerd to restart..."
 
     - name: Check GPU operator deployment status
       ansible.builtin.shell: |
