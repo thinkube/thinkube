@@ -230,10 +230,36 @@
         var: cluster_status.stdout_lines
 
     # ===========================
-    # Configure containerd for GPU operator
+    # Configure containerd for GPU operator compatibility
     # ===========================
-    # Note: NVIDIA runtime configuration will be handled by GPU Operator playbook
-    # The GPU operator will modify containerd config directly after toolkit installation
+    # Create a base runc runtime config that ensures k8s-snap's runc runtime persists
+    # even when GPU operator adds nvidia runtime via imported configs.
+    # This file is imported BEFORE any GPU operator configs (00- prefix).
+    - name: Create k8s-snap runc runtime config for GPU compatibility
+      ansible.builtin.copy:
+        content: |
+          version = 2
+
+          [plugins]
+            [plugins."io.containerd.grpc.v1.cri"]
+              [plugins."io.containerd.grpc.v1.cri".containerd]
+                default_runtime_name = "runc"
+
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                    runtime_type = "io.containerd.runc.v2"
+                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                      SystemdCgroup = true
+        dest: /etc/containerd/conf.d/00-k8s-runc.toml
+        mode: '0644'
+      become: true
+
+    - name: Signal k8s-snap containerd to reload config
+      ansible.builtin.command: pkill -SIGHUP containerd
+      become: true
+      register: containerd_reload
+      failed_when: false
+      changed_when: containerd_reload.rc == 0
 
     # ===========================
     # Verify Core Components
