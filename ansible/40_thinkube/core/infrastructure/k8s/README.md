@@ -195,6 +195,61 @@ Local storage:        /var/snap/k8s/common/rawfile-storage
 
 **Note**: The custom `containerd-base-dir: /var/lib/k8s-containerd` is configured to allow Docker and k8s-snap to coexist without conflicts. This is particularly important for DGX systems where Docker is needed for standard DGX functionality.
 
+## GPU Operator Compatibility
+
+The k8s-snap installation playbook automatically configures containerd to support GPU workloads. This configuration is required for the NVIDIA GPU Operator to function correctly.
+
+### Automatic Configuration
+
+During cluster installation, the playbook creates `/etc/containerd/conf.d/00-k8s-runc.toml`:
+
+```toml
+version = 2
+
+[plugins]
+  [plugins."io.containerd.grpc.v1.cri"]
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      default_runtime_name = "runc"
+
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+          runtime_type = "io.containerd.runc.v2"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+            SystemdCgroup = true
+```
+
+### Why This Is Needed
+
+k8s-snap imports configurations from `/etc/containerd/conf.d/*.toml` using a mechanism that **replaces** entire plugin sections rather than merging them. When the GPU operator's nvidia-container-toolkit creates `99-nvidia.toml` with only the nvidia runtime definition, it would normally cause k8s-snap's containerd to lose the runc runtime definition, resulting in this error:
+
+```
+failed to load plugin io.containerd.grpc.v1.cri: no corresponding runtime configured in containerd.runtimes for default_runtime_name = "runc"
+```
+
+The `00-k8s-runc.toml` file (with the `00-` prefix) ensures it loads **before** the GPU operator's `99-nvidia.toml`, establishing the base runc runtime that must persist alongside the nvidia runtime.
+
+### How It Works
+
+1. **During k8s-snap installation**: `00-k8s-runc.toml` is created with the runc runtime definition
+2. **When GPU operator deploys**: The nvidia-container-toolkit DaemonSet creates `99-nvidia.toml` with the nvidia runtime
+3. **Both configs coexist**: k8s-snap containerd imports both files in alphabetical order, resulting in a complete configuration with both runtimes
+4. **Automatic for new nodes**: New GPU nodes joining the cluster automatically get the correct configuration from both the k8s-snap setup and the GPU operator DaemonSet
+
+### Verification
+
+After cluster installation, verify the configuration:
+
+```bash
+# Check that the runc config exists
+cat /etc/containerd/conf.d/00-k8s-runc.toml
+
+# After GPU operator is deployed, check nvidia config exists
+cat /etc/containerd/conf.d/99-nvidia.toml
+
+# Verify containerd is using both configs
+sudo k8s kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu
+```
+
 ## Troubleshooting
 
 ### CoreDNS Readiness Probe Failed (503)
