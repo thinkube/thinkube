@@ -287,6 +287,39 @@
       changed_when: "'created' in storageclass_result.stdout or 'configured' in storageclass_result.stdout"
 
     ###########################################################################
+    # Format JuiceFS Metadata Database
+    ###########################################################################
+    - name: Check if JuiceFS volume is already formatted
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run juicefs-format-check --rm -i --restart=Never \
+          --image=juicedata/juicefs-csi-driver:v{{ juicefs_csi_version }} \
+          --namespace={{ juicefs_namespace }} \
+          --command -- /usr/local/bin/juicefs status \
+          postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: format_check
+      failed_when: false
+      changed_when: false
+
+    - name: Format JuiceFS volume if not already formatted
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run juicefs-format --rm -i --restart=Never \
+          --image=juicedata/juicefs-csi-driver:v{{ juicefs_csi_version }} \
+          --namespace={{ juicefs_namespace }} \
+          --command -- /usr/local/bin/juicefs format \
+          --storage=s3 \
+          --bucket={{ s3_endpoint_internal }}/{{ s3_bucket }} \
+          --access-key={{ admin_username }} \
+          --secret-key={{ admin_password }} \
+          postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable \
+          {{ juicefs_volume_name }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: format_check.rc != 0
+      register: format_result
+
+    ###########################################################################
     # Deploy S3 Gateway
     ###########################################################################
     - name: Deploy JuiceFS S3 Gateway
