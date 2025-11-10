@@ -486,7 +486,7 @@
       changed_when: true
       when: is_arm64
 
-    - name: Wait for Harbor pods readiness
+    - name: Wait for Harbor pods readiness (excluding trivy)
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
         kind: Pod
@@ -496,9 +496,32 @@
       register: harbor_pods
       until: >
         harbor_pods.resources | length > 0 and
-        (harbor_pods.resources | map(attribute='status.phase') | list | unique == ['Running'])
+        (harbor_pods.resources |
+         rejectattr('metadata.name', 'match', '^harbor-trivy-.*') |
+         selectattr('status.containerStatuses', 'defined') |
+         map(attribute='status.containerStatuses') | flatten |
+         map(attribute='ready') | select('equalto', false) | list | length == 0)
       retries: 30
       delay: 10
+
+    - name: Check trivy pod status (non-blocking)
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: "{{ harbor_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/instance={{ harbor_release }}"
+          - "component=trivy"
+      register: trivy_pod
+      failed_when: false
+
+    - name: Display trivy status
+      ansible.builtin.debug:
+        msg: >
+          Trivy pod status: {{
+            trivy_pod.resources[0].status.phase if trivy_pod.resources | length > 0
+            else 'Not found'
+          }} - Trivy may take 5-10 minutes to download vulnerability databases on first start
 
     - name: Get Harbor admin password
       kubernetes.core.k8s_info:
