@@ -29,12 +29,13 @@ echo "  6. Detach loop devices"
 echo "  7. Remove k8s-snap with --purge (with 2-minute timeout)"
 echo "  8. Delete ~/.kube/config"
 echo "  9. Remove all k8s-related directories"
-echo " 10. Remove pip configuration (devpi)"
-echo " 11. Remove Python virtual environment (~/.venv)"
-echo " 12. Remove thinkube installer state (~/.thinkube-installer)"
-echo " 13. Remove temporary thinkube files"
-echo " 14. Clear Tauri installer localStorage (deployment state)"
-echo " 15. Ensure snapd is running and healthy"
+echo " 10. Remove SeaweedFS and JuiceFS storage directories"
+echo " 11. Remove pip configuration (devpi)"
+echo " 12. Remove Python virtual environment (~/.venv)"
+echo " 13. Remove thinkube installer state (~/.thinkube-installer)"
+echo " 14. Remove temporary thinkube files"
+echo " 15. Clear Tauri installer localStorage (deployment state)"
+echo " 16. Ensure snapd is running and healthy"
 echo ""
 echo "Step 1a: Unmounting kubelet pod volumes..."
 KUBELET_MOUNTS=$(mount | grep '/var/snap/k8s/common/var/lib/kubelet/pods' | awk '{print $3}' || true)
@@ -189,27 +190,36 @@ sudo rm -rf /usr/local/nvidia || true
 sudo rm -rf /run/nvidia || true
 
 echo ""
-echo "Step 4: Removing pip configuration (devpi)..."
+echo "Step 4: Removing SeaweedFS and JuiceFS storage directories..."
+sudo rm -rf /storage/logs/seaweedfs || true
+sudo rm -rf /storage/filer_store || true
+sudo rm -rf /storage/volume_store || true
+sudo rm -rf /storage/master_store || true
+sudo rm -rf /var/lib/juicefs || true
+echo "SeaweedFS and JuiceFS storage removed"
+
+echo ""
+echo "Step 5: Removing pip configuration (devpi)..."
 rm -f ~/.pip/pip.conf || true
 rm -f ~/.config/pip/pip.conf || true
 echo "Pip configuration removed"
 
 echo ""
-echo "Step 5: Removing Python virtual environment..."
+echo "Step 6: Removing Python virtual environment..."
 rm -rf ~/.venv || true
 echo "Python venv removed"
 
 echo ""
-echo "Step 6: Removing thinkube installer state..."
+echo "Step 7: Removing thinkube installer state..."
 rm -rf ~/.thinkube-installer || true
 echo "Thinkube installer state removed"
 
 echo ""
-echo "Step 7: Removing temporary thinkube files..."
+echo "Step 8: Removing temporary thinkube files..."
 rm -rf /tmp/think* || true
 
 echo ""
-echo "Step 8: Clearing Tauri installer localStorage (deployment state)..."
+echo "Step 9: Clearing Tauri installer localStorage (deployment state)..."
 LOCALSTORAGE_DB="$HOME/.local/share/org.thinkube.installer/localstorage/tauri_localhost_0.localstorage"
 if [ -f "$LOCALSTORAGE_DB" ]; then
   sqlite3 "$LOCALSTORAGE_DB" "DELETE FROM ItemTable WHERE key IN ('thinkube-deployment-state-v2', 'thinkubeInstaller', 'thinkube-session-backup');" 2>/dev/null || true
@@ -219,7 +229,7 @@ else
 fi
 
 echo ""
-echo "Step 9: Ensuring snapd is running..."
+echo "Step 10: Ensuring snapd is running..."
 # Ensure snapd is running after all cleanup
 if ! systemctl is-active --quiet snapd.service; then
   echo "Snapd is not running, starting it..."
