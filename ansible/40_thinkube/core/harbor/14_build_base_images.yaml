@@ -243,6 +243,35 @@
       retries: 2
       delay: 10
 
+    # AI Inference Base Image - Regular Build for Stable Diffusion, etc.
+    # Multi-arch build (AMD64 + ARM64) with CUDA 13.0, PyTorch 2.3, and CUDA dev tools
+    # - DGX Spark and Jetson supported (ARM64 with iGPU)
+    # - Includes CUDA development tools for building xformers from source
+
+    - name: Template AI inference base Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/ai-inference-base.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/ai-inference-base.Containerfile"
+
+    - name: Build AI inference base image (regular)
+      ansible.builtin.shell: |
+        podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
+                     --tls-verify=true \
+                     -t {{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.3-py3.12 \
+                     -f {{ temp_containerfiles_dir.path }}/ai-inference-base.Containerfile \
+                     {{ base_images_dir }}
+      register: ai_inference_base_build
+      changed_when: true
+
+    - name: Push AI inference base image (regular)
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.3-py3.12
+      register: ai_inference_base_push
+      changed_when: ai_inference_base_push.rc == 0
+      failed_when: ai_inference_base_push.rc != 0
+      retries: 2
+      delay: 10
+
     # AI Inference Base Image - vLLM-based Multi-Arch Build
     # Uses NGC vLLM container which IS a multi-arch manifest (AMD64 + ARM64)
     # - Includes vLLM 0.10.1.1 pre-compiled by NVIDIA
@@ -258,19 +287,15 @@
       ansible.builtin.shell: |
         podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
                      --tls-verify=true \
-                     -t {{ harbor_registry }}/library/ai-inference-base:vllm-0.11.0 \
-                     -t {{ harbor_registry }}/library/ai-inference-base:latest \
+                     -t {{ harbor_registry }}/library/ai-inference-base:vllm0.11-cuda13.0-py3.12 \
                      -f {{ temp_containerfiles_dir.path }}/ai-inference-base-vllm.Containerfile \
                      {{ base_images_dir }}
       register: ai_inference_vllm_build
       changed_when: true
 
-    - name: Push AI inference base images (vLLM)
+    - name: Push AI inference base image (vLLM)
       ansible.builtin.shell: |
-        podman push --tls-verify=true {{ harbor_registry }}/library/ai-inference-base:{{ item }}
-      loop:
-        - "vllm-0.11.0"
-        - "latest"
+        podman push --tls-verify=true {{ harbor_registry }}/library/ai-inference-base:vllm0.11-cuda13.0-py3.12
       register: ai_inference_vllm_push
       changed_when: ai_inference_vllm_push.rc == 0
       failed_when: ai_inference_vllm_push.rc != 0
@@ -413,9 +438,12 @@
             metadata:
               base_image: "nvidia/cuda:12.4.0-runtime-ubuntu24.04"
               ml_frameworks: "pytorch tensorflow"
-          - destination: "{{ harbor_registry }}/library/ai-inference-base:latest"
+          - destination: "{{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.3-py3.12"
             source: "custom-build"
-            description: "AI inference base latest (CUDA 12.4)"
+            description: "AI inference base with CUDA 13.0, PyTorch 2.3, Python 3.12"
+          - destination: "{{ harbor_registry }}/library/ai-inference-base:vllm0.11-cuda13.0-py3.12"
+            source: "custom-build"
+            description: "AI inference base with vLLM 0.11, CUDA 13.0, Python 3.12"
           - destination: "{{ harbor_registry }}/library/mlflow-custom:latest"
             source: "custom-build"
             description: "MLflow with OIDC auth, PostgreSQL and S3 support"
@@ -455,7 +483,8 @@
           Test runner: {{ harbor_registry }}/library/test-runner:latest
           CI utils: {{ harbor_registry }}/library/ci-utils:latest
           Service discovery: {{ harbor_registry }}/library/tk-service-discovery:latest
-          AI inference: {{ harbor_registry }}/library/ai-inference-base:latest
+          AI inference (regular): {{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.3-py3.12
+          AI inference (vLLM): {{ harbor_registry }}/library/ai-inference-base:vllm0.11-cuda13.0-py3.12
           MLflow custom: {{ harbor_registry }}/library/mlflow-custom:latest
           Valkey: {{ harbor_registry }}/library/valkey:8.1.0
           tk-package-version: {{ harbor_registry }}/library/tk-package-version:latest
