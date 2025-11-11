@@ -164,51 +164,75 @@
                   return None
               
               def trigger_argocd_sync(app_name):
-                  """Trigger ArgoCD sync for an application"""
-                  try:
-                      # Ensure we have valid auth
-                      if not get_argocd_auth_token():
-                          return False, "Failed to authenticate with ArgoCD"
-                      
-                      # Trigger sync via gRPC ingress
-                      cmd = [
-                          'argocd', 'app', 'sync', app_name,
-                          '--server', ARGOCD_SERVER,
-                          '--async'  # Don't wait for sync to complete
-                      ]
-                      
-                      result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                      
-                      # Log command and outputs for debugging
-                      logger.debug(f"Sync command: {' '.join(cmd)}")
-                      logger.debug(f"Sync stdout: {result.stdout}")
-                      logger.debug(f"Sync stderr: {result.stderr}")
-                      logger.debug(f"Sync return code: {result.returncode}")
-                      
-                      if result.returncode == 0:
-                          logger.info(f"Successfully triggered sync for {app_name}")
-                          return True, result.stdout
-                      else:
-                          # If auth failed, clear the token and try once more
-                          if "unauthenticated" in result.stderr.lower():
-                              logger.info("Auth token expired, refreshing...")
-                              global _auth_token, _token_expiry
-                              _auth_token = None
-                              _token_expiry = 0
-                              
-                              if get_argocd_auth_token():
-                                  # Retry the sync
-                                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                                  if result.returncode == 0:
-                                      logger.info(f"Successfully triggered sync for {app_name} after auth refresh")
-                                      return True, result.stdout
-                          
-                          logger.error(f"Failed to sync {app_name}: {result.stderr}")
-                          return False, result.stderr
-                          
-                  except Exception as e:
-                      logger.error(f"Error triggering sync: {e}")
-                      return False, str(e)
+                  """Trigger ArgoCD sync for an application with retry logic"""
+                  import time
+
+                  max_retries = 5
+                  retry_delay = 2  # Start with 2 seconds
+
+                  for attempt in range(max_retries):
+                      try:
+                          # Ensure we have valid auth
+                          if not get_argocd_auth_token():
+                              return False, "Failed to authenticate with ArgoCD"
+
+                          # Trigger sync via gRPC ingress
+                          cmd = [
+                              'argocd', 'app', 'sync', app_name,
+                              '--server', ARGOCD_SERVER,
+                              '--async'  # Don't wait for sync to complete
+                          ]
+
+                          result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+                          # Log command and outputs for debugging
+                          logger.debug(f"Sync command: {' '.join(cmd)}")
+
+                          if result.returncode == 0:
+                              logger.info(f"Successfully triggered sync for {app_name}")
+                              return True, result.stdout
+                          else:
+                              stderr_lower = result.stderr.lower()
+
+                              # If auth failed, clear the token and retry immediately
+                              if "unauthenticated" in stderr_lower:
+                                  logger.info("Auth token expired, refreshing...")
+                                  global _auth_token, _token_expiry
+                                  _auth_token = None
+                                  _token_expiry = 0
+
+                                  if get_argocd_auth_token():
+                                      # Retry the sync once for auth
+                                      result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                                      if result.returncode == 0:
+                                          logger.info(f"Successfully triggered sync for {app_name} after auth refresh")
+                                          return True, result.stdout
+                                      stderr_lower = result.stderr.lower()  # Update for next check
+
+                              # Check for FailedPrecondition (another operation in progress)
+                              if "failedprecondition" in stderr_lower or "another operation is already in progress" in stderr_lower:
+                                  if attempt < max_retries - 1:
+                                      logger.warning(f"Sync for {app_name} blocked (operation in progress), retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})")
+                                      time.sleep(retry_delay)
+                                      retry_delay = min(retry_delay * 2, 16)  # Exponential backoff, max 16s
+                                      continue  # Retry
+                                  else:
+                                      logger.error(f"Failed to sync {app_name} after {max_retries} attempts: {result.stderr}")
+                                      return False, f"Max retries exceeded: {result.stderr}"
+
+                              # Other errors - don't retry
+                              logger.error(f"Failed to sync {app_name}: {result.stderr}")
+                              return False, result.stderr
+
+                      except Exception as e:
+                          logger.error(f"Error triggering sync (attempt {attempt + 1}/{max_retries}): {e}")
+                          if attempt < max_retries - 1:
+                              time.sleep(retry_delay)
+                              retry_delay = min(retry_delay * 2, 16)
+                          else:
+                              return False, str(e)
+
+                  return False, "Max retries exceeded"
               
               class SyncWebhookHandler(BaseHTTPRequestHandler):
                   def do_GET(self):
