@@ -1,18 +1,26 @@
 # Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# AI/ML inference base image with vLLM for consumer GPUs + DGX Spark GB10
-# Supports: RTX 20/30/40/50 series (x86-64) and DGX Spark GB10 (ARM64)
+# AI/ML inference base image with tk-vllm for DGX Spark GB10
+# Architecture: ARM64 only (x86-64 support coming in future version)
 # Based on community patches from: github.com/eelbaz/dgx-spark-vllm-setup
 
-FROM nvidia/cuda:13.0.0-devel-ubuntu22.04
+FROM {{ harbor_registry }}/library/cuda:13.0.0-devel-ubuntu24.04
 
 # Build arguments
-ARG VLLM_VERSION=v0.11.1rc5
+ARG TARGETARCH
+ARG TK_VLLM_VERSION=0.11.1rc5
 ARG PYTHON_VERSION=3.12
 
 # Prevent interactive prompts during build
 ENV DEBIAN_FRONTEND=noninteractive
+
+# Architecture validation - ARM64 only for now
+RUN if [ "$TARGETARCH" != "arm64" ]; then \
+        echo "ERROR: This image currently only supports ARM64 (DGX Spark GB10)"; \
+        echo "x86-64 support (RTX 20/30/40/50 series) will be added in future version"; \
+        exit 1; \
+    fi
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,8 +29,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python${PYTHON_VERSION}-venv \
     python3-pip \
     git \
-    build-essential \
-    ninja-build \
     wget \
     curl \
     ca-certificates \
@@ -41,14 +47,6 @@ ENV PATH="${CUDA_HOME}/bin:${PATH}"
 ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
 ENV TRITON_PTXAS_PATH="${CUDA_HOME}/bin/ptxas"
 
-# Set CUDA architectures for all consumer GPUs + DGX Spark GB10
-# 7.5 = RTX 20 series (2080 Ti, 2080, 2070)
-# 8.6 = RTX 30 series (3090, 3080, 3070)
-# 8.9 = RTX 40 series (4090, 4080, 4070)
-# 9.0 = RTX 50 series (5090, 5080, 5070)
-# 12.1a = DGX Spark GB10 (Blackwell)
-ENV TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9;9.0;12.1a"
-
 # Enable vLLM V1 engine and FlashInfer MXFP4 MOE
 ENV VLLM_USE_V1=1
 ENV VLLM_USE_FLASHINFER_MXFP4_MOE=1
@@ -56,42 +54,19 @@ ENV VLLM_TARGET_DEVICE=cuda
 
 # Install PyTorch with CUDA 13.0 support
 RUN pip3 install --no-cache-dir \
-    torch==2.9.0+cu130 \
-    torchvision==0.21.0+cu130 \
-    --index-url https://download.pytorch.org/whl/cu130 || \
-    pip3 install --no-cache-dir torch torchvision
+    torch==2.5.1 \
+    torchvision==0.20.1 \
+    --index-url https://download.pytorch.org/whl/cu121
 
-# Clone Triton from main branch (required for sm_121a bug fixes)
-RUN cd /opt && \
-    git clone https://github.com/triton-lang/triton.git && \
-    cd triton/python && \
-    pip3 install --no-cache-dir -e .
-
-# Clone vLLM at specific version
-RUN cd /opt && \
-    git clone https://github.com/vllm-project/vllm.git && \
-    cd vllm && \
-    git checkout ${VLLM_VERSION} && \
-    git submodule update --init --recursive
-
-# Apply ARM64/Blackwell patches to vLLM
-# Patch 1: CMakeLists.txt - Add sm_121a to MOE kernels
-RUN cd /opt/vllm && \
-    sed -i 's/set(SCALED_MM_ARCHS.*/set(SCALED_MM_ARCHS "8.0;8.6;8.9;9.0;12.0f;12.1a")/' CMakeLists.txt
-
-# Patch 2: pyproject.toml - Fix license formatting for newer setuptools
-RUN cd /opt/vllm && \
-    sed -i 's/license = {text = "Apache 2.0"}/license = {file = "LICENSE"}/' pyproject.toml
-
-# Build and install vLLM from source
-WORKDIR /opt/vllm
-RUN MAX_JOBS=8 pip3 install --no-cache-dir -e . --no-build-isolation
+# Install tk-vllm from pre-built wheel
+# Wheel includes patches for DGX Spark GB10 (Blackwell sm_121a support)
+RUN pip3 install --no-cache-dir \
+    https://github.com/thinkube/tk-vllm-wheels/releases/download/v${TK_VLLM_VERSION}/tk_vllm-${TK_VLLM_VERSION}+thinkube-cp312-cp312-linux_aarch64.whl
 
 # Install additional ML packages
 RUN pip3 install --no-cache-dir \
     transformers>=4.56.1 \
     accelerate>=0.33.0 \
-    flash-attn>=2.7.4 \
     xgrammar>=0.1.24 \
     gradio>=4.42.0 \
     fastapi>=0.112.0 \
@@ -110,7 +85,7 @@ RUN pip3 install --no-cache-dir \
     psutil
 
 # Verify installation
-RUN echo "=== Verifying vLLM Installation ===" && \
+RUN echo "=== Verifying tk-vLLM Installation ===" && \
     python3 -c "import vllm; print(f'✓ vLLM version: {vllm.__version__}')" && \
     python3 -c "import torch; print(f'✓ PyTorch version: {torch.__version__}')" && \
     python3 -c "import torch; print(f'✓ CUDA available: {torch.cuda.is_available()}')" && \
@@ -140,3 +115,11 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 
 # Default command
 CMD ["/bin/bash"]
+
+# ==============================================================================
+# NOTE: x86-64 Support (RTX 20/30/40/50 Series)
+# ==============================================================================
+# Future version will add x86-64 support with pre-built tk-vllm wheel
+# Requires: tk_vllm-{version}-cp312-cp312-linux_x86_64.whl
+# GPU architectures: 7.5 (RTX 20), 8.6 (RTX 30), 8.9 (RTX 40), 9.0 (RTX 50)
+# ==============================================================================
