@@ -1,70 +1,132 @@
 # Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# AI/ML inference base image with vLLM for both AMD64 and ARM64
-# Uses NVIDIA NGC vLLM container (multi-arch manifest)
-FROM nvcr.io/nvidia/vllm:25.09-py3
+# AI/ML inference base image with vLLM for consumer GPUs + DGX Spark GB10
+# Supports: RTX 20/30/40/50 series (x86-64) and DGX Spark GB10 (ARM64)
+# Based on community patches from: github.com/eelbaz/dgx-spark-vllm-setup
 
-# NGC vLLM container already includes:
-# - vLLM 0.10.1.1 (pre-compiled for AMD64 and ARM64)
-# - PyTorch 2.9.0a0 with CUDA 13.0
-# - transformers 4.55.2
-# - flash-attention 2.7.4
-# - flashinfer 0.4.0
-# - xgrammer 0.1.22
-# - Python 3.12, Ubuntu 24.04
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04
 
-# Install python dev tools and CUDA 13 dev packages for building vLLM from source
+# Build arguments
+ARG VLLM_VERSION=v0.11.1rc5
+ARG PYTHON_VERSION=3.12
+
+# Prevent interactive prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.12-dev \
-    cuda-nvcc-13-0 \
-    cuda-cudart-dev-13-0 \
-    libcublas-dev-13-0 \
+    python${PYTHON_VERSION} \
+    python${PYTHON_VERSION}-dev \
+    python${PYTHON_VERSION}-venv \
+    python3-pip \
+    git \
+    build-essential \
+    ninja-build \
+    wget \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Set CUDA paths for compilation
+# Set Python 3.12 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python${PYTHON_VERSION} 1
+
+# Upgrade pip
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Set CUDA environment variables
 ENV CUDA_HOME=/usr/local/cuda-13.0
 ENV PATH="${CUDA_HOME}/bin:${PATH}"
 ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+ENV TRITON_PTXAS_PATH="${CUDA_HOME}/bin/ptxas"
 
-# Set build environment for GB10 Blackwell GPU (SM 12.1, compute capability 12.0f)
-# These flags ensure vLLM compiles correctly for DGX Spark ARM64 architecture
-ENV TORCH_CUDA_ARCH_LIST="12.0f"
-ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
+# Set CUDA architectures for all consumer GPUs + DGX Spark GB10
+# 7.5 = RTX 20 series (2080 Ti, 2080, 2070)
+# 8.6 = RTX 30 series (3090, 3080, 3070)
+# 8.9 = RTX 40 series (4090, 4080, 4070)
+# 9.0 = RTX 50 series (5090, 5080, 5070)
+# 12.1a = DGX Spark GB10 (Blackwell)
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9;9.0;12.1a"
 
-# Upgrade vLLM to 0.11.0 for latest model support (DeepSeek-V3, Qwen3-Next, Qwen3-VL, OLMo3, etc.)
-# Force compilation from source with --no-binary to link against CUDA 13
-RUN pip install --no-cache-dir --no-binary vllm --upgrade vllm==0.11.0
+# Enable vLLM V1 engine and FlashInfer MXFP4 MOE
+ENV VLLM_USE_V1=1
+ENV VLLM_USE_FLASHINFER_MXFP4_MOE=1
+ENV VLLM_TARGET_DEVICE=cuda
+
+# Install PyTorch with CUDA 13.0 support
+RUN pip3 install --no-cache-dir \
+    torch==2.9.0+cu130 \
+    torchvision==0.21.0+cu130 \
+    --index-url https://download.pytorch.org/whl/cu130 || \
+    pip3 install --no-cache-dir torch torchvision
+
+# Clone Triton from main branch (required for sm_121a bug fixes)
+RUN cd /opt && \
+    git clone https://github.com/triton-lang/triton.git && \
+    cd triton/python && \
+    pip3 install --no-cache-dir -e .
+
+# Clone vLLM at specific version
+RUN cd /opt && \
+    git clone https://github.com/vllm-project/vllm.git && \
+    cd vllm && \
+    git checkout ${VLLM_VERSION} && \
+    git submodule update --init --recursive
+
+# Apply ARM64/Blackwell patches to vLLM
+# Patch 1: CMakeLists.txt - Add sm_121a to MOE kernels
+RUN cd /opt/vllm && \
+    sed -i 's/set(SCALED_MM_ARCHS.*/set(SCALED_MM_ARCHS "8.0;8.6;8.9;9.0;12.0f;12.1a")/' CMakeLists.txt
+
+# Patch 2: pyproject.toml - Fix license formatting for newer setuptools
+RUN cd /opt/vllm && \
+    sed -i 's/license = {text = "Apache 2.0"}/license = {file = "LICENSE"}/' pyproject.toml
+
+# Build and install vLLM from source
+WORKDIR /opt/vllm
+RUN MAX_JOBS=8 pip3 install --no-cache-dir -e . --no-build-isolation
 
 # Install additional ML packages
-RUN pip install --no-cache-dir \
-    accelerate==0.33.0 \
-    gradio==4.42.0 \
-    fastapi==0.112.0 \
-    uvicorn[standard]==0.30.5
+RUN pip3 install --no-cache-dir \
+    transformers>=4.56.1 \
+    accelerate>=0.33.0 \
+    flash-attn>=2.7.4 \
+    xgrammar>=0.1.24 \
+    gradio>=4.42.0 \
+    fastapi>=0.112.0 \
+    uvicorn[standard]>=0.30.5
 
 # Install additional utilities
-RUN pip install --no-cache-dir \
-    numpy==1.26.4 \
-    pillow==10.4.0 \
-    requests==2.32.3 \
-    pyyaml==6.0.2 \
-    huggingface-hub==0.24.5 \
-    safetensors==0.4.4 \
-    sentencepiece==0.2.0 \
-    protobuf==5.27.3 \
-    psutil==6.0.0
+RUN pip3 install --no-cache-dir \
+    numpy \
+    pillow \
+    requests \
+    pyyaml \
+    huggingface-hub \
+    safetensors \
+    sentencepiece \
+    protobuf \
+    psutil
 
-# Set environment variables
-ENV PYTHONPATH=/app \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    GRADIO_SERVER_NAME=0.0.0.0 \
-    GRADIO_SERVER_PORT=7860 \
-    HF_HOME=/app/cache \
-    TRANSFORMERS_CACHE=/app/cache
+# Verify installation
+RUN echo "=== Verifying vLLM Installation ===" && \
+    python3 -c "import vllm; print(f'✓ vLLM version: {vllm.__version__}')" && \
+    python3 -c "import torch; print(f'✓ PyTorch version: {torch.__version__}')" && \
+    python3 -c "import torch; print(f'✓ CUDA available: {torch.cuda.is_available()}')" && \
+    python3 -c "import torch; print(f'✓ CUDA version: {torch.version.cuda}')" && \
+    echo "=== Installation Verified ==="
 
-# Create directories
+# Set application environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV GRADIO_SERVER_NAME=0.0.0.0
+ENV GRADIO_SERVER_PORT=7860
+ENV HF_HOME=/app/cache
+ENV TRANSFORMERS_CACHE=/app/cache
+
+# Create application directories
 RUN mkdir -p /app/cache /app/models
 
 WORKDIR /app
@@ -75,3 +137,6 @@ EXPOSE 7860
 # Default healthcheck (can be overridden)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:7860/health || exit 1
+
+# Default command
+CMD ["/bin/bash"]
