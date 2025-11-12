@@ -1,0 +1,140 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/gpu_operator/15_configure_time_slicing.yaml
+# Description:
+#   Configures GPU time-slicing to allow multiple pods to share GPUs
+#
+# Requirements:
+#   - GPU Operator already installed (run 10_deploy.yaml first)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/gpu_operator/15_configure_time_slicing.yaml
+#
+# Variables:
+#   - gpu_time_slicing_replicas: (Optional) Virtual GPUs per physical GPU (default: 4)
+#
+# Supported GPUs:
+#   - ARM64: DGX Spark GB10
+#   - x86-64: RTX 3090, RTX 4090, and other consumer/workstation GPUs
+#
+# Note: Time-slicing shares GPU memory - monitor total usage to avoid OOM
+#
+# 🤖 [AI-assisted]
+
+- name: Configure GPU Time-Slicing
+  hosts: k8s_control_plane
+  become: false
+
+  pre_tasks:
+    - name: Verify required variables exist
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined
+      loop:
+        - kubeconfig
+        - kubectl_bin
+
+  vars:
+    gpu_operator_namespace: gpu-operator
+    gpu_time_slicing_replicas: "{{ gpu_time_slicing_replicas | default(4) }}"
+    time_slicing_config_name: time-slicing-config
+
+  tasks:
+    - name: Check if GPU Operator is installed
+      ansible.builtin.command: "{{ kubectl_bin }} get namespace {{ gpu_operator_namespace }}"
+      register: gpu_ns_check
+      failed_when: gpu_ns_check.rc != 0
+      changed_when: false
+
+
+    - name: Create time-slicing ConfigMap
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: {{ time_slicing_config_name }}
+          namespace: {{ gpu_operator_namespace }}
+        data:
+          any: |-
+            version: v1
+            flags:
+              migStrategy: none
+            sharing:
+              timeSlicing:
+                renameByDefault: false
+                failRequestsGreaterThanOne: false
+                resources:
+                - name: nvidia.com/gpu
+                  replicas: {{ gpu_time_slicing_replicas }}
+        EOF
+      register: configmap_result
+      changed_when: "'created' in configmap_result.stdout or 'configured' in configmap_result.stdout"
+
+    - name: Get current ClusterPolicy
+      ansible.builtin.command: "{{ kubectl_bin }} get clusterpolicy cluster-policy -o json"
+      register: current_clusterpolicy
+      changed_when: false
+      failed_when: current_clusterpolicy.rc != 0
+
+    - name: Check if device plugin config is already set
+      ansible.builtin.set_fact:
+        config_already_set: "{{ (current_clusterpolicy.stdout | from_json).spec.devicePlugin.config.name | default('') == time_slicing_config_name }}"
+
+    - name: Patch ClusterPolicy to use time-slicing config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch clusterpolicy cluster-policy --type='json' -p='[
+          {
+            "op": "add",
+            "path": "/spec/devicePlugin/config",
+            "value": {
+              "name": "{{ time_slicing_config_name }}",
+              "default": "any"
+            }
+          }
+        ]'
+      register: patch_result
+      changed_when: "'patched' in patch_result.stdout"
+      when: not config_already_set
+
+    - name: Wait for device plugin pods to restart
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting for device plugin to restart with new configuration..."
+      when: patch_result is changed
+
+    - name: Wait for device plugin pods to be running
+      ansible.builtin.shell: |
+        i=1
+        while [ $i -le 60 ]; do
+          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -l app=nvidia-device-plugin-daemonset --field-selector=status.phase=Running -o json | jq '.items | length')
+          if [ "$count" -ge 1 ]; then
+            echo "✓ Device plugin pods are running"
+            exit 0
+          fi
+          echo "Waiting for device plugin pods... (attempt $i/60)"
+          sleep 5
+          i=$((i + 1))
+        done
+        echo "ERROR: Device plugin pods not running"
+        exit 1
+      register: device_plugin_wait
+      changed_when: false
+      when: patch_result is changed
+
+    - name: Verify GPU time-slicing enabled
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get nodes -o json | jq -r '
+          .items[] |
+          select(.status.capacity."nvidia.com/gpu" != null) |
+          "Node: \(.metadata.name) - Physical: \(.status.capacity."nvidia.com/gpu") -> Virtual: \(.status.allocatable."nvidia.com/gpu")"
+        '
+      register: verification_result
+      changed_when: false
+
+    - name: Display GPU allocation
+      ansible.builtin.debug:
+        var: verification_result.stdout_lines
