@@ -272,33 +272,60 @@
       retries: 2
       delay: 10
 
-    # vLLM Base Image - Multi-Arch Build for LLM Inference
-    # Uses NGC vLLM container which IS a multi-arch manifest (AMD64 + ARM64)
-    # - Includes vLLM 0.10.1.1 pre-compiled by NVIDIA
-    # - Upgrades to vLLM 0.11.0 for latest model support (DeepSeek-V3, Qwen3-Next, Qwen3-VL, etc.)
-    # - DGX Spark and Jetson supported (ARM64 with GB10 Blackwell GPU)
+    # vLLM Base Image - COMMENTED OUT - Waiting for vLLM sm_121a (DGX Spark GB10) support
+    # vLLM 0.11.1rc5 does not support sm_121a Blackwell architecture
+    # Re-enable when vLLM adds full NVFP4 support for sm_121a
+    # See: https://github.com/vllm-project/vllm/issues
 
-    - name: Template vLLM base Containerfile
+    # - name: Template vLLM base Containerfile
+    #   ansible.builtin.template:
+    #     src: "{{ local_base_images_dir }}/vllm-base.Containerfile.j2"
+    #     dest: "{{ temp_containerfiles_dir.path }}/vllm-base.Containerfile"
+
+    # - name: Build vLLM base image
+    #   ansible.builtin.shell: |
+    #     podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
+    #                  --tls-verify=true \
+    #                  -t {{ harbor_registry }}/library/vllm-base:0.11-cuda13.0-py3.12 \
+    #                  -f {{ temp_containerfiles_dir.path }}/vllm-base.Containerfile \
+    #                  {{ base_images_dir }}
+    #   register: vllm_base_build
+    #   changed_when: true
+
+    # - name: Push vLLM base image
+    #   ansible.builtin.shell: |
+    #     podman push --tls-verify=true {{ harbor_registry }}/library/vllm-base:0.11-cuda13.0-py3.12
+    #   register: vllm_base_push
+    #   changed_when: vllm_base_push.rc == 0
+    #   failed_when: vllm_base_push.rc != 0
+    #   retries: 2
+    #   delay: 10
+
+    # TensorRT-LLM Base Image - Replacement for vLLM with full NVFP4 Blackwell support
+    # Uses mirrored NVIDIA NGC image with sm_121a architecture support for DGX Spark GB10
+    # Pre-installs openai and gradio dependencies to speed up template deployments
+
+    - name: Template TensorRT-LLM base Containerfile
       ansible.builtin.template:
-        src: "{{ local_base_images_dir }}/vllm-base.Containerfile.j2"
-        dest: "{{ temp_containerfiles_dir.path }}/vllm-base.Containerfile"
+        src: "{{ local_base_images_dir }}/tensorrt-llm-base.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/tensorrt-llm-base.Containerfile"
 
-    - name: Build vLLM base image
+    - name: Build TensorRT-LLM base image
       ansible.builtin.shell: |
         podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
                      --tls-verify=true \
-                     -t {{ harbor_registry }}/library/vllm-base:0.11-cuda13.0-py3.12 \
-                     -f {{ temp_containerfiles_dir.path }}/vllm-base.Containerfile \
+                     -t {{ harbor_registry }}/library/tensorrt-llm-base:1.2.0rc2 \
+                     -f {{ temp_containerfiles_dir.path }}/tensorrt-llm-base.Containerfile \
                      {{ base_images_dir }}
-      register: vllm_base_build
+      register: tensorrt_llm_base_build
       changed_when: true
 
-    - name: Push vLLM base image
+    - name: Push TensorRT-LLM base image
       ansible.builtin.shell: |
-        podman push --tls-verify=true {{ harbor_registry }}/library/vllm-base:0.11-cuda13.0-py3.12
-      register: vllm_base_push
-      changed_when: vllm_base_push.rc == 0
-      failed_when: vllm_base_push.rc != 0
+        podman push --tls-verify=true {{ harbor_registry }}/library/tensorrt-llm-base:1.2.0rc2
+      register: tensorrt_llm_base_push
+      changed_when: tensorrt_llm_base_push.rc == 0
+      failed_when: tensorrt_llm_base_push.rc != 0
       retries: 2
       delay: 10
 
@@ -441,9 +468,16 @@
           - destination: "{{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.9-py3.12"
             source: "custom-build"
             description: "AI inference base with CUDA 13.0, PyTorch 2.9, Python 3.12 - for Stable Diffusion, etc."
-          - destination: "{{ harbor_registry }}/library/vllm-base:0.11-cuda13.0-py3.12"
+          # vLLM base commented out - waiting for sm_121a support
+          # - destination: "{{ harbor_registry }}/library/vllm-base:0.11-cuda13.0-py3.12"
+          #   source: "custom-build"
+          #   description: "vLLM base image with vLLM 0.11, CUDA 13.0, Python 3.12 - for LLM inference"
+          - destination: "{{ harbor_registry }}/library/tensorrt-llm-base:1.2.0rc2"
             source: "custom-build"
-            description: "vLLM base image with vLLM 0.11, CUDA 13.0, Python 3.12 - for LLM inference"
+            description: "TensorRT-LLM base image 1.2.0rc2 with NVFP4 support for Blackwell (DGX Spark GB10)"
+            metadata:
+              base_image: "nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc2"
+              packages: "openai gradio"
           - destination: "{{ harbor_registry }}/library/mlflow-custom:latest"
             source: "custom-build"
             description: "MLflow with OIDC auth, PostgreSQL and S3 support"
@@ -484,7 +518,7 @@
           CI utils: {{ harbor_registry }}/library/ci-utils:latest
           Service discovery: {{ harbor_registry }}/library/tk-service-discovery:latest
           AI inference base: {{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.9-py3.12
-          vLLM base: {{ harbor_registry }}/library/vllm-base:0.11-cuda13.0-py3.12
+          TensorRT-LLM base: {{ harbor_registry }}/library/tensorrt-llm-base:1.2.0rc2
           MLflow custom: {{ harbor_registry }}/library/mlflow-custom:latest
           Valkey: {{ harbor_registry }}/library/valkey:8.1.0
           tk-package-version: {{ harbor_registry }}/library/tk-package-version:latest
