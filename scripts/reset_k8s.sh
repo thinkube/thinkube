@@ -206,7 +206,7 @@ echo "Pip configuration removed"
 
 echo ""
 echo "Step 6: Removing Python virtual environment..."
-rm -rf ~/.venv || true
+sudo rm -rf ~/.venv || true
 echo "Python venv removed"
 
 echo ""
