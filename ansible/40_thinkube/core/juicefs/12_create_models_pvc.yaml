@@ -1,0 +1,122 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/juicefs/12_create_models_pvc.yaml
+# Description:
+#   Create shared ML models storage PVC using JuiceFS for multi-node access
+#   This provides a centralized model cache for inference and training workloads
+#
+# Requirements:
+#   - JuiceFS CSI driver deployed (10_deploy.yaml)
+#   - JuiceFS storage class available (juicefs-rwx)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/juicefs/12_create_models_pvc.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 [AI-assisted]
+
+- name: Create shared ML models storage PVC
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    models_namespace: "thinkube-ai"
+    models_pvc_name: "thinkube-models"
+    models_storage_size: "500Gi"
+    storage_class_name: "juicefs-rwx"
+
+  tasks:
+    - name: Check for required variables
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined or item | length == 0
+      loop:
+        - kubeconfig
+        - kubectl_bin
+
+    - name: Create AI workloads namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ models_namespace }}
+          labels:
+            app.kubernetes.io/name: thinkube-ai
+            app.kubernetes.io/component: ml-infrastructure
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: namespace_result
+      changed_when: "'created' in namespace_result.stdout or 'configured' in namespace_result.stdout"
+
+    - name: Create shared models PVC with JuiceFS
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: {{ models_pvc_name }}
+          namespace: {{ models_namespace }}
+          labels:
+            app.kubernetes.io/name: ml-models
+            app.kubernetes.io/component: storage
+            app.kubernetes.io/managed-by: thinkube
+        spec:
+          accessModes:
+            - ReadWriteMany
+          storageClassName: {{ storage_class_name }}
+          resources:
+            requests:
+              storage: {{ models_storage_size }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: pvc_result
+      changed_when: "'created' in pvc_result.stdout or 'configured' in pvc_result.stdout"
+
+    - name: Wait for PVC to be bound
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pvc {{ models_pvc_name }} -n {{ models_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: pvc_status
+      until:
+        - pvc_status.rc == 0
+        - (pvc_status.stdout | from_json).status.phase == "Bound"
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Shared ML models storage created successfully!"
+          - "=================================================="
+          - "Namespace: {{ models_namespace }}"
+          - "PVC Name: {{ models_pvc_name }}"
+          - "Storage Class: {{ storage_class_name }} (JuiceFS RWX)"
+          - "Capacity: {{ models_storage_size }}"
+          - "Access Mode: ReadWriteMany (multi-node)"
+          - "=================================================="
+          - "To use in your workloads, mount the PVC:"
+          - "  volumeMounts:"
+          - "    - name: models"
+          - "      mountPath: /models"
+          - "  volumes:"
+          - "    - name: models"
+          - "      persistentVolumeClaim:"
+          - "        claimName: {{ models_pvc_name }}"
+          - "=================================================="
+          - "Model storage path: /models"
+          - "Recommended structure:"
+          - "  /models/huggingface/     # HuggingFace models"
+          - "  /models/tensorrt/        # TensorRT engines"
+          - "  /models/onnx/            # ONNX models"
+          - "=================================================="

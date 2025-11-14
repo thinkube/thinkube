@@ -10,7 +10,10 @@ This directory contains the component-based deployment structure for the Thinkub
 │   ├── infrastructure/            # MicroK8s, ingress, cert-manager, coredns
 │   ├── keycloak/                 # SSO and authentication
 │   ├── postgresql/               # Database services
+│   ├── seaweedfs/                # Object storage (S3-compatible)
+│   ├── juicefs/                  # POSIX filesystem layer
 │   ├── harbor/                   # Container registry
+│   ├── mlflow/                   # ML experiment tracking and model registry
 │   ├── argo-workflows/           # Workflow automation
 │   ├── argocd/                   # GitOps deployment
 │   ├── devpi/                    # Python package repository
@@ -22,7 +25,6 @@ This directory contains the component-based deployment structure for the Thinkub
     ├── opensearch/               # Log aggregation
     ├── jupyterhub/               # Data science notebooks
     ├── code-server/              # VS Code in browser
-    ├── mlflow/                   # ML experiment tracking
     ├── knative/                  # Serverless platform
     ├── qdrant/                   # Vector database
     ├── pgadmin/                  # PostgreSQL admin
