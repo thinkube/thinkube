@@ -36,6 +36,7 @@ echo " 13. Remove thinkube installer state (~/.thinkube-installer)"
 echo " 14. Remove temporary thinkube files"
 echo " 15. Clear Tauri installer localStorage (deployment state)"
 echo " 16. Ensure snapd is running and healthy"
+echo " 17. Restart snapd to clear state"
 echo ""
 echo "Step 1a: Unmounting kubelet pod volumes..."
 KUBELET_MOUNTS=$(mount | grep '/var/snap/k8s/common/var/lib/kubelet/pods' | awk '{print $3}' || true)
@@ -248,6 +249,27 @@ else
   sleep 5
   if snap list &>/dev/null; then
     echo "✅ Snapd is now responding"
+  else
+    echo "❌ Warning: Snapd may need manual attention"
+  fi
+fi
+
+echo ""
+echo "Step 11: Restarting snapd to clear state..."
+# Restart snapd to ensure any corrupted state from failed operations is cleared
+# This prevents "expected snap to be mounted but is not" errors on next install
+sudo systemctl restart snapd.service snapd.socket
+sleep 3
+echo "Snapd restarted"
+
+# Verify snapd is responding after restart
+if snap list &>/dev/null; then
+  echo "✅ Snapd is healthy after restart"
+else
+  echo "⚠️  Waiting for snapd to become ready..."
+  sleep 5
+  if snap list &>/dev/null; then
+    echo "✅ Snapd is now ready"
   else
     echo "❌ Warning: Snapd may need manual attention"
   fi
