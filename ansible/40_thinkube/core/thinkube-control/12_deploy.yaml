@@ -110,9 +110,15 @@
       ansible.builtin.set_fact:
         github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
       when: github_token is not defined or github_token == ""
-      
+
     # github_org is used instead of github_user - it comes from inventory
-    
+
+    # Set HuggingFace token from environment if not in inventory
+    - name: Set hf_token from environment
+      ansible.builtin.set_fact:
+        hf_token: "{{ lookup('env', 'HF_TOKEN') }}"
+      when: hf_token is not defined or hf_token == ""
+
     # Set admin_password from environment variables
     - name: Set admin_password from ADMIN_PASSWORD or ANSIBLE_BECOME_PASSWORD
       ansible.builtin.set_fact:
@@ -156,12 +162,19 @@
         - kubeconfig
         - github_token
         - github_org
-    
+        - hf_token
+
     # Store the inventory github_token before it gets overwritten
     - name: Store inventory github_token
       ansible.builtin.set_fact:
         inventory_github_token: "{{ github_token }}"
       when: github_token is defined
+
+    # Store the inventory hf_token before it gets overwritten
+    - name: Store inventory hf_token
+      ansible.builtin.set_fact:
+        inventory_hf_token: "{{ hf_token }}"
+      when: hf_token is defined
 
     - name: Load environment variables from .env file
       ansible.builtin.include_role:
@@ -233,10 +246,18 @@
     - name: Use inventory github_token if environment doesn't have one
       ansible.builtin.set_fact:
         github_token: "{{ inventory_github_token }}"
-      when: 
+      when:
         - inventory_github_token is defined
         - github_token is not defined or github_token == ""
-        
+
+    # Restore hf_token from inventory if it was overwritten
+    - name: Use inventory hf_token if environment doesn't have one
+      ansible.builtin.set_fact:
+        hf_token: "{{ inventory_hf_token }}"
+      when:
+        - inventory_hf_token is defined
+        - hf_token is not defined or hf_token == ""
+
     # Ensure CODE_SOURCE_PATH is set since code-server is not yet migrated
     - name: Check if CODE_SOURCE_PATH is in .env
       ansible.builtin.shell: grep -E '^CODE_SOURCE_PATH=' {{ ansible_env.HOME }}/.env || true
@@ -400,7 +421,20 @@
           type: Opaque
           stringData:
             token: "{{ github_token }}"
-      when: github_token is defined
+
+    - name: Create HuggingFace token secret in argo namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "huggingface-token"
+            namespace: "argo"
+          type: Opaque
+          stringData:
+            token: "{{ hf_token }}"
 
     - name: Create PostgreSQL secret for backend
       kubernetes.core.k8s:

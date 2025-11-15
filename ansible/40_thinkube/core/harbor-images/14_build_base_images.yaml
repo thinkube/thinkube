@@ -352,6 +352,29 @@
       retries: 2
       delay: 10
 
+    - name: Template model-mirror Dockerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/model-mirror.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/model-mirror.Containerfile"
+
+    - name: Build model-mirror image
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     -t {{ harbor_registry }}/library/model-mirror:latest \
+                     -f {{ temp_containerfiles_dir.path }}/model-mirror.Containerfile \
+                     {{ base_images_dir }}
+      register: model_mirror_build
+      changed_when: true
+
+    - name: Push model-mirror image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/model-mirror:latest
+      register: model_mirror_push
+      changed_when: model_mirror_push.rc == 0
+      failed_when: model_mirror_push.rc != 0
+      retries: 2
+      delay: 10
+
     # Build Valkey from custom Dockerfile
     - name: Template Valkey Dockerfile
       ansible.builtin.template:
@@ -484,6 +507,12 @@
             metadata:
               base_image: "python:3.12-slim"
               packages: "mlflow mlflow-oidc-auth psycopg2-binary boto3 PyJWT"
+          - destination: "{{ harbor_registry }}/library/model-mirror:latest"
+            source: "custom-build"
+            description: "Model mirror image for HuggingFace to MLflow mirroring"
+            metadata:
+              base_image: "python:3.12-slim"
+              packages: "huggingface_hub mlflow"
           - destination: "{{ harbor_registry }}/library/valkey:8.1.0"
             source: "github.com/valkey-io/valkey-container"
             description: "Valkey 8.1.0 Alpine - Redis OSS alternative"
@@ -520,6 +549,7 @@
           AI inference base: {{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.9-py3.12
           TensorRT-LLM base: {{ harbor_registry }}/library/tensorrt-llm-base:1.2.0rc2
           MLflow custom: {{ harbor_registry }}/library/mlflow-custom:latest
+          Model mirror: {{ harbor_registry }}/library/model-mirror:latest
           Valkey: {{ harbor_registry }}/library/valkey:8.1.0
           tk-package-version: {{ harbor_registry }}/library/tk-package-version:latest
 
