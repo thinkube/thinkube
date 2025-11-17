@@ -29,10 +29,14 @@ This enables domain-specific deployments while maintaining upstream compatibilit
 Before deploying the control system, ensure the following components are deployed:
 - CORE-004: SSL/TLS Certificates (wildcard certificate in default namespace)
 - CORE-006: Keycloak (authentication provider)
+- CORE-007: MLflow (model registry with OIDC authentication)
+- CORE-008: JupyterHub (notebook environment)
 - CORE-010: Argo Workflows (for container builds)
 - CORE-011: ArgoCD (for GitOps deployment)
 - CORE-014: Gitea (for hosting processed manifests)
 - GitHub token configured in inventory or environment
+
+**Note**: Thinkube Control must be deployed AFTER MLflow and JupyterHub because it requires the MLflow OAuth2 client secret for model mirroring workflows.
 
 ## Deployment
 
@@ -63,13 +67,14 @@ The deployment process:
 4. Deploy Redis for session storage
 5. Configure Keycloak client for OIDC authentication
 6. Deploy OAuth2 Proxy for authentication
-7. Clone source from GitHub repository
-8. Process `.jinja` templates with domain values
-9. Push to Gitea (triggers Argo Workflow via webhook)
-10. Wait for container images to be built
-11. Deploy frontend and backend via ArgoCD from Gitea
-12. Create CI/CD monitoring token for full pipeline visibility
-13. Configure code-server integration
+7. Create MLflow authentication config secret in argo namespace (for model mirroring)
+8. Clone source from GitHub repository
+9. Process `.jinja` templates with domain values
+10. Push to Gitea (triggers Argo Workflow via webhook)
+11. Wait for container images to be built
+12. Deploy frontend and backend via ArgoCD from Gitea
+13. Create CI/CD monitoring token for full pipeline visibility
+14. Configure code-server integration
 
 ## Testing
 
@@ -105,6 +110,40 @@ Once deployed, the control interface is accessible at:
 - Ephemeral Redis deployment
 - Stores OAuth2 session data
 - No persistence required
+
+### MLflow Authentication
+
+Thinkube Control integrates with MLflow for AI model mirroring. The authentication flow is:
+
+**Initial Setup (First-Time User Experience)**:
+1. User navigates to AI Models page in Thinkube Control
+2. Backend checks MLflow status via `/api/models/mlflow/status` endpoint
+3. If user hasn't initialized MLflow, frontend displays initialization banner
+4. User clicks "Initialize MLflow" button to open MLflow in browser
+5. User logs in via Keycloak OAuth2 (creates user in MLflow database)
+6. Frontend auto-rechecks status after 3 seconds
+7. Once initialized, banner disappears and model mirroring is available
+
+**Programmatic Authentication (Model Download Workflows)**:
+1. Argo Workflow reads credentials from `mlflow-auth-config` secret (argo namespace)
+2. Workflow fetches OAuth2 access token from Keycloak using Resource Owner Password Credentials flow:
+   - `grant_type: password`
+   - `client_id: mlflow`
+   - `client_secret: <from secret>`
+   - `username: <admin username>`
+   - `password: <admin password>`
+3. Sets `MLFLOW_TRACKING_TOKEN` environment variable with access token
+4. MLflow Python SDK uses token for authenticated API calls
+
+**Secret Creation**:
+The `mlflow-auth-config` secret is created during thinkube-control deployment (step 7) and contains:
+- `keycloak-token-url`: Keycloak OAuth2 token endpoint
+- `client-id`: MLflow OAuth2 client ID (`mlflow`)
+- `client-secret`: MLflow OAuth2 client secret (copied from mlflow namespace)
+- `username`: Admin username from deployment config
+- `password`: Admin password from environment
+
+This approach provides seamless single-user authentication while maintaining OAuth2 security standards.
 
 ### Container Builds
 - Argo Workflows builds frontend and backend images
