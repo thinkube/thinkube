@@ -233,6 +233,36 @@
       register: copy_cert_result
       changed_when: "'configured' in copy_cert_result.stdout or 'created' in copy_cert_result.stdout"
 
+    - name: Get SeaweedFS S3 credentials secret
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret -n seaweedfs seaweedfs-s3-config -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: seaweedfs_secret_json
+      changed_when: false
+
+    - name: Parse SeaweedFS secret JSON
+      ansible.builtin.set_fact:
+        seaweedfs_secret: "{{ seaweedfs_secret_json.stdout | from_json }}"
+
+    - name: Copy SeaweedFS S3 secret to argo namespace
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: seaweedfs-s3-secret
+          namespace: {{ argo_namespace }}
+        type: Opaque
+        data:
+          access_key: {{ seaweedfs_secret.data.access_key }}
+          secret_key: {{ seaweedfs_secret.data.secret_key }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: copy_s3_secret_result
+      changed_when: "'configured' in copy_s3_secret_result.stdout or 'created' in copy_s3_secret_result.stdout"
+
     - name: Add official Argo helm repository if not present
       ansible.builtin.shell: |
         if ! {{ helm_bin }} repo list | grep -q 'argo-helm'; then
