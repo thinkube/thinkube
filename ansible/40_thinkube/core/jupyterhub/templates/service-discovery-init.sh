@@ -93,6 +93,8 @@ echo "$CONFIGMAPS" | jq -r '.items[] | select(.data."service.yaml" != null) | .d
 done
 
 # Create kubeconfig from pod service account
+# NOTE: KUBECONFIG is NOT exported to service-env-jh.sh (environment-specific, not a shared service)
+# Instead, it's set directly in the pod's startup command in jupyterhub-values.yaml.j2
 echo ""
 echo "Configuring Kubernetes access..."
 KUBECONFIG_PATH="$OUTPUT_DIR/kube-config"
@@ -122,9 +124,7 @@ if [ -f "$SERVICEACCOUNT/token" ]; then
     echo "  user:" >> "$KUBECONFIG_PATH"
     echo "    token: $KUBE_TOKEN" >> "$KUBECONFIG_PATH"
 
-    # Export with main container's mount path, not init container path
-    echo "export KUBECONFIG=\"/home/jovyan/.config/thinkube/kube-config\"" >> "$SERVICE_ENV_FILE"
-    ENV_VAR_COUNT=$((ENV_VAR_COUNT + 1))
+    # KUBECONFIG is NOT added to SERVICE_ENV_FILE - it's environment-specific
     echo "✅ Created kubeconfig from service account"
 else
     echo "⊘ Service account token not found, skipping kubeconfig"
