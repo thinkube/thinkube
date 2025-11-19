@@ -9,7 +9,7 @@
 set -e
 
 OUTPUT_DIR="/service-config"
-SERVICE_ENV_FILE="$OUTPUT_DIR/service-env.sh"
+SERVICE_ENV_FILE="$OUTPUT_DIR/service-env-jh.sh"
 
 echo "========================================"
 echo "Thinkube Service Discovery Init"
