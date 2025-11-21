@@ -35,10 +35,10 @@
     juicefs_mlflow_volume_name: "mlflow-artifacts"
     juicefs_mlflow_storage_class: "juicefs-mlflow"
 
-    # PostgreSQL connection (reuse existing JuiceFS database)
+    # PostgreSQL connection (separate database for MLflow volume)
     postgres_internal_host: "postgresql-official.{{ postgres_namespace }}.svc.cluster.local"
     postgres_port: "5432"
-    postgres_database: "juicefs"
+    postgres_database: "juicefs_mlflow"
 
     # SeaweedFS S3 configuration pointing to mlflow bucket
     s3_endpoint_internal: "http://seaweedfs-filer.{{ seaweedfs_namespace }}.svc.cluster.local:8333"
@@ -82,7 +82,30 @@
         s3_secret_key: "{{ (s3_creds_check.stdout | from_json).data.secret_key | b64decode }}"
 
     ###########################################################################
-    # Task 2: Create JuiceFS secret for MLflow bucket
+    # Task 2: Create PostgreSQL database for MLflow volume
+    ###########################################################################
+    - name: Check if JuiceFS MLflow database exists in PostgreSQL
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/postgresql-official -- \
+          psql -U {{ admin_username }} -d mydatabase -tAc "SELECT 1 FROM pg_database WHERE datname='{{ postgres_database }}'"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        PGPASSWORD: "{{ admin_password }}"
+      register: mlflow_db_check
+      changed_when: false
+
+    - name: Create JuiceFS MLflow database in PostgreSQL
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/postgresql-official -- \
+          psql -U {{ admin_username }} -d mydatabase -c "CREATE DATABASE {{ postgres_database }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        PGPASSWORD: "{{ admin_password }}"
+      when: mlflow_db_check.stdout == ""
+      register: mlflow_db_create
+
+    ###########################################################################
+    # Task 3: Create JuiceFS secret for MLflow bucket
     ###########################################################################
     - name: Create JuiceFS MLflow volume configuration secret
       ansible.builtin.shell: |
@@ -107,7 +130,7 @@
       changed_when: "'created' in secret_result.stdout or 'configured' in secret_result.stdout"
 
     ###########################################################################
-    # Task 3: Format JuiceFS MLflow volume
+    # Task 4: Format JuiceFS MLflow volume
     ###########################################################################
     - name: Check if JuiceFS MLflow volume is already formatted
       ansible.builtin.shell: |
@@ -141,7 +164,7 @@
       register: mlflow_format_result
 
     ###########################################################################
-    # Task 4: Create StorageClass for MLflow access
+    # Task 5: Create StorageClass for MLflow access
     ###########################################################################
     - name: Create JuiceFS MLflow StorageClass
       ansible.builtin.shell: |
@@ -165,7 +188,7 @@
       changed_when: "'created' in storageclass_result.stdout or 'configured' in storageclass_result.stdout"
 
     ###########################################################################
-    # Task 5: Summary
+    # Task 6: Summary
     ###########################################################################
     - name: Display deployment summary
       ansible.builtin.debug:
