@@ -1,0 +1,199 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/juicefs/12_deploy_mlflow_gateway.yaml
+# Description:
+#   Deploy JuiceFS S3 Gateway for mlflow-artifacts volume
+#   Provides S3-compatible API access to MLflow models stored in JuiceFS
+#   MLflow writes via S3 API → Gateway → JuiceFS volume
+#   TensorRT-LLM reads via POSIX mount → Same JuiceFS volume
+#   This enables dual access (S3 + POSIX) to same data with zero duplication
+#
+# Requirements:
+#   - JuiceFS CSI driver deployed (10_deploy.yaml)
+#   - JuiceFS mlflow-artifacts volume created and formatted (11_create_mlflow_volume.yaml)
+#   - PostgreSQL accessible (metadata storage)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/juicefs/12_deploy_mlflow_gateway.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#   - admin_username: PostgreSQL admin username
+#   - admin_password: PostgreSQL admin password
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy JuiceFS S3 Gateway for MLflow artifacts
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    juicefs_mlflow_volume_name: "mlflow-artifacts"
+    juicefs_mlflow_gateway_name: "juicefs-mlflow-gateway"
+    juicefs_mlflow_gateway_port: 9001
+
+    # PostgreSQL connection (same as volume creation)
+    postgres_internal_host: "postgresql-official.{{ postgres_namespace }}.svc.cluster.local"
+    postgres_port: "5432"
+    postgres_database: "juicefs_mlflow"
+
+  pre_tasks:
+    - name: Verify admin password available
+      ansible.builtin.assert:
+        that: admin_password != ''
+        fail_msg: "ADMIN_PASSWORD environment variable must be set"
+        success_msg: "Admin password loaded from environment"
+
+    - name: Check for required variables
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined or item | length == 0
+      loop:
+        - juicefs_namespace
+        - postgres_namespace
+        - admin_username
+        - kubeconfig
+        - kubectl_bin
+
+  tasks:
+    ###########################################################################
+    # Task 1: Deploy S3 Gateway Deployment
+    ###########################################################################
+    - name: Deploy JuiceFS S3 Gateway for MLflow
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: {{ juicefs_mlflow_gateway_name }}
+          namespace: {{ juicefs_namespace }}
+          labels:
+            app: {{ juicefs_mlflow_gateway_name }}
+            app.kubernetes.io/name: {{ juicefs_mlflow_gateway_name }}
+            app.kubernetes.io/component: s3-gateway
+            app.kubernetes.io/purpose: mlflow-storage
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: {{ juicefs_mlflow_gateway_name }}
+          template:
+            metadata:
+              labels:
+                app: {{ juicefs_mlflow_gateway_name }}
+            spec:
+              containers:
+              - name: gateway
+                image: juicedata/juicefs-csi-driver:v0.30.0
+                command:
+                  - sh
+                  - -c
+                  - |
+                    /usr/local/bin/juicefs gateway \
+                      --access-log=/dev/stdout \
+                      postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable \
+                      0.0.0.0:{{ juicefs_mlflow_gateway_port }}
+                env:
+                  - name: MINIO_ROOT_USER
+                    value: "{{ admin_username }}"
+                  - name: MINIO_ROOT_PASSWORD
+                    value: "{{ admin_password }}"
+                ports:
+                  - containerPort: {{ juicefs_mlflow_gateway_port }}
+                    protocol: TCP
+                    name: s3-api
+                resources:
+                  requests:
+                    memory: "512Mi"
+                    cpu: "250m"
+                  limits:
+                    memory: "2Gi"
+                    cpu: "1000m"
+                readinessProbe:
+                  tcpSocket:
+                    port: {{ juicefs_mlflow_gateway_port }}
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+                livenessProbe:
+                  tcpSocket:
+                    port: {{ juicefs_mlflow_gateway_port }}
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gateway_result
+      changed_when: "'created' in gateway_result.stdout or 'configured' in gateway_result.stdout"
+
+    ###########################################################################
+    # Task 2: Create S3 Gateway Service
+    ###########################################################################
+    - name: Create S3 Gateway Service for MLflow
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: {{ juicefs_mlflow_gateway_name }}
+          namespace: {{ juicefs_namespace }}
+          labels:
+            app: {{ juicefs_mlflow_gateway_name }}
+            app.kubernetes.io/name: {{ juicefs_mlflow_gateway_name }}
+            app.kubernetes.io/component: s3-gateway
+        spec:
+          type: ClusterIP
+          selector:
+            app: {{ juicefs_mlflow_gateway_name }}
+          ports:
+            - port: {{ juicefs_mlflow_gateway_port }}
+              targetPort: {{ juicefs_mlflow_gateway_port }}
+              protocol: TCP
+              name: s3-api
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gateway_svc_result
+      changed_when: "'created' in gateway_svc_result.stdout or 'configured' in gateway_svc_result.stdout"
+
+    ###########################################################################
+    # Task 3: Wait for Gateway to be ready
+    ###########################################################################
+    - name: Wait for Gateway deployment to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} wait --for=condition=available --timeout=120s \
+          deployment/{{ juicefs_mlflow_gateway_name }} -n {{ juicefs_namespace }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wait_result
+      changed_when: false
+
+    ###########################################################################
+    # Task 4: Deployment summary
+    ###########################################################################
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "JuiceFS S3 Gateway for MLflow deployed successfully!"
+          - "=========================================================="
+          - "Gateway Name: {{ juicefs_mlflow_gateway_name }}"
+          - "Service Endpoint: {{ juicefs_mlflow_gateway_name }}.{{ juicefs_namespace }}.svc.cluster.local:{{ juicefs_mlflow_gateway_port }}"
+          - "Volume: {{ juicefs_mlflow_volume_name }}"
+          - "S3 Credentials: {{ admin_username }} / {{ admin_password }}"
+          - "=========================================================="
+          - "Dual Access Pattern:"
+          - "  - MLflow writes via S3 API to Gateway"
+          - "  - TensorRT-LLM reads via POSIX mount"
+          - "  - Both access same JuiceFS volume"
+          - "  - Zero data duplication"
+          - "=========================================================="
+          - "Next steps:"
+          - "  1. Update MLflow S3 endpoint to use Gateway"
+          - "  2. Test model mirroring through Gateway"
+          - "  3. Verify POSIX mount access"
+          - "=========================================================="
