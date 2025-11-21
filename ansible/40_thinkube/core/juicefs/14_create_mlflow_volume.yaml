@@ -1,0 +1,188 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/juicefs/14_create_mlflow_volume.yaml
+# Description:
+#   Create JuiceFS volume and StorageClass for accessing MLflow S3 bucket
+#   This provides POSIX filesystem access to MLflow artifacts without duplication
+#   MLflow continues using S3 API, inference workloads use POSIX interface
+#
+# Requirements:
+#   - JuiceFS CSI driver deployed (10_deploy.yaml)
+#   - PostgreSQL accessible (metadata storage)
+#   - SeaweedFS accessible with mlflow bucket
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/juicefs/14_create_mlflow_volume.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#   - admin_username: PostgreSQL admin username
+#   - admin_password: PostgreSQL admin password
+#
+# 🤖 [AI-assisted]
+
+- name: Create JuiceFS volume for MLflow S3 bucket access
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    juicefs_mlflow_volume_name: "mlflow-artifacts"
+    juicefs_mlflow_storage_class: "juicefs-mlflow"
+
+    # PostgreSQL connection (reuse existing JuiceFS database)
+    postgres_internal_host: "postgresql-official.{{ postgres_namespace }}.svc.cluster.local"
+    postgres_port: "5432"
+    postgres_database: "juicefs"
+
+    # SeaweedFS S3 configuration pointing to mlflow bucket
+    s3_endpoint_internal: "http://seaweedfs-filer.{{ seaweedfs_namespace }}.svc.cluster.local:8333"
+    s3_mlflow_bucket: "mlflow"
+
+  pre_tasks:
+    - name: Verify admin password available
+      ansible.builtin.assert:
+        that: admin_password != ''
+        fail_msg: "ADMIN_PASSWORD environment variable must be set"
+        success_msg: "Admin password loaded from environment"
+
+    - name: Check for required variables
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined or item | length == 0
+      loop:
+        - juicefs_namespace
+        - postgres_namespace
+        - admin_username
+        - kubeconfig
+        - kubectl_bin
+        - seaweedfs_namespace
+
+  tasks:
+    ###########################################################################
+    # Task 1: Get S3 credentials from SeaweedFS
+    ###########################################################################
+    - name: Get S3 credentials from SeaweedFS
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret seaweedfs-s3-credentials -n {{ seaweedfs_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: s3_creds_check
+      failed_when: s3_creds_check.rc != 0
+      changed_when: false
+
+    - name: Set S3 credentials facts
+      ansible.builtin.set_fact:
+        s3_access_key: "{{ (s3_creds_check.stdout | from_json).data.access_key | b64decode }}"
+        s3_secret_key: "{{ (s3_creds_check.stdout | from_json).data.secret_key | b64decode }}"
+
+    ###########################################################################
+    # Task 2: Create JuiceFS secret for MLflow bucket
+    ###########################################################################
+    - name: Create JuiceFS MLflow volume configuration secret
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: juicefs-mlflow-secret
+          namespace: {{ juicefs_namespace }}
+        type: Opaque
+        stringData:
+          name: "{{ juicefs_mlflow_volume_name }}"
+          metaurl: "postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable"
+          storage: "s3"
+          bucket: "{{ s3_endpoint_internal }}/{{ s3_mlflow_bucket }}"
+          access-key: "{{ s3_access_key }}"
+          secret-key: "{{ s3_secret_key }}"
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: secret_result
+      changed_when: "'created' in secret_result.stdout or 'configured' in secret_result.stdout"
+
+    ###########################################################################
+    # Task 3: Format JuiceFS MLflow volume
+    ###########################################################################
+    - name: Check if JuiceFS MLflow volume is already formatted
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run juicefs-mlflow-format-check --rm -i --restart=Never \
+          --image=juicedata/juicefs-csi-driver:v0.30.0 \
+          --namespace={{ juicefs_namespace }} \
+          --command -- /usr/local/bin/juicefs status \
+          postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable \
+          {{ juicefs_mlflow_volume_name }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: mlflow_format_check
+      failed_when: false
+      changed_when: false
+
+    - name: Format JuiceFS MLflow volume if not already formatted
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run juicefs-mlflow-format --rm -i --restart=Never \
+          --image=juicedata/juicefs-csi-driver:v0.30.0 \
+          --namespace={{ juicefs_namespace }} \
+          --command -- /usr/local/bin/juicefs format \
+          --storage=s3 \
+          --bucket={{ s3_endpoint_internal }}/{{ s3_mlflow_bucket }} \
+          --access-key={{ s3_access_key }} \
+          --secret-key={{ s3_secret_key }} \
+          postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable \
+          {{ juicefs_mlflow_volume_name }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: mlflow_format_check.rc != 0
+      register: mlflow_format_result
+
+    ###########################################################################
+    # Task 4: Create StorageClass for MLflow access
+    ###########################################################################
+    - name: Create JuiceFS MLflow StorageClass
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata:
+          name: {{ juicefs_mlflow_storage_class }}
+        provisioner: csi.juicefs.com
+        parameters:
+          csi.storage.k8s.io/provisioner-secret-name: juicefs-mlflow-secret
+          csi.storage.k8s.io/provisioner-secret-namespace: {{ juicefs_namespace }}
+          csi.storage.k8s.io/node-publish-secret-name: juicefs-mlflow-secret
+          csi.storage.k8s.io/node-publish-secret-namespace: {{ juicefs_namespace }}
+        reclaimPolicy: Retain
+        volumeBindingMode: Immediate
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: storageclass_result
+      changed_when: "'created' in storageclass_result.stdout or 'configured' in storageclass_result.stdout"
+
+    ###########################################################################
+    # Task 5: Summary
+    ###########################################################################
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "JuiceFS MLflow volume created successfully!"
+          - "=================================================="
+          - "Volume Name: {{ juicefs_mlflow_volume_name }}"
+          - "Storage Class: {{ juicefs_mlflow_storage_class }}"
+          - "S3 Bucket: {{ s3_mlflow_bucket }} (same as MLflow)"
+          - "Access: POSIX filesystem via JuiceFS CSI"
+          - "=================================================="
+          - "This provides zero-duplication access to MLflow artifacts:"
+          - "  - MLflow uses S3 API"
+          - "  - Inference workloads use POSIX filesystem"
+          - "  - Same underlying data, two access methods"
+          - "=================================================="
+          - "To use in GPU workload PVCs:"
+          - "  storageClassName: {{ juicefs_mlflow_storage_class }}"
+          - "  accessModes: [ReadWriteMany]"
+          - "=================================================="
