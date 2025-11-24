@@ -984,55 +984,31 @@
         gitea_repo_name: "{{ app_name }}"
         use_github: false
     
-    # Wait for ArgoCD application to be deployed and healthy
+    # Wait for ArgoCD application to be deployed and healthy (using kubectl)
     - name: Wait for ArgoCD application deployment
-      ansible.builtin.shell: |
-        # Wait for application to exist
-        echo "Waiting for ArgoCD application to be created..."
-        for i in $(seq 1 30); do
-          if ~/.local/bin/argocd app get {{ app_name }} >/dev/null 2>&1; then
-            echo "Application created, checking deployment status..."
-            break
-          fi
-          echo "Waiting for application creation... (attempt $i/30)"
-          sleep 2
-        done
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: argocd
+        name: "{{ app_name }}"
+      register: argocd_app
+      until:
+        - argocd_app.resources | length > 0
+        - argocd_app.resources[0].status.health.status | default("Unknown") == "Healthy"
+        - argocd_app.resources[0].status.resources | default([]) | length > 0
+      retries: 60
+      delay: 5
+      failed_when: false
 
-        # Now wait for it to be healthy
-        echo "Waiting for application to become healthy..."
-        for i in $(seq 1 60); do
-          APP_STATUS=$(~/.local/bin/argocd app get {{ app_name }} -o json 2>/dev/null || echo '{}')
-          SYNC_STATUS=$(echo "$APP_STATUS" | jq -r '.status.sync.status // "Unknown"')
-          HEALTH_STATUS=$(echo "$APP_STATUS" | jq -r '.status.health.status // "Unknown"')
-          OPERATIONAL_STATE=$(echo "$APP_STATUS" | jq -r '.status.operationState.phase // "Unknown"')
-
-          # Check if resources are deployed
-          RESOURCE_COUNT=$(echo "$APP_STATUS" | jq '.status.resources // [] | length')
-
-          if [ "$HEALTH_STATUS" = "Healthy" ] && [ "$RESOURCE_COUNT" -gt 0 ]; then
-            echo "Application is healthy with $RESOURCE_COUNT resources deployed"
-            exit 0
-          elif [ "$OPERATIONAL_STATE" = "Failed" ]; then
-            echo "ERROR: Application deployment failed"
-            echo "Sync Status: $SYNC_STATUS"
-            echo "Health Status: $HEALTH_STATUS"
-            echo "Operation State: $OPERATIONAL_STATE"
-            exit 1
-          fi
-
-          echo "Status - Sync: $SYNC_STATUS, Health: $HEALTH_STATUS, Resources: $RESOURCE_COUNT (attempt $i/60)"
-          sleep 5
-        done
-
-        echo "Application deployment completed (may still be initializing)"
-        exit 0
-      register: app_deployment_wait
-      changed_when: false
-      failed_when: app_deployment_wait.rc != 0
-
-    - name: Show ArgoCD wait output
+    - name: Show ArgoCD application status
       ansible.builtin.debug:
-        var: app_deployment_wait.stdout_lines
+        msg: |
+          ArgoCD Application Status:
+          - Sync: {{ argocd_app.resources[0].status.sync.status | default('Unknown') }}
+          - Health: {{ argocd_app.resources[0].status.health.status | default('Unknown') }}
+          - Resources: {{ argocd_app.resources[0].status.resources | default([]) | length }}
+      when: argocd_app.resources | length > 0
 
     # Verify deployments are actually running
     - name: Verify backend deployment is running
