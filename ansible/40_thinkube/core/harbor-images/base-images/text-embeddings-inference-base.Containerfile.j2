@@ -1,0 +1,90 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Text Embeddings Inference (TEI) base image for ARM64 + CUDA (Blackwell GB10)
+# Built from source for DGX Spark compatibility
+
+# Build arguments
+ARG CUDA_VERSION=13.0.0
+ARG UBUNTU_VERSION=24.04
+ARG CUDA_COMPUTE_CAP=121
+
+# =============================================================================
+# Stage 1: Builder - Compile TEI from source
+# =============================================================================
+FROM {{ harbor_registry }}/library/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+
+ARG CUDA_COMPUTE_CAP
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+# Clone TEI repository
+WORKDIR /build
+RUN git clone --depth 1 https://github.com/huggingface/text-embeddings-inference.git .
+
+# Set CUDA environment for build
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# Build TEI with CUDA support
+# Note: candle-cuda feature enables GPU acceleration
+# CUDA_COMPUTE_CAP=121 for Blackwell (sm_121a)
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+
+RUN cargo build --release \
+    --package text-embeddings-router \
+    --features candle-cuda,http \
+    --jobs $(nproc)
+
+# =============================================================================
+# Stage 2: Runtime - Minimal image with TEI binary
+# =============================================================================
+FROM {{ harbor_registry }}/library/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy TEI binary from builder
+COPY --from=builder /build/target/release/text-embeddings-router /usr/local/bin/
+
+# Set environment variables
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:/usr/local/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# Create non-root user
+RUN useradd -m -u 1000 tei
+USER tei
+
+WORKDIR /app
+
+# Default port
+EXPOSE 8355
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8355/health || exit 1
+
+# Default command - model path should be provided at runtime
+ENTRYPOINT ["text-embeddings-router"]
+CMD ["--help"]

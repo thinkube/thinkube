@@ -431,6 +431,35 @@
       retries: 2
       delay: 10
 
+    # Text Embeddings Inference (TEI) - Built from source for ARM64 + CUDA (Blackwell)
+    # This is a long build (~15-30 minutes) due to Rust compilation
+    - name: Template TEI Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/text-embeddings-inference-base.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/text-embeddings-inference-base.Containerfile"
+
+    - name: Build TEI base image (this takes ~15-30 minutes)
+      ansible.builtin.shell: |
+        podman build --tls-verify=true \
+                     --build-arg CUDA_COMPUTE_CAP=121 \
+                     -t {{ harbor_registry }}/library/text-embeddings-inference-base:1.5-blackwell \
+                     -f {{ temp_containerfiles_dir.path }}/text-embeddings-inference-base.Containerfile \
+                     {{ base_images_dir }}
+      register: tei_base_build
+      changed_when: true
+      # Long timeout for Rust compilation
+      async: 3600
+      poll: 60
+
+    - name: Push TEI base image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/text-embeddings-inference-base:1.5-blackwell
+      register: tei_base_push
+      changed_when: tei_base_push.rc == 0
+      failed_when: tei_base_push.rc != 0
+      retries: 2
+      delay: 10
+
     - name: Clean up temp dockerfiles directory
       ansible.builtin.file:
         path: "{{ temp_containerfiles_dir.path }}"
@@ -522,6 +551,13 @@
             metadata:
               language: "rust"
               type: "mcp-server"
+          - destination: "{{ harbor_registry }}/library/text-embeddings-inference-base:1.5-blackwell"
+            source: "custom-build"
+            description: "Text Embeddings Inference (TEI) built from source for ARM64 + CUDA Blackwell (DGX Spark GB10)"
+            metadata:
+              base_image: "nvidia/cuda:13.0.0-base-ubuntu24.04"
+              cuda_compute_cap: "121"
+              language: "rust"
         manifest_category: "system"
         manifest_source: "built"
         manifest_namespace: "registry"
@@ -542,6 +578,7 @@
           Service discovery: {{ harbor_registry }}/library/tk-service-discovery:latest
           AI inference base: {{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.9-py3.12
           TensorRT-LLM base: {{ harbor_registry }}/library/tensorrt-llm-base:1.2.0rc2
+          TEI base: {{ harbor_registry }}/library/text-embeddings-inference-base:1.5-blackwell
           MLflow custom: {{ harbor_registry }}/library/mlflow-custom:latest
           Model mirror: {{ harbor_registry }}/library/model-mirror:latest
           Valkey: {{ harbor_registry }}/library/valkey:8.1.0
