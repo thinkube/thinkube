@@ -4,7 +4,13 @@
 
 # Image identifier for organizing examples
 IMAGE_NAME="{{ image_name }}"
-EXAMPLES_REPO="/home/jovyan/thinkube/examples-repo/thinkube-ai-examples"
+
+# New simplified directory structure (JupyterHub mounts these):
+#   /home/jovyan/thinkube/templates/  - Read-only templates (cloned fresh each pod)
+#   /home/jovyan/thinkube/icons/      - Thinkube icons (ConfigMap mount)
+#   /home/jovyan/thinkube/notebooks/  - User's persistent work
+#   /home/jovyan/thinkube/mlflow/     - Shared MLflow artifacts
+TEMPLATES_DIR="/home/jovyan/thinkube/templates"
 
 # Ensure persistent notebooks directory exists
 mkdir -p /home/jovyan/thinkube/notebooks
@@ -26,40 +32,27 @@ if [ ! -f "/home/jovyan/thinkube/notebooks/test-thinkube-services.ipynb" ]; then
   echo "  ✓ Test notebook available at: ~/thinkube/notebooks/test-thinkube-services.ipynb"
 fi
 
-# Copy Thinkube icons to notebooks directory if not present
-if [ ! -d "/home/jovyan/thinkube/notebooks/icons" ]; then
-  echo "Copying Thinkube icons for use in notebooks..."
-  cp -r /opt/thinkube/icons /home/jovyan/thinkube/notebooks/
-  echo "  ✓ Icons available at: ~/thinkube/notebooks/icons/"
+# Icons are now mounted at /home/jovyan/thinkube/icons/ via ConfigMap
+# No need to copy from image - just verify they're available
+if [ -d "/home/jovyan/thinkube/icons" ]; then
+  echo "  ✓ Icons available at: ~/thinkube/icons/"
 fi
 
 # Create CLAUDE.md if it doesn't exist (context for Claude AI)
-# Load from examples repository (updated without rebuilding images)
 if [ ! -f "/home/jovyan/thinkube/notebooks/CLAUDE.md" ]; then
-  if [ -f "$EXAMPLES_REPO/CLAUDE.md.template" ]; then
+  if [ -f "$TEMPLATES_DIR/CLAUDE.md.template" ]; then
     echo "Creating CLAUDE.md context file for AI assistant..."
-    cp "$EXAMPLES_REPO/CLAUDE.md.template" /home/jovyan/thinkube/notebooks/CLAUDE.md
+    cp "$TEMPLATES_DIR/CLAUDE.md.template" /home/jovyan/thinkube/notebooks/CLAUDE.md
   else
-    echo "WARNING: CLAUDE.md.template not found in examples repository"
+    echo "  Note: CLAUDE.md.template not found in templates"
   fi
 fi
 
-# Fail fast if examples repository is not available
-if [ ! -d "$EXAMPLES_REPO" ]; then
-  echo "ERROR: Examples repository not found at $EXAMPLES_REPO"
-  echo "Expected structure: /home/jovyan/thinkube/examples-repo/thinkube-ai-examples/"
-  echo "The deployment is incomplete. JupyterHub deployment must clone the examples repository."
-  exit 1
-fi
-
-# Create symlink to read-only templates (from shared repository)
-if [ ! -e "/home/jovyan/thinkube/notebooks/templates" ]; then
-  echo "Creating symlink to read-only templates from repository..."
-  ln -s "$EXAMPLES_REPO" /home/jovyan/thinkube/notebooks/templates
-elif [ ! -L "/home/jovyan/thinkube/notebooks/templates" ]; then
-  echo "Removing non-symlink templates and recreating..."
-  rm -rf /home/jovyan/thinkube/notebooks/templates
-  ln -s "$EXAMPLES_REPO" /home/jovyan/thinkube/notebooks/templates
+# Check templates directory is available (mounted by JupyterHub)
+if [ ! -d "$TEMPLATES_DIR" ]; then
+  echo "WARNING: Templates directory not found at $TEMPLATES_DIR"
+  echo "This may be a deployment issue - templates should be mounted by JupyterHub"
+  # Don't fail - allow startup to continue, user can still work
 fi
 
 # Determine which examples to copy based on image type
@@ -76,22 +69,23 @@ case "$IMAGE_NAME" in
     EXAMPLE_DIRS="common agent-dev"
     ;;
   *)
-    echo "Unknown image type: $IMAGE_NAME, using common examples only"
+    echo "  Note: Image type $IMAGE_NAME, using common examples only"
     ;;
 esac
 
 # Copy examples to image-specific folder (allows multiple images to coexist)
-if [ ! -f "/home/jovyan/thinkube/notebooks/examples/${IMAGE_NAME}/.copied" ]; then
+# Only copy if templates exist and not already copied
+if [ -d "$TEMPLATES_DIR" ] && [ ! -f "/home/jovyan/thinkube/notebooks/examples/${IMAGE_NAME}/.copied" ]; then
   echo "Copying editable example notebooks to examples/${IMAGE_NAME}/..."
   mkdir -p "/home/jovyan/thinkube/notebooks/examples/${IMAGE_NAME}"
 
   for dir in $EXAMPLE_DIRS; do
-    if [ -d "$EXAMPLES_REPO/$dir" ]; then
+    if [ -d "$TEMPLATES_DIR/$dir" ]; then
       echo "  - Copying $dir examples..."
       mkdir -p "/home/jovyan/thinkube/notebooks/examples/${IMAGE_NAME}/$dir"
-      cp -r "$EXAMPLES_REPO/$dir"/* "/home/jovyan/thinkube/notebooks/examples/${IMAGE_NAME}/$dir/" 2>/dev/null || true
+      cp -r "$TEMPLATES_DIR/$dir"/* "/home/jovyan/thinkube/notebooks/examples/${IMAGE_NAME}/$dir/" 2>/dev/null || true
     else
-      echo "  - WARNING: Directory $EXAMPLES_REPO/$dir not found, skipping"
+      echo "  - Note: Directory $TEMPLATES_DIR/$dir not found, skipping"
     fi
   done
 
