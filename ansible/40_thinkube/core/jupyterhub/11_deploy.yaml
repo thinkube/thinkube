@@ -120,8 +120,38 @@
                 storage: 200Gi
 
     # MLflow artifacts - shared storage with MLflow (same JuiceFS volume!)
-    # This allows JupyterHub users to access MLflow models via POSIX without duplication
-    - name: Create PVC for MLflow artifacts (shared with MLflow)
+    # IMPORTANT: Use static PV (not dynamic StorageClass) to mount root of JuiceFS volume
+    # Dynamic PVCs create isolated subdirectories - we need the root where MLflow writes
+    - name: Create static PV for MLflow artifacts (mounts JuiceFS root)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: jupyterhub-mlflow-root
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 1Ti
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-mlflow-secret
+                namespace: juicefs
+              volumeAttributes:
+                juicefs/mount-cpu-limit: ""
+                juicefs/mount-cpu-request: ""
+                juicefs/mount-memory-limit: ""
+                juicefs/mount-memory-request: ""
+              volumeHandle: jupyterhub-mlflow-root
+            persistentVolumeReclaimPolicy: Retain
+            volumeMode: Filesystem
+
+    - name: Create PVC for MLflow artifacts (bound to static PV)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -134,10 +164,11 @@
           spec:
             accessModes:
               - ReadWriteMany
-            storageClassName: juicefs-mlflow  # Same StorageClass as MLflow uses!
+            volumeName: jupyterhub-mlflow-root
+            storageClassName: ""  # Empty string = use static binding
             resources:
               requests:
-                storage: 200Gi
+                storage: 1Ti
 
     # Step 3.5: Create ConfigMap with Thinkube icons for notebooks
     - name: Create Thinkube icons ConfigMap
