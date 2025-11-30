@@ -495,48 +495,24 @@ singleuser:
         - |
           # First time setup - check marker in persistent area
           if [ ! -f "/home/jovyan/thinkube/.thinkube-initialized" ]; then
-            echo "First time setup - creating directory structure..."
+            echo "First time setup - creating examples directory..."
 
-            # Create base thinkube directory
-            mkdir -p /home/jovyan/thinkube
-
-            # Create notebook subdirectories in JuiceFS
-            mkdir -p /home/jovyan/thinkube/notebooks/projects
-            mkdir -p /home/jovyan/thinkube/notebooks/experiments
-            mkdir -p /home/jovyan/thinkube/notebooks/agents
-            mkdir -p /home/jovyan/thinkube/notebooks/fine-tuning
-            mkdir -p /home/jovyan/thinkube/notebooks/templates  # For read-only templates from examples
-            mkdir -p /home/jovyan/thinkube/notebooks/examples   # For editable copies from examples
-
-            # Create datasets structure
-            mkdir -p /home/jovyan/thinkube/datasets/raw
-            mkdir -p /home/jovyan/thinkube/datasets/processed
-            mkdir -p /home/jovyan/thinkube/datasets/embeddings
-
-            # Create models structure
-            mkdir -p /home/jovyan/thinkube/models/checkpoints
-            mkdir -p /home/jovyan/thinkube/models/production
-            mkdir -p /home/jovyan/thinkube/models/fine-tuned
-
-            # Create scratch structure (note: this is emptyDir, recreated each time)
-            mkdir -p /home/jovyan/scratch/tmp
+            # Create examples directory for editable copies of templates
+            mkdir -p /home/jovyan/thinkube/notebooks/examples
 
             # Mark as initialized
             touch /home/jovyan/thinkube/.thinkube-initialized
             echo "First time setup complete"
           else
-            echo "Directory structure already initialized"
+            echo "Already initialized"
           fi
 
-          # Always fix permissions for persistent areas only
+          # Always fix permissions for persistent areas
           echo "Fixing permissions..."
           chown -R 1000:100 /home/jovyan/thinkube
           chmod -R 755 /home/jovyan/thinkube
-          # Also fix scratch if it exists
-          if [ -d /home/jovyan/scratch ]; then
-            chown -R 1000:100 /home/jovyan/scratch
-            chmod -R 755 /home/jovyan/scratch
-          fi
+          chown -R 1000:100 /home/jovyan/scratch 2>/dev/null || true
+          chmod -R 755 /home/jovyan/scratch 2>/dev/null || true
           echo "Permissions fixed"
       securityContext:
         runAsUser: 0  # Run as root to fix permissions
@@ -550,8 +526,8 @@ singleuser:
         - name: scratch
           mountPath: /home/jovyan/scratch
 
-    # Clone examples repository on each pod start
-    - name: clone-examples
+    # Clone templates repository on each pod start (directly to templates mount - NO symlinks!)
+    - name: clone-templates
       image: {{ harbor_registry }}/library/alpine-git:latest
       imagePullPolicy: IfNotPresent
       command:
@@ -559,19 +535,35 @@ singleuser:
         - -c
         - |
           set -e
-          echo "Cloning examples repository to /home/jovyan/thinkube/examples-repo/..."
-          mkdir -p /home/jovyan/thinkube/examples-repo
-          git clone https://github.com/thinkube/thinkube-ai-examples.git /home/jovyan/thinkube/examples-repo/thinkube-ai-examples
+          echo "Cloning templates repository..."
 
-          # Fix ownership for jovyan user
-          chown -R 1000:100 /home/jovyan/thinkube/examples-repo
-          chmod -R 755 /home/jovyan/thinkube/examples-repo
-          echo "Examples repository ready"
+          # Clone directly into the templates mount (emptyDir - fresh each pod start)
+          git clone https://github.com/thinkube/thinkube-ai-examples.git /home/jovyan/thinkube/templates/thinkube-ai-examples
+
+          # Flatten structure: /templates/thinkube-ai-examples/* → /templates/*
+          mv /home/jovyan/thinkube/templates/thinkube-ai-examples/* /home/jovyan/thinkube/templates/
+          rm -rf /home/jovyan/thinkube/templates/thinkube-ai-examples
+
+          # Fix ownership
+          chown -R 1000:100 /home/jovyan/thinkube/templates
+          chmod -R 755 /home/jovyan/thinkube/templates
+
+          # First time: copy templates to examples (editable copy)
+          if [ ! -f "/home/jovyan/thinkube/notebooks/examples/.copied" ]; then
+            echo "First time setup - copying templates to examples..."
+            cp -r /home/jovyan/thinkube/templates/* /home/jovyan/thinkube/notebooks/examples/
+            touch /home/jovyan/thinkube/notebooks/examples/.copied
+            chown -R 1000:100 /home/jovyan/thinkube/notebooks/examples
+            chmod -R 755 /home/jovyan/thinkube/notebooks/examples
+            echo "Templates copied to examples/"
+          fi
+
+          echo "Templates ready at /home/jovyan/thinkube/templates/"
       securityContext:
         runAsUser: 0  # Run as root to clone and set permissions
       volumeMounts:
-        - name: examples-repo
-          mountPath: /home/jovyan/thinkube/examples-repo
+        - name: templates
+          mountPath: /home/jovyan/thinkube/templates
         - name: notebooks
           mountPath: /home/jovyan/thinkube/notebooks
 
@@ -608,18 +600,30 @@ singleuser:
       persistentVolumeClaim:
         claimName: jupyterhub-datasets-pvc
 
-    # JuiceFS for models (MANDATORY)
+    # JuiceFS for user models (MANDATORY)
     - name: models
       persistentVolumeClaim:
         claimName: jupyterhub-models-pvc
+
+    # MLflow artifacts - SHARED with MLflow (same JuiceFS volume, zero duplication!)
+    # Users can access MLflow models via POSIX at /home/jovyan/thinkube/mlflow/
+    - name: mlflow-artifacts
+      persistentVolumeClaim:
+        claimName: jupyterhub-mlflow-artifacts-pvc
+
+    # Thinkube icons (from ConfigMap)
+    - name: thinkube-icons
+      configMap:
+        name: thinkube-icons
+        defaultMode: 0644
 
     # Local scratch for fast I/O (per-pod temporary)
     - name: scratch
       emptyDir:
         sizeLimit: 100Gi
 
-    # Examples repository (cloned fresh on each pod start)
-    - name: examples-repo
+    # Templates repository (cloned fresh on each pod start - NO symlinks!)
+    - name: templates
       emptyDir:
         sizeLimit: 1Gi
 
@@ -642,17 +646,27 @@ singleuser:
     - name: datasets
       mountPath: /home/jovyan/thinkube/datasets
 
-    # Models directory (JuiceFS - persistent across nodes)
+    # User models directory (JuiceFS - persistent across nodes)
     - name: models
       mountPath: /home/jovyan/thinkube/models
+
+    # MLflow artifacts (JuiceFS - SHARED with MLflow, zero duplication!)
+    # Access MLflow models directly: /home/jovyan/thinkube/mlflow/artifacts/
+    - name: mlflow-artifacts
+      mountPath: /home/jovyan/thinkube/mlflow
+
+    # Thinkube icons for notebooks (from ConfigMap)
+    - name: thinkube-icons
+      mountPath: /home/jovyan/thinkube/icons
 
     # Fast local scratch space (emptyDir - temporary)
     - name: scratch
       mountPath: /home/jovyan/scratch
 
-    # Examples repository (emptyDir - cloned on pod start)
-    - name: examples-repo
-      mountPath: /home/jovyan/thinkube/examples-repo
+    # Templates repository (emptyDir - cloned on pod start, NO symlinks!)
+    # Read-only examples - users should copy to notebooks/ to edit
+    - name: templates
+      mountPath: /home/jovyan/thinkube/templates
 
     # Service discovery environment file (generated by init container)
     - name: service-config
