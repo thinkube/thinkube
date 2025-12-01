@@ -40,6 +40,7 @@
     user_home: "/home/{{ user }}"
     kubectl_wrapper_path: "{{ user_home }}/.local/bin/kubectl"
     helm_wrapper_path: "{{ user_home }}/.local/bin/helm"
+    k8s_stable_ip: "172.16.0.1"  # Dummy interface IP for location-independent k8s
 
   pre_tasks:
     - name: Verify required variables exist
@@ -77,6 +78,75 @@
     #
     # Docker uses: /run/containerd, /var/lib/containerd
     # k8s-snap uses: /var/lib/k8s-containerd (custom base directory)
+
+    # ===========================
+    # Create Stable k8s Dummy Interface (Location-Independent)
+    # ===========================
+    # This dummy interface provides a stable IP address that:
+    # - Never changes regardless of physical location
+    # - Works for both local kubectl and pods accessing API server
+    # - Eliminates latency (local loopback-like performance)
+    # - Allows remote access via ZeroTier forwarding when needed
+    - name: Create systemd-networkd config directory
+      ansible.builtin.file:
+        path: /etc/systemd/network
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Create k8s dummy interface netdev configuration
+      ansible.builtin.copy:
+        content: |
+          [NetDev]
+          Name=k8s0
+          Kind=dummy
+          Description=Kubernetes API Server stable interface
+        dest: /etc/systemd/network/10-k8s-dummy.netdev
+        mode: '0644'
+      become: true
+      notify: restart_networkd
+
+    - name: Create k8s dummy interface network configuration
+      ansible.builtin.copy:
+        content: |
+          [Match]
+          Name=k8s0
+
+          [Network]
+          Address={{ k8s_stable_ip }}/32
+
+          [Link]
+          RequiredForOnline=no
+        dest: /etc/systemd/network/10-k8s-dummy.network
+        mode: '0644'
+      become: true
+      notify: restart_networkd
+
+    - name: Enable and start systemd-networkd
+      ansible.builtin.systemd:
+        name: systemd-networkd
+        enabled: true
+        state: started
+      become: true
+
+    - name: Flush handlers to apply network config
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for k8s dummy interface to be created
+      ansible.builtin.wait_for:
+        timeout: 5
+      changed_when: false
+
+    - name: Verify k8s dummy interface exists
+      ansible.builtin.command: ip addr show k8s0
+      become: true
+      register: k8s_interface_check
+      changed_when: false
+      failed_when: k8s_interface_check.rc != 0
+
+    - name: Display k8s stable interface info
+      ansible.builtin.debug:
+        msg: "k8s stable interface k8s0 configured with IP {{ k8s_stable_ip }}"
 
     # ===========================
     # UFW Firewall Configuration (CRITICAL for CoreDNS)
@@ -151,6 +221,21 @@
         direction: out
       become: true
 
+    - name: Allow k8s API server traffic on dummy interface
+      community.general.ufw:
+        rule: allow
+        interface: k8s0
+        direction: in
+        comment: 'k8s API server on dummy interface'
+      become: true
+
+    - name: Allow outbound traffic on k8s0 interface
+      community.general.ufw:
+        rule: allow
+        interface: k8s0
+        direction: out
+      become: true
+
     - name: Enable UFW
       community.general.ufw:
         state: enabled
@@ -179,7 +264,7 @@
       register: snap_install_result
       changed_when: "'installed' in snap_install_result.stdout"
 
-    - name: Create k8s bootstrap configuration with custom containerd base directory
+    - name: Create k8s bootstrap configuration with stable IP binding
       ansible.builtin.copy:
         content: |
           containerd-base-dir: /var/lib/k8s-containerd
@@ -197,9 +282,9 @@
         mode: '0644'
       become: true
 
-    - name: Bootstrap k8s cluster with custom containerd base directory
+    - name: Bootstrap k8s cluster on stable dummy interface
       ansible.builtin.shell: |
-        k8s bootstrap --file /tmp/k8s-bootstrap-config.yaml
+        k8s bootstrap --file /tmp/k8s-bootstrap-config.yaml --address {{ k8s_stable_ip }}:6400
       become: true
       register: bootstrap_result
       changed_when: "'Bootstrapped' in bootstrap_result.stdout"
@@ -435,12 +520,21 @@
         mode: '0755'
       become: false
 
-    - name: Generate kubeconfig with external IP using k8s config
+    - name: Generate kubeconfig with stable IP
       ansible.builtin.shell: |
         k8s config > "{{ user_home }}/.kube/config"
         chown {{ user }}:{{ user }} "{{ user_home }}/.kube/config"
         chmod 0600 "{{ user_home }}/.kube/config"
       become: true
+      register: kubeconfig_generated
+
+    - name: Verify kubeconfig uses stable IP
+      ansible.builtin.shell: |
+        grep "server:" "{{ user_home }}/.kube/config" | grep "{{ k8s_stable_ip }}"
+      become: false
+      register: kubeconfig_verify
+      failed_when: kubeconfig_verify.rc != 0
+      changed_when: false
 
     # ===========================
     # Deploy k8s-hostpath StorageClass
@@ -646,6 +740,13 @@
       listen: reload_ufw
       changed_when: true
 
+    - name: restart_networkd
+      ansible.builtin.systemd:
+        name: systemd-networkd
+        state: restarted
+      become: true
+      listen: restart_networkd
+
   post_tasks:
     - name: Display installation summary
       ansible.builtin.debug:
@@ -655,12 +756,19 @@
           - "==============================================="
           - "Version: {{ k8s_version }}"
           - "Channel: {{ k8s_channel }}"
+          - "API Server: https://{{ k8s_stable_ip }}:6443 (stable dummy interface k8s0)"
           - "Node Status: {{ 'Ready' if 'Ready' in nodes_status.stdout else 'Not Ready' }}"
           - "CoreDNS: {{ 'Running' if coredns_wait.rc == 0 else 'Not Ready' }}"
           - "Cilium CNI: {{ 'Running' if cilium_wait.rc == 0 else 'Not Ready' }}"
           - "Storage Classes: csi-rawfile-default (default), k8s-hostpath"
           - "kubectl: Installed at {{ kubectl_wrapper_path }} (no sudo required)"
           - "helm: Installed at {{ helm_wrapper_path }} (no sudo required)"
+          - "==============================================="
+          - "Network Configuration:"
+          - "- k8s API bound to {{ k8s_stable_ip }} (dummy interface k8s0)"
+          - "- Location-independent: works regardless of physical network"
+          - "- Zero latency for local access (no ZeroTier overhead)"
+          - "- Remote access still available via ZeroTier overlay"
           - "==============================================="
           - "Next Steps:"
           - "1. Join worker nodes: ansible/40_thinkube/core/infrastructure/k8s/20_join_workers.yaml"
