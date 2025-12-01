@@ -43,7 +43,7 @@
         update_cache: yes
       become: true
       when: ansible_os_family == "Debian"
-
+      tags: [always]
 
     - name: Ensure library project exists in Harbor
       ansible.builtin.uri:
@@ -60,6 +60,7 @@
         validate_certs: true
         status_code: [201, 409]
       register: library_project
+      tags: [always]
 
     - name: Ensure thinkube project exists in Harbor
       ansible.builtin.uri:
@@ -76,6 +77,7 @@
         validate_certs: true
         status_code: [201, 409]
       register: thinkube_project
+      tags: [always]
 
     - name: Create build context directory
       ansible.builtin.file:
@@ -95,7 +97,16 @@
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/python-base.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/python-base.Containerfile"
-    
+      tags: [python-base]
+
+    # Workaround for podman cache bug: https://github.com/containers/podman/issues/21310
+    # Delete old image before rebuild to prevent stale cached layers
+    - name: Remove old Python base image (workaround for podman cache bug)
+      ansible.builtin.shell: |
+        podman rmi -f {{ harbor_registry }}/library/python-base:3.12-slim || true
+      changed_when: false
+      tags: [python-base]
+
     - name: Build Python base image
       ansible.builtin.shell: |
         podman build --no-cache \
@@ -106,12 +117,14 @@
                      {{ base_images_dir }}
       register: python_build
       changed_when: true
+      tags: [python-base]
       
     - name: Template Node.js 18 base Dockerfile
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/node-base.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/node-base.Containerfile"
-    
+      tags: [node-base]
+
     - name: Build Node.js 18 base image
       ansible.builtin.shell: |
         podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
@@ -121,12 +134,14 @@
                      {{ base_images_dir }}
       register: node18_build
       changed_when: true
-      
+      tags: [node-base]
+
     - name: Template Node.js 22 base Dockerfile
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/node-base-22.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/node-base-22.Containerfile"
-    
+      tags: [node-base]
+
     - name: Build Node.js 22 base image
       ansible.builtin.shell: |
         podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
@@ -137,12 +152,14 @@
                      {{ base_images_dir }}
       register: node22_build
       changed_when: true
+      tags: [node-base]
       
     - name: Template test-runner Dockerfile
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/test-runner.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/test-runner.Containerfile"
-    
+      tags: [test-runner]
+
     - name: Build test-runner image
       ansible.builtin.shell: |
         podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
@@ -152,12 +169,14 @@
                      {{ base_images_dir }}
       register: test_runner_build
       changed_when: true
-      
+      tags: [test-runner]
+
     - name: Template ci-utils Dockerfile
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/ci-utils.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/ci-utils.Containerfile"
-    
+      tags: [ci-utils]
+
     - name: Build ci-utils image
       ansible.builtin.shell: |
         podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
@@ -168,11 +187,13 @@
                      {{ base_images_dir }}
       register: ci_utils_build
       changed_when: true
+      tags: [ci-utils]
 
     - name: Template tk-service-discovery Dockerfile
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/tk-service-discovery.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/tk-service-discovery.Containerfile"
+      tags: [tk-service-discovery]
 
     - name: Build tk-service-discovery image
       ansible.builtin.shell: |
@@ -183,6 +204,7 @@
                      {{ base_images_dir }}
       register: tk_service_discovery_build
       changed_when: true
+      tags: [tk-service-discovery]
 
     - name: Login to Harbor
       ansible.builtin.shell: |
@@ -199,6 +221,7 @@
       failed_when: python_push.rc != 0
       retries: 2
       delay: 10
+      tags: [python-base]
       
     - name: Push Node.js base images
       ansible.builtin.shell: |
@@ -212,7 +235,8 @@
       failed_when: node_push.rc != 0
       retries: 2
       delay: 10
-      
+      tags: [node-base]
+
     - name: Push test-runner image
       ansible.builtin.shell: |
         podman push --tls-verify=true {{ harbor_registry }}/library/test-runner:latest
@@ -221,7 +245,8 @@
       failed_when: test_runner_push.rc != 0
       retries: 2
       delay: 10
-      
+      tags: [test-runner]
+
     - name: Push ci-utils images
       ansible.builtin.shell: |
         podman push --tls-verify=true {{ harbor_registry }}/library/ci-utils:{{ item }}
@@ -233,6 +258,7 @@
       failed_when: ci_utils_push.rc != 0
       retries: 2
       delay: 10
+      tags: [ci-utils]
 
     - name: Push tk-service-discovery image
       ansible.builtin.shell: |
@@ -242,6 +268,7 @@
       failed_when: tk_service_discovery_push.rc != 0
       retries: 2
       delay: 10
+      tags: [tk-service-discovery]
 
     # AI Inference Base Image - Regular Build for Stable Diffusion, etc.
     # Multi-arch build (AMD64 + ARM64) with CUDA 13.0, PyTorch 2.3, and CUDA dev tools
@@ -252,6 +279,7 @@
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/ai-inference-base.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/ai-inference-base.Containerfile"
+      tags: [ai-inference-base]
 
     - name: Build AI inference base image (regular)
       ansible.builtin.shell: |
@@ -262,6 +290,7 @@
                      {{ base_images_dir }}
       register: ai_inference_base_build
       changed_when: true
+      tags: [ai-inference-base]
 
     - name: Push AI inference base image (regular)
       ansible.builtin.shell: |
@@ -271,6 +300,7 @@
       failed_when: ai_inference_base_push.rc != 0
       retries: 2
       delay: 10
+      tags: [ai-inference-base]
 
     # vLLM Base Image - COMMENTED OUT - Waiting for vLLM sm_121a (DGX Spark GB10) support
     # vLLM 0.11.1rc5 does not support sm_121a Blackwell architecture
