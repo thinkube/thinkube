@@ -1,0 +1,352 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/jupyterhub/16_configure_code_server_storage.yaml
+# Description:
+#   Configure code-server to mount JuiceFS storage shared with JupyterHub
+#   Creates static PVs pointing to same JuiceFS paths as JupyterHub dynamic PVs
+#
+# Requirements:
+#   - JupyterHub must be deployed with JuiceFS PVCs
+#   - code-server must be deployed
+#
+# Usage:
+#   Called from 00_install.yaml orchestration after JupyterHub deployment
+#
+# 🤖 AI-assisted
+
+- name: Configure Code Server with JuiceFS Storage
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    code_server_namespace: "code-server"
+    jupyterhub_namespace: "jupyterhub"
+    juicefs_namespace: "juicefs"
+
+  tasks:
+    ###################################################################
+    # 1) Discover subPaths from existing JupyterHub PVs
+    ###################################################################
+    - name: Get JupyterHub notebooks PVC
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: PersistentVolumeClaim
+        namespace: "{{ jupyterhub_namespace }}"
+        name: jupyterhub-notebooks-pvc
+      register: notebooks_pvc
+
+    - name: Get JupyterHub datasets PVC
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: PersistentVolumeClaim
+        namespace: "{{ jupyterhub_namespace }}"
+        name: jupyterhub-datasets-pvc
+      register: datasets_pvc
+
+    - name: Get JupyterHub models PVC
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: PersistentVolumeClaim
+        namespace: "{{ jupyterhub_namespace }}"
+        name: jupyterhub-models-pvc
+      register: models_pvc
+
+    - name: Check if JupyterHub PVCs exist
+      ansible.builtin.assert:
+        that:
+          - notebooks_pvc.resources | length > 0
+          - datasets_pvc.resources | length > 0
+          - models_pvc.resources | length > 0
+        fail_msg: "JupyterHub PVCs not found. Ensure JupyterHub is deployed first."
+
+    - name: Get notebooks PV details
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: PersistentVolume
+        name: "{{ notebooks_pvc.resources[0].spec.volumeName }}"
+      register: notebooks_pv
+
+    - name: Get datasets PV details
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: PersistentVolume
+        name: "{{ datasets_pvc.resources[0].spec.volumeName }}"
+      register: datasets_pv
+
+    - name: Get models PV details
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: PersistentVolume
+        name: "{{ models_pvc.resources[0].spec.volumeName }}"
+      register: models_pv
+
+    - name: Extract subPaths from JupyterHub PVs
+      ansible.builtin.set_fact:
+        notebooks_subpath: "{{ notebooks_pv.resources[0].spec.csi.volumeAttributes.subPath }}"
+        datasets_subpath: "{{ datasets_pv.resources[0].spec.csi.volumeAttributes.subPath }}"
+        models_subpath: "{{ models_pv.resources[0].spec.csi.volumeAttributes.subPath }}"
+
+    - name: Display discovered subPaths
+      ansible.builtin.debug:
+        msg:
+          - "Notebooks subPath: {{ notebooks_subpath }}"
+          - "Datasets subPath: {{ datasets_subpath }}"
+          - "Models subPath: {{ models_subpath }}"
+
+    ###################################################################
+    # 2) Create static PVs for code-server
+    ###################################################################
+    - name: Create static PV for code-server notebooks
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: code-server-notebooks-pv
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 100Gi
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-secret
+                namespace: "{{ juicefs_namespace }}"
+              volumeAttributes:
+                subPath: "{{ notebooks_subpath }}"
+              volumeHandle: code-server-notebooks
+            persistentVolumeReclaimPolicy: Retain
+            volumeMode: Filesystem
+
+    - name: Create static PV for code-server datasets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: code-server-datasets-pv
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 500Gi
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-secret
+                namespace: "{{ juicefs_namespace }}"
+              volumeAttributes:
+                subPath: "{{ datasets_subpath }}"
+              volumeHandle: code-server-datasets
+            persistentVolumeReclaimPolicy: Retain
+            volumeMode: Filesystem
+
+    - name: Create static PV for code-server models
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: code-server-models-pv
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 200Gi
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-secret
+                namespace: "{{ juicefs_namespace }}"
+              volumeAttributes:
+                subPath: "{{ models_subpath }}"
+              volumeHandle: code-server-models
+            persistentVolumeReclaimPolicy: Retain
+            volumeMode: Filesystem
+
+    - name: Create static PV for code-server mlflow
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: code-server-mlflow-pv
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 1Ti
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-mlflow-secret
+                namespace: "{{ juicefs_namespace }}"
+              volumeHandle: code-server-mlflow
+            persistentVolumeReclaimPolicy: Retain
+            volumeMode: Filesystem
+
+    ###################################################################
+    # 3) Create PVCs in code-server namespace
+    ###################################################################
+    - name: Create PVC for code-server notebooks
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: code-server-notebooks-pvc
+            namespace: "{{ code_server_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: code-server-notebooks-pv
+            storageClassName: ""
+            resources:
+              requests:
+                storage: 100Gi
+
+    - name: Create PVC for code-server datasets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: code-server-datasets-pvc
+            namespace: "{{ code_server_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: code-server-datasets-pv
+            storageClassName: ""
+            resources:
+              requests:
+                storage: 500Gi
+
+    - name: Create PVC for code-server models
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: code-server-models-pvc
+            namespace: "{{ code_server_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: code-server-models-pv
+            storageClassName: ""
+            resources:
+              requests:
+                storage: 200Gi
+
+    - name: Create PVC for code-server mlflow
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: code-server-mlflow-pvc
+            namespace: "{{ code_server_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: code-server-mlflow-pv
+            storageClassName: ""
+            resources:
+              requests:
+                storage: 1Ti
+
+    ###################################################################
+    # 4) Patch code-server deployment to add volumes and mounts
+    ###################################################################
+    - name: Patch code-server deployment with JuiceFS volumes
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        merge_type: strategic-merge
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: code-server
+            namespace: "{{ code_server_namespace }}"
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: code-server
+                    volumeMounts:
+                      - name: thinkube-ai-notebooks
+                        mountPath: /home/thinkube/thinkube-ai/notebooks
+                      - name: thinkube-ai-datasets
+                        mountPath: /home/thinkube/thinkube-ai/datasets
+                      - name: thinkube-ai-models
+                        mountPath: /home/thinkube/thinkube-ai/models
+                      - name: thinkube-ai-mlflow
+                        mountPath: /home/thinkube/thinkube-ai/mlflow
+                volumes:
+                  - name: thinkube-ai-notebooks
+                    persistentVolumeClaim:
+                      claimName: code-server-notebooks-pvc
+                  - name: thinkube-ai-datasets
+                    persistentVolumeClaim:
+                      claimName: code-server-datasets-pvc
+                  - name: thinkube-ai-models
+                    persistentVolumeClaim:
+                      claimName: code-server-models-pvc
+                  - name: thinkube-ai-mlflow
+                    persistentVolumeClaim:
+                      claimName: code-server-mlflow-pvc
+
+    ###################################################################
+    # 5) Restart code-server to pick up new mounts
+    ###################################################################
+    - name: Restart code-server deployment
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout restart deployment/code-server -n {{ code_server_namespace }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+
+    - name: Wait for code-server to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status deployment/code-server -n {{ code_server_namespace }} --timeout=120s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg:
+          - "Code-server JuiceFS storage configured successfully!"
+          - ""
+          - "Mount points available in code-server:"
+          - "  /home/thinkube/thinkube-ai/notebooks - JupyterHub notebooks"
+          - "  /home/thinkube/thinkube-ai/datasets  - Shared datasets"
+          - "  /home/thinkube/thinkube-ai/models    - User models"
+          - "  /home/thinkube/thinkube-ai/mlflow    - MLflow artifacts"
+          - ""
+          - "These are the same files accessible from JupyterHub at /home/jovyan/thinkube/"
