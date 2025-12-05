@@ -50,6 +50,8 @@
     valkey_hostname: "valkey.{{ domain_name }}"
     valkey_tls_secret_name: "{{ valkey_namespace }}-tls-secret"
     ingress_tcp_configmap_name: "primary-ingress-ingress-nginx-tcp"
+    # Password from environment (same as admin password)
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
 
   tasks:
     - name: Load Harbor robot token from .env file
@@ -95,6 +97,20 @@
           type: kubernetes.io/dockerconfigjson
           data:
             .dockerconfigjson: "{{ {'auths': {harbor_registry: {'username': harbor_robot_user, 'password': harbor_robot_token, 'auth': (harbor_robot_user + ':' + harbor_robot_token) | b64encode}}} | to_json | b64encode }}"
+
+    - name: Create Valkey password secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: valkey-auth
+          type: Opaque
+          stringData:
+            password: "{{ admin_password }}"
 
     - name: Create PVC for Valkey data
       kubernetes.core.k8s:
@@ -149,6 +165,16 @@
                     - "yes"
                     - "--protected-mode"
                     - "no"
+                    - "--requirepass"
+                    - "$(VALKEY_PASSWORD)"
+                    - "--maxmemory-policy"
+                    - "noeviction"
+                  env:
+                    - name: VALKEY_PASSWORD
+                      valueFrom:
+                        secretKeyRef:
+                          name: valkey-auth
+                          key: password
                   ports:
                   - containerPort: "{{ valkey_port }}"
                     name: valkey

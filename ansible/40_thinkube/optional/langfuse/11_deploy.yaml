@@ -169,53 +169,76 @@
       changed_when: "'Bucket created' in s3_media_result.stdout or s3_media_result.rc == 0"
 
     ###########################################################################
-    # Step 4: Create Langfuse Secrets
+    # Step 4: Create Langfuse Secrets (idempotent - preserve existing keys)
     ###########################################################################
-    - name: Generate NEXTAUTH_SECRET
-      ansible.builtin.set_fact:
-        nextauth_secret: "{{ lookup('password', '/dev/null length=64 chars=ascii_letters,digits') }}"
+    - name: Check if Langfuse config secret already exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ k8s_namespace }}"
+        name: langfuse-config
+      register: existing_langfuse_secret
 
-    - name: Generate SALT
+    - name: Extract existing keys if secret exists
       ansible.builtin.set_fact:
-        langfuse_salt: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+        existing_nextauth_secret: "{{ existing_langfuse_secret.resources[0].data['NEXTAUTH_SECRET'] | b64decode }}"
+        existing_salt: "{{ existing_langfuse_secret.resources[0].data['SALT'] | b64decode }}"
+        existing_encryption_key: "{{ existing_langfuse_secret.resources[0].data['ENCRYPTION_KEY'] | b64decode }}"
+        existing_admin_api_key: "{{ existing_langfuse_secret.resources[0].data['ADMIN_API_KEY'] | b64decode }}"
+        existing_public_key: "{{ existing_langfuse_secret.resources[0].data['LANGFUSE_INIT_PROJECT_PUBLIC_KEY'] | b64decode }}"
+        existing_secret_key: "{{ existing_langfuse_secret.resources[0].data['LANGFUSE_INIT_PROJECT_SECRET_KEY'] | b64decode }}"
+      when: existing_langfuse_secret.resources | length > 0
 
-    - name: Generate ENCRYPTION_KEY (64-char hex string for 256-bit encryption)
+    - name: Generate NEXTAUTH_SECRET (only if not exists)
+      ansible.builtin.set_fact:
+        nextauth_secret: "{{ existing_nextauth_secret | default(lookup('password', '/dev/null length=64 chars=ascii_letters,digits')) }}"
+
+    - name: Generate SALT (only if not exists)
+      ansible.builtin.set_fact:
+        langfuse_salt: "{{ existing_salt | default(lookup('password', '/dev/null length=32 chars=ascii_letters,digits')) }}"
+
+    - name: Generate ENCRYPTION_KEY (only if not exists)
       ansible.builtin.shell: openssl rand -hex 32
       register: encryption_key_result
       changed_when: false
+      when: existing_encryption_key is not defined
 
     - name: Set ENCRYPTION_KEY fact
       ansible.builtin.set_fact:
-        langfuse_encryption_key: "{{ encryption_key_result.stdout }}"
+        langfuse_encryption_key: "{{ existing_encryption_key | default(encryption_key_result.stdout) }}"
 
-    - name: Generate Langfuse Admin API key
+    - name: Generate Langfuse Admin API key (only if not exists)
       ansible.builtin.shell: openssl rand -hex 32
       register: admin_api_key_result
       changed_when: false
+      when: existing_admin_api_key is not defined
 
     - name: Set ADMIN_API_KEY fact
       ansible.builtin.set_fact:
-        langfuse_admin_api_key: "{{ admin_api_key_result.stdout }}"
+        langfuse_admin_api_key: "{{ existing_admin_api_key | default(admin_api_key_result.stdout) }}"
 
-    - name: Generate Langfuse project public key
+    - name: Generate Langfuse project public key (only if not exists)
       ansible.builtin.shell: |
         echo "lf_pk_$(openssl rand -hex 16)"
       register: project_public_key_result
       changed_when: false
+      when: existing_public_key is not defined
 
     - name: Set project public key fact
       ansible.builtin.set_fact:
-        langfuse_project_public_key: "{{ project_public_key_result.stdout }}"
+        langfuse_project_public_key: "{{ existing_public_key | default(project_public_key_result.stdout) }}"
 
-    - name: Generate Langfuse project secret key
+    - name: Generate Langfuse project secret key (only if not exists)
       ansible.builtin.shell: |
         echo "lf_sk_$(openssl rand -hex 32)"
       register: project_secret_key_result
       changed_when: false
+      when: existing_secret_key is not defined
 
     - name: Set project secret key fact
       ansible.builtin.set_fact:
-        langfuse_project_secret_key: "{{ project_secret_key_result.stdout }}"
+        langfuse_project_secret_key: "{{ existing_secret_key | default(project_secret_key_result.stdout) }}"
 
     - name: Create Langfuse configuration secret
       kubernetes.core.k8s:
@@ -240,6 +263,7 @@
             # Redis configuration (Langfuse v3 requirement)
             REDIS_HOST: "valkey.valkey.svc.cluster.local"
             REDIS_PORT: "6379"
+            REDIS_AUTH: "{{ admin_password }}"
             # Encryption (Langfuse v3 requirement - 64-char hex string)
             ENCRYPTION_KEY: "{{ langfuse_encryption_key }}"
             # S3 Event Upload configuration (Langfuse v3 requirement)
@@ -356,6 +380,50 @@
                       periodSeconds: 5
                       timeoutSeconds: 3
                       failureThreshold: 3
+
+    ###########################################################################
+    # Step 5b: Deploy Langfuse Worker (processes events from Redis queue)
+    ###########################################################################
+    - name: Create Langfuse Worker Deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: langfuse-worker
+            namespace: "{{ k8s_namespace }}"
+            labels:
+              app: langfuse-worker
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: langfuse-worker
+            template:
+              metadata:
+                labels:
+                  app: langfuse-worker
+              spec:
+                initContainers:
+                  - name: wait-for-langfuse
+                    image: busybox:latest
+                    command: ['sh', '-c', 'until nc -z langfuse.{{ k8s_namespace }}.svc.cluster.local 3000; do echo waiting for langfuse web; sleep 2; done;']
+                containers:
+                  - name: langfuse-worker
+                    image: "{{ harbor_registry }}/library/langfuse-worker:3.113.0"
+                    imagePullPolicy: IfNotPresent
+                    envFrom:
+                      - secretRef:
+                          name: langfuse-config
+                    resources:
+                      requests:
+                        cpu: "500m"
+                        memory: "1Gi"
+                      limits:
+                        cpu: "2"
+                        memory: "4Gi"
 
     ###########################################################################
     # Step 6: Create Langfuse Service
