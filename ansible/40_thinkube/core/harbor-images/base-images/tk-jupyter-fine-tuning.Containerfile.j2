@@ -2,24 +2,54 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Jupyter Fine-Tuning Lab - LLM fine-tuning environment with Unsloth and QLoRA
-# Base: jupyter-ml-gpu (CUDA 12.6 + PyTorch)
+# Base: jupyter-ml-gpu (CUDA 13.0 + PyTorch 2.9.1 stable)
 # Includes: Unsloth, bitsandbytes, PEFT, TRL for efficient LLM fine-tuning
 
 FROM {{ harbor_registry }}/library/tk-jupyter-ml-gpu:latest
 
-USER jovyan
+USER root
 
-# Install LLM fine-tuning packages
-RUN python -m pip install --no-cache-dir --user \
-    unsloth==2025.9.9 \
-    bitsandbytes==0.47.0 \
-    peft==0.17.1 \
-    trl==0.23.0
+# Install CUDA toolkit (nvcc) and Python dev headers for torch.compile/Inductor/Triton JIT
+# Required by Unsloth for optimized CUDA kernel generation
+# - cuda-nvcc-13-0: CUDA compiler
+# - cuda-cudart-dev-13-0: CUDA runtime development files
+# - python3.12-dev: Python.h headers needed by Triton to compile CUDA utilities
+# Note: python3.12-dev reinstates EXTERNALLY-MANAGED marker (PEP 668), so we remove it again
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        cuda-nvcc-13-0 \
+        cuda-cudart-dev-13-0 \
+        python3.12-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/lib/python*/EXTERNALLY-MANAGED \
+    && ln -sf /usr/local/cuda-13.0 /usr/local/cuda
+
+# Ensure nvcc is in PATH
+ENV PATH="/usr/local/cuda/bin:${PATH}"
+
+# Install LLM fine-tuning packages compatible with CUDA 13.0 + PyTorch 2.9.1 stable
+# bitsandbytes 0.48.2+ supports CUDA 13
+RUN pip install --no-cache-dir \
+    bitsandbytes>=0.48.2 \
+    peft>=0.17.1 \
+    trl>=0.23.0
+
+# Install Unsloth with CUDA 13.0 + PyTorch 2.9.1 support
+# Use cu130onlytorch291 extra for exact version match
+# The --no-deps flag prevents conflicts with our existing torch installation
+RUN pip install --no-deps git+https://github.com/unslothai/unsloth-zoo.git && \
+    pip install "unsloth[cu130onlytorch291] @ git+https://github.com/unslothai/unsloth.git" --no-build-isolation --no-deps
+
+# Install unsloth dependencies separately to avoid torch conflicts
+RUN pip install --no-cache-dir \
+    tyro \
+    hf_transfer \
+    sentencepiece \
+    protobuf
 
 # All Thinkube service clients are inherited from base image
 
 # Override Jupyter flavor identifier for fine-tuning
-USER root
 RUN echo "fine-tuning" > /home/jovyan/.jupyter_flavor && \
     chown 1000:100 /home/jovyan/.jupyter_flavor
 
@@ -27,6 +57,7 @@ RUN echo "fine-tuning" > /home/jovyan/.jupyter_flavor && \
 # But we need to override with our image name
 COPY startup.sh /usr/local/bin/startup.sh
 RUN chmod +x /usr/local/bin/startup.sh
+
 USER jovyan
 
 # 🤖 AI-assisted

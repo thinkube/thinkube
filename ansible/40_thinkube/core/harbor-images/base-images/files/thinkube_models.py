@@ -158,29 +158,49 @@ def load_model_for_finetuning(model_id: str, device_map: str = "auto"):
     experiment_id = run_response.json()['run']['info']['experiment_id']
 
     # Construct model path on JuiceFS
-    # Models are stored at: /mlflow-models/artifacts/{experiment_id}/{run_id}/artifacts/model
-    model_path = Path(f'/mlflow-models/artifacts/{experiment_id}/{run_id}/artifacts/model')
+    # Try multiple possible mount points for different environments:
+    # - JupyterHub: /home/jovyan/thinkube/mlflow/artifacts/...
+    # - TensorRT-LLM pods: /mlflow-models/artifacts/...
+    possible_base_paths = [
+        Path('/home/jovyan/thinkube/mlflow'),  # JupyterHub mount
+        Path('/mlflow-models'),                 # GPU pod mount
+        Path.home() / 'thinkube' / 'mlflow',    # Generic home-based path
+    ]
 
-    if not model_path.exists():
+    model_path = None
+    for base_path in possible_base_paths:
+        candidate = base_path / 'artifacts' / experiment_id / run_id / 'artifacts' / 'model'
+        if candidate.exists():
+            model_path = candidate
+            break
+
+    if model_path is None:
+        tried_paths = [str(p / 'artifacts' / experiment_id / run_id / 'artifacts' / 'model')
+                       for p in possible_base_paths]
         raise FileNotFoundError(
-            f"Model path does not exist: {model_path}. "
-            f"The model may not have been mirrored correctly."
+            f"Model not found. Tried paths:\n" +
+            "\n".join(f"  - {p}" for p in tried_paths) +
+            f"\nThe model may not have been mirrored correctly."
         )
 
     print(f"  Model path: {model_path}")
 
     # Load with Unsloth for efficient fine-tuning
+    # Unsloth handles MXFP4 models internally - it converts MXFP4 to NF4 for training
+    # when load_in_4bit=True. This is their "magic" for gpt-oss models.
     try:
         from unsloth import FastLanguageModel
 
-        print(f"  Loading with Unsloth FastLanguageModel...")
+        print(f"  Loading with Unsloth FastLanguageModel from: {model_path}")
+        print(f"  Using load_in_4bit=True (Unsloth handles MXFP4→NF4 conversion)")
+
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=str(model_path),
-            dtype=None,  # Auto-detect
-            load_in_4bit=True,  # Use 4-bit for fine-tuning efficiency
+            dtype=None,
+            load_in_4bit=True,  # Unsloth converts MXFP4 to trainable NF4 internally
             device_map=device_map,
         )
-        print(f"  ✓ Model loaded successfully with Unsloth")
+        print(f"  ✓ Model loaded with Unsloth (ready for QLoRA fine-tuning)")
 
     except ImportError:
         # Fallback to standard transformers if Unsloth not available
