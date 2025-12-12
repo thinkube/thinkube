@@ -14,12 +14,18 @@ USER root
 # - cuda-nvcc-13-0: CUDA compiler
 # - cuda-cudart-dev-13-0: CUDA runtime development files
 # - python3.12-dev: Python.h headers needed by Triton to compile CUDA utilities
+# - cmake, g++, git: Required to build pyonmttok from source (AINA translator dependency)
+# - libicu-dev: ICU library required by OpenNMT Tokenizer
 # Note: python3.12-dev reinstates EXTERNALLY-MANAGED marker (PEP 668), so we remove it again
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         cuda-nvcc-13-0 \
         cuda-cudart-dev-13-0 \
         python3.12-dev \
+        cmake \
+        g++ \
+        git \
+        libicu-dev \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /usr/lib/python*/EXTERNALLY-MANAGED \
     && ln -sf /usr/local/cuda-13.0 /usr/local/cuda
@@ -32,7 +38,7 @@ ENV PATH="/usr/local/cuda/bin:${PATH}"
 RUN pip install --no-cache-dir \
     bitsandbytes>=0.48.2 \
     peft>=0.17.1 \
-    trl>=0.23.0
+    trl==0.23.0
 
 # Install Unsloth with CUDA 13.0 + PyTorch 2.9.1 support
 # Use cu130onlytorch291 extra for exact version match
@@ -46,6 +52,51 @@ RUN pip install --no-cache-dir \
     hf_transfer \
     sentencepiece \
     protobuf
+
+# Build CTranslate2 from source with CUDA support for NVIDIA GB10 (sm_120)
+# The pip wheel is CPU-only; we need GPU acceleration for translation
+# Key challenges solved:
+# - CMake's FindCUDA module doesn't know sm_120, so we patch CMakeLists.txt
+# - Replace cuda_select_nvcc_arch_flags() call with direct -gencode flags
+# - No MKL on ARM64, use OpenMP from compiler instead
+# - Disable cuDNN (INT8 doesn't work on Blackwell anyway per PR #1937)
+RUN pip install --no-cache-dir pybind11 && \
+    git clone --recursive --branch v4.6.2 https://github.com/OpenNMT/CTranslate2.git /tmp/ctranslate2 && \
+    cd /tmp/ctranslate2 && \
+    # Patch CMakeLists.txt to bypass cuda_select_nvcc_arch_flags which doesn't know sm_120
+    # The original code:
+    #   cuda_select_nvcc_arch_flags(ARCH_FLAGS ${CUDA_ARCH_LIST})
+    #   list(APPEND CUDA_NVCC_FLAGS ${ARCH_FLAGS})
+    # We replace both lines with direct sm_120 flags
+    sed -i 's/cuda_select_nvcc_arch_flags(ARCH_FLAGS \${CUDA_ARCH_LIST})/# Patched: skip cuda_select_nvcc_arch_flags for sm_120/' CMakeLists.txt && \
+    sed -i 's/list(APPEND CUDA_NVCC_FLAGS \${ARCH_FLAGS})/list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=sm_120")/' CMakeLists.txt && \
+    mkdir build && cd build && \
+    cmake -DWITH_CUDA=ON \
+          -DWITH_MKL=OFF \
+          -DWITH_CUDNN=OFF \
+          -DOPENMP_RUNTIME=COMP \
+          .. && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd /tmp/ctranslate2/python && \
+    pip install --no-cache-dir . && \
+    rm -rf /tmp/ctranslate2
+
+# Install pyonmttok for AINA translator (Spanish→Catalan)
+# pyonmttok must be built from source on ARM64 (no pre-built wheels available)
+# Requires: cmake, g++, git, libicu-dev installed above
+# Build process: 1) Build C++ library, 2) Install it, 3) Build Python bindings
+RUN git clone --depth 1 --recurse-submodules https://github.com/OpenNMT/Tokenizer.git /tmp/tokenizer && \
+    cd /tmp/tokenizer && \
+    mkdir build && cd build && \
+    cmake -DLIB_ONLY=ON -DCMAKE_INSTALL_PREFIX=/usr/local .. && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd /tmp/tokenizer/bindings/python && \
+    pip install --no-cache-dir . && \
+    rm -rf /tmp/tokenizer
 
 # All Thinkube service clients are inherited from base image
 
