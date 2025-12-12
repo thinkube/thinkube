@@ -15,7 +15,18 @@
 #
 # Usage:
 #   cd ~/thinkube
-#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/15_build_jupyter_images.yaml
+#   # Build all images:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/harbor-images/15_build_jupyter_images.yaml
+#
+#   # Build individual images with tags:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/harbor-images/15_build_jupyter_images.yaml --tags ml-gpu
+#   ./scripts/tk_ansible ansible/40_thinkube/core/harbor-images/15_build_jupyter_images.yaml --tags fine-tuning
+#   ./scripts/tk_ansible ansible/40_thinkube/core/harbor-images/15_build_jupyter_images.yaml --tags agent-dev
+#
+# Available tags:
+#   ml-gpu       - Build tk-jupyter-ml-gpu (base image)
+#   fine-tuning  - Build tk-jupyter-fine-tuning (requires ml-gpu in registry)
+#   agent-dev    - Build tk-jupyter-agent-dev (requires ml-gpu in registry)
 #
 # Variables from inventory:
 #   - harbor_registry: Harbor registry hostname
@@ -37,70 +48,90 @@
     admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
   tasks:
+    # ==========================================================================
+    # COMMON SETUP (always runs)
+    # ==========================================================================
     - name: Create build context directory
       ansible.builtin.file:
         path: "{{ base_images_dir }}"
         state: directory
         mode: '0755'
+      tags: [always]
 
     - name: Create temp directory for templated Containerfiles
       ansible.builtin.tempfile:
         state: directory
         suffix: jupyter-containerfiles
       register: temp_containerfiles_dir
+      tags: [always]
 
     - name: Template Thinkube environment file for Jupyter images
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/thinkube_env.j2"
         dest: "{{ base_images_dir }}/.thinkube_env"
         mode: '0644'
+      tags: [always]
 
     - name: Template iPython startup script for environment loading
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/templates/00-thinkube-env.py"
         dest: "{{ base_images_dir }}/00-thinkube-env.py"
         mode: '0644'
+      tags: [always]
 
     - name: Template Jupyter test notebook
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/templates/test-thinkube-services.ipynb.j2"
         dest: "{{ base_images_dir }}/test-thinkube-services.ipynb"
         mode: '0644'
+      tags: [always]
 
     - name: Copy Thinkube icons to build context
       ansible.builtin.copy:
         src: "{{ local_base_images_dir }}/icons/"
         dest: "{{ base_images_dir }}/icons/"
         mode: '0644'
+      tags: [always]
 
     - name: Copy Jupyter flavor validation helper
       ansible.builtin.copy:
         src: "{{ local_base_images_dir }}/files/check_jupyter_flavor.py"
         dest: "{{ base_images_dir }}/check_jupyter_flavor.py"
         mode: '0644'
+      tags: [always]
 
     - name: Copy Thinkube models helper
       ansible.builtin.copy:
         src: "{{ local_base_images_dir }}/files/thinkube_models.py"
         dest: "{{ base_images_dir }}/thinkube_models.py"
         mode: '0644'
+      tags: [always]
 
     - name: Login to Harbor
       ansible.builtin.shell: |
         echo {{ admin_password }} | podman login {{ harbor_registry }} -u admin --password-stdin --tls-verify=true
       changed_when: false
       no_log: true
-
-    - name: Template tk-jupyter-ml-gpu Containerfile
-      ansible.builtin.template:
-        src: "{{ local_base_images_dir }}/tk-jupyter-ml-gpu.Containerfile.j2"
-        dest: "{{ temp_containerfiles_dir.path }}/tk-jupyter-ml-gpu.Containerfile"
+      tags: [always]
 
     - name: Template startup.sh for Jupyter images
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/startup.sh.j2"
         dest: "{{ base_images_dir }}/startup.sh"
+      tags: [always]
 
+    # ==========================================================================
+    # ML-GPU IMAGE (base image for others)
+    # Usage: --tags ml-gpu
+    # ==========================================================================
+    - name: Template tk-jupyter-ml-gpu Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/tk-jupyter-ml-gpu.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/tk-jupyter-ml-gpu.Containerfile"
+      tags: [ml-gpu]
+
+    # Use CACHE_BUST arg to invalidate only the tk-ai-extension layer (last layers in Containerfile)
+    # All base packages (PyTorch, transformers, etc.) will use cached layers for fast rebuilds
     - name: Build tk-jupyter-ml-gpu image
       ansible.builtin.shell: |
         podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
@@ -111,6 +142,7 @@
                      {{ base_images_dir }}
       register: tk_jupyter_ml_gpu_build
       changed_when: true
+      tags: [ml-gpu]
 
     - name: Push tk-jupyter-ml-gpu image
       ansible.builtin.shell: |
@@ -120,11 +152,17 @@
       failed_when: tk_jupyter_ml_gpu_push.rc != 0
       retries: 2
       delay: 10
+      tags: [ml-gpu]
 
+    # ==========================================================================
+    # FINE-TUNING IMAGE (depends on ml-gpu)
+    # Usage: --tags fine-tuning
+    # ==========================================================================
     - name: Template tk-jupyter-fine-tuning Containerfile
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/tk-jupyter-fine-tuning.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/tk-jupyter-fine-tuning.Containerfile"
+      tags: [fine-tuning]
 
     - name: Build tk-jupyter-fine-tuning image
       ansible.builtin.shell: |
@@ -135,6 +173,7 @@
                      {{ base_images_dir }}
       register: tk_jupyter_fine_tuning_build
       changed_when: true
+      tags: [fine-tuning]
 
     - name: Push tk-jupyter-fine-tuning image
       ansible.builtin.shell: |
@@ -144,11 +183,17 @@
       failed_when: tk_jupyter_fine_tuning_push.rc != 0
       retries: 2
       delay: 10
+      tags: [fine-tuning]
 
+    # ==========================================================================
+    # AGENT-DEV IMAGE (depends on ml-gpu)
+    # Usage: --tags agent-dev
+    # ==========================================================================
     - name: Template tk-jupyter-agent-dev Containerfile
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/tk-jupyter-agent-dev.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/tk-jupyter-agent-dev.Containerfile"
+      tags: [agent-dev]
 
     - name: Build tk-jupyter-agent-dev image
       ansible.builtin.shell: |
@@ -159,6 +204,7 @@
                      {{ base_images_dir }}
       register: tk_jupyter_agent_dev_build
       changed_when: true
+      tags: [agent-dev]
 
     - name: Push tk-jupyter-agent-dev image
       ansible.builtin.shell: |
@@ -168,13 +214,21 @@
       failed_when: tk_jupyter_agent_dev_push.rc != 0
       retries: 2
       delay: 10
+      tags: [agent-dev]
 
+    # ==========================================================================
+    # CLEANUP (always runs)
+    # ==========================================================================
     - name: Clean up temp containerfiles directory
       ansible.builtin.file:
         path: "{{ temp_containerfiles_dir.path }}"
         state: absent
       when: temp_containerfiles_dir.path is defined
+      tags: [always]
 
+    # ==========================================================================
+    # MANIFEST & COMPLETION (only when building all images)
+    # ==========================================================================
     - name: Create manifest for Jupyter images
       include_role:
         name: container_deployment/image_manifest
@@ -212,6 +266,7 @@
         manifest_category: "user"
         manifest_source: "built"
         manifest_namespace: "registry"
+      tags: [ml-gpu, fine-tuning, agent-dev]
 
     - name: Display completion message
       ansible.builtin.debug:
@@ -242,3 +297,4 @@
           Run this playbook separately from JupyterHub deployment
           for faster iteration during image development.
           ════════════════════════════════════════════════════════
+      tags: [ml-gpu, fine-tuning, agent-dev]
