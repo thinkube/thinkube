@@ -4,31 +4,24 @@
 # ansible/40_thinkube/core/jupyterhub/99_build_venvs.yaml
 #
 # PURPOSE:
-#   Build pre-packaged Python virtualenvs for JupyterHub.
-#   This is a MAINTAINER playbook - run once per architecture to create
-#   venv tarballs that get uploaded to GitHub releases.
+#   Build pre-packaged Python virtualenvs for JupyterHub and upload to GitHub.
+#   Fully automated - waits for build completion and uploads to GitHub releases.
 #
 # REQUIREMENTS:
 #   - tk-jupyter-base image built and pushed to Harbor
 #   - kubectl access to the cluster
 #   - GPU node available for the target architecture
+#   - gh CLI authenticated (gh auth login)
 #
 # USAGE:
-#   # Build venvs for ARM64 (run on cluster with ARM64 GPU nodes):
 #   ./scripts/tk_ansible ansible/40_thinkube/core/jupyterhub/99_build_venvs.yaml
 #
-#   # After build completes, upload tarballs to GitHub:
-#   kubectl cp jupyterhub/venvs-builder:/output /tmp/venvs-output
-#   gh release create v0.1.0 /tmp/venvs-output/arm64/*.tar.gz --repo thinkube/thinkube-venvs
-#
 # OUTPUT:
-#   Venv tarballs in the pod at /output/{arch}/:
-#   - ml-gpu.tar.gz
-#   - fine-tuning.tar.gz
-#   - agent-dev.tar.gz
+#   Venv tarballs uploaded to GitHub release at:
+#   https://github.com/thinkube/thinkube-venvs/releases/tag/{version}
 
 ---
-- name: Build Jupyter Virtualenvs
+- name: Build and Upload Jupyter Virtualenvs
   hosts: k8s_control_plane
   gather_facts: false
 
@@ -36,17 +29,29 @@
     venvs_version: "v0.1.0"
     build_namespace: "jupyterhub"
     job_name: "venvs-builder"
+    github_repo: "thinkube/thinkube-venvs"
+    local_output_dir: "/tmp/venvs-output-{{ ansible_date_time.epoch | default(lookup('pipe', 'date +%s')) }}"
 
   tasks:
     - name: Display build info
       ansible.builtin.debug:
         msg: |
-          Building Jupyter venvs version {{ venvs_version }}
-          This will create a K8s Job that builds venvs inside tk-jupyter-base.
+          ════════════════════════════════════════════════════════════════
+          Building Jupyter Venvs {{ venvs_version }}
+          ════════════════════════════════════════════════════════════════
 
-          After completion, copy the tarballs and upload to GitHub:
-            kubectl cp {{ build_namespace }}/{{ job_name }}:/output /tmp/venvs-output
-            gh release create {{ venvs_version }} /tmp/venvs-output/*/*.tar.gz --repo thinkube/thinkube-venvs
+          This playbook will:
+          1. Build venvs in a K8s Job (30-60 minutes)
+          2. Copy tarballs from the pod
+          3. Upload to GitHub release automatically
+
+          GitHub repo: {{ github_repo }}
+
+    - name: Check gh CLI is authenticated
+      ansible.builtin.command: gh auth status
+      register: gh_auth
+      failed_when: gh_auth.rc != 0
+      changed_when: false
 
     - name: Copy build script to ConfigMap
       kubernetes.core.k8s:
@@ -68,6 +73,8 @@
         kind: Job
         name: "{{ job_name }}"
         namespace: "{{ build_namespace }}"
+        wait: true
+        wait_timeout: 60
       ignore_errors: true
 
     - name: Create venvs build job
@@ -80,7 +87,7 @@
             name: "{{ job_name }}"
             namespace: "{{ build_namespace }}"
           spec:
-            ttlSecondsAfterFinished: 86400  # Keep for 24 hours
+            ttlSecondsAfterFinished: 3600  # Keep for 1 hour after completion
             backoffLimit: 0  # Don't retry on failure
             template:
               spec:
@@ -121,44 +128,120 @@
                 nodeSelector:
                   nvidia.com/gpu.present: "true"
 
-    - name: Wait for build job to start
+    - name: Wait for build job to complete (this takes 30-60 minutes)
       kubernetes.core.k8s_info:
         api_version: batch/v1
         kind: Job
         name: "{{ job_name }}"
         namespace: "{{ build_namespace }}"
       register: job_info
-      until: job_info.resources[0].status.active is defined and job_info.resources[0].status.active > 0
-      retries: 30
-      delay: 10
+      until: >
+        (job_info.resources[0].status.succeeded is defined and job_info.resources[0].status.succeeded == 1) or
+        (job_info.resources[0].status.failed is defined and job_info.resources[0].status.failed > 0)
+      retries: 180  # 180 * 20s = 60 minutes max wait
+      delay: 20
 
-    - name: Display build progress instructions
+    - name: Check if build succeeded
+      ansible.builtin.fail:
+        msg: "Venvs build job failed! Check logs with: kubectl logs job/{{ job_name }} -n {{ build_namespace }}"
+      when: job_info.resources[0].status.failed is defined and job_info.resources[0].status.failed > 0
+
+    - name: Get builder pod name
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ build_namespace }}"
+        label_selectors:
+          - "job-name={{ job_name }}"
+      register: pod_info
+
+    - name: Set pod name fact
+      ansible.builtin.set_fact:
+        builder_pod: "{{ pod_info.resources[0].metadata.name }}"
+
+    - name: Create local output directory
+      ansible.builtin.file:
+        path: "{{ local_output_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Copy tarballs from pod
+      ansible.builtin.command: >
+        kubectl cp {{ build_namespace }}/{{ builder_pod }}:/output {{ local_output_dir }}
+      register: copy_result
+
+    - name: List downloaded tarballs
+      ansible.builtin.find:
+        paths: "{{ local_output_dir }}"
+        patterns: "*.tar.gz"
+        recurse: true
+      register: tarballs
+
+    - name: Display tarballs found
+      ansible.builtin.debug:
+        msg: "Found {{ tarballs.files | length }} tarballs: {{ tarballs.files | map(attribute='path') | list }}"
+
+    - name: Check if GitHub release already exists
+      ansible.builtin.command: gh release view {{ venvs_version }} --repo {{ github_repo }}
+      register: release_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Create GitHub release (if it doesn't exist)
+      ansible.builtin.command: >
+        gh release create {{ venvs_version }}
+        --repo {{ github_repo }}
+        --title "Jupyter Venvs {{ venvs_version }}"
+        --notes "Pre-built Python virtualenvs for JupyterHub.
+
+        These venvs inherit PyTorch from the tk-jupyter-base image via --system-site-packages.
+
+        Venvs included:
+        - **ml-gpu**: Base ML packages (transformers, datasets, accelerate, etc.)
+        - **fine-tuning**: ML + fine-tuning packages (bitsandbytes, peft, trl, unsloth)
+        - **agent-dev**: ML + agent frameworks (langchain, crewai, langgraph, etc.)
+
+        Architecture: arm64 (DGX Spark GB10)"
+      when: release_exists.rc != 0
+
+    - name: Upload tarballs to GitHub release
+      ansible.builtin.command: >
+        gh release upload {{ venvs_version }} {{ item.path }}
+        --repo {{ github_repo }}
+        --clobber
+      loop: "{{ tarballs.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Clean up local output directory
+      ansible.builtin.file:
+        path: "{{ local_output_dir }}"
+        state: absent
+
+    - name: Delete build job
+      kubernetes.core.k8s:
+        state: absent
+        api_version: batch/v1
+        kind: Job
+        name: "{{ job_name }}"
+        namespace: "{{ build_namespace }}"
+
+    - name: Display completion message
       ansible.builtin.debug:
         msg: |
 
           ════════════════════════════════════════════════════════════════
-          Venvs Build Job Started
+          Venvs Build and Upload Complete!
           ════════════════════════════════════════════════════════════════
 
-          Job: {{ build_namespace }}/{{ job_name }}
+          Version: {{ venvs_version }}
+          GitHub Release: https://github.com/{{ github_repo }}/releases/tag/{{ venvs_version }}
 
-          Monitor progress:
-            kubectl logs -f job/{{ job_name }} -n {{ build_namespace }}
+          Uploaded tarballs:
+          {% for tarball in tarballs.files %}
+            - {{ tarball.path | basename }}
+          {% endfor %}
 
-          Check status:
-            kubectl get job {{ job_name }} -n {{ build_namespace }}
-
-          After completion (may take 30-60 minutes):
-            # Get the pod name
-            POD=$(kubectl get pods -n {{ build_namespace }} -l job-name={{ job_name }} -o jsonpath='{.items[0].metadata.name}')
-
-            # Copy output
-            kubectl cp {{ build_namespace }}/$POD:/output /tmp/venvs-output
-
-            # Upload to GitHub (requires gh CLI and authentication)
-            gh release create {{ venvs_version }} /tmp/venvs-output/*/*.tar.gz \
-              --repo thinkube/thinkube-venvs \
-              --title "Jupyter Venvs {{ venvs_version }}" \
-              --notes "Pre-built virtualenvs for JupyterHub"
+          JupyterHub pods will automatically download these venvs on startup.
 
           ════════════════════════════════════════════════════════════════
