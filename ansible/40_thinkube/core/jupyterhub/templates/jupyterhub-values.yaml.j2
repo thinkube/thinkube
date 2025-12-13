@@ -60,15 +60,15 @@ hub:
 
       # Set KUBECONFIG as environment variable for notebook kernels
       c.KubeSpawner.environment = {
-        'KUBECONFIG': '/home/jovyan/.config/thinkube/kube-config'
+        'KUBECONFIG': '/home/thinkube/.config/thinkube/kube-config'
       }
 
       # Override command to source service discovery environment
       import textwrap
       c.KubeSpawner.cmd = ['bash', '-c', textwrap.dedent("""
-      if [ -f /home/jovyan/.config/thinkube/service-env-jh.sh ]; then
+      if [ -f /home/thinkube/.config/thinkube/service-env-jh.sh ]; then
         echo "Loading service environment variables..."
-        source /home/jovyan/.config/thinkube/service-env-jh.sh
+        source /home/thinkube/.config/thinkube/service-env-jh.sh
       fi
       exec jupyterhub-singleuser --ServerApp.trust_xheaders=True
       """).strip()]
@@ -506,14 +506,14 @@ singleuser:
         - -c
         - |
           # First time setup - check marker in persistent area
-          if [ ! -f "/home/jovyan/thinkube/.thinkube-initialized" ]; then
+          if [ ! -f "/home/thinkube/thinkube/.thinkube-initialized" ]; then
             echo "First time setup - creating examples directory..."
 
             # Create examples directory for editable copies of templates
-            mkdir -p /home/jovyan/thinkube/notebooks/examples
+            mkdir -p /home/thinkube/thinkube/notebooks/examples
 
             # Mark as initialized
-            touch /home/jovyan/thinkube/.thinkube-initialized
+            touch /home/thinkube/thinkube/.thinkube-initialized
             echo "First time setup complete"
           else
             echo "Already initialized"
@@ -521,22 +521,22 @@ singleuser:
 
           # Always fix permissions for persistent areas
           echo "Fixing permissions..."
-          chown -R 1000:100 /home/jovyan/thinkube
-          chmod -R 755 /home/jovyan/thinkube
-          chown -R 1000:100 /home/jovyan/scratch 2>/dev/null || true
-          chmod -R 755 /home/jovyan/scratch 2>/dev/null || true
+          chown -R 1000:100 /home/thinkube/thinkube
+          chmod -R 755 /home/thinkube/thinkube
+          chown -R 1000:100 /home/thinkube/scratch 2>/dev/null || true
+          chmod -R 755 /home/thinkube/scratch 2>/dev/null || true
           echo "Permissions fixed"
       securityContext:
         runAsUser: 0  # Run as root to fix permissions
       volumeMounts:
         - name: notebooks
-          mountPath: /home/jovyan/thinkube/notebooks
+          mountPath: /home/thinkube/thinkube/notebooks
         - name: datasets
-          mountPath: /home/jovyan/thinkube/datasets
+          mountPath: /home/thinkube/thinkube/datasets
         - name: models
-          mountPath: /home/jovyan/thinkube/models
+          mountPath: /home/thinkube/thinkube/models
         - name: scratch
-          mountPath: /home/jovyan/scratch
+          mountPath: /home/thinkube/scratch
 
     # Clone templates repository on each pod start (directly to templates mount - NO symlinks!)
     - name: clone-templates
@@ -550,34 +550,34 @@ singleuser:
           echo "Cloning templates repository..."
 
           # Clone directly into the templates mount (emptyDir - fresh each pod start)
-          git clone https://github.com/thinkube/thinkube-ai-examples.git /home/jovyan/thinkube/templates/thinkube-ai-examples
+          git clone https://github.com/thinkube/thinkube-ai-examples.git /home/thinkube/thinkube/templates/thinkube-ai-examples
 
           # Flatten structure: /templates/thinkube-ai-examples/* → /templates/*
-          mv /home/jovyan/thinkube/templates/thinkube-ai-examples/* /home/jovyan/thinkube/templates/
-          rm -rf /home/jovyan/thinkube/templates/thinkube-ai-examples
+          mv /home/thinkube/thinkube/templates/thinkube-ai-examples/* /home/thinkube/thinkube/templates/
+          rm -rf /home/thinkube/thinkube/templates/thinkube-ai-examples
 
           # Fix ownership
-          chown -R 1000:100 /home/jovyan/thinkube/templates
-          chmod -R 755 /home/jovyan/thinkube/templates
+          chown -R 1000:100 /home/thinkube/thinkube/templates
+          chmod -R 755 /home/thinkube/thinkube/templates
 
           # First time: copy templates to examples (editable copy)
-          if [ ! -f "/home/jovyan/thinkube/notebooks/examples/.copied" ]; then
+          if [ ! -f "/home/thinkube/thinkube/notebooks/examples/.copied" ]; then
             echo "First time setup - copying templates to examples..."
-            cp -r /home/jovyan/thinkube/templates/* /home/jovyan/thinkube/notebooks/examples/
-            touch /home/jovyan/thinkube/notebooks/examples/.copied
-            chown -R 1000:100 /home/jovyan/thinkube/notebooks/examples
-            chmod -R 755 /home/jovyan/thinkube/notebooks/examples
+            cp -r /home/thinkube/thinkube/templates/* /home/thinkube/thinkube/notebooks/examples/
+            touch /home/thinkube/thinkube/notebooks/examples/.copied
+            chown -R 1000:100 /home/thinkube/thinkube/notebooks/examples
+            chmod -R 755 /home/thinkube/thinkube/notebooks/examples
             echo "Templates copied to examples/"
           fi
 
-          echo "Templates ready at /home/jovyan/thinkube/templates/"
+          echo "Templates ready at /home/thinkube/thinkube/templates/"
       securityContext:
         runAsUser: 0  # Run as root to clone and set permissions
       volumeMounts:
         - name: templates
-          mountPath: /home/jovyan/thinkube/templates
+          mountPath: /home/thinkube/thinkube/templates
         - name: notebooks
-          mountPath: /home/jovyan/thinkube/notebooks
+          mountPath: /home/thinkube/thinkube/notebooks
 
     # Query service discovery and generate environment file
     - name: service-discovery
@@ -593,6 +593,65 @@ singleuser:
           mountPath: /service-config
       securityContext:
         runAsUser: 0  # Need root to create config directory and fix permissions
+
+    # Setup venvs: detect architecture and register Jupyter kernels
+    - name: setup-venvs
+      image: {{ harbor_registry }}/library/tk-jupyter-base:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - bash
+        - -c
+        - |
+          set -e
+          echo "Setting up virtualenv kernels..."
+
+          # Detect architecture
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ]; then
+            ARCH_DIR="arm64"
+          else
+            ARCH_DIR="amd64"
+          fi
+          echo "Detected architecture: $ARCH_DIR"
+
+          # Check if venvs exist for this architecture
+          VENVS_BASE="/home/thinkube/venvs"
+          if [ ! -d "$VENVS_BASE/$ARCH_DIR" ]; then
+            echo "WARNING: No venvs found for $ARCH_DIR at $VENVS_BASE/$ARCH_DIR"
+            echo "Run the bootstrap playbook: 13_bootstrap_venvs.yaml"
+            exit 0
+          fi
+
+          # Create symlink to current architecture
+          ln -sfn "$VENVS_BASE/$ARCH_DIR" "$VENVS_BASE/current"
+          echo "Created symlink: $VENVS_BASE/current -> $ARCH_DIR"
+
+          # Register each venv as a Jupyter kernel
+          mkdir -p /home/thinkube/.local/share/jupyter/kernels
+          for venv in "$VENVS_BASE/$ARCH_DIR"/*/; do
+            if [ -d "$venv" ] && [ -f "$venv/bin/python" ]; then
+              VENV_NAME=$(basename "$venv")
+              echo "Registering kernel: $VENV_NAME"
+
+              # Use the venv's Python to register the kernel
+              "$venv/bin/python" -m ipykernel install \
+                --user \
+                --name="$VENV_NAME" \
+                --display-name="$VENV_NAME ($ARCH_DIR)" \
+                2>/dev/null || echo "  Note: kernel may already be registered"
+            fi
+          done
+
+          # Fix ownership
+          chown -R 1000:100 /home/thinkube/.local
+          chown -R 1000:100 "$VENVS_BASE/current" 2>/dev/null || true
+
+          echo "Venv setup complete!"
+      volumeMounts:
+        - name: venvs
+          mountPath: /home/thinkube/venvs
+      securityContext:
+        runAsUser: 0  # Need root to create symlinks and fix permissions
 
   # ServiceAccount for querying ConfigMaps
   serviceAccountName: jupyter-service-discovery
@@ -618,10 +677,16 @@ singleuser:
         claimName: jupyterhub-models-pvc
 
     # MLflow artifacts - SHARED with MLflow (same JuiceFS volume, zero duplication!)
-    # Users can access MLflow models via POSIX at /home/jovyan/thinkube/mlflow/
+    # Users can access MLflow models via POSIX at /home/thinkube/thinkube/mlflow/
     - name: mlflow-artifacts
       persistentVolumeClaim:
         claimName: jupyterhub-mlflow-artifacts-pvc
+
+    # Persistent virtualenvs (JuiceFS - per-architecture Python environments)
+    # Contains arm64/ and amd64/ subdirectories with venvs for each architecture
+    - name: venvs
+      persistentVolumeClaim:
+        claimName: jupyterhub-venvs-pvc
 
     # Thinkube icons (from ConfigMap)
     - name: thinkube-icons
@@ -652,37 +717,42 @@ singleuser:
     extraVolumeMounts:
     # Primary notebook storage (JuiceFS - persistent across nodes)
     - name: notebooks
-      mountPath: /home/jovyan/thinkube/notebooks
+      mountPath: /home/thinkube/thinkube/notebooks
 
     # Datasets directory (JuiceFS - persistent across nodes)
     - name: datasets
-      mountPath: /home/jovyan/thinkube/datasets
+      mountPath: /home/thinkube/thinkube/datasets
 
     # User models directory (JuiceFS - persistent across nodes)
     - name: models
-      mountPath: /home/jovyan/thinkube/models
+      mountPath: /home/thinkube/thinkube/models
 
     # MLflow artifacts (JuiceFS - SHARED with MLflow, zero duplication!)
-    # Access MLflow models directly: /home/jovyan/thinkube/mlflow/artifacts/
+    # Access MLflow models directly: /home/thinkube/thinkube/mlflow/artifacts/
     - name: mlflow-artifacts
-      mountPath: /home/jovyan/thinkube/mlflow
+      mountPath: /home/thinkube/thinkube/mlflow
 
     # Thinkube icons for notebooks (from ConfigMap)
     - name: thinkube-icons
-      mountPath: /home/jovyan/thinkube/icons
+      mountPath: /home/thinkube/thinkube/icons
 
     # Fast local scratch space (emptyDir - temporary)
     - name: scratch
-      mountPath: /home/jovyan/scratch
+      mountPath: /home/thinkube/scratch
 
     # Templates repository (emptyDir - cloned on pod start, NO symlinks!)
     # Read-only examples - users should copy to notebooks/ to edit
     - name: templates
-      mountPath: /home/jovyan/thinkube/templates
+      mountPath: /home/thinkube/thinkube/templates
 
     # Service discovery environment file (generated by init container)
     - name: service-config
-      mountPath: /home/jovyan/.config/thinkube
+      mountPath: /home/thinkube/.config/thinkube
+
+    # Persistent virtualenvs (JuiceFS - mounted to /home/thinkube/venvs)
+    # Init container creates symlink from /home/thinkube/venvs/current -> {arch}/
+    - name: venvs
+      mountPath: /home/thinkube/venvs
 
   # Image configuration
   image:
@@ -742,24 +812,24 @@ singleuser:
           - |
             # Add service-env-jh.sh to bashrc for interactive shells
             # (kernels get it via cmd override, but terminals need it too)
-            if [ -f /home/jovyan/.config/thinkube/service-env-jh.sh ]; then
-              if ! grep -q "service-env-jh.sh" /home/jovyan/.bashrc 2>/dev/null; then
-                echo "" >> /home/jovyan/.bashrc
-                echo "# Thinkube service discovery (auto-generated)" >> /home/jovyan/.bashrc
-                echo "if [ -f ~/.config/thinkube/service-env-jh.sh ]; then" >> /home/jovyan/.bashrc
-                echo "  source ~/.config/thinkube/service-env-jh.sh" >> /home/jovyan/.bashrc
-                echo "fi" >> /home/jovyan/.bashrc
+            if [ -f /home/thinkube/.config/thinkube/service-env-jh.sh ]; then
+              if ! grep -q "service-env-jh.sh" /home/thinkube/.bashrc 2>/dev/null; then
+                echo "" >> /home/thinkube/.bashrc
+                echo "# Thinkube service discovery (auto-generated)" >> /home/thinkube/.bashrc
+                echo "if [ -f ~/.config/thinkube/service-env-jh.sh ]; then" >> /home/thinkube/.bashrc
+                echo "  source ~/.config/thinkube/service-env-jh.sh" >> /home/thinkube/.bashrc
+                echo "fi" >> /home/thinkube/.bashrc
               fi
             fi
 
             # Add .secrets.env to bashrc for thinkube-control API keys
-            if [ -f /home/jovyan/thinkube/notebooks/.secrets.env ]; then
-              if ! grep -q "\.secrets\.env" /home/jovyan/.bashrc 2>/dev/null; then
-                echo "" >> /home/jovyan/.bashrc
-                echo "# Thinkube secrets (exported from thinkube-control)" >> /home/jovyan/.bashrc
-                echo "if [ -f /home/jovyan/thinkube/notebooks/.secrets.env ]; then" >> /home/jovyan/.bashrc
-                echo "  source /home/jovyan/thinkube/notebooks/.secrets.env" >> /home/jovyan/.bashrc
-                echo "fi" >> /home/jovyan/.bashrc
+            if [ -f /home/thinkube/thinkube/notebooks/.secrets.env ]; then
+              if ! grep -q "\.secrets\.env" /home/thinkube/.bashrc 2>/dev/null; then
+                echo "" >> /home/thinkube/.bashrc
+                echo "# Thinkube secrets (exported from thinkube-control)" >> /home/thinkube/.bashrc
+                echo "if [ -f /home/thinkube/thinkube/notebooks/.secrets.env ]; then" >> /home/thinkube/.bashrc
+                echo "  source /home/thinkube/thinkube/notebooks/.secrets.env" >> /home/thinkube/.bashrc
+                echo "fi" >> /home/thinkube/.bashrc
               fi
             fi
 

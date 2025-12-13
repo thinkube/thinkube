@@ -1,0 +1,164 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Jupyter Base - Minimal JupyterLab environment with NVIDIA PyTorch
+# Base: NVIDIA PyTorch 25.04 with FA2/Triton/xformers for Blackwell (sm_121)
+# Includes: JupyterLab, JupyterHub, Claude Code CLI
+# ML packages are installed in persistent venvs on JuiceFS, not in this image
+
+FROM {{ harbor_registry }}/library/pytorch:25.04-py3
+
+# Avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ============================================================
+# SYSTEM PACKAGES
+# ============================================================
+
+# Install additional system dependencies
+# Note: NVIDIA base already has Python, git, curl, etc.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        vim \
+        build-essential \
+        ca-certificates \
+        gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20.x LTS (required for Claude Code CLI)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI globally
+RUN npm install -g @anthropic-ai/claude-code && \
+    NPM_PREFIX=$(npm config get prefix) && \
+    NPM_BIN="$NPM_PREFIX/bin" && \
+    if [ -f "$NPM_BIN/claude" ]; then \
+        ln -sf "$NPM_BIN/claude" /usr/local/bin/claude; \
+    elif [ -f "$NPM_BIN/claude-code" ]; then \
+        ln -sf "$NPM_BIN/claude-code" /usr/local/bin/claude; \
+    else \
+        echo "ERROR: Claude binary not found in $NPM_BIN!"; \
+        exit 1; \
+    fi
+
+# ============================================================
+# USER SETUP: thinkube (UID 1000)
+# ============================================================
+
+# NVIDIA image runs as root by default
+# Create thinkube user with UID 1000 for consistency across services
+RUN if id 1000 2>/dev/null; then \
+        EXISTING_USER=$(id -nu 1000); \
+        if [ "$EXISTING_USER" != "thinkube" ]; then \
+            usermod -l thinkube -d /home/thinkube -m $EXISTING_USER 2>/dev/null || \
+            (userdel -f $EXISTING_USER && useradd -m -s /bin/bash -N -u 1000 thinkube); \
+        fi; \
+    else \
+        useradd -m -s /bin/bash -N -u 1000 thinkube; \
+    fi
+
+ENV NB_UID=1000
+ENV NB_GID=100
+ENV NB_USER=thinkube
+
+# ============================================================
+# JUPYTER INSTALLATION
+# ============================================================
+
+USER root
+
+# Install uv for fast package installation
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Install JupyterLab and JupyterHub to system Python
+RUN uv pip install --system \
+    jupyterlab==4.5.0 \
+    jupyterhub==5.3.0 \
+    ipykernel \
+    ipywidgets \
+    jupyterlab-widgets
+
+# ============================================================
+# THINKUBE INTEGRATION
+# ============================================================
+
+# Copy Thinkube environment configuration
+COPY .thinkube_env /home/thinkube/.thinkube_env
+RUN chown $NB_UID:$NB_GID /home/thinkube/.thinkube_env
+
+# Source Thinkube environment in bashrc
+RUN echo 'if [ -f /home/thinkube/.thinkube_env ]; then source /home/thinkube/.thinkube_env; fi' >> /home/thinkube/.bashrc
+
+# Add Jupyter flavor identifier (base - kernels come from venvs)
+RUN echo "base" > /home/thinkube/.jupyter_flavor && \
+    chown $NB_UID:$NB_GID /home/thinkube/.jupyter_flavor
+
+# Copy startup script
+COPY startup.sh /usr/local/bin/startup.sh
+RUN chmod +x /usr/local/bin/startup.sh
+
+# Copy Thinkube environment setup files
+RUN mkdir -p /opt/thinkube
+COPY 00-thinkube-env.py /opt/thinkube/
+COPY test-thinkube-services.ipynb /opt/thinkube/
+COPY icons/ /opt/thinkube/icons/
+
+# Copy helper modules
+COPY check_jupyter_flavor.py /opt/thinkube/
+COPY thinkube_models.py /opt/thinkube/
+
+# Install helpers to system Python
+# Note: NVIDIA image uses different Python path
+RUN PYTHON_SITE=$(python -c "import site; print(site.getsitepackages()[0])") && \
+    cp /opt/thinkube/check_jupyter_flavor.py $PYTHON_SITE/ && \
+    cp /opt/thinkube/thinkube_models.py $PYTHON_SITE/
+
+# OpenAI Harmony - Parser for GPT-OSS harmony format responses
+# Pre-download tiktoken vocab file for offline support
+RUN uv pip install --system openai-harmony && \
+    mkdir -p /opt/tiktoken_encodings && \
+    curl -sL -o /opt/tiktoken_encodings/o200k_base.tiktoken \
+    "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
+ENV TIKTOKEN_ENCODINGS_BASE=/opt/tiktoken_encodings
+
+# ============================================================
+# JUPYTER EXTENSIONS
+# ============================================================
+
+ARG CACHE_BUST=1
+# Install tk-ai-extension from GitHub Releases
+RUN echo "Cache bust: ${CACHE_BUST}" && \
+    uv pip install --system --reinstall \
+    https://github.com/thinkube/tk-ai-extension/releases/download/latest/tk_ai_extension-0.1.0-py3-none-any.whl && \
+    uv pip install --system --reinstall \
+    git+https://github.com/thinkube/thinkube-ai-lab-theme.git && \
+    jupyter lab build --minimize=False
+
+# Set Thinkube AI Lab theme as default
+RUN mkdir -p /usr/local/share/jupyter/lab/settings && \
+    echo '{"@jupyterlab/apputils-extension:themes": {"theme": "thinkube-ai-lab-theme"}}' \
+    > /usr/local/share/jupyter/lab/settings/overrides.json
+
+# ============================================================
+# RUNTIME CONFIGURATION
+# ============================================================
+
+USER thinkube
+WORKDIR /home/thinkube
+
+# Add user's local bin to PATH
+ENV PATH="/home/thinkube/.local/bin:${PATH}"
+
+# Expose JupyterLab port
+EXPOSE 8888
+
+# Use startup script as entrypoint
+ENTRYPOINT ["/usr/local/bin/startup.sh"]
+
+# Default command (JupyterHub will override with jupyterhub-singleuser)
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
+
+# 🤖 AI-assisted
