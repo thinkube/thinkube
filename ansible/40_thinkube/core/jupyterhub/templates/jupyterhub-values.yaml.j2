@@ -594,7 +594,7 @@ singleuser:
       securityContext:
         runAsUser: 0  # Need root to create config directory and fix permissions
 
-    # Setup venvs: detect architecture and register Jupyter kernels
+    # Setup venvs: download from GitHub if needed, then register Jupyter kernels
     - name: setup-venvs
       image: {{ harbor_registry }}/library/tk-jupyter-base:latest
       imagePullPolicy: IfNotPresent
@@ -605,6 +605,11 @@ singleuser:
           set -e
           echo "Setting up virtualenv kernels..."
 
+          # Configuration
+          VENVS_VERSION="{{ jupyter_venvs_version | default('v0.1.0') }}"
+          GITHUB_REPO="thinkube/thinkube-venvs"
+          GITHUB_RELEASE_URL="https://github.com/$GITHUB_REPO/releases/download/$VENVS_VERSION"
+
           # Detect architecture
           ARCH=$(uname -m)
           if [ "$ARCH" = "aarch64" ]; then
@@ -613,22 +618,45 @@ singleuser:
             ARCH_DIR="amd64"
           fi
           echo "Detected architecture: $ARCH_DIR"
+          echo "Venvs version: $VENVS_VERSION"
 
-          # Check if venvs exist for this architecture
           VENVS_BASE="/home/thinkube/venvs"
-          if [ ! -d "$VENVS_BASE/$ARCH_DIR" ]; then
-            echo "WARNING: No venvs found for $ARCH_DIR at $VENVS_BASE/$ARCH_DIR"
-            echo "Run the bootstrap playbook: 13_bootstrap_venvs.yaml"
-            exit 0
+          VENVS_ARCH_DIR="$VENVS_BASE/$ARCH_DIR"
+
+          # Check if venvs already exist and are the correct version
+          VERSION_FILE="$VENVS_ARCH_DIR/.version"
+          if [ -f "$VERSION_FILE" ] && [ "$(cat $VERSION_FILE)" = "$VENVS_VERSION" ]; then
+            echo "Venvs $VENVS_VERSION already installed for $ARCH_DIR"
+          else
+            echo "Downloading venvs $VENVS_VERSION for $ARCH_DIR..."
+            mkdir -p "$VENVS_ARCH_DIR"
+
+            # Download and extract each venv
+            for venv in ml-gpu fine-tuning agent-dev; do
+              TARBALL_URL="$GITHUB_RELEASE_URL/$ARCH_DIR/$venv.tar.gz"
+              echo "  Downloading $venv..."
+
+              if curl -fsSL "$TARBALL_URL" | tar -xzf - -C "$VENVS_ARCH_DIR/"; then
+                echo "    ✓ $venv extracted"
+              else
+                echo "    ✗ Failed to download $venv from $TARBALL_URL"
+                echo "    Venvs may not be available yet. Run 99_build_venvs.yaml and upload to GitHub."
+                # Continue without failing - user can still use base Python
+              fi
+            done
+
+            # Record installed version
+            echo "$VENVS_VERSION" > "$VERSION_FILE"
+            echo "Venvs $VENVS_VERSION installed for $ARCH_DIR"
           fi
 
           # Create symlink to current architecture
-          ln -sfn "$VENVS_BASE/$ARCH_DIR" "$VENVS_BASE/current"
+          ln -sfn "$VENVS_ARCH_DIR" "$VENVS_BASE/current"
           echo "Created symlink: $VENVS_BASE/current -> $ARCH_DIR"
 
           # Register each venv as a Jupyter kernel
           mkdir -p /home/thinkube/.local/share/jupyter/kernels
-          for venv in "$VENVS_BASE/$ARCH_DIR"/*/; do
+          for venv in "$VENVS_ARCH_DIR"/*/; do
             if [ -d "$venv" ] && [ -f "$venv/bin/python" ]; then
               VENV_NAME=$(basename "$venv")
               echo "Registering kernel: $VENV_NAME"
@@ -644,7 +672,7 @@ singleuser:
 
           # Fix ownership
           chown -R 1000:100 /home/thinkube/.local
-          chown -R 1000:100 "$VENVS_BASE/current" 2>/dev/null || true
+          chown -R 1000:100 "$VENVS_BASE" 2>/dev/null || true
 
           echo "Venv setup complete!"
       volumeMounts:

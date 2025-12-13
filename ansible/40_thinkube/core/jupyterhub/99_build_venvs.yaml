@@ -1,0 +1,164 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# ansible/40_thinkube/core/jupyterhub/99_build_venvs.yaml
+#
+# PURPOSE:
+#   Build pre-packaged Python virtualenvs for JupyterHub.
+#   This is a MAINTAINER playbook - run once per architecture to create
+#   venv tarballs that get uploaded to GitHub releases.
+#
+# REQUIREMENTS:
+#   - tk-jupyter-base image built and pushed to Harbor
+#   - kubectl access to the cluster
+#   - GPU node available for the target architecture
+#
+# USAGE:
+#   # Build venvs for ARM64 (run on cluster with ARM64 GPU nodes):
+#   ./scripts/tk_ansible ansible/40_thinkube/core/jupyterhub/99_build_venvs.yaml
+#
+#   # After build completes, upload tarballs to GitHub:
+#   kubectl cp jupyterhub/venvs-builder:/output /tmp/venvs-output
+#   gh release create v0.1.0 /tmp/venvs-output/arm64/*.tar.gz --repo thinkube/thinkube-venvs
+#
+# OUTPUT:
+#   Venv tarballs in the pod at /output/{arch}/:
+#   - ml-gpu.tar.gz
+#   - fine-tuning.tar.gz
+#   - agent-dev.tar.gz
+
+---
+- name: Build Jupyter Virtualenvs
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    venvs_version: "v0.1.0"
+    build_namespace: "jupyterhub"
+    job_name: "venvs-builder"
+
+  tasks:
+    - name: Display build info
+      ansible.builtin.debug:
+        msg: |
+          Building Jupyter venvs version {{ venvs_version }}
+          This will create a K8s Job that builds venvs inside tk-jupyter-base.
+
+          After completion, copy the tarballs and upload to GitHub:
+            kubectl cp {{ build_namespace }}/{{ job_name }}:/output /tmp/venvs-output
+            gh release create {{ venvs_version }} /tmp/venvs-output/*/*.tar.gz --repo thinkube/thinkube-venvs
+
+    - name: Copy build script to ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: venvs-build-script
+            namespace: "{{ build_namespace }}"
+          data:
+            build-venvs.sh: |
+              {{ lookup('file', playbook_dir + '/scripts/build-venvs.sh') | indent(14) }}
+
+    - name: Delete existing build job if present
+      kubernetes.core.k8s:
+        state: absent
+        api_version: batch/v1
+        kind: Job
+        name: "{{ job_name }}"
+        namespace: "{{ build_namespace }}"
+      ignore_errors: true
+
+    - name: Create venvs build job
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "{{ job_name }}"
+            namespace: "{{ build_namespace }}"
+          spec:
+            ttlSecondsAfterFinished: 86400  # Keep for 24 hours
+            backoffLimit: 0  # Don't retry on failure
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: builder
+                    image: "{{ harbor_registry }}/library/tk-jupyter-base:latest"
+                    imagePullPolicy: Always
+                    command:
+                      - bash
+                      - /scripts/build-venvs.sh
+                    env:
+                      - name: VENVS_VERSION
+                        value: "{{ venvs_version }}"
+                      - name: OUTPUT_DIR
+                        value: /output
+                    volumeMounts:
+                      - name: build-script
+                        mountPath: /scripts
+                      - name: output
+                        mountPath: /output
+                    resources:
+                      requests:
+                        memory: "8Gi"
+                        cpu: "2"
+                      limits:
+                        memory: "16Gi"
+                        cpu: "4"
+                volumes:
+                  - name: build-script
+                    configMap:
+                      name: venvs-build-script
+                      defaultMode: 0755
+                  - name: output
+                    emptyDir:
+                      sizeLimit: 20Gi
+                # Schedule on GPU nodes to get correct architecture
+                nodeSelector:
+                  nvidia.com/gpu.present: "true"
+
+    - name: Wait for build job to start
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ job_name }}"
+        namespace: "{{ build_namespace }}"
+      register: job_info
+      until: job_info.resources[0].status.active is defined and job_info.resources[0].status.active > 0
+      retries: 30
+      delay: 10
+
+    - name: Display build progress instructions
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════════════
+          Venvs Build Job Started
+          ════════════════════════════════════════════════════════════════
+
+          Job: {{ build_namespace }}/{{ job_name }}
+
+          Monitor progress:
+            kubectl logs -f job/{{ job_name }} -n {{ build_namespace }}
+
+          Check status:
+            kubectl get job {{ job_name }} -n {{ build_namespace }}
+
+          After completion (may take 30-60 minutes):
+            # Get the pod name
+            POD=$(kubectl get pods -n {{ build_namespace }} -l job-name={{ job_name }} -o jsonpath='{.items[0].metadata.name}')
+
+            # Copy output
+            kubectl cp {{ build_namespace }}/$POD:/output /tmp/venvs-output
+
+            # Upload to GitHub (requires gh CLI and authentication)
+            gh release create {{ venvs_version }} /tmp/venvs-output/*/*.tar.gz \
+              --repo thinkube/thinkube-venvs \
+              --title "Jupyter Venvs {{ venvs_version }}" \
+              --notes "Pre-built virtualenvs for JupyterHub"
+
+          ════════════════════════════════════════════════════════════════
