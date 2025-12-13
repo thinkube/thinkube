@@ -7,15 +7,12 @@
 # This script runs inside a tk-jupyter-base container and creates venvs
 # that inherit PyTorch from the base image via --system-site-packages.
 #
-# Usage:
-#   # Run inside tk-jupyter-base container on target architecture
-#   docker run --rm -v /tmp/venvs-output:/output harbor.thinkube.io/library/tk-jupyter-base:latest \
-#     /bin/bash /path/to/build-venvs.sh
+# TWO venvs are built:
+# - fine-tuning: Base ML packages + fine-tuning specific (bitsandbytes, peft, trl, unsloth)
+# - agent-dev: Base ML packages + agent frameworks (langchain, crewai, etc.)
 #
-# Output:
-#   /output/{arch}/ml-gpu.tar.gz
-#   /output/{arch}/fine-tuning.tar.gz
-#   /output/{arch}/agent-dev.tar.gz
+# Users who only need basic ML (PyTorch, transformers) use the system Python
+# from tk-jupyter-base directly - no venv needed.
 
 set -euo pipefail
 
@@ -39,29 +36,30 @@ BUILD_DIR="/tmp/venvs-build"
 OUTPUT_DIR="${OUTPUT_DIR:-/output}/$ARCH_DIR"
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 
-# Base packages (included in ALL venvs)
+# Base ML packages (included in BOTH venvs)
+# These provide the common ML/data science foundation
 BASE_PACKAGES=(
   ipykernel
-  "transformers==4.56.2"
-  "datasets==4.1.1"
-  "accelerate==1.10.1"
+  transformers
+  datasets
+  accelerate
   nvidia-modelopt
-  "pandas==2.3.2"
-  "scikit-learn==1.7.2"
-  "matplotlib==3.10.6"
-  "seaborn==0.13.2"
-  "plotly==6.3.0"
-  "psycopg2-binary==2.9.10"
-  "redis==6.4.0"
-  "qdrant-client==1.15.1"
-  "opensearch-py==3.0.0"
-  "mlflow==3.4.0"
-  "boto3==1.40.40"
+  pandas
+  scikit-learn
+  matplotlib
+  seaborn
+  plotly
+  psycopg2-binary
+  redis
+  qdrant-client
+  opensearch-py
+  mlflow
+  boto3
   clickhouse-connect
   chromadb
   nats-py
-  "weaviate-client==4.17.0"
-  "litellm==1.74.9"
+  weaviate-client
+  litellm
   kubernetes
   PyGithub
   hera-workflows
@@ -70,10 +68,10 @@ BASE_PACKAGES=(
   langfuse
   openai
   arxiv
-  "python-dotenv==1.1.1"
-  "requests==2.32.5"
-  "httpx==0.28.1"
-  "pydantic==2.11.9"
+  python-dotenv
+  requests
+  httpx
+  pydantic
   sqlalchemy
   alembic
   ipywidgets
@@ -91,11 +89,11 @@ BASE_PACKAGES=(
   openai-harmony
 )
 
-# Fine-tuning specific packages
+# Fine-tuning specific packages (ON TOP of base)
 FINETUNING_PACKAGES=(
-  "bitsandbytes>=0.48.2"
-  "peft>=0.17.1"
-  "trl==0.23.0"
+  bitsandbytes
+  peft
+  trl
   tyro
   hf_transfer
   sentencepiece
@@ -103,7 +101,7 @@ FINETUNING_PACKAGES=(
   openpyxl
 )
 
-# Agent development packages
+# Agent development packages (ON TOP of base)
 # Note: Let pip resolve compatible versions for langchain ecosystem
 AGENT_PACKAGES=(
   langchain
@@ -123,7 +121,7 @@ AGENT_PACKAGES=(
 )
 
 # Function to create a venv with base packages
-create_venv() {
+create_venv_with_base() {
   local name=$1
   local venv_path="$BUILD_DIR/$name"
 
@@ -138,7 +136,7 @@ create_venv() {
   "$venv_path/bin/pip" install --upgrade pip
 
   # Install base packages
-  echo "Installing base packages..."
+  echo "Installing base ML packages..."
   "$venv_path/bin/pip" install "${BASE_PACKAGES[@]}"
 }
 
@@ -151,8 +149,6 @@ package_venv() {
   echo ">>> Packaging venv: $name"
 
   # Fix the pyvenv.cfg to use relative paths
-  # The venv will be extracted to /home/thinkube/venvs/{arch}/{name}
-  # We set home to a placeholder that gets fixed at extraction time
   sed -i "s|^home = .*|home = /home/thinkube/venvs/$ARCH_DIR/$name|" "$venv_path/pyvenv.cfg"
 
   # Register as Jupyter kernel (kernel.json will be inside the venv)
@@ -171,15 +167,9 @@ package_venv() {
 }
 
 # ============================================
-# Build ml-gpu venv (base only)
-# ============================================
-create_venv "ml-gpu"
-package_venv "ml-gpu"
-
-# ============================================
 # Build fine-tuning venv (base + fine-tuning)
 # ============================================
-create_venv "fine-tuning"
+create_venv_with_base "fine-tuning"
 
 echo "Installing fine-tuning packages..."
 "$BUILD_DIR/fine-tuning/bin/pip" install "${FINETUNING_PACKAGES[@]}"
@@ -194,7 +184,7 @@ package_venv "fine-tuning"
 # ============================================
 # Build agent-dev venv (base + agent frameworks)
 # ============================================
-create_venv "agent-dev"
+create_venv_with_base "agent-dev"
 
 echo "Installing agent development packages..."
 "$BUILD_DIR/agent-dev/bin/pip" install "${AGENT_PACKAGES[@]}"
@@ -216,8 +206,8 @@ echo ""
 echo "Output directory: $OUTPUT_DIR"
 ls -lh "$OUTPUT_DIR"
 echo ""
-echo "To upload to GitHub release $VERSION:"
-echo "  gh release create $VERSION $OUTPUT_DIR/*.tar.gz --repo thinkube/thinkube-venvs"
+echo "Venvs built:"
+echo "  - fine-tuning: Base ML + fine-tuning packages"
+echo "  - agent-dev: Base ML + agent frameworks"
 echo ""
-echo "Or upload to an existing release:"
-echo "  gh release upload $VERSION $OUTPUT_DIR/*.tar.gz --repo thinkube/thinkube-venvs"
+echo "Users who only need PyTorch/transformers use the system Python directly."
