@@ -12,7 +12,9 @@
 #   - kubectl access to the cluster
 #   - GPU node available for the target architecture
 #   - gh CLI authenticated (gh auth login)
-#   - jupyterhub-venvs-pvc exists (created by 11_deploy.yaml)
+#
+# NOTE: This playbook is self-contained. It creates its own temporary PVC
+#       for the build and cleans it up afterward. No dependency on 11_deploy.yaml.
 #
 # USAGE:
 #   ./scripts/tk_ansible ansible/40_thinkube/core/jupyterhub/99_build_venvs.yaml
@@ -24,16 +26,43 @@
 ---
 - name: Build and Upload Jupyter Virtualenvs
   hosts: k8s_control_plane
-  gather_facts: false
+  gather_facts: true
 
   vars:
     venvs_version: "v0.1.0"
     build_namespace: "jupyterhub"
     job_name: "venvs-builder"
+    build_pvc_name: "venvs-build-temp"
     github_repo: "thinkube/thinkube-venvs"
     local_output_dir: "/tmp/venvs-output-{{ ansible_date_time.epoch | default(lookup('pipe', 'date +%s')) }}"
 
   tasks:
+    - name: Ensure namespace exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ build_namespace }}"
+
+    - name: Create temporary PVC for build output
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ build_pvc_name }}"
+            namespace: "{{ build_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            storageClassName: csi-rawfile-default
+            resources:
+              requests:
+                storage: 50Gi
+
     - name: Display build info
       ansible.builtin.debug:
         msg: |
@@ -53,6 +82,51 @@
       register: gh_auth
       failed_when: gh_auth.rc != 0
       changed_when: false
+      delegate_to: localhost
+
+    - name: Check if GitHub repo exists
+      ansible.builtin.command: gh repo view {{ github_repo }}
+      register: repo_check
+      failed_when: false
+      changed_when: false
+      delegate_to: localhost
+
+    - name: Create GitHub repo if it doesn't exist
+      ansible.builtin.command: >
+        gh repo create {{ github_repo }}
+        --public
+        --description "Pre-built Python virtualenvs for Thinkube JupyterHub"
+      when: repo_check.rc != 0
+      delegate_to: localhost
+
+    - name: Check if repo has commits (releases require non-empty repo)
+      ansible.builtin.shell: |
+        result=$(gh api repos/{{ github_repo }}/commits --jq 'length' 2>&1)
+        if echo "$result" | grep -q "empty"; then
+          echo "empty"
+        else
+          echo "$result"
+        fi
+      register: repo_commits
+      failed_when: false
+      changed_when: false
+      delegate_to: localhost
+
+    - name: Initialize repo with README (required for releases)
+      ansible.builtin.shell: |
+        set -e
+        cd /tmp && rm -rf thinkube-venvs
+        git clone git@github.com:{{ github_repo }}.git thinkube-venvs
+        cd thinkube-venvs
+        echo "# Thinkube Venvs" > README.md
+        echo "" >> README.md
+        echo "Pre-built Python virtualenvs for Thinkube JupyterHub." >> README.md
+        git add README.md
+        git commit -m "Initial commit"
+        git push origin main
+        cd /tmp && rm -rf thinkube-venvs
+      when: repo_commits.stdout | trim == "empty"
+      delegate_to: localhost
 
     - name: Copy build script to ConfigMap
       kubernetes.core.k8s:
@@ -93,6 +167,16 @@
             template:
               spec:
                 restartPolicy: Never
+                # Init container to fix PVC permissions for thinkube user (UID 1000)
+                initContainers:
+                  - name: fix-permissions
+                    image: "{{ harbor_registry }}/library/busybox:latest"
+                    command: ["sh", "-c", "chown -R 1000:100 /output"]
+                    securityContext:
+                      runAsUser: 0
+                    volumeMounts:
+                      - name: output
+                        mountPath: /output
                 containers:
                   - name: builder
                     image: "{{ harbor_registry }}/library/tk-jupyter-base:latest"
@@ -122,10 +206,10 @@
                     configMap:
                       name: venvs-build-script
                       defaultMode: 0755
-                  # Use venvs PVC for persistent output (survives pod completion)
+                  # Use temporary PVC for build output (survives pod completion)
                   - name: output
                     persistentVolumeClaim:
-                      claimName: jupyterhub-venvs-pvc
+                      claimName: "{{ build_pvc_name }}"
                 # Schedule on GPU nodes to get correct architecture
                 nodeSelector:
                   nvidia.com/gpu.present: "true"
@@ -170,7 +254,7 @@
             volumes:
               - name: venvs
                 persistentVolumeClaim:
-                  claimName: jupyterhub-venvs-pvc
+                  claimName: "{{ build_pvc_name }}"
             nodeSelector:
               nvidia.com/gpu.present: "true"
 
@@ -194,10 +278,14 @@
 
     - name: Copy tarballs from helper pod
       ansible.builtin.shell: |
-        kubectl cp {{ build_namespace }}/venvs-copy-helper:/venvs {{ local_output_dir }}
+        export KUBECONFIG=$HOME/.kube/config
+        # List available tarballs first
+        kubectl exec -n {{ build_namespace }} venvs-copy-helper -- ls -la /venvs/arm64/
+        # Copy each tarball directly
+        kubectl cp {{ build_namespace }}/venvs-copy-helper:/venvs/arm64/fine-tuning.tar.gz {{ local_output_dir }}/fine-tuning.tar.gz
+        kubectl cp {{ build_namespace }}/venvs-copy-helper:/venvs/arm64/agent-dev.tar.gz {{ local_output_dir }}/agent-dev.tar.gz
+        ls -la {{ local_output_dir }}/
       delegate_to: localhost
-      environment:
-        KUBECONFIG: "{{ ansible_env.HOME }}/.kube/config"
 
     - name: Delete helper pod
       kubernetes.core.k8s:
@@ -265,6 +353,14 @@
         api_version: batch/v1
         kind: Job
         name: "{{ job_name }}"
+        namespace: "{{ build_namespace }}"
+
+    - name: Delete temporary build PVC
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ build_pvc_name }}"
         namespace: "{{ build_namespace }}"
 
     - name: Display completion message
