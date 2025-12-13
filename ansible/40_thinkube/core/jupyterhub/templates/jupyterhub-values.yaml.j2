@@ -111,20 +111,6 @@ hub:
 
               resources = resources_response.json()
 
-              # Query for available images
-              logger.info("Querying thinkube-control for available images...")
-              images_response = requests.get(
-                  'http://backend.thinkube-control.svc.cluster.local:8000/api/v1/images/jupyter',
-                  headers={'Accept': 'application/json'},
-                  timeout=10
-              )
-
-              if images_response.status_code != 200:
-                  logger.error(f"Failed to get images: {images_response.status_code}")
-                  sys.exit(1)
-
-              images = images_response.json()
-
               # Query for JupyterHub configuration (defaults)
               logger.info("Querying thinkube-control for JupyterHub configuration...")
               config_response = requests.get(
@@ -139,7 +125,7 @@ hub:
                   sys.exit(1)
 
               jupyterhub_config = config_response.json()
-              logger.info(f"Loaded JupyterHub config: image={jupyterhub_config.get('default_image')}, node={jupyterhub_config.get('default_node')}, defaults=({jupyterhub_config['default_cpu_cores']}CPU, {jupyterhub_config['default_memory_gb']}GB, {jupyterhub_config['default_gpu_count']}GPU)")
+              logger.info(f"Loaded JupyterHub config: node={jupyterhub_config.get('default_node')}, defaults=({jupyterhub_config['default_cpu_cores']}CPU, {jupyterhub_config['default_memory_gb']}GB, {jupyterhub_config['default_gpu_count']}GPU)")
 
               profiles = []
 
@@ -223,26 +209,13 @@ hub:
                       'default': (i == jupyterhub_config['default_gpu_count'])
                   }
 
-              # Create a single "Resource Selection" profile with image choice
-              image_choices = {}
-              for img in images:
-                  image_choices[img['name']] = {
-                      'display_name': img.get('display_name', img['name']),
-                      'default': (img['name'] == jupyterhub_config.get('default_image')),
-                      'kubespawner_override': {
-                          'image': f"{{ harbor_registry }}/library/{img['name']}:latest"
-                      }
-                  }
-
+              # Create a single "Resource Selection" profile
+              # Image is fixed to tk-jupyter-base (venvs provide different Python environments)
               profile = {
-                  'display_name': 'Custom Resource Allocation',
-                  'description': 'Select your image and compute resources',
+                  'display_name': 'Thinkube AI Lab',
+                  'description': 'Select compute resources (Python environments available via kernel selection)',
                   'default': True,
                   'profile_options': {
-                      'image': {
-                          'display_name': 'Select Image',
-                          'choices': image_choices
-                      },
                       'node': {
                           'display_name': 'Select Node',
                           'choices': node_choices
@@ -261,19 +234,19 @@ hub:
                       }
                   },
                   'kubespawner_override': {
+                      'image': '{{ harbor_registry }}/library/tk-jupyter-base:latest',
                       'image_pull_policy': 'Always'
                   }
               }
               profiles.append(profile)
 
-              # Debug logging to verify defaults (inside choices now)
-              default_image = next((k for k, v in image_choices.items() if v.get('default')), None)
+              # Debug logging to verify defaults
               default_node = next((k for k, v in node_choices.items() if v.get('default')), None)
               default_cpu = next((k for k, v in cpu_choices.items() if v.get('default')), None)
               default_memory = next((k for k, v in memory_choices.items() if v.get('default')), None)
               default_gpu = next((k for k, v in gpu_choices.items() if v.get('default')), None)
               logger.info(f"Profile defaults set to:")
-              logger.info(f"  image: {default_image}")
+              logger.info(f"  image: tk-jupyter-base (fixed)")
               logger.info(f"  node: {default_node}")
               logger.info(f"  cpu: {default_cpu}")
               logger.info(f"  memory: {default_memory}")
