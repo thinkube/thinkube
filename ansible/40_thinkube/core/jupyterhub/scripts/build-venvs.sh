@@ -104,20 +104,21 @@ FINETUNING_PACKAGES=(
 )
 
 # Agent development packages
+# Note: Let pip resolve compatible versions for langchain ecosystem
 AGENT_PACKAGES=(
-  "langchain==1.1.3"
-  "langchain-core==1.1.3"
-  "langchain-community==0.4.1"
-  "langchain-openai==1.1.1"
-  "ag2[openai]==0.10.2"
-  "langgraph==0.4.1"
-  "openai-agents==0.6.2"
-  "crewai==1.7.0"
-  "crewai-tools==1.7.0"
-  "faiss-cpu==1.12.0"
-  "opentelemetry-sdk==1.39.0"
-  "opentelemetry-exporter-otlp==1.39.0"
-  "opentelemetry-api==1.39.0"
+  langchain
+  langchain-core
+  langchain-community
+  langchain-openai
+  langgraph
+  "ag2[openai]"
+  openai-agents
+  crewai
+  crewai-tools
+  faiss-cpu
+  opentelemetry-sdk
+  opentelemetry-exporter-otlp
+  opentelemetry-api
   tiktoken
 )
 
