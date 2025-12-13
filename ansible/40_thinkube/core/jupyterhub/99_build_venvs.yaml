@@ -12,6 +12,7 @@
 #   - kubectl access to the cluster
 #   - GPU node available for the target architecture
 #   - gh CLI authenticated (gh auth login)
+#   - jupyterhub-venvs-pvc exists (created by 11_deploy.yaml)
 #
 # USAGE:
 #   ./scripts/tk_ansible ansible/40_thinkube/core/jupyterhub/99_build_venvs.yaml
@@ -41,8 +42,8 @@
           ════════════════════════════════════════════════════════════════
 
           This playbook will:
-          1. Build venvs in a K8s Job (30-60 minutes)
-          2. Copy tarballs from the pod
+          1. Build venvs in a K8s Job (20-40 minutes)
+          2. Copy tarballs to local filesystem
           3. Upload to GitHub release automatically
 
           GitHub repo: {{ github_repo }}
@@ -121,14 +122,15 @@
                     configMap:
                       name: venvs-build-script
                       defaultMode: 0755
+                  # Use venvs PVC for persistent output (survives pod completion)
                   - name: output
-                    emptyDir:
-                      sizeLimit: 20Gi
+                    persistentVolumeClaim:
+                      claimName: jupyterhub-venvs-pvc
                 # Schedule on GPU nodes to get correct architecture
                 nodeSelector:
                   nvidia.com/gpu.present: "true"
 
-    - name: Wait for build job to complete (this takes 30-60 minutes)
+    - name: Wait for build job to complete (this takes 20-40 minutes)
       kubernetes.core.k8s_info:
         api_version: batch/v1
         kind: Job
@@ -146,29 +148,64 @@
         msg: "Venvs build job failed! Check logs with: kubectl logs job/{{ job_name }} -n {{ build_namespace }}"
       when: job_info.resources[0].status.failed is defined and job_info.resources[0].status.failed > 0
 
-    - name: Get builder pod name
+    # Use a helper pod to copy files from PVC since kubectl cp requires running pod
+    - name: Create helper pod to copy tarballs
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: venvs-copy-helper
+            namespace: "{{ build_namespace }}"
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: helper
+                image: "{{ harbor_registry }}/library/busybox:latest"
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: venvs
+                    mountPath: /venvs
+            volumes:
+              - name: venvs
+                persistentVolumeClaim:
+                  claimName: jupyterhub-venvs-pvc
+            nodeSelector:
+              nvidia.com/gpu.present: "true"
+
+    - name: Wait for helper pod to be ready
       kubernetes.core.k8s_info:
         api_version: v1
         kind: Pod
+        name: venvs-copy-helper
         namespace: "{{ build_namespace }}"
-        label_selectors:
-          - "job-name={{ job_name }}"
-      register: pod_info
-
-    - name: Set pod name fact
-      ansible.builtin.set_fact:
-        builder_pod: "{{ pod_info.resources[0].metadata.name }}"
+      register: helper_pod
+      until: helper_pod.resources[0].status.phase == "Running"
+      retries: 30
+      delay: 5
 
     - name: Create local output directory
       ansible.builtin.file:
         path: "{{ local_output_dir }}"
         state: directory
         mode: '0755'
+      delegate_to: localhost
 
-    - name: Copy tarballs from pod
-      ansible.builtin.command: >
-        kubectl cp {{ build_namespace }}/{{ builder_pod }}:/output {{ local_output_dir }}
-      register: copy_result
+    - name: Copy tarballs from helper pod
+      ansible.builtin.shell: |
+        kubectl cp {{ build_namespace }}/venvs-copy-helper:/venvs {{ local_output_dir }}
+      delegate_to: localhost
+      environment:
+        KUBECONFIG: "{{ ansible_env.HOME }}/.kube/config"
+
+    - name: Delete helper pod
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Pod
+        name: venvs-copy-helper
+        namespace: "{{ build_namespace }}"
 
     - name: List downloaded tarballs
       ansible.builtin.find:
@@ -176,6 +213,7 @@
         patterns: "*.tar.gz"
         recurse: true
       register: tarballs
+      delegate_to: localhost
 
     - name: Display tarballs found
       ansible.builtin.debug:
@@ -186,23 +224,24 @@
       register: release_exists
       failed_when: false
       changed_when: false
+      delegate_to: localhost
 
     - name: Create GitHub release (if it doesn't exist)
-      ansible.builtin.command: >
-        gh release create {{ venvs_version }}
-        --repo {{ github_repo }}
-        --title "Jupyter Venvs {{ venvs_version }}"
-        --notes "Pre-built Python virtualenvs for JupyterHub.
+      ansible.builtin.shell: |
+        gh release create {{ venvs_version }} \
+          --repo {{ github_repo }} \
+          --title "Jupyter Venvs {{ venvs_version }}" \
+          --notes "Pre-built Python virtualenvs for JupyterHub.
 
         These venvs inherit PyTorch from the tk-jupyter-base image via --system-site-packages.
 
         Venvs included:
-        - **ml-gpu**: Base ML packages (transformers, datasets, accelerate, etc.)
-        - **fine-tuning**: ML + fine-tuning packages (bitsandbytes, peft, trl, unsloth)
-        - **agent-dev**: ML + agent frameworks (langchain, crewai, langgraph, etc.)
+        - **fine-tuning**: Base ML + fine-tuning packages (bitsandbytes, peft, trl, unsloth)
+        - **agent-dev**: Base ML + agent frameworks (langchain, crewai, langgraph, etc.)
 
         Architecture: arm64 (DGX Spark GB10)"
       when: release_exists.rc != 0
+      delegate_to: localhost
 
     - name: Upload tarballs to GitHub release
       ansible.builtin.command: >
@@ -212,11 +251,13 @@
       loop: "{{ tarballs.files }}"
       loop_control:
         label: "{{ item.path | basename }}"
+      delegate_to: localhost
 
     - name: Clean up local output directory
       ansible.builtin.file:
         path: "{{ local_output_dir }}"
         state: absent
+      delegate_to: localhost
 
     - name: Delete build job
       kubernetes.core.k8s:
