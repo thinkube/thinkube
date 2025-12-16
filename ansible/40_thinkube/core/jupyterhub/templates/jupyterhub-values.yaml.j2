@@ -59,9 +59,13 @@ hub:
       c.Spawner.stop_timeout = 10  # Reduce from default 60 - time to wait for stop
 
       # Set KUBECONFIG as environment variable for notebook kernels
-      c.KubeSpawner.environment = {
+      # Use update() to merge with extraEnv rather than overwriting
+      c.KubeSpawner.environment.update({
         'KUBECONFIG': '/home/thinkube/.config/thinkube/kube-config'
-      }
+      })
+
+      # Disable the native python3 kernel - we provide our own venv kernels
+      c.KernelSpecManager.ensure_native_kernel = False
 
       # Override command to source service discovery environment
       import textwrap
@@ -70,7 +74,7 @@ hub:
         echo "Loading service environment variables..."
         source /home/thinkube/.config/thinkube/service-env-jh.sh
       fi
-      exec jupyterhub-singleuser --ServerApp.trust_xheaders=True
+      exec jupyterhub-singleuser --ServerApp.trust_xheaders=True --KernelSpecManager.ensure_native_kernel=False
       """).strip()]
 
     01-dynamic-profile-generator: |
@@ -632,7 +636,9 @@ singleuser:
           echo "Created symlink: $VENVS_BASE/current -> $ARCH_DIR"
 
           # Register each venv as a Jupyter kernel (system venvs + custom venvs)
-          mkdir -p /home/thinkube/.local/share/jupyter/kernels
+          # Use --prefix to install kernels to shared venvs volume (accessible by main container)
+          KERNELS_DIR="$VENVS_BASE/kernels"
+          mkdir -p "$KERNELS_DIR"
 
           # Register system venvs (downloaded from GitHub)
           for venv in "$VENVS_ARCH_DIR"/*/; do
@@ -640,7 +646,7 @@ singleuser:
               VENV_NAME=$(basename "$venv")
               echo "Registering kernel: $VENV_NAME"
               "$venv/bin/python" -m ipykernel install \
-                --user \
+                --prefix="$VENVS_BASE" \
                 --name="$VENV_NAME" \
                 --display-name="$VENV_NAME ($ARCH_DIR)" \
                 2>/dev/null || echo "  Note: kernel may already be registered"
@@ -676,7 +682,7 @@ singleuser:
 
                 echo "Registering custom kernel: $VENV_NAME as '$DISPLAY_NAME'"
                 "$venv/bin/python" -m ipykernel install \
-                  --user \
+                  --prefix="$VENVS_BASE" \
                   --name="$VENV_NAME" \
                   --display-name="$DISPLAY_NAME" \
                   2>/dev/null || echo "  Note: kernel may already be registered"
@@ -684,9 +690,34 @@ singleuser:
             done
           fi
 
-          # Fix ownership
-          chown -R 1000:100 /home/thinkube/.local
+          # Fix ownership for venvs (includes kernels now)
           chown -R 1000:100 "$VENVS_BASE" 2>/dev/null || true
+
+          # Jupyter looks for kernels at $JUPYTER_PATH/kernels, but ipykernel install --prefix
+          # creates them at $JUPYTER_PATH/share/jupyter/kernels. Create symlink to fix this.
+          if [ -d "$VENVS_BASE/share/jupyter/kernels" ] && [ ! -L "$VENVS_BASE/kernels" ]; then
+            rm -rf "$VENVS_BASE/kernels" 2>/dev/null || true
+            ln -sf share/jupyter/kernels "$VENVS_BASE/kernels"
+            echo "Created symlink: $VENVS_BASE/kernels -> share/jupyter/kernels"
+          fi
+
+          echo "Kernels registered to: $VENVS_BASE/share/jupyter/kernels"
+          ls -la "$VENVS_BASE/share/jupyter/kernels/" 2>/dev/null || echo "  (no kernels yet)"
+
+          # Add Thinkube AI icon to all kernels (both 32x32 and 64x64 PNG required by JupyterLab)
+          # Base64-encoded tk_ai PNG icons
+          TK_ICON_64_B64="iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAJGUExURQAAAABoggBmgABmgABmgABlgABkgABohABmgABmgABmgABmmQBlgQBmgABmgACAgABogABmgABngABkgABmhQBmgABogABngABmgQBkggBmgABmgABqgABngABmgABnggBmgABmiABmgABmgABmgABtgABngQBmgABmgAAAAABkgwBmgABmgABpgwCAgABmgABmgABmgABngABmgABlgQBngQBngABmgABmgABmgABmgQBmgABlgABmgABngABlggBmgABmgABkhQBmgABmgABngABmggBmgQBmgABngQBngABjgABmgABmgABmgQBmgABmgQBqgABngABmgABtkgBlgQBjhABmgABmgABmgABmgQBkgABngABngABmgABmgwBlgABmgABngABmgQBmgABmgQBlgABlgABmgABmgABlgABngABkgABmgABmgABmgABmgQBlgQBmgABmgABrhgBmgABngQBlgABmgABmgABmgABngQBVqgBmgABxjgBmgABlgABmgABngQBmgQBmgABdiwBmgABigABhhgBmgQBngABnggBlgABlgQBlggBlgABmgABlgABlgABlgABmgABlgABlggBmgABmgABmgABmgABkggBlgABlgABjgABmgABmgABmgABlgABmgABogABlgABlgABlgABmgABmgABmgABmgABmgABmgABmgABlgABmgABngABngQBggABngABlgQBggABmgABogABngwBmgABngABphwBoggBngABmgQBmgAAAAPsJvWMAAADAdFJOUwA7rOnwsC4bov0UBW/y7QJA1Mw4Gf4Wcmk90s4YXuw5ww+R/PsOTePmASG2vCcEdvX6s3hdYZX3+Z5rbo3ffCvLpRfbj1Q3dfhtgRLFjFWJfQzC3Ad5H/G312ccPq7eI37ikHGnf4ir9sAmqULgmchLZaP0E45jTFrv00MDmwnrdK13QdgLsRoVcyovOkc1MNCXumCAvz+56IdkM0RqJITzloPGLMROYt3u5ZiFCueh6rhFEJ9RCM02JdlKETFme6S97e4AAAABYktHRACIBR1IAAAAB3RJTUUH6QwQDiQGemMz7QAABCNJREFUWMOdV/df00AUP20FKm1BtDhRoRVBEAsqxT0QwY2COCpqHYgDK9ZVRetCxT0qOBBRUcG9wK3vT/Pukl4ul9C0fn9oku973+8n9+69JEUoGgYMNJkHJaD/RWISEFiSBv+XPNlqAxl2a0r8+tQhwCFtaJzyYUkOUMGRlB7P3Q+3gQb2ETGvY+Qo0MXo2NYxRrx7fh3G+5GSMRaiwHA/xo0GA4yP1leZWU4jPYAra0J/+uyJxnKCnIxcPfmkvNjkBPmTNfKCKW51TmHR1GnTiz0AJTNmzpo9R3DwzE1W6+fNFzIWLKR8KcAicswtyxESRi3m9eUVQniJHMAGS6WzZcuFFMsKZUdXimtchRSDSvl0tegAI5jBGiFSVc0ZrI2c16wT0tYzgw1CZCPmvJtkg3J8qN28Bf9uFdI2MAOfOuDwYm4bXQc22I4bDGAKvtgiGPiYgbr9XTsItxRgJzXA9RwGUEe4XeoxMzGDep7evYdye3Bf7N3XQEtVA7CfkpP9fKaZGfCbuLdAJg/YJaKR3vtBiZzAl8vDDEoUMnCIsd7DtOxH6B3kye1/lO8EPQNla8jWHwtSg3QcOH6CUk1BA4OT5PoUi5RSAxQiodOUSVNynXoGZ8hcBjYKBglna+vBcY4w5/UMChUyhKdsMYSa1QZkA0JwAR8ucjvp0jMYm4jQJYAWjQHaCTnEIBTdwHSZXPvBdkVjUAY2crjqYcmFOgap9PqaA9x11wWDG3CTHpfoGLgi1E2ZaCErvSUZ3L7jpVxumI4XSmZDWaI1GBhhxp0JOlskA4y7rXx3+LUGbAltSECpPJ9rOY69+Cq0fXAvWWtw/wF+XFseMiqdvTuUWVAK26g1wEUMs2HCWMSS3YxTxrm+Xc+g2gTrmmTmkdJJAZbm5gbkjqLueJznlrZxEECHxJVz09jJMgMcWxkhM59ItSUGTwEuSmwll2pjBp0cO03mCp7h4q8xSwZdz4tlupFLVZ5I/AfNC5l7CeDvQt1KJyKhDwGCjDVzrFXm2mAIHskG0aCYS+1hLPeUAb/MVdEt9QkGp15xqXZG93AszJK4u07yXfdKMHjNZ4YYbedpy5u3hJtURn7fqQwOvecT4QMLCN9VPbu6IpEQZzCy1qPOU14smk+bLK46zOCjmHWPGRwRQ555SodEDD5pPh+3KourE4NzpEV8xnN6UprQ1qCQ4jzNV/dalRB2fTnW/uI1FXXP7e215luEhKpUVX+gvrBQoeiw7F+NRHTE8Zn39RvSQ3ZDbHKztQnp4224IgZ9kRf1j+9tRvIfn1B0ZPuiyd3hamSE5nBJv/qiGkM5QcJzfXn3z5jkGLkZJq28MKs5Vj3GryfiX4/1HXHICX4/4+W+jDjlGCl/2HMm8Lcvfj1Zh/wXKsba62Hox05bfmvUlH8ff2epAz+4PgAAAABJRU5ErkJggg=="
+          TK_ICON_32_B64="iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAMAAABEpIrGAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAG/UExURQAAAABggABngQBmgABmgABlgQCAgABkgABmgABmgABmgABmgABngABmgABlgABigABmmQBmgABmgABmgABVgABngQBmgABkggBphwBmgABmgABkhQBmgABmgABmgABlgABmgABmgABmgABmgABmgABmgQAAAABkgABlgABlgABtkgBmgABmgABhhgBmgABngABpgABngABngABVqgBmgABkgwBlgQBmgABlgABmgABkgwBmgABmgABmgQBmgABngABmgABmgABmgABmgABmgABmgABmgABkgABrhgBmgABmgABmgABngABngABmgACAgABlgABmgABqhABmgABogABmgABmgABngABmgABmgABmgABlgQBlggBmgABlgABmgABmgABngABngwBngABqgABmgABjgABmgABmgABmgQBngABmgABlgABmgABoggBmgABxjgBlgABmgABogABlgABmgABpgwBlggBnggBmgABlgABmgABjhABmgABnggBmgABmgABiiQBmgABngABlgABmgABqgABmgABjgABmgABngABlgABmgABmgABngABmgABmgABlgABmgABmgAAAADGQD8QAAACTdFJOUwAId9/pbwRC1thGHq7+phoF8vSABkPSPRGZohda6rzE/cG+9+9nARy1gwftxRWvwiKavQPoIXm5apgp6/Fzpz7utI7IevPwOBOl/LGLVNwCsHgd7BbLCkr79sNlNfXJ+BRoJccMoyT62324+bqtMc0JTOA2MOQnPy+sjeEfqDnR5g3ZZli3GGwSkbM6z9Ve1Nd05WggvGcAAAABYktHRACIBR1IAAAAB3RJTUUH6QwQDiQGemMz7QAAAfRJREFUOMt1U+tfEkEUPYmmQpssopWZgRIpa0rRUyk1K18ZK2riA1HLqOhlD620tEx7WFnOP9zMnYF1Cc6H/Z17z5mZO3vvAPtxoMRRWnYQRVFewTgqnUVk1yEmoR2uKiC7y3SWg6fam6/XVDIbao/Y5KPHNJYHre64pdefkEm94aSP+RubZBQ4FZTy6Wa1qCUEGK3AmTaVaA+ToVGFZ0VgnOOfSHaJnwznVXQBF8MwLuHyFXSoVCcZOolHrwLXHF3dPbjeC9y4SclbZOgm3sdZ/8AgG8LtCk6HZdVkiAp6B4hxXqWbGGGtcURoCw8ZPIKOBsfGI6JIE3cn2hvgTYjsJBno2lOhSGBaGoCZJLyzIpsig/Cm5oD5RNsCjHtx4P4i8ED82zQZfJw9FGTmURwG0x7LXgZ4ejC3QybbYOOJ0/FUkGcst0Na0OfUmhdLHhPzaT5TrpcimyFDhq78irPXb6IJE8vjbmCFWUWmiL/lzP+uP2DKo5yUbCI+Sfw9Z6tr0JXhA7P+Q1I2ZqAPvNIkGT4OqdEjw7pq3cYnUZAwzGXH8zMZwr0qnOpa2NQ2vnQsZZdsbcvzYpsGKwD9azA3lN+++/7Tf7hsc73z0y7/Ks9/GLHfo5acrA4VeFvbdVrh3S2s7Ar5Tw2Kwv13b6/E/iz/AYuV/qUBBBs9AAAAAElFTkSuQmCC"
+          for kernel_dir in "$VENVS_BASE/share/jupyter/kernels"/*/; do
+            if [ -d "$kernel_dir" ]; then
+              # Replace kernel icons with Thinkube AI logo (both sizes required by JupyterLab)
+              echo "$TK_ICON_64_B64" | base64 -d > "$kernel_dir/logo-64x64.png"
+              echo "$TK_ICON_32_B64" | base64 -d > "$kernel_dir/logo-32x32.png"
+              # Remove old SVG to avoid conflicts
+              rm -f "$kernel_dir/logo-svg.svg"
+              echo "Added Thinkube icons to $(basename "$kernel_dir")"
+            fi
+          done
 
           echo "Venv setup complete!"
       volumeMounts:
@@ -814,6 +845,10 @@ singleuser:
     # JupyterLab configuration
     JUPYTER_ENABLE_LAB: "yes"
     GRANT_SUDO: "yes"
+
+    # Include venvs directory in Jupyter's search path for kernels
+    # Kernels are installed to /home/thinkube/venvs/share/jupyter/kernels by init container
+    JUPYTER_PATH: "/home/thinkube/venvs"
 
     # Enable collaborative mode for YDoc/RTC integration (JupyterLab >= 4.1)
     JUPYTER_LAB_ENABLE_COLLABORATION: "true"
