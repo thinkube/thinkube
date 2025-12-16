@@ -567,7 +567,7 @@ singleuser:
       securityContext:
         runAsUser: 0  # Need root to create config directory and fix permissions
 
-    # Setup venvs: download from GitHub if needed, then register Jupyter kernels
+    # Setup venvs: download from GitHub if needed (local disk - fast!), then register Jupyter kernels
     - name: setup-venvs
       image: {{ harbor_registry }}/library/tk-jupyter-base:latest
       imagePullPolicy: IfNotPresent
@@ -576,7 +576,7 @@ singleuser:
         - -c
         - |
           set -e
-          echo "Setting up virtualenv kernels..."
+          echo "Setting up virtualenv kernels (local storage - fast I/O)..."
 
           # Configuration
           VENVS_VERSION="{{ jupyter_venvs_version | default('v0.1.0') }}"
@@ -604,13 +604,17 @@ singleuser:
             echo "Downloading venvs $VENVS_VERSION for $ARCH_DIR..."
             mkdir -p "$VENVS_ARCH_DIR"
 
-            # Download and extract each venv
-            for venv in ml-gpu fine-tuning agent-dev; do
-              TARBALL_URL="$GITHUB_RELEASE_URL/$ARCH_DIR/$venv.tar.gz"
+            # Download and extract each system venv directly to local storage (fast!)
+            for venv in fine-tuning agent-dev; do
+              TARBALL_URL="$GITHUB_RELEASE_URL/$venv.tar.gz"
               echo "  Downloading $venv..."
 
+              # Remove any existing incomplete venv first
+              rm -rf "$VENVS_ARCH_DIR/$venv" 2>/dev/null || true
+
+              # Extract directly to local storage (hostPath = fast local disk)
               if curl -fsSL "$TARBALL_URL" | tar -xzf - -C "$VENVS_ARCH_DIR/"; then
-                echo "    ✓ $venv extracted"
+                echo "    ✓ $venv downloaded and extracted"
               else
                 echo "    ✗ Failed to download $venv from $TARBALL_URL"
                 echo "    Venvs may not be available yet. Run 99_build_venvs.yaml and upload to GitHub."
@@ -627,7 +631,7 @@ singleuser:
           ln -sfn "$VENVS_ARCH_DIR" "$VENVS_BASE/current"
           echo "Created symlink: $VENVS_BASE/current -> $ARCH_DIR"
 
-          # Register each venv as a Jupyter kernel (system venvs + user custom venvs)
+          # Register each venv as a Jupyter kernel (system venvs + custom venvs)
           mkdir -p /home/thinkube/.local/share/jupyter/kernels
 
           # Register system venvs (downloaded from GitHub)
@@ -643,17 +647,38 @@ singleuser:
             fi
           done
 
-          # Register user custom venvs (created by user in ~/venvs/custom/)
+          # Register custom venvs (built via thinkube-control, synced to all GPU nodes)
+          # Only register custom venvs that match the current architecture (via .arch file)
           CUSTOM_VENVS_DIR="$VENVS_BASE/custom"
           if [ -d "$CUSTOM_VENVS_DIR" ]; then
             for venv in "$CUSTOM_VENVS_DIR"/*/; do
               if [ -d "$venv" ] && [ -f "$venv/bin/python" ]; then
                 VENV_NAME=$(basename "$venv")
-                echo "Registering custom kernel: $VENV_NAME"
+
+                # Check architecture marker for multi-arch support
+                VENV_ARCH=""
+                if [ -f "$venv/.arch" ]; then
+                  VENV_ARCH=$(cat "$venv/.arch" 2>/dev/null || echo "")
+                fi
+
+                # Skip if venv was built for different architecture
+                if [ -n "$VENV_ARCH" ] && [ "$VENV_ARCH" != "$ARCH_DIR" ]; then
+                  echo "Skipping custom kernel $VENV_NAME - built for $VENV_ARCH, current arch is $ARCH_DIR"
+                  continue
+                fi
+
+                # Register kernel with architecture info
+                DISPLAY_NAME="$VENV_NAME (custom"
+                if [ -n "$VENV_ARCH" ]; then
+                  DISPLAY_NAME="$DISPLAY_NAME, $VENV_ARCH"
+                fi
+                DISPLAY_NAME="$DISPLAY_NAME)"
+
+                echo "Registering custom kernel: $VENV_NAME as '$DISPLAY_NAME'"
                 "$venv/bin/python" -m ipykernel install \
                   --user \
                   --name="$VENV_NAME" \
-                  --display-name="$VENV_NAME (custom)" \
+                  --display-name="$DISPLAY_NAME" \
                   2>/dev/null || echo "  Note: kernel may already be registered"
               fi
             done
@@ -699,11 +724,12 @@ singleuser:
       persistentVolumeClaim:
         claimName: jupyterhub-mlflow-artifacts-pvc
 
-    # Persistent virtualenvs (JuiceFS - per-architecture Python environments)
-    # Contains arm64/ and amd64/ subdirectories with venvs for each architecture
+    # Local node storage for venvs (fast I/O - no JuiceFS small file bottleneck)
+    # Each GPU node has its own copy, synced via rsync after custom venv builds
     - name: venvs
-      persistentVolumeClaim:
-        claimName: jupyterhub-venvs-pvc
+      hostPath:
+        path: /var/lib/jupyterhub-venvs
+        type: DirectoryOrCreate
 
     # Thinkube icons (from ConfigMap)
     - name: thinkube-icons
@@ -766,8 +792,8 @@ singleuser:
     - name: service-config
       mountPath: /home/thinkube/.config/thinkube
 
-    # Persistent virtualenvs (JuiceFS - mounted to /home/thinkube/venvs)
-    # Init container creates symlink from /home/thinkube/venvs/current -> {arch}/
+    # Local node venvs (fast I/O - hostPath on each GPU node)
+    # Init container downloads system venvs from GitHub releases
     - name: venvs
       mountPath: /home/thinkube/venvs
 
@@ -816,8 +842,8 @@ singleuser:
   networkPolicy:
     enabled: false
 
-  # Start timeout (5 minutes for image pull)
-  startTimeout: 300
+  # Start timeout (20 minutes for image pull + venv download/extraction)
+  startTimeout: 1200
 
   # Lifecycle hooks - add environment sourcing to shell configs
   lifecycleHooks:
