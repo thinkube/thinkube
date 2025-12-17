@@ -1,31 +1,45 @@
 # Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# TensorRT-LLM base image with NVFP4 support for Blackwell GPUs
-# Based on NVIDIA NGC TensorRT-LLM 1.2.0rc2 mirrored to Harbor
-FROM {{ harbor_registry }}/library/tensorrt-llm:1.2.0rc2
+# TensorRT-LLM base image for DGX Spark with MXFP4 support
+# Based on NVIDIA's official spark-single-gpu-dev container (TensorRT-LLM 1.1.0rc3)
+# Supports: GPT-OSS-20B/120B, Qwen, with FlashAttention2 and trtllm-serve
+FROM {{ harbor_registry }}/library/tensorrt-llm-spark:latest
 
-# Set working directory
 WORKDIR /app
 
-# Pre-install common Python dependencies for LLM serving templates
-# These are commonly used across all TensorRT-LLM deployments
-RUN pip install --no-cache-dir \
-    openai>=1.0.0 \
-    gradio>=4.42.0
+# Add dependencies for Thinkube LLM serving templates
+# Force upgrade openai-harmony to 0.0.8+ (spark container has 0.0.4 pinned by tensorrt_llm)
+# We need 0.0.8 for the strict parameter in parse_messages_from_completion_tokens
+RUN pip install --no-cache-dir --force-reinstall \
+    openai-harmony>=0.0.8 && \
+    pip install --no-cache-dir \
+    gradio>=4.42.0 \
+    mlflow~=3.6.0 \
+    httpx>=0.27.0
+
+# Pre-download tiktoken encoding files for openai-harmony (offline support)
+# Required because HF_HUB_OFFLINE=1 blocks runtime downloads
+RUN mkdir -p /app/tiktoken_encodings && \
+    curl -sL -o /app/tiktoken_encodings/o200k_base.tiktoken \
+    "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
+ENV TIKTOKEN_ENCODINGS_BASE=/app/tiktoken_encodings
 
 # Create icons directory for Thinkube branding
 RUN mkdir -p /app/icons
 
-# The base image already includes:
-# - TensorRT-LLM runtime and tools
-# - CUDA 13.0 with Blackwell (sm_121a) support
-# - Python 3.12
-# - All TensorRT-LLM dependencies
+# The base image (tensorrt-llm-spark) includes:
+# - TensorRT-LLM 1.1.0rc3 with trtllm-serve
+# - FlashAttention2 (built into TensorRT-LLM)
+# - CUDA 13.0 with Blackwell (sm_121a) support for DGX Spark
+# - GPT-OSS-20B/120B MXFP4 support
+# - Qwen model support
+# - PyTorch with CUDA
+# - OpenAI-compatible API via trtllm-serve
 
-# This image is used as base for tkt-tensorrt-llm template deployments
-# Templates only need to:
-# 1. Copy their application code (server.py, entrypoint.sh, etc.)
-# 2. Copy icons
-# 3. Install any additional template-specific requirements
-# 4. Set MODEL_ID via environment variable (not baked into image)
+# This image adds:
+# - Gradio for web UI
+# - MLflow client for model discovery
+# - httpx for proxying to trtllm-serve backend
+# - openai-harmony for harmony format parsing
+# - Pre-downloaded tiktoken encodings for offline support
