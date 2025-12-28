@@ -110,6 +110,51 @@
       become: true
 
     # ===========================
+    # Create Host Driver Validation Marker (for pre-installed drivers)
+    # ===========================
+    # When driver.enabled=false, the GPU operator components wait for
+    # /run/nvidia/validations/host-driver-ready to signal that the host
+    # driver is available. Since /run is tmpfs, we need a systemd service
+    # to create this on every boot.
+    - name: Create systemd service for NVIDIA host driver validation marker
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Create NVIDIA host driver validation marker
+          After=local-fs.target
+          Before=snap.k8s.kubelet.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/bash -c 'mkdir -p /run/nvidia/validations && touch /run/nvidia/validations/host-driver-ready'
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/nvidia-host-driver-validation.service
+        mode: '0644'
+      become: true
+
+    - name: Enable and start NVIDIA host driver validation service
+      ansible.builtin.systemd:
+        name: nvidia-host-driver-validation
+        enabled: true
+        state: started
+        daemon_reload: true
+      become: true
+
+    - name: Verify host driver validation marker exists
+      ansible.builtin.stat:
+        path: /run/nvidia/validations/host-driver-ready
+      become: true
+      register: validation_marker
+
+    - name: Fail if validation marker was not created
+      ansible.builtin.fail:
+        msg: "Failed to create /run/nvidia/validations/host-driver-ready"
+      when: not validation_marker.stat.exists
+
+    # ===========================
     # Install GPU Operator
     # ===========================
     - name: Install GPU Operator
@@ -120,7 +165,6 @@
           --wait \
           --timeout 15m \
           --set driver.enabled=false \
-          --set hostPaths.driverInstallDir=/ \
           --set toolkit.env[0].name=CONTAINERD_CONFIG \
           --set toolkit.env[0].value=/var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml \
           --set toolkit.env[1].name=CONTAINERD_SOCKET \
