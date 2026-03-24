@@ -129,18 +129,23 @@ timeout 120 sudo snap remove k8s --purge || {
     done
     echo "All k8s mounts cleared"
 
-    # Detach all loop devices again
+    # Detach all loop devices again (with timeout to prevent hanging)
     echo "Detaching loop devices..."
-    losetup -a | grep '/var/snap/k8s' | cut -d: -f1 | xargs -I {} sudo losetup -d {} 2>/dev/null || true
+    timeout 10 bash -c 'losetup -a 2>/dev/null | grep "/var/snap/k8s" | cut -d: -f1 | xargs -I {} sudo losetup -d {} 2>/dev/null' || true
 
-    # Find and remove stuck changes
-    STUCK_CHANGES=$(snap changes 2>/dev/null | grep -E "Do|Doing|Undo|Error" | grep -i "k8s" | awk '{print $1}' || true)
-    if [ -n "$STUCK_CHANGES" ]; then
-      echo "Removing stuck snap changes from state.json: $STUCK_CHANGES"
-      for CHANGE_ID in $STUCK_CHANGES; do
+    # Find and remove ALL k8s-related changes (not just stuck ones)
+    echo "Removing all k8s-related changes from state.json..."
+    ALL_K8S_CHANGES=$(sudo jq -r '.changes | to_entries[] | select(.value.summary | contains("k8s")) | .key' /var/lib/snapd/state.json 2>/dev/null || true)
+    if [ -n "$ALL_K8S_CHANGES" ]; then
+      CHANGE_COUNT=$(echo "$ALL_K8S_CHANGES" | wc -l)
+      echo "Found $CHANGE_COUNT k8s-related changes to remove"
+      for CHANGE_ID in $ALL_K8S_CHANGES; do
         sudo jq "del(.changes.\"$CHANGE_ID\")" /var/lib/snapd/state.json > /tmp/state.json.new
         sudo mv /tmp/state.json.new /var/lib/snapd/state.json
       done
+      echo "All k8s changes removed"
+    else
+      echo "No k8s changes found in state.json"
     fi
 
     # Unmount snap if still mounted

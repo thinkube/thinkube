@@ -91,10 +91,10 @@ k8s-snap manages its own containerd instance and will conflict with system conta
 ### 1. Install k8s-snap
 
 ```bash
-sudo snap install k8s --classic --channel=1.34-classic/stable
+sudo snap install k8s --classic --channel=1.35-classic/stable
 ```
 
-**Tested version**: 1.34.0 (from 1.34-classic/stable channel)
+**Tested version**: 1.35.0 (from 1.35-classic/stable channel)
 
 ### 2. Bootstrap Cluster
 
@@ -409,7 +409,7 @@ sudo k8s kubectl get nodes
 ```
 
 ### Prerequisites for Workers
-- k8s-snap installed: `sudo snap install k8s --classic --channel=1.34-classic/stable`
+- k8s-snap installed: `sudo snap install k8s --classic --channel=1.35-classic/stable`
 - Same UFW configuration as control plane
 - Docker stopped/disabled if present
 - Network connectivity to control plane (port 6400)
@@ -429,7 +429,7 @@ Following the same structure as MicroK8s playbooks, we need 6 playbooks:
    - Stop and disable pre-installed Docker
 
 3. **Installation**
-   - Install k8s snap from 1.34-classic/stable channel
+   - Install k8s snap from 1.35-classic/stable channel
    - Bootstrap cluster
    - Wait for ready state
 

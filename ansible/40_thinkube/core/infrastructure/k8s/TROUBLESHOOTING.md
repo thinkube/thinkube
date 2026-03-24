@@ -337,7 +337,7 @@ k8s kubectl delete pvc test-pvc -n default
 
 **Issue:** Snap auto-refresh can interrupt cluster operations.
 
-**Mitigation:** The playbook installs k8s snap with specific channel (`1.34-classic/stable`) to ensure version consistency.
+**Mitigation:** The playbook installs k8s snap with specific channel (`1.35-classic/stable`) to ensure version consistency.
 
 **Workaround if needed:**
 ```bash
