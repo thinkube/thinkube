@@ -1,0 +1,217 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/acme-certificates/15_configure_renewal_hook.yaml
+# Description:
+#   Installs a renewal hook script that syncs the wildcard TLS certificate
+#   to all Kubernetes TLS secrets after acme.sh renews it.
+#
+#   The script compares each secret's tls.crt content against the current
+#   on-disk certificate — only secrets holding the old wildcard cert are
+#   updated. This makes it safe to run even if non-wildcard TLS secrets
+#   exist in the cluster.
+#
+#   After patching secrets, it restarts the ingress-nginx pods so they
+#   pick up the new certificate.
+#
+# Requirements:
+#   - acme-certificates/10_deploy.yaml must have run first
+#   - k8s-snap installed on the control plane
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/acme-certificates/15_configure_renewal_hook.yaml
+#
+# Variables from inventory:
+#   - domain_name: Main domain for the cluster
+#   - system_username: System user that owns acme.sh
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 [AI-assisted]
+
+- name: Configure acme.sh renewal hook for Kubernetes TLS secrets
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+  vars:
+    acme_home: "/home/{{ system_username }}/.acme.sh"
+    cert_dir: "/etc/ssl/thinkube"
+    tls_crt_path: "{{ cert_dir }}/{{ domain_name }}/fullchain.cer"
+    tls_key_path: "{{ cert_dir }}/{{ domain_name }}/{{ domain_name }}.key"
+    hook_script_dir: "{{ cert_dir }}/scripts"
+    hook_script_path: "{{ cert_dir }}/scripts/sync-k8s-tls.sh"
+
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - system_username is defined
+          - kubectl_bin is defined
+          - kubeconfig is defined
+        fail_msg: "Required variables not defined in inventory"
+
+    - name: Verify certificate files exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ tls_crt_path }}"
+        - "{{ tls_key_path }}"
+      register: cert_files
+      failed_when: not cert_files.stat.exists
+
+    - name: Create hook script directory
+      ansible.builtin.file:
+        path: "{{ hook_script_dir }}"
+        state: directory
+        mode: '0750'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      become: true
+
+    - name: Install TLS sync script
+      ansible.builtin.copy:
+        dest: "{{ hook_script_path }}"
+        mode: '0750'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        content: |
+          #!/usr/bin/env bash
+          # sync-k8s-tls.sh — Sync renewed wildcard cert to all Kubernetes TLS secrets
+          # Called by acme.sh --reloadcmd after certificate renewal.
+          #
+          # Safety: only patches secrets whose tls.crt matches the OLD certificate.
+          # This ensures non-wildcard TLS secrets are never touched.
+
+          set -euo pipefail
+
+          KUBECTL="{{ kubectl_bin }}"
+          KUBECONFIG="{{ kubeconfig }}"
+          export KUBECONFIG
+
+          TLS_CRT="{{ tls_crt_path }}"
+          TLS_KEY="{{ tls_key_path }}"
+          LOG_TAG="sync-k8s-tls"
+
+          log() { logger -t "$LOG_TAG" "$*"; echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
+
+          # Read the NEW certificate and key from disk (just renewed by acme.sh)
+          NEW_CRT_B64=$(base64 -w0 < "$TLS_CRT")
+          NEW_KEY_B64=$(base64 -w0 < "$TLS_KEY")
+
+          # Collect all kubernetes.io/tls secrets across all namespaces
+          SECRETS=$($KUBECTL get secrets --all-namespaces \
+            --field-selector type=kubernetes.io/tls \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.data.tls\.crt}{"\n"}{end}')
+
+          UPDATED=0
+          SKIPPED=0
+
+          while IFS=' ' read -r ns name old_crt_b64; do
+            [ -z "$ns" ] && continue
+
+            # Skip if the secret already has the new cert (idempotent)
+            if [ "$old_crt_b64" = "$NEW_CRT_B64" ]; then
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            # Only patch secrets that held the OLD wildcard cert.
+            # Decode the secret's cert and check if it shares the same SAN (Subject Alternative Names)
+            # as our wildcard cert. This avoids touching unrelated TLS secrets.
+            OLD_SANS=$(echo "$old_crt_b64" | base64 -d 2>/dev/null | \
+              openssl x509 -noout -ext subjectAltName 2>/dev/null | \
+              grep -oP 'DNS:[^,]+' | sort || true)
+            NEW_SANS=$(openssl x509 -in "$TLS_CRT" -noout -ext subjectAltName 2>/dev/null | \
+              grep -oP 'DNS:[^,]+' | sort || true)
+
+            if [ "$OLD_SANS" != "$NEW_SANS" ]; then
+              log "SKIP $ns/$name — different SANs"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            # Patch the secret with the new cert and key
+            $KUBECTL patch secret "$name" -n "$ns" \
+              --type='json' \
+              -p="[
+                {\"op\": \"replace\", \"path\": \"/data/tls.crt\", \"value\": \"$NEW_CRT_B64\"},
+                {\"op\": \"replace\", \"path\": \"/data/tls.key\", \"value\": \"$NEW_KEY_B64\"}
+              ]" >/dev/null
+
+            log "UPDATED $ns/$name"
+            UPDATED=$((UPDATED + 1))
+          done <<< "$SECRETS"
+
+          log "Done: $UPDATED secrets updated, $SKIPPED skipped"
+
+          # Restart ingress-nginx so it picks up the new cert
+          $KUBECTL delete pod -n ingress -l app.kubernetes.io/name=ingress-nginx 2>/dev/null || true
+          log "Restarted ingress-nginx pods"
+      become: true
+
+    - name: Verify hook script is executable
+      ansible.builtin.shell: |
+        test -x {{ hook_script_path }} && echo "OK"
+      register: script_check
+      changed_when: false
+      failed_when: "'OK' not in script_check.stdout"
+
+    - name: Get current acme.sh reloadcmd for domain
+      ansible.builtin.shell: |
+        grep -A5 "Le_Domain='{{ domain_name }}'" {{ acme_home }}/{{ domain_name }}_ecc/{{ domain_name }}.conf 2>/dev/null | \
+          grep "Le_ReloadCmd=" || echo "Le_ReloadCmd=''"
+      register: current_reloadcmd
+      changed_when: false
+      become: false
+      become_user: "{{ system_username }}"
+      args:
+        executable: /bin/bash
+
+    - name: Display current reloadcmd
+      ansible.builtin.debug:
+        msg: "Current reloadcmd: {{ current_reloadcmd.stdout }}"
+
+    - name: Update acme.sh reloadcmd to use sync script
+      ansible.builtin.shell: |
+        {{ acme_home }}/acme.sh --install-cert -d {{ domain_name }} \
+          -d "*.{{ domain_name }}" \
+          -d "*.kn.{{ domain_name }}" \
+          --cert-file {{ cert_dir }}/{{ domain_name }}/{{ domain_name }}.cer \
+          --key-file {{ tls_key_path }} \
+          --fullchain-file {{ tls_crt_path }} \
+          --reloadcmd "{{ hook_script_path }}"
+      become: false
+      become_user: "{{ system_username }}"
+      args:
+        executable: /bin/bash
+      when: "hook_script_path not in current_reloadcmd.stdout"
+
+    - name: Verify reloadcmd was updated
+      ansible.builtin.shell: |
+        grep "Le_ReloadCmd=" {{ acme_home }}/{{ domain_name }}_ecc/{{ domain_name }}.conf
+      register: updated_reloadcmd
+      changed_when: false
+      become: false
+      become_user: "{{ system_username }}"
+      args:
+        executable: /bin/bash
+
+    - name: Display updated reloadcmd
+      ansible.builtin.debug:
+        msg: "Updated reloadcmd: {{ updated_reloadcmd.stdout }}"
+
+    - name: Run sync script now to ensure all secrets are current
+      ansible.builtin.shell: |
+        {{ hook_script_path }}
+      register: sync_result
+      become: false
+      become_user: "{{ system_username }}"
+      args:
+        executable: /bin/bash
+
+    - name: Display sync results
+      ansible.builtin.debug:
+        msg: "{{ sync_result.stdout_lines }}"
