@@ -11,7 +11,7 @@
 #   - Kubernetes (k8s-snap) must be installed
 #   - Harbor must have Ollama image mirrored
 #   - GPU node available
-#   - JuiceFS MLflow volume created (core/juicefs/11_create_mlflow_volume.yaml)
+#   - JupyterHub deployed (creates the shared jupyterhub-mlflow-root PV)
 #
 # Usage:
 #   cd ~/thinkube
@@ -39,11 +39,6 @@
 
     # Storage settings
     ollama_storage_size: "100Gi"
-    mlflow_storage_size: "500Gi"
-
-    # JuiceFS settings
-    juicefs_namespace: "{{ juicefs_namespace | default('juicefs') }}"
-    juicefs_mlflow_storage_class: "juicefs-mlflow"
 
   tasks:
     ###########################################################################
@@ -108,9 +103,47 @@
                 storage: "{{ ollama_storage_size }}"
 
     ###########################################################################
-    # Step 3: Create PVC for JuiceFS MLflow access
+    # Step 3: Create PV and PVC for JuiceFS MLflow access
     ###########################################################################
-    - name: Create PVC for JuiceFS MLflow access
+    # IMPORTANT: Create a static PV that mounts the SAME JuiceFS volume that
+    # JupyterHub uses. This allows Ollama to access:
+    #   - Models mirrored from HuggingFace (via thinkube-control)
+    #   - Fine-tuned models created in JupyterHub
+    #
+    # Path mapping:
+    #   JupyterHub:  /home/thinkube/thinkube/mlflow/
+    #   Ollama:      /mlflow-models/
+    #
+    - name: Create static PV for MLflow access (mounts same JuiceFS volume)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: ollama-mlflow-root
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 1Ti
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-mlflow-secret
+                namespace: juicefs
+              volumeAttributes:
+                juicefs/mount-cpu-limit: ""
+                juicefs/mount-cpu-request: ""
+                juicefs/mount-memory-limit: ""
+                juicefs/mount-memory-request: ""
+              volumeHandle: ollama-mlflow-root
+            persistentVolumeReclaimPolicy: Retain
+            volumeMode: Filesystem
+
+    - name: Create PVC for JuiceFS MLflow access (bound to static PV)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -123,10 +156,11 @@
           spec:
             accessModes:
               - ReadWriteMany
-            storageClassName: "{{ juicefs_mlflow_storage_class }}"
+            volumeName: ollama-mlflow-root
+            storageClassName: ""  # Empty string = use static binding
             resources:
               requests:
-                storage: "{{ mlflow_storage_size }}"
+                storage: 1Ti
 
     ###########################################################################
     # Step 4: Deploy Ollama StatefulSet

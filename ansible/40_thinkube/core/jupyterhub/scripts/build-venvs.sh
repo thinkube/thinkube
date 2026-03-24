@@ -41,7 +41,7 @@ mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 BASE_PACKAGES=(
   ipykernel
   transformers
-  datasets
+  "datasets==4.3.0"  # Pinned for Unsloth compatibility (4.4.x causes recursion errors)
   accelerate
   nvidia-modelopt
   pandas
@@ -52,6 +52,7 @@ BASE_PACKAGES=(
   psycopg2-binary
   redis
   qdrant-client
+  langchain-qdrant
   opensearch-py
   mlflow
   boto3

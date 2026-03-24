@@ -36,13 +36,20 @@
     admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
     
   tasks:
+    - name: Check if podman is installed
+      ansible.builtin.command: which podman
+      register: podman_check
+      changed_when: false
+      failed_when: false
+      tags: [always]
+
     - name: Install podman (ensure it's available)
       ansible.builtin.apt:
         name: podman
         state: present
         update_cache: yes
       become: true
-      when: ansible_os_family == "Debian"
+      when: ansible_os_family == "Debian" and podman_check.rc != 0
       tags: [always]
 
     - name: Ensure library project exists in Harbor
@@ -331,33 +338,38 @@
     #   retries: 2
     #   delay: 10
 
-    # TensorRT-LLM Base Image - Replacement for vLLM with full NVFP4 Blackwell support
-    # Uses mirrored NVIDIA NGC image with sm_121a architecture support for DGX Spark GB10
+    # TensorRT-LLM Base Image - Based on PyTorch 25.11 with TensorRT-LLM pip installed
+    # Provides FA2 + TransformerEngine optimizations with full trtllm-serve support
     # Pre-installs openai and gradio dependencies to speed up template deployments
 
     - name: Template TensorRT-LLM base Containerfile
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/tensorrt-llm-base.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/tensorrt-llm-base.Containerfile"
+      tags: [tensorrt-llm-base]
 
     - name: Build TensorRT-LLM base image
       ansible.builtin.shell: |
-        podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
+        podman build --platform linux/arm64 \
                      --tls-verify=true \
-                     -t {{ harbor_registry }}/library/tensorrt-llm-base:1.2.0rc2 \
+                     -t {{ harbor_registry }}/library/tensorrt-llm-base:25.11 \
+                     -t {{ harbor_registry }}/library/tensorrt-llm-base:latest \
                      -f {{ temp_containerfiles_dir.path }}/tensorrt-llm-base.Containerfile \
                      {{ base_images_dir }}
       register: tensorrt_llm_base_build
       changed_when: true
+      tags: [tensorrt-llm-base]
 
     - name: Push TensorRT-LLM base image
       ansible.builtin.shell: |
-        podman push --tls-verify=true {{ harbor_registry }}/library/tensorrt-llm-base:1.2.0rc2
+        podman push --tls-verify=true {{ harbor_registry }}/library/tensorrt-llm-base:25.11
+        podman push --tls-verify=true {{ harbor_registry }}/library/tensorrt-llm-base:latest
       register: tensorrt_llm_base_push
       changed_when: tensorrt_llm_base_push.rc == 0
       failed_when: tensorrt_llm_base_push.rc != 0
       retries: 2
       delay: 10
+      tags: [tensorrt-llm-base]
 
     - name: Template MLflow Dockerfile
       ansible.builtin.template:
@@ -554,12 +566,12 @@
           # - destination: "{{ harbor_registry }}/library/vllm-base:0.11-cuda13.0-py3.12"
           #   source: "custom-build"
           #   description: "vLLM base image with vLLM 0.11, CUDA 13.0, Python 3.12 - for LLM inference"
-          - destination: "{{ harbor_registry }}/library/tensorrt-llm-base:1.2.0rc2"
+          - destination: "{{ harbor_registry }}/library/tensorrt-llm-base:25.11"
             source: "custom-build"
-            description: "TensorRT-LLM base image 1.2.0rc2 with NVFP4 support for Blackwell (DGX Spark GB10)"
+            description: "TensorRT-LLM base image based on PyTorch 25.11 with FA2, TransformerEngine, and TensorRT-LLM"
             metadata:
-              base_image: "nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc2"
-              packages: "openai gradio"
+              base_image: "pytorch:25.11-py3"
+              packages: "tensorrt_llm openai gradio"
           - destination: "{{ harbor_registry }}/library/mlflow-custom:latest"
             source: "custom-build"
             description: "MLflow with OIDC auth, PostgreSQL and S3 support"
@@ -613,7 +625,7 @@
           CI utils: {{ harbor_registry }}/library/ci-utils:latest
           Service discovery: {{ harbor_registry }}/library/tk-service-discovery:latest
           AI inference base: {{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.9-py3.12
-          TensorRT-LLM base: {{ harbor_registry }}/library/tensorrt-llm-base:1.2.0rc2
+          TensorRT-LLM base: {{ harbor_registry }}/library/tensorrt-llm-base:25.11
           TEI base: {{ harbor_registry }}/library/text-embeddings-inference-base:1.5-blackwell
           MLflow custom: {{ harbor_registry }}/library/mlflow-custom:latest
           Model mirror: {{ harbor_registry }}/library/model-mirror:latest

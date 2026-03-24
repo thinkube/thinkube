@@ -1,384 +1,190 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with the Thinkube Ansible playbooks repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-Thinkube is a collection of Ansible playbooks for deploying a complete Kubernetes homelab platform. The playbooks are designed to be run either:
-1. **Via the Thinkube Installer** (GUI desktop app) - Recommended for initial deployments
-2. **Manually via command line** - For development, testing, and rollbacks
+Thinkube is a collection of Ansible playbooks for deploying a complete Kubernetes homelab platform on Ubuntu servers. The playbooks provision bare-metal hosts, install Canonical k8s-snap, and deploy 17 core services plus 17+ optional services (AI/ML tools, databases, monitoring).
 
-**Repository**: `~/thinkube/` (source of truth)
-**Installer clone**: `/tmp/thinkube-installer/` (temporary, created by installer)
+**Version**: 0.1.0 (under active development)
 
-# ⚠️ CRITICAL PATH RULES ⚠️
+## Running Playbooks
 
-**BEFORE ANY EDIT/WRITE/GIT OPERATION - CHECK THIS:**
+Playbooks are designed to be run by the **thinkube-installer**, a Tauri desktop app (separate repo at `../thinkube-installer/`). The installer:
 
-## Allowed Paths for Edits
+1. Clones this repo to `/tmp/thinkube-installer-<random>/`
+2. Generates inventory (minimal for SSH setup, full for deployment)
+3. Executes playbooks via its FastAPI backend with real-time WebSocket streaming
+4. Cleans up the temp clone after deployment
 
-✅ **ALLOWED** - This is the source of truth:
-- `/home/alexmc/thinkube/` - Ansible playbooks repository (edit here!)
+### Manual Execution (Development)
 
-❌ **FORBIDDEN** - Changes will be lost:
-- `/tmp/thinkube-installer/` - TEMPORARY CLONE by installer, never edit here
-- `/tmp/*` - Any temporary files created during deployment
+For development and testing, use `scripts/tk_ansible` from code-server:
 
-## Pre-Commit Verification Checklist
-
-**Before ANY `git commit` or `git push` command:**
-
-1. ✅ Run `pwd` - Am I in `~/thinkube/`?
-2. ❌ If in `/tmp/*` → **STOP IMMEDIATELY**, cd to `~/thinkube/`
-3. ✅ If in `~/thinkube/` → Proceed with commit
-
-**Always use full paths in git commands:**
 ```bash
-# CORRECT - Explicit directory change
-cd ~/thinkube && git add ... && git commit -m "..." && git push
-
-# WRONG - Uses current directory
-git commit -m "..."  # Where am I? /tmp? ~/thinkube? Unknown!
+./scripts/tk_ansible ansible/40_thinkube/core/keycloak/00_install.yaml
+./scripts/tk_ansible ansible/40_thinkube/core/harbor/10_deploy.yaml
+./scripts/tk_ansible ansible/40_thinkube/core/postgresql/18_test.yaml -v
 ```
 
----
+`tk_ansible` loads `$HOME/.env` (requires `ANSIBLE_BECOME_PASSWORD`), activates `$HOME/.venv`, and runs against shared inventory at `/home/thinkube/.ansible/inventory/`.
 
-# Running Playbooks Manually
+For running from outside the cluster network (via ZeroTier), use `scripts/run_ansible.sh` instead - it auto-detects network and rewrites inventory IPs to ZeroTier addresses.
 
-## Understanding the Two Execution Contexts
+### Environment Variables
 
-### 1. Via Installer (Automatic)
-The Thinkube Installer (GUI app) automatically:
-- Clones this repo to `/tmp/thinkube-installer/`
-- Creates inventory at `/tmp/thinkube-installer/inventory/inventory.yaml`
-- Sets up Ansible environment in `~/.thinkube-installer/ansible-venv/`
-- Runs playbooks with proper environment variables
-- Cleans up `/tmp/` clone after deployment
+Required in `~/.env`:
+- `ANSIBLE_BECOME_PASSWORD` - Sudo password for remote hosts
+- `ANSIBLE_SSH_PASS` - SSH password (falls back to ANSIBLE_BECOME_PASSWORD)
 
-### 2. Manually (For Development/Rollbacks)
-When running playbooks manually, you must:
-- Use the installer's temporary clone at `/tmp/thinkube-installer/`
-- Provide the inventory path explicitly
-- Set required environment variables
-- Use the correct Ansible binary
+Optional:
+- `ADMIN_PASSWORD`, `ADMIN_USERNAME` (default: tkadmin) - Service admin credentials
+- `GITHUB_TOKEN`, `GITHUB_ORG` - GitHub integration
+- `CLOUDFLARE_TOKEN` - DNS management
+- `ZEROTIER_NETWORK_ID` - Network overlay
+- `CLUSTER_NAME` - Kubernetes cluster name
+- `DOMAIN_NAME` - Domain name for services
 
----
+## Testing
 
-## How to Run Playbooks Manually
-
-### Prerequisites
-
-1. **Environment variables** in `~/.env`:
-   ```bash
-   ADMIN_PASSWORD=your_sudo_password
-   # Other vars loaded automatically by playbooks
-   ```
-
-2. **Installer has run** at least once to create:
-   - `~/.venv/` - Python virtual environment with Ansible
-   - `/tmp/thinkube-installer/` - Clone of this repo
-   - `/tmp/thinkube-installer/inventory/inventory.yaml` - Inventory file
-
-### Standard Playbook Execution
-
-**Command template:**
+Each component has an `18_test.yaml` that validates the deployment:
 ```bash
-cd /tmp/thinkube-installer
-ANSIBLE_BECOME_PASSWORD='your_sudo_password' \
-~/.venv/bin/ansible-playbook \
-  -i inventory/inventory.yaml \
-  ansible/PATH/TO/PLAYBOOK.yaml
+./scripts/tk_ansible ansible/40_thinkube/core/keycloak/18_test.yaml
 ```
 
-**Example - Deploy Harbor:**
+Basic connectivity test:
 ```bash
-cd /tmp/thinkube-installer
-ANSIBLE_BECOME_PASSWORD='<your-password-here>' \
-~/.venv/bin/ansible-playbook \
-  -i inventory/inventory.yaml \
-  ansible/40_thinkube/core/harbor/00_install.yaml
+./scripts/tk_ansible ansible/test/hello-world.yaml
 ```
 
-### Rollback Playbooks
+## Architecture
 
-**Purpose**: Rollback playbooks (numbered `19_rollback.yaml`) clean up deployments by:
-- Terminating active connections (e.g., database sessions)
-- Dropping databases cleanly
-- Deleting Kubernetes namespaces and resources
-- Leaving system in clean state for redeployment
+### Deployment Phases
 
-**Example - Rollback Thinkube Control:**
-```bash
-cd /tmp/thinkube-installer
-ANSIBLE_BECOME_PASSWORD='<your-password-here>' \
-~/.venv/bin/ansible-playbook \
-  -i inventory/inventory.yaml \
-  ansible/40_thinkube/core/thinkube-control/19_rollback.yaml
-```
-
-**When to run rollback playbooks:**
-- Deployment failed and you want to start fresh
-- Database has active connections preventing drop
-- Need to completely remove a component
-- Testing changes that require clean slate
-
----
-
-## Common Mistakes and How to Avoid Them
-
-### ❌ MISTAKE #1: Wrong Working Directory
-
-**Wrong:**
-```bash
-cd ~/thinkube
-ansible-playbook ansible/40_thinkube/core/harbor/00_install.yaml
-```
-
-**Why wrong:** Inventory file is at `/tmp/thinkube-installer/inventory/inventory.yaml`, not in `~/thinkube/`
-
-**Correct:**
-```bash
-cd /tmp/thinkube-installer
-ANSIBLE_BECOME_PASSWORD='password' ~/.venv/bin/ansible-playbook \
-  -i inventory/inventory.yaml \
-  ansible/40_thinkube/core/harbor/00_install.yaml
-```
-
----
-
-### ❌ MISTAKE #2: Missing Environment Variables
-
-**Wrong:**
-```bash
-cd /tmp/thinkube-installer
-ansible-playbook -i inventory/inventory.yaml ansible/some/playbook.yaml
-```
-
-**Why wrong:** Playbooks expect `ANSIBLE_BECOME_PASSWORD` for sudo operations
-
-**Correct:**
-```bash
-cd /tmp/thinkube-installer
-ANSIBLE_BECOME_PASSWORD='your_password' ~/.venv/bin/ansible-playbook \
-  -i inventory/inventory.yaml \
-  ansible/some/playbook.yaml
-```
-
----
-
-### ❌ MISTAKE #3: Wrong Inventory Path
-
-**Wrong:**
-```bash
-ansible-playbook -i ~/.thinkube-installer/inventory.yaml ...
-```
-
-**Why wrong:** Inventory is at `/tmp/thinkube-installer/inventory/inventory.yaml` (note the `inventory/` subdirectory)
-
-**Correct:**
-```bash
-ansible-playbook -i inventory/inventory.yaml ...  # Relative to /tmp/thinkube-installer/
-# OR
-ansible-playbook -i /tmp/thinkube-installer/inventory/inventory.yaml ...  # Absolute path
-```
-
----
-
-### ❌ MISTAKE #4: Editing /tmp/thinkube-installer/
-
-**Wrong:**
-```bash
-cd /tmp/thinkube-installer
-# Edit ansible/40_thinkube/core/harbor/10_deploy.yaml
-git commit -m "Fix Harbor"
-```
-
-**Why wrong:** `/tmp/thinkube-installer/` is a temporary clone. Changes will be lost when you restart the installer or reboot.
-
-**Correct:**
-```bash
-cd ~/thinkube  # Source of truth
-# Edit ansible/40_thinkube/core/harbor/10_deploy.yaml
-git add ansible/40_thinkube/core/harbor/10_deploy.yaml
-git commit -m "Fix Harbor"
-git push
-# Then pull changes into /tmp/ for testing:
-cd /tmp/thinkube-installer && git pull
-```
-
----
-
-### ❌ MISTAKE #5: Using run_ansible.sh from ~/thinkube/
-
-**Wrong:**
-```bash
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/00_install.yaml
-```
-
-**Why wrong:** `run_ansible.sh` expects inventory at `inventory/inventory.yaml` (relative path), which doesn't exist in `~/thinkube/`. The inventory is only created by the installer at `/tmp/thinkube-installer/inventory/inventory.yaml`.
-
-**Correct:** Use the direct `ansible-playbook` command from `/tmp/thinkube-installer/` as shown in examples above.
-
----
-
-## Repository Structure
+Playbooks are organized into numbered phases reflecting deployment order:
 
 ```
-~/thinkube/
-├── ansible/
-│   ├── 00_initial_setup/        # Bootstrap nodes, install k8s
-│   │   ├── 00_install.yaml
-│   │   ├── 10_deploy.yaml
-│   │   └── 19_rollback.yaml
-│   ├── 10_baremetal_infra/      # Storage, networking
-│   ├── 30_networking/           # Cert-manager, ingress, Calico
-│   ├── 40_thinkube/             # Main platform components
-│   │   ├── core/                # Essential services
-│   │   │   ├── postgresql/
-│   │   │   ├── harbor/
-│   │   │   ├── argocd/
-│   │   │   ├── thinkube-control/
-│   │   │   └── ...
-│   │   └── optional/            # Optional services
-│   │       ├── litellm/
-│   │       ├── cvat/
-│   │       └── ...
-│   └── roles/                   # Reusable Ansible roles
-├── scripts/
-│   └── run_ansible.sh           # Helper script (not for manual use)
-└── CLAUDE.md                    # This file
+ansible/
+  00_initial_setup/     # SSH keys, environment, GPU reservation, GitHub CLI
+  10_baremetal_infra/   # Network bridges, server restarts
+  30_networking/        # ZeroTier/Tailscale VPN overlay
+  40_thinkube/          # Main platform
+    core/               # Required services
+    optional/           # Add-on services
+  misc/                 # Shell/dev environment setup (fish, tmux, claude)
+  roles/                # Reusable Ansible roles
+  test/                 # Test playbooks
 ```
 
 ### Playbook Numbering Convention
 
-- `00_install.yaml` - Meta-playbook that includes sub-playbooks
-- `10_*.yaml` - Deployment/configuration playbooks
-- `11_*.yaml`, `12_*.yaml` - Additional deployment steps
-- `17_configure_discovery.yaml` - Service discovery setup
-- `18_test.yaml` - Testing/validation playbook
-- `19_rollback.yaml` - Cleanup/removal playbook
+Every component follows a standardized lifecycle:
 
----
+| Prefix | Purpose |
+|--------|---------|
+| `00_install.yaml` | Orchestrator - calls subsequent playbooks in order |
+| `10_deploy.yaml` | Primary deployment (Helm chart, k8s resources) |
+| `10_configure_keycloak.yaml` | SSO/OIDC client setup (services needing auth) |
+| `11-16_*.yaml` | Additional config steps (tokens, CLI, SSH keys, etc.) |
+| `17_configure_discovery.yaml` | Service discovery registration |
+| `18_test.yaml` | Validation and health checks |
+| `19_rollback.yaml` | Clean removal (terminates connections, drops DBs, deletes namespace) |
 
-## Environment Variables
+Use `19_rollback.yaml` when a deployment failed and you need a clean slate, or when a database has active connections preventing a drop.
 
-### Required Variables
+### Core Components (ansible/40_thinkube/core/)
 
-- **ANSIBLE_BECOME_PASSWORD** - Sudo password for the remote host
-  - Must be set when running playbooks manually
-  - Automatically loaded from `~/.env` by installer
+Deployed in dependency order:
 
-### Optional Variables (loaded from ~/.env)
+1. **infrastructure/** - k8s-snap cluster, ingress (nginx), ACME certificates, CoreDNS, GPU operator
+2. **postgresql/** - Shared database
+3. **seaweedfs/** - S3-compatible object storage
+4. **juicefs/** - POSIX filesystem layer + MLflow gateway
+5. **keycloak/** - Identity provider (SSO for all services, realm: `thinkube`)
+6. **harbor/** - Container registry + **harbor-images/** for building base images
+7. **gitea/** - Internal Git server
+8. **argo-workflows/** - Workflow engine (triggered by Gitea webhooks)
+9. **argocd/** - GitOps continuous deployment
+10. **devpi/** - Python package repository
+11. **code-server/** - VS Code in browser
+12. **jupyterhub/** - Jupyter notebook environment
+13. **mlflow/** - ML experiment tracking
+14. **thinkube-control/** - Platform control plane (FastAPI + React)
 
-- **ADMIN_PASSWORD** - Admin password for services (fallback for ANSIBLE_BECOME_PASSWORD)
-- **ADMIN_USERNAME** - Admin username (default: tkadmin)
-- **GITHUB_TOKEN** - GitHub personal access token
-- **GITHUB_ORG** - GitHub organization name
-- **CLOUDFLARE_TOKEN** - Cloudflare API token
-- **ZEROTIER_NETWORK_ID** - ZeroTier network ID
-- **CLUSTER_NAME** - Kubernetes cluster name
-- **DOMAIN_NAME** - Domain name for services
+### Optional Components (ansible/40_thinkube/optional/)
 
----
+AI/ML: ollama, litellm, langfuse, argilla, cvat
+Vector DBs: qdrant, chroma, weaviate
+Data: clickhouse, opensearch, nats
+Monitoring: prometheus, perses
+Tools: pgadmin, valkey, knative
+
+### Reusable Roles (ansible/roles/)
+
+- **container_deployment/** - Main deployment framework (Helm, ArgoCD, webhooks, image management)
+- **keycloak/** - OIDC client/realm configuration
+- **common/** - Shared environment and SSH key utilities
+- **gitea/** - Gitea API interactions
+- **oauth2_proxy/** - OAuth2 proxy setup
+- **valkey/** - Cache deployment
+- **waiting_for_image/** - Image availability polling
+
+### Key Variables
+
+Variables are defined in inventory group vars (`/home/thinkube/.ansible/inventory/group_vars/k8s.yml`). Key patterns:
+
+- `domain_name` - Base domain
+- `*_hostname` - Service hostnames (e.g., `keycloak_hostname: auth.{{ domain_name }}`)
+- `*_namespace` - K8s namespaces per service
+- `harbor_registry` - Container registry URL (`registry.{{ domain_name }}`)
+- `kubeconfig` - Path to kubeconfig
+- `kubectl_bin`, `helm_bin` - Binary paths under `~/.local/bin/`
+- `keycloak_realm: thinkube` - Shared SSO realm
+- `zerotier_subnet_prefix` - Network prefix for all cluster IPs
+
+### Playbook Patterns
+
+Playbooks target host groups from inventory (e.g., `k8s_control_plane`, `baremetal`). They use the `kubernetes.core` Ansible collection for k8s operations. Sensitive values come from environment variables loaded via `$HOME/.env`.
+
+## Path Safety
+
+This repository is the source of truth. The installer clones it to `/tmp/` for execution. Never edit files in the `/tmp/` clone - changes will be lost. Always edit and commit from this repository.
+
+## thinkube-control Deployment Workflow
+
+When modifying thinkube-control (the platform control plane), follow this exact workflow:
+
+1. Edit files in `/home/thinkube/thinkube-platform/thinkube-control/`
+2. Commit and push to GitHub
+3. Deploy: `./scripts/tk_ansible ansible/40_thinkube/core/thinkube-control/12_deploy_dev.yaml`
+
+The deployment uses Copier to sync from GitHub to the runtime location (`/home/thinkube/thinkube-control/`), then triggers a build via Gitea webhook + Argo Workflow, and ArgoCD deploys the new image.
+
+- Do NOT edit files in `/home/thinkube/thinkube-control/` directly (overwritten by Copier)
+- Do NOT use `12_deploy.yaml` (not idempotent) - always use `12_deploy_dev.yaml`
+
+## Template Deployments (FORBIDDEN)
+
+Never deploy, redeploy, or trigger builds for template deployments (namespaces like `gptoss20`). These are only triggered through the thinkube-control UI. You may modify template source files in `/home/thinkube/thinkube-platform/tkt-*` and build/push base images, but stop after changes and let the user trigger rebuilds.
+
+## Monitoring
+
+```bash
+# Check Argo build workflows
+kubectl get workflows -n argo --sort-by=.metadata.creationTimestamp | tail -10
+
+# Check a component's pods
+kubectl get pods -n <namespace>
+
+# Check thinkube-control backend
+kubectl get pods -n thinkube-control -l app=thinkube-control-backend
+```
 
 ## Troubleshooting
 
-### "database is being accessed by other users"
-
-**Problem:** Trying to drop a database that has active connections.
-
-**Solution:** Run the rollback playbook to terminate connections and clean up:
+**"database is being accessed by other users"** - Run the component's rollback playbook to terminate active connections and drop databases cleanly:
 ```bash
-cd /tmp/thinkube-installer
-ANSIBLE_BECOME_PASSWORD='password' ~/.venv/bin/ansible-playbook \
-  -i inventory/inventory.yaml \
-  ansible/40_thinkube/core/SERVICE_NAME/19_rollback.yaml
+./scripts/tk_ansible ansible/40_thinkube/core/SERVICE_NAME/19_rollback.yaml
 ```
 
-Example services with rollback playbooks:
-- `thinkube-control/19_rollback.yaml`
-- `argocd/19_rollback.yaml`
-
-### "Unable to parse inventory"
-
-**Problem:** Inventory file path is wrong or doesn't exist.
-
-**Check:**
-```bash
-ls -la /tmp/thinkube-installer/inventory/inventory.yaml
-```
-
-**Solution:** Ensure you're using the correct path:
-- Relative: `inventory/inventory.yaml` (when cd'd to `/tmp/thinkube-installer/`)
-- Absolute: `/tmp/thinkube-installer/inventory/inventory.yaml`
-
-### "ANSIBLE_BECOME_PASSWORD not set"
-
-**Problem:** Environment variable not set.
-
-**Solution:** Set it before running:
-```bash
-ANSIBLE_BECOME_PASSWORD='your_password' ansible-playbook ...
-```
-
-Or load from `~/.env`:
-```bash
-source ~/.env
-export ANSIBLE_BECOME_PASSWORD=$ADMIN_PASSWORD
-ansible-playbook ...
-```
-
----
-
-## Quick Reference
-
-### Most Common Commands
-
-**Run a deployment playbook:**
-```bash
-cd /tmp/thinkube-installer && \
-ANSIBLE_BECOME_PASSWORD='password' ~/.venv/bin/ansible-playbook \
-  -i inventory/inventory.yaml \
-  ansible/40_thinkube/core/SERVICE/00_install.yaml
-```
-
-**Run a rollback playbook:**
-```bash
-cd /tmp/thinkube-installer && \
-ANSIBLE_BECOME_PASSWORD='password' ~/.venv/bin/ansible-playbook \
-  -i inventory/inventory.yaml \
-  ansible/40_thinkube/core/SERVICE/19_rollback.yaml
-```
-
-**Get password from ~/.env:**
-```bash
-grep ADMIN_PASSWORD ~/.env
-# ADMIN_PASSWORD=<your-password-here>
-```
-
-**Check if /tmp clone exists:**
-```bash
-ls -la /tmp/thinkube-installer/
-```
-
-**Pull latest changes into /tmp clone:**
-```bash
-cd /tmp/thinkube-installer && git pull
-```
-
----
-
-## Summary: Golden Rules
-
-1. **Edit in `~/thinkube/`** - Never edit in `/tmp/`
-2. **Run from `/tmp/thinkube-installer/`** - Working directory matters
-3. **Use `inventory/inventory.yaml`** - Relative to `/tmp/thinkube-installer/`
-4. **Set ANSIBLE_BECOME_PASSWORD** - Required for sudo operations
-5. **Use `~/.venv/bin/ansible-playbook`** - Correct Ansible binary
-6. **Commit from `~/thinkube/`** - Check `pwd` before committing
-7. **Rollback playbooks clean databases** - Use `19_rollback.yaml` for fresh start
-
----
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+**"ANSIBLE_BECOME_PASSWORD not set"** - Ensure `~/.env` contains `ANSIBLE_BECOME_PASSWORD=<password>` and is loaded before running playbooks. `tk_ansible` loads it automatically; for manual runs, `source ~/.env` first.
