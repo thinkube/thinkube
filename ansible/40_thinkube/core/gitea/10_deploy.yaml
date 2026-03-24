@@ -514,39 +514,34 @@
       register: service_result
       changed_when: "'created' in service_result.stdout or 'configured' in service_result.stdout"
     
-    # Note: Ingress TCP port 2222 is configured in the ingress deployment via Helm values
-    - name: Create Gitea ingress
+    - name: Create Gitea HTTPRoute
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
         metadata:
           name: gitea
           namespace: {{ gitea_namespace }}
-          annotations:
-            nginx.ingress.kubernetes.io/proxy-body-size: "0"
-            nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
-            nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
         spec:
-          ingressClassName: nginx
-          tls:
-          - hosts:
-            - {{ gitea_host }}
-            secretName: gitea-tls-secret
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ gitea_host }}"
           rules:
-          - host: {{ gitea_host }}
-            http:
-              paths:
-              - path: /
-                pathType: Prefix
-                backend:
-                  service:
-                    name: gitea
-                    port:
-                      number: 3000
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: gitea
+                  port: 3000
+              timeouts:
+                request: "600s"
         EOF
-      register: ingress_result
-      changed_when: "'created' in ingress_result.stdout or 'configured' in ingress_result.stdout"
+      register: httproute_result
+      changed_when: "'created' in httproute_result.stdout or 'configured' in httproute_result.stdout"
     
     - name: Wait for Gitea to be ready
       ansible.builtin.shell: |

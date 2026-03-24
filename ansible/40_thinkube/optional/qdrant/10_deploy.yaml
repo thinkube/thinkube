@@ -268,117 +268,108 @@
     ###########################################################################
     # Step 5: Create Qdrant HTTP Ingress (secured via /oauth2/auth)
     ###########################################################################
-    - name: Create or update Qdrant HTTP Dashboard Ingress
+    - name: Create or update Qdrant HTTP Dashboard HTTPRoute
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
           metadata:
-            name: "qdrant-http-ingress"
+            name: qdrant-dashboard-route
             namespace: "{{ k8s_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/proxy-body-size: "0"
-              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
-              nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
-              nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$escaped_request_uri"
           spec:
-            ingressClassName: "{{ primary_ingress_class }}"
-            tls:
-              - hosts:
-                  - "{{ qdrant_dashboard_host }}"
-                secretName: "{{ tls_secret_name }}"
+            parentRefs:
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
+              - "{{ qdrant_dashboard_host }}"
             rules:
-              - host: "{{ qdrant_dashboard_host }}"
-                http:
-                  paths:
-                    - path: "/"
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: "qdrant"
-                          port:
-                            number: 6333
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: qdrant
+                    port: 6333
 
     ###########################################################################
     # Step 6: Create a root-redirect Ingress (redirect "/" to "/dashboard")
     ###########################################################################
-    - name: Create Qdrant root redirect Ingress
+    - name: Create Qdrant root redirect HTTPRoute
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
           metadata:
-            name: "qdrant-root-redirect"
+            name: qdrant-root-redirect
             namespace: "{{ k8s_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/permanent-redirect: "https://{{ qdrant_dashboard_host }}/dashboard"
-              nginx.ingress.kubernetes.io/permanent-redirect-code: "301"
           spec:
-            ingressClassName: "{{ primary_ingress_class }}"
+            parentRefs:
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
+              - "{{ qdrant_dashboard_host }}"
             rules:
-              - host: "{{ qdrant_dashboard_host }}"
-                http:
-                  paths:
-                    - path: "/"
-                      pathType: Exact
-                      backend:
-                        service:
-                          # Dummy backend; the redirect annotation takes precedence
-                          name: "qdrant"
-                          port:
-                            number: 80
+              - matches:
+                  - path:
+                      type: Exact
+                      value: /
+                filters:
+                  - type: RequestRedirect
+                    requestRedirect:
+                      path:
+                        type: ReplaceFullPath
+                        replaceFullPath: /dashboard
+                      statusCode: 301
                             
     ###########################################################################
     # Step 7: Create Qdrant API Ingress (without authentication)
     ###########################################################################
-    - name: Create or update Qdrant API Ingress
+    - name: Create or update Qdrant API HTTPRoute
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
           metadata:
-            name: "qdrant-api-ingress"
+            name: qdrant-api-route
             namespace: "{{ k8s_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/proxy-body-size: "0"
-              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
           spec:
-            ingressClassName: "{{ primary_ingress_class }}"
-            tls:
-              - hosts:
-                  - "{{ qdrant_hostname }}"
-                secretName: "{{ tls_secret_name }}"
+            parentRefs:
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
+              - "{{ qdrant_hostname }}"
             rules:
-              - host: "{{ qdrant_hostname }}"
-                http:
-                  paths:
-                    - path: "/"
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: "qdrant"
-                          port:
-                            number: 6333
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: qdrant
+                    port: 6333
 
     ###########################################################################
     # Step 8: Debug task to check resources
     ###########################################################################
-    - name: List all ingresses in namespace
+    - name: List all HTTPRoutes in namespace
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
-        kind: Ingress
+        kind: HTTPRoute
+        api_version: gateway.networking.k8s.io/v1
         namespace: "{{ k8s_namespace }}"
-      register: ingresses
+      register: httproutes
 
-    - name: Debug ingresses
+    - name: Debug HTTPRoutes
       ansible.builtin.debug:
-        msg: "Ingresses in namespace: {{ ingresses.resources | map(attribute='metadata.name') | list }}"
+        msg: "HTTPRoutes in namespace: {{ httproutes.resources | map(attribute='metadata.name') | list }}"
         
     ###########################################################################
     # Step 9: Test Qdrant API endpoint

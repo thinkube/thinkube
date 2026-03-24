@@ -132,36 +132,31 @@
             tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
 
-    - name: Create HTTP Ingress for ClickHouse
+    - name: Create ClickHouse HTTPRoute
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
           metadata:
-            name: clickhouse-http-ingress
+            name: clickhouse-route
             namespace: "{{ clickhouse_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
-              nginx.ingress.kubernetes.io/proxy-body-size: "0"
           spec:
-            ingressClassName: "{{ primary_ingress_class }}"
-            tls:
-              - hosts:
-                  - "{{ clickhouse_hostname }}"
-                secretName: "{{ clickhouse_tls_secret_name }}"
+            parentRefs:
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
+              - "{{ clickhouse_hostname }}"
             rules:
-              - host: "{{ clickhouse_hostname }}"
-                http:
-                  paths:
-                    - path: /
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: clickhouse-clickhouse
-                          port:
-                            number: "{{ clickhouse_http_port }}"
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: clickhouse-clickhouse
+                    port: "{{ clickhouse_http_port }}"
 
     # Note: TCP port 9000 is pre-configured in ingress controller during deployment
     # We only need to update the ConfigMap to route traffic to ClickHouse service

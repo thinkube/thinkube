@@ -616,91 +616,79 @@
       ansible.builtin.include_role:
         name: oauth2_proxy
 
-    - name: Create CVAT API Ingress (bypasses OAuth2 for CLI access)
+    - name: Create CVAT API HTTPRoute (bypasses OAuth2 for CLI access)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
           metadata:
-            name: cvat-api-ingress
+            name: cvat-api-route
             namespace: "{{ cvat_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/proxy-body-size: "1024m"
-              nginx.ingress.kubernetes.io/proxy-send-timeout: "1200"
-              nginx.ingress.kubernetes.io/proxy-read-timeout: "1200"
-              nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
-              nginx.ingress.kubernetes.io/proxy-buffers-number: "4"
-              # NO auth-url or auth-signin annotations - allows cvat-cli basic auth
           spec:
-            ingressClassName: nginx
-            tls:
-              - hosts:
-                  - "{{ cvat_hostname }}"
-                secretName: "{{ cvat_namespace }}-tls-secret"
+            parentRefs:
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
+              - "{{ cvat_hostname }}"
             rules:
-              - host: "{{ cvat_hostname }}"
-                http:
-                  paths:
-                    - path: /api
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: cvat-backend
-                          port:
-                            number: 8080
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /api
+                backendRefs:
+                  - name: cvat-backend
+                    port: 8080
+                timeouts:
+                  request: "1200s"
 
-    - name: Create CVAT Main Ingress (secured via OAuth2)
+    - name: Create CVAT Main HTTPRoute
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
           metadata:
-            name: cvat-ingress
+            name: cvat-main-route
             namespace: "{{ cvat_namespace }}"
-            annotations:
-              nginx.ingress.kubernetes.io/proxy-body-size: "1024m"
-              nginx.ingress.kubernetes.io/proxy-send-timeout: "1200"
-              nginx.ingress.kubernetes.io/proxy-read-timeout: "1200"
-              nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
-              nginx.ingress.kubernetes.io/proxy-buffers-number: "4"
-              nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
-              nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$escaped_request_uri"
-              nginx.ingress.kubernetes.io/auth-response-headers: "X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Access-Token,X-Auth-Request-Groups"
           spec:
-            ingressClassName: nginx
-            tls:
-              - hosts:
-                  - "{{ cvat_hostname }}"
-                secretName: "{{ cvat_namespace }}-tls-secret"
+            parentRefs:
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
+              - "{{ cvat_hostname }}"
             rules:
-              - host: "{{ cvat_hostname }}"
-                http:
-                  paths:
-                    - path: /static
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: cvat-backend
-                          port:
-                            number: 8080
-                    - path: /django-rq
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: cvat-backend
-                          port:
-                            number: 8080
-                    - path: /
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: cvat-ui
-                          port:
-                            number: 80
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /static
+                backendRefs:
+                  - name: cvat-backend
+                    port: 8080
+                timeouts:
+                  request: "1200s"
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /django-rq
+                backendRefs:
+                  - name: cvat-backend
+                    port: 8080
+                timeouts:
+                  request: "1200s"
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: cvat-ui
+                    port: 80
+                timeouts:
+                  request: "1200s"
 
     # PostgreSQL readiness is checked by init containers in the deployment
     # No separate wait needed since we use shared core PostgreSQL

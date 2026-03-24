@@ -333,76 +333,67 @@
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
       register: secret_copy
 
-    - name: Create Ingress rule for Knative wildcard domains
+    - name: Create HTTPRoute for Knative wildcard domains
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
           metadata:
-            name: knative-wildcard-ingress
+            name: knative-wildcard-route
             namespace: kourier-system
-            annotations:
-              kubernetes.io/ingress.class: "{{ secondary_ingress_class }}"
-              nginx.ingress.kubernetes.io/ssl-redirect: "true"
-              nginx.ingress.kubernetes.io/proxy-body-size: "0"
-              nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-              nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
           spec:
-            tls:
-            - hosts:
+            parentRefs:
+              - name: "{{ gateway_kn_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
               - "*.{{ kn_domain }}"
-              secretName: "{{ ingress_kn_namespace }}-tls-secret"
             rules:
-            - host: "*.{{ kn_domain }}"
-              http:
-                paths:
-                - path: /
-                  pathType: Prefix
-                  backend:
-                    service:
-                      name: kourier
-                      port:
-                        number: 80
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: kourier
+                    port: 80
+                timeouts:
+                  request: "3600s"
 
-    - name: Create direct ServiceEntry for Kourier
+    - name: Create direct HTTPRoute for Kourier
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
           metadata:
-            name: knative-direct-ingress
+            name: knative-direct-route
             namespace: kourier-system
-            annotations:
-              kubernetes.io/ingress.class: "{{ secondary_ingress_class }}"
-              nginx.ingress.kubernetes.io/ssl-redirect: "false"
-              nginx.ingress.kubernetes.io/proxy-body-size: "0"
-              nginx.ingress.kubernetes.io/proxy-connect-timeout: "3600"
-              nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-              nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-              nginx.ingress.kubernetes.io/rewrite-target: "/$2"
-              nginx.ingress.kubernetes.io/upstream-vhost: "$host"
-              nginx.ingress.kubernetes.io/upstream-hash-by: "$request_uri"
-              nginx.ingress.kubernetes.io/preserve-host: "true"
           spec:
-            tls:
-            - hosts:
+            parentRefs:
+              - name: "{{ gateway_kn_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
               - "*.{{ kn_domain }}"
-              secretName: "{{ ingress_kn_namespace }}-tls-secret"
             rules:
-            - host: "*.{{ kn_domain }}"
-              http:
-                paths:
-                - path: /(/|$)(.*)
-                  pathType: ImplementationSpecific
-                  backend:
-                    service:
-                      name: kourier
-                      port:
-                        number: 80
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                filters:
+                  - type: URLRewrite
+                    urlRewrite:
+                      path:
+                        type: ReplacePrefixMatch
+                        replacePrefixMatch: /
+                backendRefs:
+                  - name: kourier
+                    port: 80
+                timeouts:
+                  request: "3600s"
 
     # --- PHASE 5: CONFIGURE DOMAIN MAPPING AND NETWORK ---
     

@@ -1,0 +1,84 @@
+---
+# roles/httproute/tasks/main.yaml
+# Creates an HTTPRoute resource for Cilium Gateway API
+#
+# Required variables:
+#   httproute_name: Name of the HTTPRoute
+#   httproute_namespace: Namespace to create the route in
+#   httproute_hostname: Hostname to match (e.g., "app.example.com")
+#   httproute_backend_service: Backend service name
+#   httproute_backend_port: Backend service port
+#
+# Optional variables:
+#   httproute_gateway_name: Gateway to attach to (default: thinkube-gateway)
+#   httproute_gateway_namespace: Gateway namespace (default: gateway-system)
+#   httproute_gateway_section: Gateway listener section (default: https)
+#   httproute_path: Path to match (default: /)
+#   httproute_path_type: PathPrefix or Exact (default: PathPrefix)
+#   httproute_request_timeout: Request timeout e.g. "3600s" (default: omitted)
+#   httproute_backend_timeout: Backend request timeout (default: omitted)
+#   httproute_rules: Full custom rules list (overrides simple path/backend)
+#   httproute_filters: List of filters (URLRewrite, etc.)
+
+- name: Create ReferenceGrant for cross-namespace routing
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: gateway.networking.k8s.io/v1beta1
+      kind: ReferenceGrant
+      metadata:
+        name: allow-gateway-httproute
+        namespace: "{{ httproute_namespace }}"
+      spec:
+        from:
+          - group: gateway.networking.k8s.io
+            kind: HTTPRoute
+            namespace: "{{ httproute_namespace }}"
+        to:
+          - group: ""
+            kind: Service
+  when: httproute_namespace != httproute_gateway_namespace
+
+- name: "Create HTTPRoute {{ httproute_name }}"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition: >-
+      {{
+        {
+          "apiVersion": "gateway.networking.k8s.io/v1",
+          "kind": "HTTPRoute",
+          "metadata": {
+            "name": httproute_name,
+            "namespace": httproute_namespace
+          },
+          "spec": {
+            "parentRefs": [
+              {
+                "name": httproute_gateway_name,
+                "namespace": httproute_gateway_namespace,
+                "sectionName": httproute_gateway_section
+              }
+            ],
+            "hostnames": [httproute_hostname],
+            "rules": httproute_rules | default([
+              (
+                {
+                  "matches": [{"path": {"type": httproute_path_type, "value": httproute_path}}],
+                  "backendRefs": [{"name": httproute_backend_service, "port": httproute_backend_port | int}]
+                }
+                | combine(
+                    {"timeouts": {
+                      "request": httproute_request_timeout,
+                      "backendRequest": httproute_backend_timeout | default(httproute_request_timeout)
+                    }} if httproute_request_timeout else {}
+                  )
+                | combine(
+                    {"filters": httproute_filters} if httproute_filters is defined else {}
+                  )
+              )
+            ])
+          }
+        }
+      }}

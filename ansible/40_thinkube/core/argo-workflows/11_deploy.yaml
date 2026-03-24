@@ -477,75 +477,64 @@
         var: crd_check.stdout_lines
 
     ##############################################################################
-    # (1) HTTP/HTTPS UI Ingress at 'argo_domain'
+    # (1) HTTP/HTTPS UI HTTPRoute at 'argo_domain'
     ##############################################################################
-    - name: Create Ingress for Argo Workflows (UI)
+    - name: Create HTTPRoute for Argo Workflows (UI)
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
         metadata:
-          name: argo-ingress
+          name: argo-httproute
           namespace: {{ argo_namespace }}
-          annotations:
-            nginx.ingress.kubernetes.io/ssl-redirect: "true"
         spec:
-          tls:
-            - hosts:
-                - {{ argo_domain }}
-              secretName: {{ argo_tls_secret_name }}
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ argo_domain }}"
           rules:
-            - host: {{ argo_domain }}
-              http:
-                paths:
-                  - path: /
-                    pathType: Prefix
-                    backend:
-                      service:
-                        name: {{ argo_release_name }}-server
-                        port:
-                          number: 2746
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: {{ argo_release_name }}-server
+                  port: 2746
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: ui_ingress_result
-      changed_when: "'configured' in ui_ingress_result.stdout or 'created' in ui_ingress_result.stdout"
+      register: ui_httproute_result
+      changed_when: "'configured' in ui_httproute_result.stdout or 'created' in ui_httproute_result.stdout"
 
     ##############################################################################
-    # (2) gRPC Ingress at 'argo_grpc_domain'
+    # (2) gRPC GRPCRoute at 'argo_grpc_domain'
     ##############################################################################
-    - name: Create gRPC Ingress for Argo Workflows
+    - name: Create GRPCRoute for Argo Workflows
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: GRPCRoute
         metadata:
-          name: argo-grpc-ingress
+          name: argo-grpc-route
           namespace: {{ argo_namespace }}
-          annotations:
-            nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
-            nginx.ingress.kubernetes.io/enable-http2: "true"
         spec:
-          tls:
-            - hosts:
-                - {{ argo_grpc_domain }}
-              secretName: {{ argo_tls_secret_name }}
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ argo_grpc_domain }}"
           rules:
-            - host: {{ argo_grpc_domain }}
-              http:
-                paths:
-                  - path: /
-                    pathType: Prefix
-                    backend:
-                      service:
-                        name: {{ argo_release_name }}-server
-                        port:
-                          number: 2746
+            - backendRefs:
+                - name: {{ argo_release_name }}-server
+                  port: 2746
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: grpc_ingress_result
-      changed_when: "'configured' in grpc_ingress_result.stdout or 'created' in grpc_ingress_result.stdout"
+      register: grpc_route_result
+      changed_when: "'configured' in grpc_route_result.stdout or 'created' in grpc_route_result.stdout"
 
     - name: Display Argo Workflows and Events installation details
       ansible.builtin.shell: |

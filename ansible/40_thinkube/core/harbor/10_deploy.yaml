@@ -357,17 +357,12 @@
         dest: "{{ harbor_values }}"
         content: |
           expose:
-            type: ingress
-            ingress:
-              hosts:
-                core: "{{ harbor_registry }}"
-              annotations:
-                kubernetes.io/ingress.class: "{{ primary_ingress_class }}"
-                nginx.ingress.kubernetes.io/proxy-body-size: "0"
-                nginx.ingress.kubernetes.io/ssl-redirect: "true"
-                nginx.ingress.kubernetes.io/proxy-connect-timeout: "3600"
-                nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-                nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+            type: clusterIP
+            clusterIP:
+              name: harbor
+              ports:
+                httpPort: 80
+                httpsPort: 443
             tls:
               enabled: true
               certSource: secret
@@ -461,6 +456,34 @@
           - "{{ harbor_values }}"
         wait: false
         wait_timeout: "600s"
+
+    - name: Create Harbor HTTPRoute
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: harbor
+            namespace: "{{ harbor_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
+              - "{{ harbor_registry }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: harbor
+                    port: 443
+                timeouts:
+                  request: "3600s"
 
     - name: Patch harbor-portal deployment to fix command duplication
       ansible.builtin.command:

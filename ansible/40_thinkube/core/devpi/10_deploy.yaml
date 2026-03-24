@@ -261,76 +261,63 @@
       register: configmap_result
       changed_when: "'created' in configmap_result.stdout or 'configured' in configmap_result.stdout"
 
-    - name: Create DevPi HTTP Ingress (secured with OAuth2 Proxy)
+    - name: Create DevPi HTTP HTTPRoute (OAuth2 handled by oauth2-proxy role)
       ansible.builtin.shell: |
         {{ kubectl_bin }} apply -f - <<EOF
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
         metadata:
-          name: {{ app_name }}-http-ingress
+          name: {{ app_name }}-http-httproute
           namespace: {{ devpi_namespace }}
-          annotations:
-            nginx.ingress.kubernetes.io/auth-url: "http://oauth2-proxy.{{ devpi_namespace }}.svc.cluster.local/oauth2/auth"
-            nginx.ingress.kubernetes.io/auth-signin: "https://{{ devpi_dashboard_hostname }}/oauth2/start?rd=\$escaped_request_uri"
-            nginx.ingress.kubernetes.io/proxy-body-size: "50m"
-            nginx.ingress.kubernetes.io/proxy-set-headers: "devpi/nginx-headers"
-            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
         spec:
-          ingressClassName: nginx
-          tls:
-          - hosts:
-            - {{ devpi_dashboard_hostname }}
-            secretName: {{ tls_secret_name }}
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ devpi_dashboard_hostname }}"
           rules:
-          - host: {{ devpi_dashboard_hostname }}
-            http:
-              paths:
-              - path: /
-                pathType: Prefix
-                backend:
-                  service:
-                    name: {{ app_name }}
-                    port:
-                      number: 3141
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: {{ app_name }}
+                  port: 3141
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: http_ingress_result
-      changed_when: "'created' in http_ingress_result.stdout or 'configured' in http_ingress_result.stdout"
+      register: http_httproute_result
+      changed_when: "'created' in http_httproute_result.stdout or 'configured' in http_httproute_result.stdout"
 
-    - name: Create DevPi API Ingress (no auth required)
+    - name: Create DevPi API HTTPRoute (no auth required)
       ansible.builtin.shell: |
         {{ kubectl_bin }} apply -f - <<EOF
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
         metadata:
-          name: {{ app_name }}-api-ingress
+          name: {{ app_name }}-api-httproute
           namespace: {{ devpi_namespace }}
-          annotations:
-            nginx.ingress.kubernetes.io/proxy-body-size: "50m"
-            nginx.ingress.kubernetes.io/proxy-set-headers: "devpi/nginx-headers"
         spec:
-          ingressClassName: nginx
-          tls:
-          - hosts:
-            - {{ devpi_api_hostname }}
-            secretName: {{ tls_secret_name }}
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ devpi_api_hostname }}"
           rules:
-          - host: {{ devpi_api_hostname }}
-            http:
-              paths:
-              - path: /
-                pathType: Prefix
-                backend:
-                  service:
-                    name: {{ app_name }}
-                    port:
-                      number: 3141
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: {{ app_name }}
+                  port: 3141
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: api_ingress_result
-      changed_when: "'created' in api_ingress_result.stdout or 'configured' in api_ingress_result.stdout"
+      register: api_httproute_result
+      changed_when: "'created' in api_httproute_result.stdout or 'configured' in api_httproute_result.stdout"
 
     - name: Wait for DevPi deployment to be ready
       ansible.builtin.shell: |

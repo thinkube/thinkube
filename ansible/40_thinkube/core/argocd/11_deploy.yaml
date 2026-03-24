@@ -265,46 +265,41 @@
       changed_when: "'deleted' in delete_ingress_result.stdout"
       failed_when: delete_ingress_result.rc != 0
 
-    - name: Create SSL-passthrough Ingress for ArgoCD (recommended approach)
+    - name: Create TLSRoute for ArgoCD (passthrough)
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
+        apiVersion: gateway.networking.k8s.io/v1alpha2
+        kind: TLSRoute
         metadata:
-          name: argocd-ingress
+          name: argocd-passthrough
           namespace: {{ argocd_namespace }}
-          annotations:
-            nginx.ingress.kubernetes.io/ssl-passthrough: "true"
-            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
         spec:
-          ingressClassName: nginx
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: argocd-passthrough
+          hostnames:
+            - "{{ argocd_hostname }}"
           rules:
-          - host: {{ argocd_hostname }}
-            http:
-              paths:
-              - path: /
-                pathType: Prefix
-                backend:
-                  service:
-                    name: argocd-server
-                    port:
-                      number: 443
+            - backendRefs:
+                - name: argocd-server
+                  port: 443
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: ingress_result
-      changed_when: "'created' in ingress_result.stdout or 'configured' in ingress_result.stdout"
-      failed_when: ingress_result.rc != 0
+      register: tlsroute_result
+      changed_when: "'created' in tlsroute_result.stdout or 'configured' in tlsroute_result.stdout"
+      failed_when: tlsroute_result.rc != 0
 
-    - name: Display ArgoCD Ingress details
-      ansible.builtin.shell: "{{ kubectl_bin }} get ingress -n {{ argocd_namespace }} -o yaml"
-      register: ingress_info
+    - name: Display ArgoCD TLSRoute details
+      ansible.builtin.shell: "{{ kubectl_bin }} get tlsroutes -n {{ argocd_namespace }} -o yaml"
+      register: tlsroute_info
       changed_when: false
       failed_when: false
 
-    - name: Show ArgoCD Ingress configuration
+    - name: Show ArgoCD TLSRoute configuration
       ansible.builtin.debug:
-        var: ingress_info.stdout_lines
+        var: tlsroute_info.stdout_lines
 
     #######################################################################
     # (D) Configure ArgoCD with OIDC and RBAC

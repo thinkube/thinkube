@@ -394,98 +394,81 @@
       register: oauth2_wait_result
       when: oauth2_proxy_enabled
 
-    - name: Create SeaweedFS UI Ingress (with OAuth2)
+    - name: Create SeaweedFS UI HTTPRoute (OAuth2 handled by oauth2-proxy role)
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
         metadata:
-          name: seaweedfs-ui-ingress
+          name: seaweedfs-ui-httproute
           namespace: {{ seaweedfs_namespace }}
-          annotations:
-            nginx.ingress.kubernetes.io/auth-url: "http://oauth2-proxy.{{ seaweedfs_namespace }}.svc.cluster.local/oauth2/auth"
-            nginx.ingress.kubernetes.io/auth-signin: "https://{{ seaweedfs_ui_hostname }}/oauth2/start?rd=\$escaped_request_uri"
-            nginx.ingress.kubernetes.io/auth-request-redirect: "\$scheme://\$best_http_host\$request_uri"
-            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-            nginx.ingress.kubernetes.io/proxy-body-size: "0"
-            nginx.ingress.kubernetes.io/proxy-buffering: "off"
-            nginx.ingress.kubernetes.io/client-body-buffer-size: "1m"
-            nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
         spec:
-          ingressClassName: nginx
-          tls:
-          - hosts:
-            - {{ seaweedfs_ui_hostname }}
-            secretName: {{ tls_secret_name }}
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ seaweedfs_ui_hostname }}"
           rules:
-          - host: {{ seaweedfs_ui_hostname }}
-            http:
-              paths:
-              - path: /
-                pathType: Prefix
-                backend:
-                  service:
-                    name: seaweedfs-filer
-                    port:
-                      number: 8888
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: seaweedfs-filer
+                  port: 8888
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: ui_ingress_result
-      changed_when: "'created' in ui_ingress_result.stdout or 'configured' in ui_ingress_result.stdout"
+      register: ui_httproute_result
+      changed_when: "'created' in ui_httproute_result.stdout or 'configured' in ui_httproute_result.stdout"
       when: oauth2_proxy_enabled
 
-    - name: Create S3 API Ingress (without auth)
+    - name: Create S3 API HTTPRoute (without auth)
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
         metadata:
-          name: seaweedfs-s3-ingress
+          name: seaweedfs-s3-httproute
           namespace: {{ seaweedfs_namespace }}
-          annotations:
-            nginx.ingress.kubernetes.io/proxy-body-size: "0"
-            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-            nginx.ingress.kubernetes.io/proxy-buffering: "off"
         spec:
-          ingressClassName: nginx
-          tls:
-          - hosts:
-            - {{ seaweedfs_s3_hostname }}
-            secretName: {{ tls_secret_name }}
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ seaweedfs_s3_hostname }}"
           rules:
-          - host: {{ seaweedfs_s3_hostname }}
-            http:
-              paths:
-              - path: /
-                pathType: Prefix
-                backend:
-                  service:
-                    name: seaweedfs-s3
-                    port:
-                      number: 8333
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: seaweedfs-s3
+                  port: 8333
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: s3_ingress_result
-      changed_when: "'created' in s3_ingress_result.stdout or 'configured' in s3_ingress_result.stdout"
+      register: s3_httproute_result
+      changed_when: "'created' in s3_httproute_result.stdout or 'configured' in s3_httproute_result.stdout"
 
-    - name: Verify all ingresses are created
+    - name: Verify all HTTPRoutes are created
       ansible.builtin.shell: |
-        {{ kubectl_bin }} get ingress -n {{ seaweedfs_namespace }} -o json
+        {{ kubectl_bin }} get httproutes -n {{ seaweedfs_namespace }} -o json
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: ingress_check_raw
+      register: httproute_check_raw
 
-    - name: Parse and verify ingress count
+    - name: Parse and verify HTTPRoute count
       ansible.builtin.set_fact:
-        ingress_count: "{{ (ingress_check_raw.stdout | from_json)['items'] | length }}"
+        httproute_count: "{{ (httproute_check_raw.stdout | from_json)['items'] | length }}"
 
-    - name: Fail if expected ingresses not created
+    - name: Fail if expected HTTPRoutes not created
       ansible.builtin.fail:
-        msg: "Expected ingresses not found. Found {{ ingress_count }}, expected {{ '3 (UI, S3, OAuth2)' if oauth2_proxy_enabled else '1 (S3)' }}"
+        msg: "Expected HTTPRoutes not found. Found {{ httproute_count }}, expected {{ '2 (UI, S3)' if oauth2_proxy_enabled else '1 (S3)' }}"
       when:
-        - (oauth2_proxy_enabled and ingress_count | int < 3) or (not oauth2_proxy_enabled and ingress_count | int < 1)
+        - (oauth2_proxy_enabled and httproute_count | int < 2) or (not oauth2_proxy_enabled and httproute_count | int < 1)
 
     - name: Display deployment summary
       ansible.builtin.debug:

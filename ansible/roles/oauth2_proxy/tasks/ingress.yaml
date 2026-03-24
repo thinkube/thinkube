@@ -3,78 +3,46 @@
 
 # roles/oauth2_proxy/tasks/ingress.yaml
 ---
-# Create OAuth2 Proxy Ingress
+# Create OAuth2 Proxy HTTPRoute (Gateway API)
+# The oauth2-proxy /oauth2/* paths need their own route so the callback works.
 
-- name: Debug Ingress settings
+- name: Debug HTTPRoute settings
   debug:
     msg:
-      - "Ingress name: {{ oauth2_proxy_ingress_name }}"
+      - "HTTPRoute name: {{ oauth2_proxy_ingress_name }}"
       - "Namespace: {{ oauth2_proxy_namespace }}"
       - "Host: {{ oauth2_proxy_ingress_host }}"
       - "Path: {{ oauth2_proxy_ingress_path }}"
-      - "TLS enabled: {{ oauth2_proxy_ingress_tls_enabled }}"
-      - "TLS secret: {{ oauth2_proxy_ingress_tls_secret_name }}"
+      - "Gateway: {{ gateway_name | default('thinkube-gateway') }}"
   when: oauth2_proxy_debug | bool
 
-# Use a conditional for TLS configuration to handle it properly
-- name: Create OAuth2 Proxy Ingress with TLS
+- name: Create OAuth2 Proxy HTTPRoute
   kubernetes.core.k8s:
-    kubeconfig: "{{ oauth2_proxy_kubeconfig | default(omit) }}"
+    kubeconfig: "{{ oauth2_proxy_kubeconfig | default(kubeconfig) }}"
     state: present
     definition:
-      apiVersion: networking.k8s.io/v1
-      kind: Ingress
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: HTTPRoute
       metadata:
         name: "{{ oauth2_proxy_ingress_name }}"
         namespace: "{{ oauth2_proxy_namespace }}"
-        annotations: "{{ oauth2_proxy_ingress_annotations }}"
       spec:
-        ingressClassName: "{{ oauth2_proxy_ingress_class }}"
-        tls:
-          - hosts:
-              - "{{ oauth2_proxy_ingress_host }}"
-            secretName: "{{ oauth2_proxy_ingress_tls_secret_name }}"
+        parentRefs:
+          - name: "{{ gateway_name | default('thinkube-gateway') }}"
+            namespace: "{{ gateway_namespace | default('gateway-system') }}"
+            sectionName: https
+        hostnames:
+          - "{{ oauth2_proxy_ingress_host }}"
         rules:
-          - host: "{{ oauth2_proxy_ingress_host }}"
-            http:
-              paths:
-                - path: "{{ oauth2_proxy_ingress_path }}"
-                  pathType: "{{ oauth2_proxy_ingress_path_type }}"
-                  backend:
-                    service:
-                      name: "{{ oauth2_proxy_name }}"
-                      port:
-                        number: "{{ oauth2_proxy_service_port }}"
-  when: oauth2_proxy_ingress_tls_enabled | default(true) | bool
+          - matches:
+              - path:
+                  type: "{{ oauth2_proxy_ingress_path_type }}"
+                  value: "{{ oauth2_proxy_ingress_path }}"
+            backendRefs:
+              - name: "{{ oauth2_proxy_name }}"
+                port: "{{ oauth2_proxy_service_port | int }}"
 
-# Alternative version without TLS
-- name: Create OAuth2 Proxy Ingress without TLS
-  kubernetes.core.k8s:
-    kubeconfig: "{{ oauth2_proxy_kubeconfig | default(omit) }}"
-    state: present
-    definition:
-      apiVersion: networking.k8s.io/v1
-      kind: Ingress
-      metadata:
-        name: "{{ oauth2_proxy_ingress_name }}"
-        namespace: "{{ oauth2_proxy_namespace }}"
-        annotations: "{{ oauth2_proxy_ingress_annotations }}"
-      spec:
-        ingressClassName: "{{ oauth2_proxy_ingress_class }}"
-        rules:
-          - host: "{{ oauth2_proxy_ingress_host }}"
-            http:
-              paths:
-                - path: "{{ oauth2_proxy_ingress_path }}"
-                  pathType: "{{ oauth2_proxy_ingress_path_type }}"
-                  backend:
-                    service:
-                      name: "{{ oauth2_proxy_name }}"
-                      port:
-                        number: "{{ oauth2_proxy_service_port }}"
-  when: not (oauth2_proxy_ingress_tls_enabled | default(true) | bool)
-
-- name: Debug OAuth2 Proxy Ingress creation
+- name: Debug OAuth2 Proxy HTTPRoute creation
   debug:
-    msg: "Created OAuth2 Proxy Ingress '{{ oauth2_proxy_ingress_name }}' for host '{{ oauth2_proxy_ingress_host }}'"
+    msg: "Created OAuth2 Proxy HTTPRoute '{{ oauth2_proxy_ingress_name }}' for host '{{ oauth2_proxy_ingress_host }}'"
   when: oauth2_proxy_debug | bool

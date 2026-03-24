@@ -883,37 +883,30 @@
         KUBECONFIG: "{{ kubeconfig }}"
       changed_when: false
 
-    - name: Create code-server Ingress (secured with oauth2-proxy)
+    - name: Create code-server HTTPRoute (OAuth2 handled by oauth2-proxy role)
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
         metadata:
           name: code-server
-          annotations:
-            kubernetes.io/ingress.class: nginx
-            nginx.ingress.kubernetes.io/ssl-redirect: "true"
-            nginx.ingress.kubernetes.io/proxy-body-size: "0"
-            nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-            nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-            nginx.ingress.kubernetes.io/auth-url: "https://\$host/oauth2/auth"
-            nginx.ingress.kubernetes.io/auth-signin: "https://\$host/oauth2/start?rd=\$escaped_request_uri"
         spec:
-          tls:
-            - hosts:
-                - "{{ code_server_hostname }}"
-              secretName: "{{ code_server_tls_secret_name }}"
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ code_server_hostname }}"
           rules:
-            - host: "{{ code_server_hostname }}"
-              http:
-                paths:
-                  - path: /
-                    pathType: Prefix
-                    backend:
-                      service:
-                        name: code-server
-                        port:
-                          number: 8080
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: code-server
+                  port: 8080
+              timeouts:
+                request: "3600s"
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
@@ -1031,32 +1024,28 @@
     ###################################################################
     # 9) Create oauth2-proxy Ingress for /oauth2 routing
     ###################################################################
-    - name: Create oauth2-proxy Ingress for /oauth2
+    - name: Create oauth2-proxy HTTPRoute for /oauth2
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
-        apiVersion: networking.k8s.io/v1
-        kind: Ingress
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
         metadata:
           name: oauth2-proxy
-          annotations:
-            kubernetes.io/ingress.class: "nginx"
-            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
         spec:
-          tls:
-            - hosts:
-                - "{{ code_server_hostname }}"
-              secretName: "{{ code_server_tls_secret_name }}"
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ code_server_hostname }}"
           rules:
-            - host: "{{ code_server_hostname }}"
-              http:
-                paths:
-                  - path: /oauth2
-                    pathType: Prefix
-                    backend:
-                      service:
-                        name: oauth2-proxy
-                        port:
-                          number: 80
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /oauth2
+              backendRefs:
+                - name: oauth2-proxy
+                  port: 80
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
