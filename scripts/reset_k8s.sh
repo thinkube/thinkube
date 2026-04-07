@@ -241,7 +241,9 @@ sudo rm -rf /opt/cni || true
 sudo rm -rf /var/lib/cni || true
 sudo rm -rf /etc/containerd/conf.d || true
 sudo rm -rf /usr/local/nvidia || true
-sudo rm -rf /run/nvidia || true
+# NOTE: do NOT delete /run/nvidia — it contains NVIDIA driver runtime state
+# (e.g. /run/nvidia/validations/host-driver-ready) needed by GPU operator.
+# /run/ is a tmpfs cleared on reboot; no need to manually clean it.
 
 echo ""
 echo "Step 4: Removing SeaweedFS and JuiceFS storage directories..."
@@ -290,6 +292,21 @@ if [ -f "$LOCALSTORAGE_DB" ]; then
   echo "Cleared stale deployment state from localStorage"
 else
   echo "No localStorage database found (installer not yet run)"
+fi
+
+echo ""
+echo "Step 9b: Recreating NVIDIA host driver validation marker..."
+# The reset script does NOT delete /run/nvidia, but restart the service
+# to ensure the marker exists in case it was lost for any other reason.
+if systemctl is-enabled --quiet nvidia-host-driver-validation.service 2>/dev/null; then
+  sudo systemctl restart nvidia-host-driver-validation.service
+  if [ -f /run/nvidia/validations/host-driver-ready ]; then
+    echo "✅ NVIDIA validation marker recreated"
+  else
+    echo "⚠️  NVIDIA validation marker missing — GPU operator may fail"
+  fi
+else
+  echo "nvidia-host-driver-validation.service not found, skipping"
 fi
 
 echo ""
