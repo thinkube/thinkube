@@ -99,7 +99,30 @@
       changed_when: false
 
     ###########################################################################
-    # Step 2: Enable Gateway API in Cilium
+    # Step 2: Enable Gateway API via k8s-snap (installs CRDs and RBAC)
+    ###########################################################################
+    - name: Enable Gateway API via k8s-snap
+      ansible.builtin.shell: |
+        k8s set gateway=true
+      become: true
+      register: k8s_gateway_set
+      changed_when: "'already enabled' not in k8s_gateway_set.stdout"
+      failed_when:
+        - k8s_gateway_set.rc != 0
+        - "'already' not in k8s_gateway_set.stderr | lower
+          and 'already' not in k8s_gateway_set.stdout | lower"
+
+    - name: Wait for ciliumenvoyconfigs CRD to be established
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} wait --for=condition=Established crd/ciliumenvoyconfigs.cilium.io --timeout=60s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: envoy_crd_wait
+      failed_when: false
+      changed_when: false
+
+    ###########################################################################
+    # Step 3: Enable Gateway API in Cilium configmap
     ###########################################################################
     - name: Check current Cilium Gateway API config
       ansible.builtin.shell: |
@@ -222,7 +245,7 @@
       changed_when: false
 
     ###########################################################################
-    # Step 3: Create gateway-system namespace and copy TLS certs
+    # Step 4: Create gateway-system namespace and copy TLS certs
     ###########################################################################
     - name: Create gateway-system namespace
       kubernetes.core.k8s:
