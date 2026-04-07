@@ -80,6 +80,52 @@
 
   tasks:
     ###########################################################################
+    # Task 0) CLEANUP: Remove stale StatefulSet/PVC if pod is not running
+    # Handles the case where a previous partial deployment left broken CSI state
+    ###########################################################################
+    - name: Check if PostgreSQL StatefulSet exists and has ready replicas
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get statefulset {{ postgres_release_name }} -n {{ postgres_namespace }} \
+          -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "absent"
+      register: pg_ready_replicas
+      changed_when: false
+      failed_when: false
+
+    - name: Check if StatefulSet-generated PVC exists from a previous partial run
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pvc data-{{ postgres_release_name }}-0 -n {{ postgres_namespace }} \
+          --ignore-not-found -o name 2>/dev/null
+      register: pg_sts_pvc_check
+      changed_when: false
+      failed_when: false
+
+    - name: Clean up stale StatefulSet and PVC (no running pod + stale PVC = broken CSI state)
+      when: >
+        pg_sts_pvc_check.stdout != "" and
+        (pg_ready_replicas.stdout == "absent" or pg_ready_replicas.stdout == "" or pg_ready_replicas.stdout == "0")
+      block:
+        - name: Delete stale PostgreSQL StatefulSet
+          ansible.builtin.shell: |
+            {{ kubectl_bin }} delete statefulset {{ postgres_release_name }} -n {{ postgres_namespace }} --ignore-not-found
+          changed_when: true
+
+        - name: Delete stale PostgreSQL StatefulSet PVC
+          ansible.builtin.shell: |
+            {{ kubectl_bin }} delete pvc data-{{ postgres_release_name }}-0 -n {{ postgres_namespace }} --ignore-not-found
+          changed_when: true
+
+        - name: Wait for stale PVC to be fully removed
+          ansible.builtin.shell: |
+            attempt=0
+            while {{ kubectl_bin }} get pvc data-{{ postgres_release_name }}-0 -n {{ postgres_namespace }} &>/dev/null; do
+              attempt=$((attempt + 1))
+              [ $attempt -ge 30 ] && echo "Timeout waiting for PVC deletion" && exit 1
+              sleep 2
+            done
+            echo "PVC removed"
+          changed_when: false
+
+    ###########################################################################
     # Task 1) PREP: Ensure Postgres namespace, create TLS secret
     ###########################################################################
     - name: Ensure PostgreSQL namespace exists

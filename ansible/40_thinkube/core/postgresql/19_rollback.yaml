@@ -24,7 +24,6 @@
     postgres_tls_secret_name: "{{ postgres_namespace }}-tls-secret"
     postgres_data_volume_name: "postgres-data"
     postgres_tcp_port: 5432
-    ingress_tcp_configmap_name: "nginx-ingress-tcp-k8s-snap-conf"
 
   pre_tasks:
     - name: Check for required variables
@@ -33,8 +32,6 @@
       when: item is not defined or item | length == 0
       with_items:
         - kubectl_bin
-        - ingress_namespace
-        - primary_ingress_service
 
   tasks:
     ###########################################################################
@@ -70,140 +67,30 @@
       changed_when: delete_secret.rc == 0
 
     ###########################################################################
-    # Task 2) REMOVE PersistentVolumeClaim (optional, uncomment to delete data)
+    # Task 2) REMOVE PersistentVolumeClaims (both explicit PVC and StatefulSet PVC)
     ###########################################################################
-    - name: Confirm PVC exists
-      ansible.builtin.shell: "{{ kubectl_bin }} get pvc {{ postgres_data_volume_name }} -n {{ postgres_namespace }} --ignore-not-found"
-      become: true
-      register: pvc_exists
-      changed_when: false
-      failed_when: false
-
-    - name: Show warning about PVC deletion
-      ansible.builtin.debug:
-        msg: "WARNING: Deleting PVC {{ postgres_data_volume_name }} in namespace {{ postgres_namespace }} (ALL DATA WILL BE LOST)"
-      when: pvc_exists.rc == 0 and pvc_exists.stdout != ""
-
-    - name: Delete PostgreSQL PVC
-      ansible.builtin.shell: "{{ kubectl_bin }} delete pvc {{ postgres_data_volume_name }} -n {{ postgres_namespace }}"
+    - name: Delete explicit PostgreSQL PVC (postgres-data) if it exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pvc {{ postgres_data_volume_name }} -n {{ postgres_namespace }} --ignore-not-found
       become: true
       register: delete_pvc
-      when: pvc_exists.rc == 0 and pvc_exists.stdout != ""
-      changed_when: delete_pvc.rc == 0
+      changed_when: "'deleted' in delete_pvc.stdout"
 
-    ###########################################################################
-    # Task 3) REMOVE Ingress TCP configuration
-    ###########################################################################
-    - name: Check if Ingress TCP ConfigMap exists
-      ansible.builtin.shell: "{{ kubectl_bin }} get configmap {{ ingress_tcp_configmap_name }} -n {{ ingress_namespace }} --ignore-not-found"
+    - name: Delete StatefulSet-generated PostgreSQL PVC (data-postgresql-official-0) if it exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pvc data-{{ postgres_release_name }}-0 -n {{ postgres_namespace }} --ignore-not-found
       become: true
-      register: configmap_exists
+      register: delete_sts_pvc
+      changed_when: "'deleted' in delete_sts_pvc.stdout"
+
+    - name: Wait for PostgreSQL PVCs to be fully deleted
+      ansible.builtin.shell: |
+        while {{ kubectl_bin }} get pvc -n {{ postgres_namespace }} 2>/dev/null | grep -qE 'postgres-data|data-postgresql-official'; do
+          sleep 2
+        done
+        echo "PVCs cleaned up"
       changed_when: false
-      failed_when: false
-
-    - name: Get current TCP ConfigMap data
-      ansible.builtin.shell: "{{ kubectl_bin }} get configmap {{ ingress_tcp_configmap_name }} -n {{ ingress_namespace }} -o jsonpath='{.data}'"
-      become: true
-      register: configmap_data
-      when: configmap_exists.rc == 0 and configmap_exists.stdout != ""
-      changed_when: false
-      failed_when: false
-
-    - name: Remove PostgreSQL port from ConfigMap
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} patch configmap {{ ingress_tcp_configmap_name }} -n {{ ingress_namespace }} --type=json \
-        -p='[{"op": "remove", "path": "/data/{{ postgres_tcp_port }}"}]'
-      become: true
-      register: patch_configmap
-      when: >
-        configmap_exists.rc == 0 and 
-        configmap_exists.stdout != "" and
-        configmap_data.stdout is defined and
-        configmap_data.stdout | regex_search(postgres_tcp_port | string)
-      changed_when: patch_configmap.rc == 0
-      failed_when: false
-
-    # Remove container port from Ingress Deployment if it exists
-    - name: Check if PostgreSQL port is exposed in Ingress Deployment
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} -o json | 
-        jq '.spec.template.spec.containers[0].ports[] | select(.name=="pg-{{ postgres_tcp_port }}") | .name' || echo ""
-      become: true
-      register: port_in_deployment
-      changed_when: false
-      failed_when: false
-
-    - name: Get port indices in Ingress Deployment
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} -o json | 
-        jq '.spec.template.spec.containers[0].ports | to_entries | .[] | select(.value.name=="pg-{{ postgres_tcp_port }}") | .key'
-      become: true
-      register: port_indices
-      when: port_in_deployment.stdout != ""
-      changed_when: false
-      failed_when: false
-      
-    - name: Remove port from Ingress Deployment if needed
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} patch deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} --type=json \
-        -p='[{"op": "remove", "path": "/spec/template/spec/containers/0/ports/{{ item }}"}]'
-      become: true
-      register: patch_deployment
-      with_items: "{{ port_indices.stdout_lines | default([]) }}"
-      when: port_in_deployment.stdout != "" and port_indices is defined and port_indices.stdout_lines | length > 0
-      changed_when: patch_deployment.rc == 0
-      failed_when: false
-
-    # Remove service port from Ingress Service if it exists
-    - name: Check if PostgreSQL port is exposed in Ingress Service
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get service -n {{ ingress_namespace }} {{ primary_ingress_service }} -o json | 
-        jq '.spec.ports[] | select(.name=="pg-{{ postgres_tcp_port }}") | .name' || echo ""
-      become: true
-      register: port_in_service
-      changed_when: false
-      failed_when: false
-
-    - name: Get port indices in Ingress Service
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get service -n {{ ingress_namespace }} {{ primary_ingress_service }} -o json | 
-        jq '.spec.ports | to_entries | .[] | select(.value.name=="pg-{{ postgres_tcp_port }}") | .key'
-      become: true
-      register: service_port_indices
-      when: port_in_service.stdout != ""
-      changed_when: false
-      failed_when: false
-
-    - name: Remove port from Ingress Service if needed
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} patch service -n {{ ingress_namespace }} {{ primary_ingress_service }} --type=json \
-        -p='[{"op": "remove", "path": "/spec/ports/{{ item }}"}]'
-      become: true
-      register: patch_service
-      with_items: "{{ service_port_indices.stdout_lines | default([]) }}"
-      when: port_in_service.stdout != "" and service_port_indices is defined and service_port_indices.stdout_lines | length > 0
-      changed_when: patch_service.rc == 0
-      failed_when: false
-
-    # Restart Ingress controller to apply changes
-    - name: Restart NGINX Ingress controller to apply changes
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout restart deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }}
-      become: true
-      register: rollout_restart
-      when: >
-        patch_configmap is defined and patch_configmap.changed or
-        patch_deployment is defined and patch_deployment.changed or
-        patch_service is defined and patch_service.changed
-      changed_when: rollout_restart.rc == 0
-
-    - name: Wait for Ingress controller to restart
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout status deployment/{{ primary_ingress_service }} -n {{ ingress_namespace }} --timeout=60s
-      become: true
-      register: rollout_status
-      when: rollout_restart is defined and rollout_restart.changed
-      failed_when: rollout_status.rc != 0
+      when: delete_pvc.changed or delete_sts_pvc.changed
 
     ###########################################################################
     # Task 4) OPTIONALLY Remove PostgreSQL namespace
@@ -238,8 +125,6 @@
           - StatefulSet deletion: {{ 'Performed' if delete_statefulset is defined and delete_statefulset.changed else 'Not needed' }}
           - Service deletion: {{ 'Performed' if delete_service is defined and delete_service.changed else 'Not needed' }}
           - TLS Secret deletion: {{ 'Performed' if delete_secret is defined and delete_secret.changed else 'Not needed' }}
-          - PVC deletion: {{ 'Performed' if delete_pvc is defined and delete_pvc.changed else 'Skipped - data preserved' }}
-          - ConfigMap update: {{ 'Performed' if patch_configmap is defined and patch_configmap.changed else 'Not needed' }}
-          - Deployment update: {{ 'Performed' if patch_deployment is defined and patch_deployment.changed else 'Not needed' }}
-          - Service update: {{ 'Performed' if patch_service is defined and patch_service.changed else 'Not needed' }}
+          - Explicit PVC (postgres-data) deletion: {{ 'Performed' if delete_pvc is defined and delete_pvc.changed else 'Not needed' }}
+          - StatefulSet PVC (data-postgresql-official-0) deletion: {{ 'Performed' if delete_sts_pvc is defined and delete_sts_pvc.changed else 'Not needed' }}
           - Namespace deletion: {{ 'Performed' if delete_namespace is defined and delete_namespace.changed else 'Skipped - namespace preserved' }}
