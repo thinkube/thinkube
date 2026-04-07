@@ -249,6 +249,16 @@ sudo rm -rf /storage/logs/seaweedfs || true
 sudo rm -rf /storage/filer_store || true
 sudo rm -rf /storage/volume_store || true
 sudo rm -rf /storage/master_store || true
+
+# JuiceFS uses FUSE mounts — must unmount before removing
+for attempt in $(seq 1 10); do
+  JUICEFS_MOUNTS=$(mount | grep '/var/lib/juicefs' | awk '{print $3}' || true)
+  [ -z "$JUICEFS_MOUNTS" ] && break
+  COUNT=$(echo "$JUICEFS_MOUNTS" | wc -l)
+  echo "Attempt $attempt: found $COUNT JuiceFS mounts, unmounting..."
+  echo "$JUICEFS_MOUNTS" | xargs -I {} sudo umount -f -l {} 2>/dev/null || true
+  sleep 1
+done
 sudo rm -rf /var/lib/juicefs || true
 echo "SeaweedFS and JuiceFS storage removed"
 
