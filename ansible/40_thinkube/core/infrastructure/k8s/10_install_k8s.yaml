@@ -285,8 +285,6 @@
               enabled: true
             gateway:
               enabled: true
-            annotations:
-              k8sd/v1alpha1/cilium/enable-wireguard: "true"
           extra-node-kubelet-args:
             --max-pods: "500"
             --root-dir: "/var/snap/k8s/common/var/lib/kubelet"
@@ -383,6 +381,45 @@
       delay: 10
       until: cilium_wait.rc == 0
       changed_when: false
+
+    # ===========================
+    # Enable Cilium WireGuard Encryption
+    # ===========================
+    # k8s-snap 1.35 does not expose WireGuard via its configuration layer,
+    # so we patch the Cilium ConfigMap directly after bootstrap.
+    # The k8sd reconciler does not manage the enable-wireguard key,
+    # so this patch persists across reconciliation cycles.
+    - name: Enable WireGuard encryption in Cilium ConfigMap
+      ansible.builtin.command: >
+        k8s kubectl patch configmap cilium-config -n kube-system
+        --type merge -p '{"data":{"enable-wireguard":"true","enable-wireguard-userspace-fallback":"false"}}'
+      become: true
+      register: wireguard_patch
+      changed_when: "'patched' in wireguard_patch.stdout"
+      failed_when: wireguard_patch.rc != 0
+
+    - name: Restart Cilium DaemonSet to apply WireGuard config
+      ansible.builtin.command: k8s kubectl rollout restart daemonset/cilium -n kube-system
+      become: true
+      register: cilium_restart
+      changed_when: cilium_restart.rc == 0
+      failed_when: cilium_restart.rc != 0
+
+    - name: Wait for Cilium to be ready after WireGuard restart
+      ansible.builtin.command: k8s kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=300s
+      become: true
+      register: cilium_wg_wait
+      retries: 3
+      delay: 10
+      until: cilium_wg_wait.rc == 0
+      changed_when: false
+
+    - name: Verify WireGuard is active in Cilium
+      ansible.builtin.command: k8s kubectl get configmap cilium-config -n kube-system -o jsonpath='{.data.enable-wireguard}'
+      become: true
+      register: wg_verify
+      changed_when: false
+      failed_when: wg_verify.stdout != "true"
 
     - name: Verify node is ready
       ansible.builtin.command: k8s kubectl get nodes
