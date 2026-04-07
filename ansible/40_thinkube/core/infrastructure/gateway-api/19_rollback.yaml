@@ -3,19 +3,24 @@
 
 ---
 # ansible/40_thinkube/core/infrastructure/gateway-api/19_rollback.yaml
-# Removes Gateway API infrastructure
+# Description:
+#   Removes Envoy Gateway and all associated Gateway API resources.
+#
+# Usage:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/gateway-api/19_rollback.yaml
 #
 # 🤖 [AI-assisted]
 
-- name: Rollback Gateway API Infrastructure
+- name: Rollback Envoy Gateway Infrastructure
   hosts: k8s_control_plane
   become: false
   gather_facts: false
   vars:
+    eg_namespace: "envoy-gateway-system"
     gateway_namespace: "gateway-system"
 
   tasks:
-    - name: Delete all TCPRoutes in gateway-system
+    - name: Delete TCPRoutes in gateway-system
       ansible.builtin.shell: |
         {{ kubectl_bin }} delete tcproute --all -n {{ gateway_namespace }} --ignore-not-found=true
       environment:
@@ -23,7 +28,7 @@
       changed_when: true
       failed_when: false
 
-    - name: Delete all HTTPRoutes in gateway-system
+    - name: Delete HTTPRoutes in gateway-system
       ansible.builtin.shell: |
         {{ kubectl_bin }} delete httproute --all -n {{ gateway_namespace }} --ignore-not-found=true
       environment:
@@ -31,7 +36,7 @@
       changed_when: true
       failed_when: false
 
-    - name: Delete all Gateways in gateway-system
+    - name: Delete Gateways in gateway-system
       ansible.builtin.shell: |
         {{ kubectl_bin }} delete gateway --all -n {{ gateway_namespace }} --ignore-not-found=true
       environment:
@@ -39,7 +44,7 @@
       changed_when: true
       failed_when: false
 
-    - name: Delete ReferenceGrants across namespaces
+    - name: Delete ReferenceGrants for TCP services
       ansible.builtin.shell: |
         {{ kubectl_bin }} delete referencegrant allow-gateway-tcp -n {{ item }} --ignore-not-found=true
       environment:
@@ -53,6 +58,36 @@
       changed_when: true
       failed_when: false
 
+    - name: Delete GatewayClass eg
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete gatewayclass eg --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Delete EnvoyProxy resource
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete envoyproxy thinkube-proxy -n {{ eg_namespace }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Uninstall Envoy Gateway Helm release
+      ansible.builtin.shell: |
+        {{ helm_bin }} uninstall eg -n {{ eg_namespace }} --kubeconfig {{ kubeconfig }} 2>/dev/null || true
+      changed_when: true
+      failed_when: false
+
+    - name: Delete envoy-gateway-system namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete namespace {{ eg_namespace }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      failed_when: false
+
     - name: Delete gateway-system namespace
       ansible.builtin.shell: |
         {{ kubectl_bin }} delete namespace {{ gateway_namespace }} --ignore-not-found=true
@@ -61,37 +96,6 @@
       changed_when: true
       failed_when: false
 
-    - name: Disable Gateway API in Cilium ConfigMap
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} patch configmap cilium-config -n kube-system --type=merge \
-          -p '{"data":{"enable-gateway-api":"false"}}'
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: true
-      failed_when: false
-
-    - name: Restart Cilium
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout restart daemonset/cilium -n kube-system
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: true
-
-    - name: Wait for Cilium rollout
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout status daemonset/cilium -n kube-system --timeout=120s
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
-
-    - name: Remove Gateway API CRDs
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} delete -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/experimental-install.yaml --ignore-not-found=true
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: true
-      failed_when: false
-
     - name: Display rollback status
       ansible.builtin.debug:
-        msg: "Gateway API infrastructure has been removed"
+        msg: "Envoy Gateway infrastructure has been removed"

@@ -4,44 +4,58 @@
 ---
 # ansible/40_thinkube/core/infrastructure/gateway-api/10_deploy.yaml
 # Description:
-#   Deploys Cilium Gateway API infrastructure to replace ingress-nginx.
-#   - Installs Gateway API CRDs (experimental channel for TCPRoute/GRPCRoute)
-#   - Enables Gateway API in Cilium
-#   - Creates 3 Gateways: primary HTTPS, TCP, and Knative
-#   - Creates TCPRoutes for PostgreSQL, Gitea SSH, NATS, Valkey, ClickHouse
-#   - Copies wildcard TLS certs to gateway-system namespace
+#   Deploys Envoy Gateway as the Gateway API controller for the cluster.
+#   Envoy Gateway fully supports HTTPRoute, TLSRoute, GRPCRoute, and TCPRoute.
+#   Creates two Gateways:
+#     - thinkube-gateway: HTTP/HTTPS/TLS-passthrough + all TCP services
+#     - thinkube-kn-gateway: HTTPS for Knative (*.kn.<domain>)
+#
+#   Images are pre-pulled via podman and imported into containerd to avoid
+#   Docker Hub dependency at deploy time (same approach as dns-server).
 #
 # Requirements:
 #   - Canonical k8s-snap installed with Cilium CNI
-#   - MetalLB/load-balancer enabled (k8s enable load-balancer)
+#   - MetalLB load-balancer enabled (k8s enable load-balancer)
 #   - acme-certificates deployed (wildcard cert in default namespace)
+#   - podman installed (handled by this playbook)
 #
 # Usage:
 #   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/gateway-api/10_deploy.yaml
 #
+# Variables from inventory:
+#   - domain_name, argocd_hostname
+#   - primary_ingress_ip_octet, secondary_ingress_ip_octet
+#   - network_mode, network_cidr, zerotier_subnet_prefix
+#   - kubectl_bin, helm_bin, kubeconfig
+#
 # 🤖 [AI-assisted]
 
-- name: Deploy Cilium Gateway API Infrastructure
+- name: Deploy Envoy Gateway for Gateway API
   hosts: k8s_control_plane
   become: false
   gather_facts: false
   vars:
-    # Determine subnet prefix based on network mode
     subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     primary_gateway_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
     secondary_gateway_ip: "{{ subnet_prefix }}{{ secondary_ingress_ip_octet }}"
 
-    # Gateway API CRDs version — experimental channel includes TCPRoute, GRPCRoute
-    gateway_api_version: "v1.2.1"
-    gateway_api_crds_url: "https://github.com/kubernetes-sigs/gateway-api/releases/download/{{ gateway_api_version }}/experimental-install.yaml"
-
-    # Namespace and names
+    eg_version: "v1.7.1"
+    eg_namespace: "envoy-gateway-system"
     gateway_namespace: "gateway-system"
     gateway_name: "thinkube-gateway"
-    gateway_tcp_name: "thinkube-tcp-gateway"
     gateway_kn_name: "thinkube-kn-gateway"
 
-    # TCP service backends (namespace/service:port)
+    eg_images:
+      - name: "docker.io/envoyproxy/gateway:{{ eg_version }}"
+        file: "/tmp/envoyproxy-gateway-{{ eg_version }}.tar"
+      - name: "docker.io/envoyproxy/envoy:distroless-v1.37.1"
+        file: "/tmp/envoyproxy-envoy-distroless-v1.37.1.tar"
+      - name: "docker.io/envoyproxy/ratelimit:c8765e89"
+        file: "/tmp/envoyproxy-ratelimit-c8765e89.tar"
+
+    containerd_sock: "/var/lib/k8s-containerd/k8s-containerd/run/containerd/containerd.sock"
+    ctr_bin: "/snap/k8s/current/bin/ctr"
+
     tcp_services:
       - name: postgres
         port: 5432
@@ -71,147 +85,213 @@
 
   tasks:
     ###########################################################################
-    # Step 1: Fix CRD ownership so k8s-snap can manage them via Helm
-    #
-    # k8s-snap installs Gateway API CRDs via its own 'ck-gateway' Helm release
-    # (from gateway-api-1.2.0.tgz). If the CRDs already exist from a previous
-    # manual installation (without Helm ownership metadata), the Helm install
-    # fails. We annotate any existing CRDs with the required Helm metadata so
-    # the snap can adopt them.
+    # Step 1: Disable k8s-snap gateway feature (Cilium Gateway API controller)
+    # This leaves Cilium running as CNI only. Envoy Gateway replaces it for
+    # all Gateway API functionality.
     ###########################################################################
-    - name: Check if standard Gateway API CRDs have ck-gateway Helm ownership
+    - name: Check if k8s-snap gateway feature is enabled
       ansible.builtin.shell: |
-        {{ kubectl_bin }} get crd gateways.gateway.networking.k8s.io \
-          -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}' 2>/dev/null
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: gateway_crd_helm_owner
-      failed_when: false
+        sudo k8s status --output-format yaml 2>/dev/null | grep -A2 "^gateway:" | grep -q "enabled" && echo "enabled" || echo "disabled"
+      register: k8s_gateway_status
       changed_when: false
+      failed_when: false
 
-    - name: Annotate existing Gateway API CRDs with Helm ownership for ck-gateway
+    - name: Disable k8s-snap gateway feature (Cilium Gateway controller)
       ansible.builtin.shell: |
-        for crd in gatewayclasses gateways grpcroutes httproutes referencegrants tlsroutes; do
-          crdfull="${crd}.gateway.networking.k8s.io"
-          if {{ kubectl_bin }} get crd "${crdfull}" &>/dev/null; then
-            {{ kubectl_bin }} annotate crd "${crdfull}" \
-              meta.helm.sh/release-name=ck-gateway \
-              meta.helm.sh/release-namespace=kube-system \
-              --overwrite
-            {{ kubectl_bin }} label crd "${crdfull}" \
-              app.kubernetes.io/managed-by=Helm \
-              --overwrite
-          fi
-        done
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      when: gateway_crd_helm_owner.stdout != "ck-gateway"
+        sudo k8s set gateway.enabled=false
+      become: true
+      register: k8s_gateway_disable
+      changed_when: k8s_gateway_status.stdout == "enabled"
+      when: k8s_gateway_status.stdout == "enabled"
+
+    ###########################################################################
+    # Step 2: Pull Envoy Gateway images with podman, import into containerd
+    # Same pattern as dns-server (BIND9): podman pull → tar → ctr import
+    ###########################################################################
+    - name: Install podman
+      ansible.builtin.apt:
+        name: podman
+        state: present
+        update_cache: false
+      become: true
+
+    - name: Check which Envoy Gateway images are already in containerd
+      ansible.builtin.shell: |
+        sudo {{ ctr_bin }} --address {{ containerd_sock }} --namespace k8s.io images ls \
+          --format '{{ "{{" }}.Name{{ "}}" }}' 2>/dev/null | grep "{{ item.name.split(':')[0] }}" | grep "{{ item.name.split(':')[1] }}" || echo ""
+      loop: "{{ eg_images }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: containerd_image_checks
+      changed_when: false
+      failed_when: false
+
+    - name: Pull missing Envoy Gateway images with podman
+      ansible.builtin.shell: |
+        podman pull {{ item.item.name }}
+      loop: "{{ containerd_image_checks.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout == ""
+      changed_when: true
+      failed_when: false
+
+    - name: Save pulled images to tar files
+      ansible.builtin.shell: |
+        podman save -o {{ item.item.file }} {{ item.item.name }}
+      loop: "{{ containerd_image_checks.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout == ""
       changed_when: true
 
-    ###########################################################################
-    # Step 2: Enable Gateway API via k8s-snap
-    #
-    # This upgrades the ck-network (Cilium) Helm release with
-    # gatewayAPI.enabled=true (which also enables envoyConfig, installing the
-    # CiliumEnvoyConfig CRD), and installs the ck-gateway Helm release
-    # (Gateway API CRDs + GatewayClass 'ck-gateway').
-    ###########################################################################
-    - name: Enable Gateway API via k8s-snap
+    - name: Import images into containerd
       ansible.builtin.shell: |
-        k8s set gateway.enabled=true
+        sudo {{ ctr_bin }} --address {{ containerd_sock }} --namespace k8s.io images import {{ item.item.file }}
+      loop: "{{ containerd_image_checks.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout == ""
       become: true
-      register: k8s_gateway_set
-      changed_when: "'Configuration updated' in k8s_gateway_set.stdout"
-      failed_when:
-        - k8s_gateway_set.rc != 0
-        - "'already' not in k8s_gateway_set.stderr | lower
-          and 'already' not in k8s_gateway_set.stdout | lower"
+      changed_when: true
 
-    - name: Wait for k8s-snap gateway deployment to succeed
-      ansible.builtin.shell: |
-        sudo k8s status --output-format yaml 2>/dev/null | grep -A2 "^gateway:" | grep -v "Failed\|Error\|failed\|error" | grep -q "enabled\|ready" && echo "ok" || echo "pending"
-      become: true
-      register: gateway_snap_status
-      until: gateway_snap_status.stdout == "ok"
-      retries: 30
-      delay: 10
-      changed_when: false
-      failed_when: false
-
-    - name: Wait for standard Gateway API CRDs to be established
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} wait --for=condition=Established \
-          crd/gatewayclasses.gateway.networking.k8s.io \
-          crd/gateways.gateway.networking.k8s.io \
-          crd/httproutes.gateway.networking.k8s.io \
-          --timeout=120s
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
+    - name: Clean up image tar files
+      ansible.builtin.file:
+        path: "{{ item.item.file }}"
+        state: absent
+      loop: "{{ containerd_image_checks.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout == ""
 
     ###########################################################################
-    # Step 3: Install experimental Gateway API CRDs (TCPRoute, UDPRoute, etc.)
-    #
-    # The snap's gateway-api chart only includes standard channel CRDs.
-    # We install the experimental channel on top for TCPRoute/UDPRoute support.
-    # These CRDs are NOT in the snap's Helm chart, so no ownership conflict.
+    # Step 3: Install experimental Gateway API CRDs (TCPRoute, UDPRoute)
+    # EG v1.7.1 uses Gateway API v1.4.1 standard channel.
+    # TCPRoute is still in experimental channel — install separately.
     ###########################################################################
-    - name: Check if experimental Gateway API CRDs are installed (TCPRoute)
+    - name: Check if TCPRoute CRD exists
       ansible.builtin.shell: |
-        {{ kubectl_bin }} get crd tcproutes.gateway.networking.k8s.io 2>/dev/null
+        {{ kubectl_bin }} get crd tcproutes.gateway.networking.k8s.io 2>/dev/null && echo "exists" || echo "absent"
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: tcproute_crd_check
+      changed_when: false
       failed_when: false
-      changed_when: false
 
-    - name: Install experimental Gateway API CRDs (TCPRoute, UDPRoute, BackendLBPolicy)
+    - name: Install experimental Gateway API CRDs (TCPRoute)
       ansible.builtin.shell: |
-        {{ kubectl_bin }} apply -f {{ gateway_api_crds_url }}
+        {{ kubectl_bin }} apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/experimental-install.yaml
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: exp_crd_install
-      changed_when: "'created' in exp_crd_install.stdout or 'configured' in exp_crd_install.stdout"
-      when: tcproute_crd_check.rc != 0
+      when: tcproute_crd_check.stdout == "absent"
+      changed_when: true
 
-    - name: Wait for experimental CRDs to be established
+    - name: Wait for TCPRoute CRD to be established
       ansible.builtin.shell: |
-        {{ kubectl_bin }} wait --for=condition=Established \
-          crd/tcproutes.gateway.networking.k8s.io \
-          --timeout=60s
+        {{ kubectl_bin }} wait --for=condition=Established crd/tcproutes.gateway.networking.k8s.io --timeout=60s
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      when: tcproute_crd_check.rc != 0
       changed_when: false
 
     ###########################################################################
-    # Step 4: Wait for GatewayClass 'ck-gateway' to appear
-    #
-    # k8s-snap installs the 'ck-gateway' GatewayClass via the ck-gateway-cilium
-    # Helm chart (gatewayClass.create=false in ck-network, so Cilium chart does
-    # NOT create a 'cilium' GatewayClass — the snap manages its own).
+    # Step 4: Download and install Envoy Gateway via Helm
     ###########################################################################
-    - name: Wait for ciliumenvoyconfigs CRD to be established
+    - name: Check if Envoy Gateway is already installed
       ansible.builtin.shell: |
-        {{ kubectl_bin }} wait --for=condition=Established crd/ciliumenvoyconfigs.cilium.io --timeout=120s
+        {{ helm_bin }} list -n {{ eg_namespace }} --kubeconfig {{ kubeconfig }} 2>/dev/null | grep -q "^eg" && echo "installed" || echo "absent"
+      register: eg_helm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download Envoy Gateway Helm chart
+      ansible.builtin.shell: |
+        {{ helm_bin }} pull oci://docker.io/envoyproxy/gateway-helm \
+          --version {{ eg_version }} \
+          --destination /tmp/
+      register: helm_pull
+      changed_when: true
+      when: eg_helm_check.stdout == "absent"
+
+    - name: Install Envoy Gateway via Helm
+      ansible.builtin.shell: |
+        {{ helm_bin }} upgrade --install eg /tmp/gateway-helm-{{ eg_version }}.tgz \
+          --namespace {{ eg_namespace }} \
+          --create-namespace \
+          --set deployment.envoyGateway.imagePullPolicy=IfNotPresent \
+          --kubeconfig {{ kubeconfig }}
+      register: eg_install
+      changed_when: true
+      when: eg_helm_check.stdout == "absent"
+
+    - name: Clean up Helm chart file
+      ansible.builtin.file:
+        path: "/tmp/gateway-helm-{{ eg_version }}.tgz"
+        state: absent
+      when: eg_helm_check.stdout == "absent"
+
+    - name: Wait for Envoy Gateway controller to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status deployment/envoy-gateway \
+          -n {{ eg_namespace }} --timeout=120s
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: envoy_crd_wait
       changed_when: false
 
-    - name: Wait for GatewayClass 'ck-gateway' to appear
+    ###########################################################################
+    # Step 5: Create EnvoyProxy resource (imagePullPolicy for data plane)
+    ###########################################################################
+    - name: Create EnvoyProxy resource for Thinkube
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.envoyproxy.io/v1alpha1
+          kind: EnvoyProxy
+          metadata:
+            name: thinkube-proxy
+            namespace: "{{ eg_namespace }}"
+          spec:
+            provider:
+              type: Kubernetes
+              kubernetes:
+                envoyDeployment:
+                  container:
+                    imagePullPolicy: IfNotPresent
+
+    ###########################################################################
+    # Step 6: Create GatewayClass pointing to Envoy Gateway
+    ###########################################################################
+    - name: Create GatewayClass for Envoy Gateway
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: eg
+          spec:
+            controllerName: gateway.envoyproxy.io/gatewayclass-controller
+            parametersRef:
+              group: gateway.envoyproxy.io
+              kind: EnvoyProxy
+              name: thinkube-proxy
+              namespace: "{{ eg_namespace }}"
+
+    - name: Wait for GatewayClass eg to be accepted
       ansible.builtin.shell: |
-        {{ kubectl_bin }} get gatewayclass ck-gateway -o jsonpath='{.metadata.name}'
+        {{ kubectl_bin }} get gatewayclass eg \
+          -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}'
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: gatewayclass_check
-      until: gatewayclass_check.rc == 0 and gatewayclass_check.stdout == "ck-gateway"
+      register: gatewayclass_status
+      until: gatewayclass_status.stdout == "True"
       retries: 30
-      delay: 10
+      delay: 5
       changed_when: false
 
     ###########################################################################
-    # Step 4: Create gateway-system namespace and copy TLS certs
+    # Step 7: Create gateway-system namespace and copy TLS certificates
     ###########################################################################
     - name: Create gateway-system namespace
       kubernetes.core.k8s:
@@ -236,7 +316,7 @@
       ansible.builtin.set_fact:
         wildcard_cert_data: "{{ wildcard_cert_raw.stdout | from_json }}"
 
-    - name: Create wildcard TLS secret for primary gateway
+    - name: Create TLS secret for main gateway
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -246,15 +326,12 @@
           metadata:
             name: gateway-tls-secret
             namespace: "{{ gateway_namespace }}"
-            labels:
-              app.kubernetes.io/name: wildcard-certificate
-              app.kubernetes.io/managed-by: acme.sh
           type: kubernetes.io/tls
           data:
             tls.crt: "{{ wildcard_cert_data.data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert_data.data['tls.key'] }}"
 
-    - name: Create wildcard TLS secret for Knative gateway
+    - name: Create TLS secret for Knative gateway
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -264,18 +341,15 @@
           metadata:
             name: gateway-kn-tls-secret
             namespace: "{{ gateway_namespace }}"
-            labels:
-              app.kubernetes.io/name: wildcard-certificate-kn
-              app.kubernetes.io/managed-by: acme.sh
           type: kubernetes.io/tls
           data:
             tls.crt: "{{ wildcard_cert_data.data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert_data.data['tls.key'] }}"
 
     ###########################################################################
-    # Step 4: Create Primary Gateway (HTTPS + HTTP redirect + ArgoCD passthrough)
+    # Step 8: Create main Gateway (HTTP + HTTPS + TLS passthrough + TCP ports)
     ###########################################################################
-    - name: Create Primary Gateway
+    - name: Create main Gateway (thinkube-gateway)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -285,10 +359,11 @@
           metadata:
             name: "{{ gateway_name }}"
             namespace: "{{ gateway_namespace }}"
-            annotations:
-              io.cilium/lb-ipam-ips: "{{ primary_gateway_ip }}"
           spec:
-            gatewayClassName: ck-gateway
+            gatewayClassName: eg
+            addresses:
+              - type: IPAddress
+                value: "{{ primary_gateway_ip }}"
             listeners:
               - name: http
                 protocol: HTTP
@@ -317,8 +392,73 @@
                 allowedRoutes:
                   namespaces:
                     from: All
+              - name: postgres
+                protocol: TCP
+                port: 5432
+                allowedRoutes:
+                  namespaces:
+                    from: All
+              - name: gitea-ssh
+                protocol: TCP
+                port: 2222
+                allowedRoutes:
+                  namespaces:
+                    from: All
+              - name: nats
+                protocol: TCP
+                port: 4222
+                allowedRoutes:
+                  namespaces:
+                    from: All
+              - name: valkey
+                protocol: TCP
+                port: 6379
+                allowedRoutes:
+                  namespaces:
+                    from: All
+              - name: clickhouse
+                protocol: TCP
+                port: 9000
+                allowedRoutes:
+                  namespaces:
+                    from: All
 
-    # HTTP→HTTPS redirect route
+    ###########################################################################
+    # Step 9: Create Knative Gateway (HTTPS for *.kn.<domain>)
+    ###########################################################################
+    - name: Create Knative Gateway (thinkube-kn-gateway)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: "{{ gateway_kn_name }}"
+            namespace: "{{ gateway_namespace }}"
+          spec:
+            gatewayClassName: eg
+            addresses:
+              - type: IPAddress
+                value: "{{ secondary_gateway_ip }}"
+            listeners:
+              - name: https
+                protocol: HTTPS
+                port: 443
+                hostname: "*.kn.{{ domain_name }}"
+                tls:
+                  mode: Terminate
+                  certificateRefs:
+                    - kind: Secret
+                      name: gateway-kn-tls-secret
+                      namespace: "{{ gateway_namespace }}"
+                allowedRoutes:
+                  namespaces:
+                    from: All
+
+    ###########################################################################
+    # Step 10: HTTP → HTTPS redirect route
+    ###########################################################################
     - name: Create HTTP to HTTPS redirect route
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -342,72 +482,7 @@
                       statusCode: 301
 
     ###########################################################################
-    # Step 5: Create TCP Gateway
-    ###########################################################################
-    - name: Create TCP Gateway
-      ansible.builtin.shell: |
-        cat <<'MANIFEST' | {{ kubectl_bin }} apply -f -
-        apiVersion: gateway.networking.k8s.io/v1
-        kind: Gateway
-        metadata:
-          name: {{ gateway_tcp_name }}
-          namespace: {{ gateway_namespace }}
-          annotations:
-            io.cilium/lb-ipam-ips: "{{ primary_gateway_ip }}"
-        spec:
-          gatewayClassName: ck-gateway
-          listeners:
-        {% for svc in tcp_services %}
-            - name: {{ svc.name }}
-              protocol: TCP
-              port: {{ svc.port }}
-              allowedRoutes:
-                namespaces:
-                  from: All
-        {% endfor %}
-        MANIFEST
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: tcp_gw_apply
-      changed_when: "'created' in tcp_gw_apply.stdout or 'configured' in tcp_gw_apply.stdout"
-
-    ###########################################################################
-    # Step 6: Create Knative Gateway
-    ###########################################################################
-    - name: Create Knative Gateway
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: gateway.networking.k8s.io/v1
-          kind: Gateway
-          metadata:
-            name: "{{ gateway_kn_name }}"
-            namespace: "{{ gateway_namespace }}"
-            annotations:
-              io.cilium/lb-ipam-ips: "{{ secondary_gateway_ip }}"
-          spec:
-            gatewayClassName: ck-gateway
-            listeners:
-              - name: https
-                protocol: HTTPS
-                port: 443
-                hostname: "*.kn.{{ domain_name }}"
-                tls:
-                  mode: Terminate
-                  certificateRefs:
-                    - kind: Secret
-                      name: gateway-kn-tls-secret
-                      namespace: "{{ gateway_namespace }}"
-                allowedRoutes:
-                  namespaces:
-                    from: All
-
-    ###########################################################################
-    # Step 7: Ensure backend namespaces exist, then create ReferenceGrants
-    # and TCPRoutes for TCP services.
-    # Namespaces are created empty here so ReferenceGrants can be applied;
-    # the service deployments later deploy into the already-existing namespace.
+    # Step 11: Ensure backend namespaces exist and create ReferenceGrants
     ###########################################################################
     - name: Ensure backend namespaces exist for TCP services
       kubernetes.core.k8s:
@@ -445,7 +520,7 @@
         label: "{{ item.backend_namespace }}"
 
     ###########################################################################
-    # Step 8: Create TCPRoutes
+    # Step 12: Create TCPRoutes (referencing thinkube-gateway)
     ###########################################################################
     - name: Create TCPRoutes for each TCP service
       kubernetes.core.k8s:
@@ -459,7 +534,8 @@
             namespace: "{{ gateway_namespace }}"
           spec:
             parentRefs:
-              - name: "{{ gateway_tcp_name }}"
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
                 sectionName: "{{ item.name }}"
             rules:
               - backendRefs:
@@ -471,9 +547,9 @@
         label: "{{ item.name }}"
 
     ###########################################################################
-    # Step 9: Wait for Gateways to be ready
+    # Step 13: Wait for Gateways to receive IP addresses
     ###########################################################################
-    - name: Wait for Primary Gateway to have an IP assigned
+    - name: Wait for main Gateway to have IP assigned
       ansible.builtin.shell: |
         {{ kubectl_bin }} get gateway {{ gateway_name }} -n {{ gateway_namespace }} \
           -o jsonpath='{.status.addresses[0].value}'
@@ -481,11 +557,11 @@
         KUBECONFIG: "{{ kubeconfig }}"
       register: primary_gw_ip
       until: primary_gw_ip.stdout == primary_gateway_ip
-      retries: 30
-      delay: 5
+      retries: 40
+      delay: 10
       changed_when: false
 
-    - name: Wait for Knative Gateway to have an IP assigned
+    - name: Wait for Knative Gateway to have IP assigned
       ansible.builtin.shell: |
         {{ kubectl_bin }} get gateway {{ gateway_kn_name }} -n {{ gateway_namespace }} \
           -o jsonpath='{.status.addresses[0].value}'
@@ -493,29 +569,27 @@
         KUBECONFIG: "{{ kubeconfig }}"
       register: kn_gw_ip
       until: kn_gw_ip.stdout == secondary_gateway_ip
-      retries: 30
-      delay: 5
+      retries: 40
+      delay: 10
       changed_when: false
 
     ###########################################################################
-    # Step 10: Display results
+    # Step 14: Display summary
     ###########################################################################
-    - name: Display Gateway API deployment summary
+    - name: Display Gateway deployment summary
       ansible.builtin.debug:
         msg:
-          - "Gateway API deployment complete"
+          - "Envoy Gateway {{ eg_version }} deployed successfully"
           - ""
-          - "Primary Gateway ({{ gateway_name }}): {{ primary_gateway_ip }}"
-          - "  - HTTP (80) → HTTPS redirect"
-          - "  - HTTPS (443) → TLS termination with wildcard cert"
-          - "  - TLS passthrough for {{ argocd_hostname }}"
-          - ""
-          - "TCP Gateway ({{ gateway_tcp_name }}): {{ primary_gateway_ip }}"
-          - "  - PostgreSQL: {{ primary_gateway_ip }}:5432"
-          - "  - Gitea SSH: {{ primary_gateway_ip }}:2222"
-          - "  - NATS: {{ primary_gateway_ip }}:4222"
-          - "  - Valkey: {{ primary_gateway_ip }}:6379"
-          - "  - ClickHouse: {{ primary_gateway_ip }}:9000"
+          - "Main Gateway ({{ gateway_name }}): {{ primary_gateway_ip }}"
+          - "  - HTTP  (80)   → HTTPS redirect"
+          - "  - HTTPS (443)  → TLS termination (*.{{ domain_name }})"
+          - "  - TLS   (443)  → Passthrough for {{ argocd_hostname }}"
+          - "  - TCP   (5432) → PostgreSQL"
+          - "  - TCP   (2222) → Gitea SSH"
+          - "  - TCP   (4222) → NATS"
+          - "  - TCP   (6379) → Valkey"
+          - "  - TCP   (9000) → ClickHouse"
           - ""
           - "Knative Gateway ({{ gateway_kn_name }}): {{ secondary_gateway_ip }}"
-          - "  - HTTPS (443) for *.kn.{{ domain_name }}"
+          - "  - HTTPS (443)  → *.kn.{{ domain_name }}"
