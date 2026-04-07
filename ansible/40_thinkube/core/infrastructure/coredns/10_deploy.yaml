@@ -4,14 +4,14 @@
 ---
 # ansible/40_thinkube/core/infrastructure/coredns/10_deploy.yaml
 # Description:
-#   Configures CoreDNS as the primary DNS server for the cluster
-#   Provides both internal Kubernetes DNS and external domain resolution
-#   Exposes DNS service externally via LoadBalancer for network-wide DNS
+#   Configures CoreDNS as the primary DNS server for the cluster.
+#   Provides Kubernetes internal DNS (cluster.local) and forwards all
+#   external queries to BIND9, which handles *.domain resolution.
 #
 # Requirements:
 #   - Kubernetes must be installed and running (k8s-snap)
-#   - MetalLB should be deployed for LoadBalancer services
-#   - Ingress controllers should be deployed with proper IPs after this
+#   - MetalLB load-balancer must be enabled
+#   - dns-server/10_deploy.yaml must have run first (BIND9)
 #
 # Usage:
 #   cd ~/thinkube
@@ -30,7 +30,7 @@
 #
 # 🤖 [AI-assisted]
 
-- name: Configure CoreDNS for Ingress Hairpin Routing and Service Resolution
+- name: Configure CoreDNS for Kubernetes DNS and External Domain Resolution
   hosts: k8s_control_plane
   gather_facts: true
   become: false
@@ -44,8 +44,8 @@
     kn_subdomain: "kn"  # Knative subdomain
     # Determine subnet prefix based on network mode
     subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
-    primary_ingress_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
-    secondary_ingress_ip: "{{ subnet_prefix }}{{ secondary_ingress_ip_octet }}"
+    primary_gateway_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
+    secondary_gateway_ip: "{{ subnet_prefix }}{{ secondary_ingress_ip_octet }}"
     coredns_external_ip: "{{ subnet_prefix }}{{ dns_external_ip_octet }}"  # From inventory configuration
 
   pre_tasks:
@@ -86,80 +86,6 @@
       become: true
       register: k8s_dns_config
       changed_when: "'Configuration updated' in k8s_dns_config.stdout"
-
-    # Detect current Kourier service IPs if installed
-    - name: Check if Kourier services exist
-      ansible.builtin.command: >
-        {{ kubectl_bin }} get svc -n kourier-system kourier --no-headers
-      register: kourier_exists
-      changed_when: false
-      failed_when: false
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-
-    - name: Get current Kourier service IP
-      ansible.builtin.command: >
-        {{ kubectl_bin }} get svc kourier -n kourier-system -o jsonpath='{.spec.clusterIP}'
-      register: kourier_svc_ip
-      changed_when: false
-      when: kourier_exists.rc == 0
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-
-    - name: Get current Kourier internal service IP
-      ansible.builtin.command: >
-        {{ kubectl_bin }} get svc kourier-internal -n kourier-system -o jsonpath='{.spec.clusterIP}'
-      register: kourier_internal_svc_ip
-      changed_when: false
-      when: kourier_exists.rc == 0
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-
-    - name: Set dynamic Kourier IPs
-      ansible.builtin.set_fact:
-        kourier_ip: "{{ kourier_svc_ip.stdout | default('') }}"
-        kourier_internal_ip: "{{ kourier_internal_svc_ip.stdout | default('') }}"
-      when: kourier_exists.rc == 0
-
-    # Get primary ingress controller service IP
-    - name: Check if primary ingress controller exists
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get svc -n ingress primary-ingress-ingress-nginx-controller --no-headers 2>/dev/null || echo "not-found"
-      register: primary_ingress_check
-      changed_when: false
-      failed_when: false
-
-    - name: Get primary ingress controller ClusterIP
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get svc -n ingress primary-ingress-ingress-nginx-controller -o jsonpath='{.spec.clusterIP}'
-      register: primary_ingress_cluster_ip
-      when: primary_ingress_check.stdout != "not-found" and "not-found" not in primary_ingress_check.stdout
-      changed_when: false
-
-    - name: Set primary ingress internal IP
-      ansible.builtin.set_fact:
-        primary_ingress_internal_ip: "{{ primary_ingress_cluster_ip.stdout | default('') }}"
-      when: primary_ingress_cluster_ip is defined and primary_ingress_cluster_ip.stdout is defined
-
-    # Get secondary ingress controller service IP
-    - name: Check if secondary ingress controller exists
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get svc -n ingress-kn secondary-ingress-ingress-nginx-controller --no-headers 2>/dev/null || echo "not-found"
-      register: secondary_ingress_check
-      changed_when: false
-      failed_when: false
-
-    - name: Get secondary ingress controller ClusterIP
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get svc -n ingress-kn secondary-ingress-ingress-nginx-controller -o jsonpath='{.spec.clusterIP}'
-      register: secondary_ingress_cluster_ip
-      when: secondary_ingress_check.stdout != "not-found" and "not-found" not in secondary_ingress_check.stdout
-      changed_when: false
-
-    - name: Set secondary ingress internal IP
-      ansible.builtin.set_fact:
-        secondary_ingress_internal_ip: "{{ secondary_ingress_cluster_ip.stdout | default('') }}"
-      when: secondary_ingress_cluster_ip is defined and secondary_ingress_cluster_ip.stdout is defined
 
     # Create CoreDNS configuration
     - name: Create temporary CoreDNS Corefile content
