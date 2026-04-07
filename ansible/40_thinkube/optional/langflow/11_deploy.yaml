@@ -49,7 +49,7 @@
     postgres_namespace: "postgres"
     postgres_release_name: "postgresql-official"
     langflow_db_name: "langflow"
-    langflow_db_user: "langflow"
+    langflow_db_user: "{{ admin_username }}"
     langflow_db_password: "{{ admin_password }}"
 
     # Valkey settings for oauth2-proxy sessions
@@ -146,53 +146,10 @@
       register: create_db
       changed_when: create_db.rc == 0
 
-    - name: Check if Langflow database user exists
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/{{ postgres_release_name }} -- \
-          psql -U {{ admin_username }} -d postgres -tAc \
-          "SELECT 1 FROM pg_roles WHERE rolname='{{ langflow_db_user }}';"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: user_exists
-      changed_when: false
-      failed_when: false
-
-    - name: Create Langflow database user
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/{{ postgres_release_name }} -- \
-          psql -U {{ admin_username }} -d postgres -c \
-          "CREATE USER {{ langflow_db_user }} WITH PASSWORD '{{ langflow_db_password }}';"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      when: user_exists.stdout.strip() != "1"
-      register: create_user
-      changed_when: create_user.rc == 0
-      no_log: true
-
-    - name: Grant privileges on Langflow database to user
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/{{ postgres_release_name }} -- \
-          psql -U {{ admin_username }} -d postgres -c \
-          "GRANT ALL PRIVILEGES ON DATABASE {{ langflow_db_name }} TO {{ langflow_db_user }};"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
-      failed_when: false
-
-    - name: Grant schema privileges on Langflow database
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/{{ postgres_release_name }} -- \
-          psql -U {{ admin_username }} -d {{ langflow_db_name }} -c \
-          "GRANT ALL ON SCHEMA public TO {{ langflow_db_user }};"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
-      failed_when: false
-
     ###########################################################################
     # Step 3: Create Langflow Secret
     ###########################################################################
-    - name: Create Langflow secret (DB credentials + secret key)
+    - name: Create Langflow secret (DB URL + secret key)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
@@ -204,7 +161,7 @@
             namespace: "{{ k8s_namespace }}"
           type: Opaque
           data:
-            db-password: "{{ langflow_db_password | b64encode }}"
+            database-url: "{{ ('postgresql://' + langflow_db_user + ':' + langflow_db_password + '@' + postgres_release_name + '.' + postgres_namespace + '.svc.cluster.local:5432/' + langflow_db_name) | b64encode }}"
             secret-key: "{{ (langflow_db_password + '-langflow-secret') | b64encode }}"
 
     ###########################################################################
@@ -277,12 +234,10 @@
                         name: http
                     env:
                       - name: LANGFLOW_DATABASE_URL
-                        value: "postgresql://{{ langflow_db_user }}:$(DB_PASSWORD)@{{ postgres_release_name }}.{{ postgres_namespace }}.svc.cluster.local:5432/{{ langflow_db_name }}"
-                      - name: DB_PASSWORD
                         valueFrom:
                           secretKeyRef:
                             name: langflow-secret
-                            key: db-password
+                            key: database-url
                       - name: LANGFLOW_SECRET_KEY
                         valueFrom:
                           secretKeyRef:
