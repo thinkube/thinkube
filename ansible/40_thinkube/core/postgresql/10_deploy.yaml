@@ -61,11 +61,6 @@
     postgres_tls_secret_name: "{{ postgres_namespace }}-tls-secret"
     postgres_tcp_port: 5432
 
-    ###########################################################################
-    # 3) NGINX Ingress (TCP)
-    ###########################################################################
-    ingress_tcp_configmap_name: "nginx-ingress-tcp-k8s-conf"
-
   pre_tasks:
     - name: Verify admin password available
       ansible.builtin.assert:
@@ -81,8 +76,6 @@
         - admin_username
         - postgres_hostname
         - kubeconfig
-        - ingress_namespace
-        - primary_ingress_service
         - kubectl_bin
 
   tasks:
@@ -324,106 +317,5 @@
       ansible.builtin.pause:
         seconds: 10
 
-    ###########################################################################
-    # Task 6) CONFIGURE NGINX Ingress FOR TCP
-    ###########################################################################
-    - name: Display NGINX Ingress TCP ConfigMap (non-fatal)
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get configmap {{ ingress_tcp_configmap_name }} -n {{ ingress_namespace }} -o yaml || echo "ConfigMap not found yet"
-      register: current_ingress_map
-      failed_when: false
-      ignore_errors: true
-
-    - name: Debug existing configmap
-      ansible.builtin.debug:
-        var: current_ingress_map.stdout_lines
-
-    - name: Construct data for the TCP ConfigMap
-      ansible.builtin.set_fact:
-        postgres_tcp_map_data: >-
-          {{
-            {
-              (postgres_tcp_port | string):
-              postgres_namespace ~ '/' ~ postgres_release_name ~ ':' ~ (postgres_tcp_port | string)
-            }
-          }}
-
-    - name: Create temporary manifest for NGINX Ingress TCP ConfigMap
-      ansible.builtin.copy:
-        content: |
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: {{ ingress_tcp_configmap_name }}
-            namespace: {{ ingress_namespace }}
-          data:
-            "{{ postgres_tcp_port }}": "{{ postgres_namespace }}/{{ postgres_release_name }}:{{ postgres_tcp_port }}"
-        dest: /tmp/nginx-tcp-configmap.yaml
-        mode: '0644'
-
-    - name: Create or update NGINX Ingress TCP ConfigMap for PostgreSQL
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} apply -f /tmp/nginx-tcp-configmap.yaml
-      register: configmap_update
-      changed_when: "'created' in configmap_update.stdout or 'configured' in configmap_update.stdout"
-
-    - name: Check if PostgreSQL port is already exposed in Ingress
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.template.spec.containers[0].ports[*].containerPort}' | grep -q "{{ postgres_tcp_port }}"
-      register: port_check
-      changed_when: false
-      failed_when: false
-
-    # Fix 3: Ensure the port is properly exposed on the deployment
-    - name: Patch NGINX Ingress controller Deployment to expose PostgreSQL port
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} patch deployment -n {{ ingress_namespace }} {{ primary_ingress_service }} \
-          --type=json \
-          -p='[
-            {
-              "op": "add",
-              "path": "/spec/template/spec/containers/0/ports/-",
-              "value": {
-                "name": "pg-{{ postgres_tcp_port }}",
-                "containerPort": {{ postgres_tcp_port }},
-                "hostPort": {{ postgres_tcp_port }},
-                "protocol": "TCP"
-              }
-            }
-          ]'
-      register: patch_deploy
-      changed_when: "'patched' in patch_deploy.stdout or patch_deploy.rc == 0"
-      when: port_check.rc != 0
-
-    # Fix 4: Patch the service to ensure the port is exposed on the service as well
-    - name: Check if PostgreSQL port is already exposed in Ingress Service
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get service -n {{ ingress_namespace }} {{ primary_ingress_service }} -o jsonpath='{.spec.ports[*].port}' | grep -q "{{ postgres_tcp_port }}"
-      register: service_port_check
-      changed_when: false
-      failed_when: false
-
-    - name: Patch NGINX Ingress controller Service to expose PostgreSQL port
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} patch service -n {{ ingress_namespace }} {{ primary_ingress_service }} \
-          --type=json \
-          -p='[
-            {
-              "op": "add",
-              "path": "/spec/ports/-",
-              "value": {
-                "name": "pg-{{ postgres_tcp_port }}",
-                "port": {{ postgres_tcp_port }},
-                "targetPort": {{ postgres_tcp_port }},
-                "protocol": "TCP"
-              }
-            }
-          ]'
-      register: patch_service
-      changed_when: "'patched' in patch_service.stdout or patch_service.rc == 0"
-      when: service_port_check.rc != 0
-
-    # Fix 5: Wait a bit longer to ensure all changes take effect
-    - name: Wait for changes to propagate
-      ansible.builtin.pause:
-        seconds: 15
+    # TCP routing for PostgreSQL (port 5432) is handled by the Gateway API
+    # TCPRoute created in gateway-api/10_deploy.yaml — no ingress patching needed.
