@@ -71,166 +71,131 @@
 
   tasks:
     ###########################################################################
-    # Step 1: Install Gateway API CRDs
+    # Step 1: Fix CRD ownership so k8s-snap can manage them via Helm
+    #
+    # k8s-snap installs Gateway API CRDs via its own 'ck-gateway' Helm release
+    # (from gateway-api-1.2.0.tgz). If the CRDs already exist from a previous
+    # manual installation (without Helm ownership metadata), the Helm install
+    # fails. We annotate any existing CRDs with the required Helm metadata so
+    # the snap can adopt them.
     ###########################################################################
-    - name: Check if Gateway API CRDs are already installed
+    - name: Check if standard Gateway API CRDs have ck-gateway Helm ownership
       ansible.builtin.shell: |
-        {{ kubectl_bin }} get crd gateways.gateway.networking.k8s.io 2>/dev/null
+        {{ kubectl_bin }} get crd gateways.gateway.networking.k8s.io \
+          -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}' 2>/dev/null
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: gateway_crd_check
+      register: gateway_crd_helm_owner
       failed_when: false
       changed_when: false
 
-    - name: Install Gateway API CRDs (experimental channel)
+    - name: Annotate existing Gateway API CRDs with Helm ownership for ck-gateway
       ansible.builtin.shell: |
-        {{ kubectl_bin }} apply -f {{ gateway_api_crds_url }}
+        for crd in gatewayclasses gateways grpcroutes httproutes referencegrants tlsroutes; do
+          crdfull="${crd}.gateway.networking.k8s.io"
+          if {{ kubectl_bin }} get crd "${crdfull}" &>/dev/null; then
+            {{ kubectl_bin }} annotate crd "${crdfull}" \
+              meta.helm.sh/release-name=ck-gateway \
+              meta.helm.sh/release-namespace=kube-system \
+              --overwrite
+            {{ kubectl_bin }} label crd "${crdfull}" \
+              app.kubernetes.io/managed-by=Helm \
+              --overwrite
+          fi
+        done
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: crd_install
-      changed_when: "'created' in crd_install.stdout or 'configured' in crd_install.stdout"
-      when: gateway_crd_check.rc != 0
-
-    - name: Wait for Gateway API CRDs to be established
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} wait --for=condition=Established crd/gateways.gateway.networking.k8s.io --timeout=60s
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
+      when: gateway_crd_helm_owner.stdout != "ck-gateway"
+      changed_when: true
 
     ###########################################################################
-    # Step 2: Enable Gateway API via k8s-snap (installs CRDs and RBAC)
+    # Step 2: Enable Gateway API via k8s-snap
+    #
+    # This upgrades the ck-network (Cilium) Helm release with
+    # gatewayAPI.enabled=true (which also enables envoyConfig, installing the
+    # CiliumEnvoyConfig CRD), and installs the ck-gateway Helm release
+    # (Gateway API CRDs + GatewayClass 'cilium').
     ###########################################################################
     - name: Enable Gateway API via k8s-snap
       ansible.builtin.shell: |
         k8s set gateway.enabled=true
       become: true
       register: k8s_gateway_set
-      changed_when: k8s_gateway_set.rc == 0
+      changed_when: "'Configuration updated' in k8s_gateway_set.stdout"
       failed_when:
         - k8s_gateway_set.rc != 0
         - "'already' not in k8s_gateway_set.stderr | lower
           and 'already' not in k8s_gateway_set.stdout | lower"
 
+    - name: Wait for k8s-snap gateway deployment to succeed
+      ansible.builtin.shell: |
+        sudo k8s status --output-format yaml 2>/dev/null | grep -A2 "^gateway:" | grep -v "Failed\|Error\|failed\|error" | grep -q "enabled\|ready" && echo "ok" || echo "pending"
+      become: true
+      register: gateway_snap_status
+      until: gateway_snap_status.stdout == "ok"
+      retries: 30
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Wait for standard Gateway API CRDs to be established
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} wait --for=condition=Established \
+          crd/gatewayclasses.gateway.networking.k8s.io \
+          crd/gateways.gateway.networking.k8s.io \
+          crd/httproutes.gateway.networking.k8s.io \
+          --timeout=120s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    ###########################################################################
+    # Step 3: Install experimental Gateway API CRDs (TCPRoute, UDPRoute, etc.)
+    #
+    # The snap's gateway-api chart only includes standard channel CRDs.
+    # We install the experimental channel on top for TCPRoute/UDPRoute support.
+    # These CRDs are NOT in the snap's Helm chart, so no ownership conflict.
+    ###########################################################################
+    - name: Check if experimental Gateway API CRDs are installed (TCPRoute)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get crd tcproutes.gateway.networking.k8s.io 2>/dev/null
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: tcproute_crd_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install experimental Gateway API CRDs (TCPRoute, UDPRoute, BackendLBPolicy)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f {{ gateway_api_crds_url }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: exp_crd_install
+      changed_when: "'created' in exp_crd_install.stdout or 'configured' in exp_crd_install.stdout"
+      when: tcproute_crd_check.rc != 0
+
+    - name: Wait for experimental CRDs to be established
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} wait --for=condition=Established \
+          crd/tcproutes.gateway.networking.k8s.io \
+          --timeout=60s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: tcproute_crd_check.rc != 0
+      changed_when: false
+
+    ###########################################################################
+    # Step 4: Wait for GatewayClass 'cilium' to appear
+    #
+    # The Cilium Helm chart creates GatewayClass 'cilium' when
+    # gatewayAPI.enabled=true. Wait for the operator to create it.
+    ###########################################################################
     - name: Wait for ciliumenvoyconfigs CRD to be established
       ansible.builtin.shell: |
-        {{ kubectl_bin }} wait --for=condition=Established crd/ciliumenvoyconfigs.cilium.io --timeout=60s
+        {{ kubectl_bin }} wait --for=condition=Established crd/ciliumenvoyconfigs.cilium.io --timeout=120s
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: envoy_crd_wait
-      failed_when: false
-      changed_when: false
-
-    ###########################################################################
-    # Step 3: Enable Gateway API in Cilium configmap
-    ###########################################################################
-    - name: Check current Cilium Gateway API config
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get configmap cilium-config -n kube-system -o jsonpath='{.data.enable-gateway-api}'
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: cilium_gateway_config
-      failed_when: false
-      changed_when: false
-
-    - name: Enable Gateway API in Cilium ConfigMap
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} patch configmap cilium-config -n kube-system --type=merge \
-          -p '{"data":{"enable-gateway-api":"true"}}'
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: cilium_patch
-      changed_when: "'patched' in cilium_patch.stdout"
-      when: cilium_gateway_config.stdout != "true"
-
-    - name: Restart Cilium agent to pick up Gateway API config
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout restart daemonset/cilium -n kube-system
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      when: cilium_gateway_config.stdout != "true"
-      changed_when: true
-
-    - name: Wait for Cilium agent rollout to complete
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout status daemonset/cilium -n kube-system --timeout=120s
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      when: cilium_gateway_config.stdout != "true"
-      changed_when: false
-
-    - name: Grant cilium-operator RBAC permissions for Gateway API resources
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: rbac.authorization.k8s.io/v1
-          kind: ClusterRole
-          metadata:
-            name: cilium-operator-gateway-api
-          rules:
-            - apiGroups: ["gateway.networking.k8s.io"]
-              resources:
-                - gatewayclasses
-                - gateways
-                - httproutes
-                - grpcroutes
-                - tlsroutes
-                - tcproutes
-                - udproutes
-                - referencegrants
-                - backendtlspolicies
-              verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-            - apiGroups: ["gateway.networking.k8s.io"]
-              resources:
-                - gatewayclasses/status
-                - gateways/status
-                - httproutes/status
-                - grpcroutes/status
-                - tlsroutes/status
-              verbs: ["get", "update", "patch"]
-
-    - name: Bind cilium-operator to Gateway API ClusterRole
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: rbac.authorization.k8s.io/v1
-          kind: ClusterRoleBinding
-          metadata:
-            name: cilium-operator-gateway-api
-          roleRef:
-            apiGroup: rbac.authorization.k8s.io
-            kind: ClusterRole
-            name: cilium-operator-gateway-api
-          subjects:
-            - kind: ServiceAccount
-              name: cilium-operator
-              namespace: kube-system
-
-    - name: Check if GatewayClass 'cilium' already exists
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get gatewayclass cilium -o jsonpath='{.metadata.name}' 2>/dev/null
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: gatewayclass_exists
-      failed_when: false
-      changed_when: false
-
-    - name: Restart Cilium operator to register GatewayClass
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout restart deployment/cilium-operator -n kube-system
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      when: gatewayclass_exists.stdout != "cilium"
-      changed_when: true
-
-    - name: Wait for Cilium operator rollout to complete
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout status deployment/cilium-operator -n kube-system --timeout=120s
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      when: gatewayclass_exists.stdout != "cilium"
       changed_when: false
 
     - name: Wait for GatewayClass 'cilium' to appear
@@ -239,9 +204,9 @@
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: gatewayclass_check
-      until: gatewayclass_check.rc == 0
+      until: gatewayclass_check.rc == 0 and gatewayclass_check.stdout == "cilium"
       retries: 30
-      delay: 5
+      delay: 10
       changed_when: false
 
     ###########################################################################
