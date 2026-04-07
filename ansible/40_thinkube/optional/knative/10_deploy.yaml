@@ -69,6 +69,7 @@
     # Gateway API references (Envoy Gateway class is 'eg')
     gateway_kn_name: "thinkube-kn-gateway"
     gateway_namespace: "gateway-system"
+    eg_namespace: "envoy-gateway-system"
     gateway_class: "eg"
 
   tasks:
@@ -254,21 +255,24 @@
       changed_when: false
       failed_when: wait_gw_controller.rc != 0
 
-    - name: Get Envoy Gateway backing service for external gateway
+    - name: Wait for Envoy Gateway backing service for external kn gateway
       ansible.builtin.shell: |
-        {{ kubectl_bin }} get svc -n {{ gateway_namespace }} \
-          -l gateway.envoyproxy.io/owning-gateway-name={{ gateway_kn_name }} \
+        {{ kubectl_bin }} get svc -n {{ eg_namespace }} \
+          -l "gateway.envoyproxy.io/owning-gateway-name={{ gateway_kn_name }},gateway.envoyproxy.io/owning-gateway-namespace={{ gateway_namespace }}" \
           -o jsonpath='{.items[0].metadata.name}'
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: kn_gateway_svc
+      retries: 12
+      delay: 10
+      until: kn_gateway_svc.stdout != ''
       changed_when: false
-      failed_when: kn_gateway_svc.stdout == ''
+      failed_when: kn_gateway_svc.rc != 0 and kn_gateway_svc.attempts | default(1) >= 12
 
     - name: Wait for local gateway backing service to appear
       ansible.builtin.shell: |
-        {{ kubectl_bin }} get svc -n knative-serving \
-          -l gateway.envoyproxy.io/owning-gateway-name=knative-local-gateway \
+        {{ kubectl_bin }} get svc -n {{ eg_namespace }} \
+          -l "gateway.envoyproxy.io/owning-gateway-name=knative-local-gateway,gateway.envoyproxy.io/owning-gateway-namespace=knative-serving" \
           -o jsonpath='{.items[0].metadata.name}'
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
@@ -292,12 +296,12 @@
             external-gateways: |
               - class: "{{ gateway_class }}"
                 gateway: "{{ gateway_namespace }}/{{ gateway_kn_name }}"
-                service: "{{ gateway_namespace }}/{{ kn_gateway_svc.stdout }}"
+                service: "{{ eg_namespace }}/{{ kn_gateway_svc.stdout }}"
                 allowed-namespaces: "*"
             local-gateways: |
               - class: "{{ gateway_class }}"
                 gateway: "knative-serving/knative-local-gateway"
-                service: "knative-serving/{{ local_gateway_svc.stdout }}"
+                service: "{{ eg_namespace }}/{{ local_gateway_svc.stdout }}"
                 allowed-namespaces: "*"
 
     # --- PHASE 5: CONFIGURE DOMAIN MAPPING ---
