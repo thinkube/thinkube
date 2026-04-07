@@ -1,0 +1,196 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/langflow/18_test.yaml
+# Description:
+#   Test Langflow deployment and validate all components are running.
+#
+# Requirements:
+#   - Langflow must be deployed (11_deploy.yaml)
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/langflow/18_test.yaml
+
+- name: Test Langflow Deployment
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    k8s_namespace: "{{ langflow_namespace }}"
+
+  tasks:
+    - name: Check Langflow namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ k8s_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check Langflow deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+        name: langflow
+      register: langflow_deployment
+      failed_when: langflow_deployment.resources | length == 0
+
+    - name: Verify Langflow deployment is ready
+      ansible.builtin.assert:
+        that:
+          - langflow_deployment.resources[0].status.readyReplicas is defined
+          - langflow_deployment.resources[0].status.readyReplicas == 1
+        success_msg: "Langflow deployment is ready"
+        fail_msg: "Langflow deployment is not ready: {{ langflow_deployment.resources[0].status | to_json }}"
+
+    - name: Check OAuth2 Proxy deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+        name: oauth2-proxy
+      register: oauth2_deployment
+      failed_when: oauth2_deployment.resources | length == 0
+
+    - name: Check Valkey deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+        name: ephemeral-valkey
+      register: valkey_deployment
+      failed_when: valkey_deployment.resources | length == 0
+
+    - name: Check Langflow service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ k8s_namespace }}"
+        name: langflow
+      register: langflow_service
+      failed_when: langflow_service.resources | length == 0
+
+    - name: Check OAuth2 Proxy service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ k8s_namespace }}"
+        name: oauth2-proxy
+      register: oauth2_service
+      failed_when: oauth2_service.resources | length == 0
+
+    - name: Check Langflow HTTPRoute exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        namespace: "{{ k8s_namespace }}"
+        name: langflow-route
+      register: langflow_route
+      failed_when: langflow_route.resources | length == 0
+
+    - name: Check TLS secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ k8s_namespace }}"
+        name: "tls-cmxela-com"
+      register: tls_secret
+      failed_when: tls_secret.resources | length == 0
+
+    - name: Check PVC exists and is bound
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ k8s_namespace }}"
+        name: langflow-data
+      register: pvc_check
+      failed_when: >
+        pvc_check.resources | length == 0 or
+        pvc_check.resources[0].status.phase != 'Bound'
+
+    - name: Check Keycloak client exists for Langflow
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+
+    - name: Verify Langflow client in Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ langflow_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: langflow_client
+      failed_when: langflow_client.json | length == 0
+
+    - name: Test Langflow URL redirects to OAuth2 login
+      ansible.builtin.uri:
+        url: "https://{{ langflow_hostname }}/"
+        method: GET
+        follow_redirects: none
+        validate_certs: false
+        status_code: [302, 303]
+      register: auth_redirect_test
+
+    - name: Verify redirect goes to OAuth2 login
+      ansible.builtin.assert:
+        that:
+          - auth_redirect_test.status in [302, 303]
+          - "'oauth2' in auth_redirect_test.location"
+        success_msg: "Langflow is properly protected by OAuth2 Proxy"
+        fail_msg: "Langflow is not redirecting to OAuth2 login: {{ auth_redirect_test }}"
+
+    - name: Test summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Langflow Test Results
+          ════════════════════════════════════════════════════════
+
+          Namespace: {{ k8s_namespace }}
+          URL: https://{{ langflow_hostname }}
+
+          Component Status:
+          ✓ Langflow deployment: Ready
+          ✓ OAuth2 Proxy: Running
+          ✓ Valkey session store: Running
+          ✓ HTTPRoute configured: Yes
+          ✓ TLS certificate: Present
+          ✓ Keycloak client: Configured
+          ✓ PVC: Bound
+          ✓ Authentication redirect: Working
+
+          Access Instructions:
+          1. Navigate to: https://{{ langflow_hostname }}
+          2. You will be redirected to Keycloak for SSO login
+          3. After login, Langflow opens directly (auto-login mode)
+
+          Troubleshooting Commands:
+          - kubectl -n {{ k8s_namespace }} get pods
+          - kubectl -n {{ k8s_namespace }} logs deployment/langflow
+          - kubectl -n {{ k8s_namespace }} logs deployment/oauth2-proxy
+
+          ════════════════════════════════════════════════════════

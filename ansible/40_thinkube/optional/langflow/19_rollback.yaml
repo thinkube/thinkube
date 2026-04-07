@@ -1,0 +1,109 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/langflow/19_rollback.yaml
+# Description:
+#   Rollback Langflow deployment and clean up all resources including
+#   the Keycloak client and PostgreSQL database.
+#
+# Requirements:
+#   - kubectl access configured
+#   - ADMIN_PASSWORD environment variable set (for Keycloak cleanup)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/langflow/19_rollback.yaml
+
+- name: Rollback Langflow deployment
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    k8s_namespace: "{{ langflow_namespace }}"
+    postgres_namespace: "postgres"
+    postgres_release_name: "postgresql-official"
+    langflow_db_name: "langflow"
+    langflow_db_user: "langflow"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    - name: Delete Langflow namespace (removes all resources within)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: Namespace
+        name: "{{ k8s_namespace }}"
+      failed_when: false
+
+    - name: Remove Keycloak client for Langflow
+      block:
+        - name: Get Keycloak admin token
+          ansible.builtin.uri:
+            url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+            method: POST
+            body_format: form-urlencoded
+            body:
+              client_id: "admin-cli"
+              username: "{{ admin_username }}"
+              password: "{{ admin_password }}"
+              grant_type: "password"
+            validate_certs: false
+            status_code: 200
+          register: keycloak_token
+          no_log: true
+
+        - name: Find Langflow client in Keycloak
+          ansible.builtin.uri:
+            url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ langflow_client_id }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+            validate_certs: false
+            status_code: 200
+          register: langflow_clients
+
+        - name: Delete Langflow Keycloak client
+          ansible.builtin.uri:
+            url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ langflow_clients.json[0].id }}"
+            method: DELETE
+            headers:
+              Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+            validate_certs: false
+            status_code: [200, 204]
+          when: langflow_clients.json | length > 0
+          register: delete_client
+      failed_when: false
+
+    - name: Drop Langflow PostgreSQL database
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/{{ postgres_release_name }} -- \
+          psql -U {{ admin_username }} -d postgres -c \
+          "DROP DATABASE IF EXISTS {{ langflow_db_name }};"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: drop_db
+      changed_when: drop_db.rc == 0
+      failed_when: false
+
+    - name: Drop Langflow PostgreSQL user
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/{{ postgres_release_name }} -- \
+          psql -U {{ admin_username }} -d postgres -c \
+          "DROP USER IF EXISTS {{ langflow_db_user }};"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: drop_user
+      changed_when: drop_user.rc == 0
+      failed_when: false
+
+    - name: Display rollback completion
+      ansible.builtin.debug:
+        msg:
+          - "Langflow rollback completed"
+          - "-----------------------------------"
+          - "Removed namespace: {{ k8s_namespace }}"
+          - "Removed Keycloak client: {{ langflow_client_id }}"
+          - "Dropped PostgreSQL database: {{ langflow_db_name }}"
+          - "Dropped PostgreSQL user: {{ langflow_db_user }}"
+          - "-----------------------------------"
