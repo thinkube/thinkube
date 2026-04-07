@@ -38,6 +38,30 @@ echo " 15. Clear Tauri installer localStorage (deployment state)"
 echo " 16. Ensure snapd is running and healthy"
 echo " 17. Restart snapd to clear state"
 echo ""
+echo "Step 0: Deleting all PVCs and PVs to allow clean CSI teardown..."
+KUBECTL="$HOME/.local/bin/kubectl"
+KUBECONFIG="$HOME/.kube/config"
+if [ -f "$KUBECTL" ] && [ -f "$KUBECONFIG" ]; then
+  export KUBECONFIG
+
+  # Remove finalizers and delete all PVs (including Retain-policy ones)
+  PVS=$("$KUBECTL" get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  if [ -n "$PVS" ]; then
+    for PV in $PVS; do
+      "$KUBECTL" patch pv "$PV" -p '{"metadata":{"finalizers":null}}' --ignore-not-found=true 2>/dev/null || true
+    done
+    echo "Finalizers removed from PVs"
+  fi
+
+  "$KUBECTL" delete pvc --all -A --wait=false --ignore-not-found=true 2>/dev/null || true
+  "$KUBECTL" delete pv --all --wait=false --ignore-not-found=true 2>/dev/null || true
+  echo "PVCs and PVs deleted"
+  sleep 10
+else
+  echo "kubectl or kubeconfig not found, skipping PVC/PV deletion"
+fi
+
+echo ""
 echo "Step 1a: Unmounting kubelet pod volumes..."
 KUBELET_MOUNTS=$(mount | grep '/var/snap/k8s/common/var/lib/kubelet/pods' | awk '{print $3}' || true)
 if [ -n "$KUBELET_MOUNTS" ]; then
