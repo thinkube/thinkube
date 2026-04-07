@@ -62,39 +62,22 @@ else
 fi
 
 echo ""
-echo "Step 1a: Unmounting kubelet pod volumes..."
-KUBELET_MOUNTS=$(mount | grep '/var/snap/k8s/common/var/lib/kubelet/pods' | awk '{print $3}' || true)
-if [ -n "$KUBELET_MOUNTS" ]; then
-  MOUNT_COUNT=$(echo "$KUBELET_MOUNTS" | wc -l)
-  echo "Found $MOUNT_COUNT kubelet pod volume mounts to unmount"
-  echo "$KUBELET_MOUNTS" | xargs -I {} sudo umount -l {} 2>/dev/null || true
-  echo "Kubelet pod volumes unmounted"
-else
-  echo "No kubelet pod volumes to unmount"
-fi
-
-echo ""
-echo "Step 1b: Unmounting CSI loop device mounts..."
-CSI_MOUNTS=$(mount | grep '/var/snap/k8s/common/var/lib/kubelet/plugins/kubernetes.io/csi' | awk '{print $3}' || true)
-if [ -n "$CSI_MOUNTS" ]; then
-  CSI_COUNT=$(echo "$CSI_MOUNTS" | wc -l)
-  echo "Found $CSI_COUNT CSI loop device mounts to unmount"
-  echo "$CSI_MOUNTS" | xargs -I {} sudo umount -l {} 2>/dev/null || true
-  echo "CSI mounts unmounted"
-else
-  echo "No CSI mounts to unmount"
-fi
-
-echo ""
-echo "Step 1c: Unmounting any remaining k8s mounts..."
-K8S_MOUNTS=$(mount | grep '/var/snap/k8s' | awk '{print $3}' || true)
-if [ -n "$K8S_MOUNTS" ]; then
-  REMAINING_COUNT=$(echo "$K8S_MOUNTS" | wc -l)
-  echo "Found $REMAINING_COUNT remaining k8s mounts to unmount"
-  echo "$K8S_MOUNTS" | xargs -I {} sudo umount -l {} 2>/dev/null || true
-  echo "Remaining k8s mounts unmounted"
-else
-  echo "No remaining k8s mounts"
+echo "Step 1a: Unmounting all k8s mounts (loop until clean)..."
+for attempt in $(seq 1 10); do
+  K8S_MOUNTS=$(mount | grep '/var/snap/k8s' | awk '{print $3}' || true)
+  if [ -z "$K8S_MOUNTS" ]; then
+    echo "All k8s mounts cleared"
+    break
+  fi
+  COUNT=$(echo "$K8S_MOUNTS" | wc -l)
+  echo "Attempt $attempt: found $COUNT k8s mounts, force-unmounting..."
+  echo "$K8S_MOUNTS" | xargs -I {} sudo umount -f -l {} 2>/dev/null || true
+  sleep 1
+done
+# Final check
+if mount | grep -q '/var/snap/k8s'; then
+  echo "WARNING: some k8s mounts could not be cleared:"
+  mount | grep '/var/snap/k8s'
 fi
 
 echo ""
@@ -195,8 +178,49 @@ timeout 120 sudo snap remove k8s --purge || {
     sleep 2
 
     echo "✅ Manual cleanup complete"
+  elif [ $EXIT_CODE -ne 0 ]; then
+    echo "⚠️  snap remove failed (exit $EXIT_CODE), attempting manual cleanup..."
+
+    # Stop snapd
+    sudo systemctl stop snapd.service snapd.socket
+    sleep 1
+
+    # Force unmount any remaining k8s mounts
+    for attempt in $(seq 1 10); do
+      K8S_MOUNTS=$(mount | grep '/var/snap/k8s' | awk '{print $3}' || true)
+      [ -z "$K8S_MOUNTS" ] && break
+      echo "$K8S_MOUNTS" | xargs -I {} sudo umount -f -l {} 2>/dev/null || true
+      sleep 1
+    done
+
+    # Detach all loop devices again
+    timeout 10 bash -c 'losetup -a 2>/dev/null | grep "/var/snap/k8s" | cut -d: -f1 | xargs -I {} sudo losetup -d {} 2>/dev/null' || true
+
+    # Remove all k8s-related changes from snapd state
+    ALL_K8S_CHANGES=$(sudo jq -r '.changes | to_entries[] | select(.value.summary | contains("k8s")) | .key' /var/lib/snapd/state.json 2>/dev/null || true)
+    if [ -n "$ALL_K8S_CHANGES" ]; then
+      for CHANGE_ID in $ALL_K8S_CHANGES; do
+        sudo jq "del(.changes.\"$CHANGE_ID\")" /var/lib/snapd/state.json > /tmp/state.json.new
+        sudo mv /tmp/state.json.new /var/lib/snapd/state.json
+      done
+      echo "k8s changes removed from snapd state"
+    fi
+
+    # Unmount /snap/k8s if still mounted
+    mount | grep "/snap/k8s" | awk '{print $3}' | xargs -I {} sudo umount -f -l {} 2>/dev/null || true
+
+    # Remove snap directories and state
+    sudo rm -rf /var/snap/k8s /snap/k8s
+    sudo rm -f /var/lib/snapd/snaps/k8s_*.snap
+    sudo jq 'del(.data.snaps.k8s)' /var/lib/snapd/state.json > /tmp/state.json.new
+    sudo mv /tmp/state.json.new /var/lib/snapd/state.json
+
+    # Restart snapd
+    sudo systemctl start snapd.service snapd.socket
+    sleep 2
+    echo "✅ Manual cleanup complete"
   else
-    echo "k8s-snap not installed or already removed"
+    echo "k8s-snap not installed, skipping"
   fi
 }
 
