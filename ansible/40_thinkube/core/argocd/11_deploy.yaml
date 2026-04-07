@@ -116,38 +116,6 @@
       changed_when: ensure_ns.stdout != ""
       failed_when: ensure_ns.rc != 0
 
-    # --- Get wildcard TLS certificate from default namespace ---
-    - name: Get wildcard certificate from default namespace
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: wildcard_cert_result
-      failed_when: wildcard_cert_result.rc != 0
-
-    - name: Parse wildcard certificate JSON
-      ansible.builtin.set_fact:
-        wildcard_cert: "{{ wildcard_cert_result.stdout | from_json }}"
-
-    - name: Copy wildcard certificate to argocd namespace
-      ansible.builtin.shell: |
-        cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: v1
-        kind: Secret
-        metadata:
-          name: {{ argocd_tls_secret_name }}
-          namespace: {{ argocd_namespace }}
-        type: kubernetes.io/tls
-        data:
-          tls.crt: {{ wildcard_cert.data['tls.crt'] }}
-          tls.key: {{ wildcard_cert.data['tls.key'] }}
-        EOF
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: copy_cert_result
-      changed_when: "'created' in copy_cert_result.stdout or 'configured' in copy_cert_result.stdout"
-      failed_when: copy_cert_result.rc != 0
-
     - name: Add ArgoCD Helm repository if not present
       ansible.builtin.shell: |
         if ! {{ helm_bin }} repo list | grep -q 'argo-helm'; then
@@ -189,36 +157,23 @@
             cm:
               admin.enabled: true
               url: "https://{{ argocd_hostname }}"
-              # dex.config: |  # Removed - using direct OIDC to Keycloak instead of Dex proxy
-              #   connectors:
-              #     - type: oidc
-              #       id: keycloak
-              #       name: Keycloak
-              #       config:
-              #         issuer: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
-              #         clientID: "{{ argocd_client_id }}"
-              #         clientSecret: "{{ argocd_client_secret }}"
-              #         insecureSkipVerify: false
             secret:
               createSecret: true
               # Set admin credentials
               admin.password: "{{ password_hash.stdout }}"
               admin.passwordMtime: "{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%SZ') }}"
-          # Set the admin user creation to the standard admin_username
+            params:
+              server.insecure: "true"
           global:
             additionalLabels: {}
           server:
-            # Use SSL-passthrough approach (recommended by ArgoCD docs)
-            # ArgoCD server handles TLS and auto-detects HTTP vs gRPC protocols
+            # Insecure mode: ArgoCD server serves plain HTTP, gateway handles TLS
+            # Required because Envoy Gateway cannot mix TLS passthrough + terminate on same port
             # See: https://argo-cd.readthedocs.io/en/stable/operator-manual/ingress/
             service:
               type: ClusterIP
             config:
               url: "https://{{ argocd_hostname }}"
-              # Configure server TLS
-              tls.minVersion: "1.2"
-              tls.maxVersion: "1.3"
-              tls.cipherSuites: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
           ingress:
             enabled: false
 
@@ -265,41 +220,50 @@
       changed_when: "'deleted' in delete_ingress_result.stdout"
       failed_when: delete_ingress_result.rc != 0
 
-    - name: Create TLSRoute for ArgoCD (passthrough)
+    - name: Remove old TLSRoute if it exists (replaced by HTTPRoute)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete tlsroute argocd-passthrough -n {{ argocd_namespace }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: delete_tlsroute_result
+      changed_when: "'deleted' in delete_tlsroute_result.stdout"
+      failed_when: delete_tlsroute_result.rc != 0
+
+    - name: Create HTTPRoute for ArgoCD (insecure mode, TLS terminated by gateway)
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: gateway.networking.k8s.io/v1alpha2
-        kind: TLSRoute
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
         metadata:
-          name: argocd-passthrough
+          name: argocd-httproute
           namespace: {{ argocd_namespace }}
         spec:
           parentRefs:
             - name: "{{ gateway_name }}"
               namespace: "{{ gateway_namespace }}"
-              sectionName: argocd-passthrough
+              sectionName: https
           hostnames:
             - "{{ argocd_hostname }}"
           rules:
             - backendRefs:
                 - name: argocd-server
-                  port: 443
+                  port: 80
         EOF
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: tlsroute_result
-      changed_when: "'created' in tlsroute_result.stdout or 'configured' in tlsroute_result.stdout"
-      failed_when: tlsroute_result.rc != 0
+      register: httproute_result
+      changed_when: "'created' in httproute_result.stdout or 'configured' in httproute_result.stdout"
+      failed_when: httproute_result.rc != 0
 
-    - name: Display ArgoCD TLSRoute details
-      ansible.builtin.shell: "{{ kubectl_bin }} get tlsroutes -n {{ argocd_namespace }} -o yaml"
-      register: tlsroute_info
+    - name: Display ArgoCD HTTPRoute details
+      ansible.builtin.shell: "{{ kubectl_bin }} get httproute argocd-httproute -n {{ argocd_namespace }} -o yaml"
+      register: httproute_info
       changed_when: false
       failed_when: false
 
-    - name: Show ArgoCD TLSRoute configuration
+    - name: Show ArgoCD HTTPRoute configuration
       ansible.builtin.debug:
-        var: tlsroute_info.stdout_lines
+        var: httproute_info.stdout_lines
 
     #######################################################################
     # (D) Configure ArgoCD with OIDC and RBAC
