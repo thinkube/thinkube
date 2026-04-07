@@ -120,7 +120,7 @@
       changed_when: "'patched' in cilium_patch.stdout"
       when: cilium_gateway_config.stdout != "true"
 
-    - name: Restart Cilium to pick up Gateway API config
+    - name: Restart Cilium agent to pick up Gateway API config
       ansible.builtin.shell: |
         {{ kubectl_bin }} rollout restart daemonset/cilium -n kube-system
       environment:
@@ -128,12 +128,37 @@
       when: cilium_gateway_config.stdout != "true"
       changed_when: true
 
-    - name: Wait for Cilium rollout to complete
+    - name: Wait for Cilium agent rollout to complete
       ansible.builtin.shell: |
         {{ kubectl_bin }} rollout status daemonset/cilium -n kube-system --timeout=120s
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       when: cilium_gateway_config.stdout != "true"
+      changed_when: false
+
+    - name: Check if GatewayClass 'cilium' already exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get gatewayclass cilium -o jsonpath='{.metadata.name}' 2>/dev/null
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gatewayclass_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Restart Cilium operator to register GatewayClass
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout restart deployment/cilium-operator -n kube-system
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: gatewayclass_exists.stdout != "cilium"
+      changed_when: true
+
+    - name: Wait for Cilium operator rollout to complete
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status deployment/cilium-operator -n kube-system --timeout=120s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: gatewayclass_exists.stdout != "cilium"
       changed_when: false
 
     - name: Wait for GatewayClass 'cilium' to appear
