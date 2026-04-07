@@ -20,16 +20,12 @@
 #
 # Variables from inventory:
 #   - domain_name: Base domain for the cluster
-#   - primary_ingress_ip: IP for primary ingress controller
-#   - secondary_ingress_ip_octet: Octet for secondary ingress IP
-#   - zerotier_subnet_prefix: Prefix for ZeroTier network
 #   - kubectl_bin: Path to kubectl binary
 #   - kubeconfig: Path to kubeconfig file
 #   - harbor_registry: Harbor registry URL
 #   - admin_username: Admin username for applications
-#   - ingress_kn_namespace: Namespace for Knative ingress
-#   - secondary_ingress_class: Ingress class for secondary controller
-#   - secondary_ingress_service: Name of secondary ingress service
+#   - gateway_kn_name: Name of the Cilium Gateway for kn.domain_name
+#   - gateway_namespace: Namespace of the Cilium Gateway (default: gateway-system)
 #
 # Dependencies:
 #   - CORE-001: Kubernetes (k8s-snap) must be installed and running
@@ -77,8 +73,8 @@
     # Harbor configuration
     harbor_robot_name: "kaniko"
     
-    # Computed variables
-    secondary_ingress_ip: "{{ zerotier_subnet_prefix }}{{ secondary_ingress_ip_octet }}"
+    # TLS secret name used in kourier-system
+    knative_tls_secret_name: "knative-tls-secret"
 
   tasks:
     # --- PHASE 1: PREPARE ENVIRONMENT ---
@@ -128,28 +124,6 @@
       register: wildcard_cert
       failed_when: wildcard_cert.resources | length == 0
 
-    - name: Copy wildcard certificate to secondary ingress namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: "{{ ingress_kn_namespace }}-tls-secret"
-            namespace: "{{ ingress_kn_namespace }}"
-          type: kubernetes.io/tls
-          data:
-            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
-            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
-      register: tls_secret_created
-
-    - name: Restart secondary ingress controller to apply the TLS certificate
-      ansible.builtin.shell: "{{ kubectl_bin }} rollout restart deployment {{ secondary_ingress_service }} -n {{ ingress_kn_namespace }}"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      when: tls_secret_created is changed
-    
     # --- PHASE 2: INSTALL KNATIVE COMPONENTS ---
     
     - name: Install Knative Serving CRDs
@@ -205,8 +179,8 @@
             namespace: knative-serving
           data:
             ingress-class: "kourier.ingress.networking.knative.dev"
-            certs-secret-namespace: "{{ ingress_kn_namespace }}"
-            certs-secret-name: "{{ ingress_kn_namespace }}-tls-secret"
+            certs-secret-namespace: "kourier-system"
+            certs-secret-name: "{{ knative_tls_secret_name }}"
 
     - name: Wait for webhook deployment to be ready
       ansible.builtin.shell: |
@@ -303,7 +277,7 @@
         kubeconfig: "{{ kubeconfig }}"
         api_version: v1
         kind: Secret
-        name: "{{ ingress_kn_namespace }}-tls-secret"
+        name: "{{ knative_tls_secret_name }}"
         namespace: kourier-system
       register: existing_secret
 
@@ -312,7 +286,7 @@
         kubeconfig: "{{ kubeconfig }}"
         api_version: v1
         kind: Secret
-        name: "{{ ingress_kn_namespace }}-tls-secret"
+        name: "{{ knative_tls_secret_name }}"
         namespace: kourier-system
         state: absent
       when: existing_secret.resources is defined and existing_secret.resources | length > 0
@@ -325,7 +299,7 @@
           apiVersion: v1
           kind: Secret
           metadata:
-            name: "{{ ingress_kn_namespace }}-tls-secret"
+            name: "{{ knative_tls_secret_name }}"
             namespace: kourier-system
           type: kubernetes.io/tls
           data:
