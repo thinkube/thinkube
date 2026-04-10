@@ -31,6 +31,10 @@
     harbor_host: "{{ dest_parts[0] }}"
     project_name: "{{ dest_parts[1] }}"
 
+- name: Determine if tag is mutable (latest)
+  ansible.builtin.set_fact:
+    is_mutable_tag: "{{ dest_tag == 'latest' }}"
+
 - name: Check if image already exists in Harbor
   ansible.builtin.uri:
     url: "https://{{ harbor_host }}/api/v2.0/projects/{{ project_name }}/repositories/{{ repo_name }}/artifacts/{{ dest_tag }}"
@@ -43,13 +47,45 @@
   ignore_errors: true
   no_log: "{{ harbor_api_password is defined }}"
 
-- name: Display status - image exists in Harbor
+- name: Display status - pinned image exists in Harbor
   ansible.builtin.debug:
-    msg: "Image {{ destination_image }} already exists in Harbor. Skipping."
-  when: image_check.status == 200
+    msg: "Image {{ destination_image }} already exists in Harbor. Skipping (pinned tag)."
+  when: image_check.status == 200 and not is_mutable_tag
 
-# Process image only if it doesn't exist in Harbor - single block evaluation
-- name: Process image not in Harbor
+- name: Display status - mutable tag will be refreshed
+  ansible.builtin.debug:
+    msg: "Image {{ destination_image }} exists but tag is 'latest' — pulling fresh from source."
+  when: image_check.status == 200 and is_mutable_tag
+
+# For mutable tags (:latest), always pull fresh from source and push to Harbor.
+# This prevents stale local podman cache from silently providing outdated images.
+- name: Refresh mutable tag from source
+  block:
+    - name: Pull fresh image from source registry
+      ansible.builtin.command: >
+        podman pull {{ source_image }}
+      register: pull_result
+      changed_when: pull_result.rc == 0
+      failed_when: pull_result.rc != 0
+
+    - name: Tag source image for destination registry
+      ansible.builtin.command: >
+        podman tag {{ source_image }} {{ destination_image }}
+      register: tag_result
+      changed_when: tag_result.rc == 0
+      failed_when: tag_result.rc != 0
+
+    - name: Push refreshed image to destination registry
+      ansible.builtin.command: >
+        podman push {{ destination_image }}
+        --tls-verify=false
+      register: push_result
+      changed_when: push_result.rc == 0
+      failed_when: push_result.rc != 0
+  when: is_mutable_tag
+
+# For pinned tags, process only if not already in Harbor
+- name: Process pinned image not in Harbor
   block:
     - name: Check image in local podman cache
       ansible.builtin.command: podman image exists {{ destination_image }}
@@ -106,4 +142,4 @@
           changed_when: push_result.rc == 0
           failed_when: push_result.rc != 0
       when: local_image_exists.rc != 0
-  when: image_check.status != 200
+  when: image_check.status != 200 and not is_mutable_tag
