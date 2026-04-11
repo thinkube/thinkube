@@ -110,6 +110,11 @@
 
         # npm global packages
         export PATH="/home/thinkube/.npm-global/bin:$PATH"
+
+        # Rust toolchain (rustup/cargo/rustc)
+        if [ -d /home/thinkube/.cargo/bin ]; then
+            export PATH="/home/thinkube/.cargo/bin:$PATH"
+        fi
         EOF
         chmod +x /home/thinkube/.thinkube_shared_shell/env_setup.sh
         echo "✅ Bash/Zsh environment setup created"'
@@ -139,6 +144,11 @@
 
         # npm global packages
         set -gx PATH /home/thinkube/.npm-global/bin $PATH
+
+        # Rust toolchain (rustup/cargo/rustc)
+        if test -d /home/thinkube/.cargo/bin
+            set -gx PATH /home/thinkube/.cargo/bin $PATH
+        end
         EOF
         chmod +x /home/thinkube/.thinkube_shared_shell/env_setup.fish
         echo "✅ Fish environment setup created"'
@@ -321,12 +331,31 @@
             nats-py \
             chromadb \
             lfx \
+            maturin \
             && echo '✅ Python packages installed'"
 
     - name: Install uv (fast Python package manager)
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "curl -LsSf https://astral.sh/uv/install.sh | sh && echo '✅ uv installed'"
+
+    - name: Check if Rust toolchain is installed
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "test -x /home/thinkube/.cargo/bin/cargo"
+      register: rust_installed
+      failed_when: false
+      changed_when: false
+
+    - name: Install Rust toolchain (rustup + cargo + rustc) via rustup
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path && \
+            /home/thinkube/.cargo/bin/rustc --version && \
+            /home/thinkube/.cargo/bin/cargo --version && \
+            echo '✅ Rust toolchain installed'"
+      when: rust_installed.rc != 0
 
     - name: Configure pip to use DevPi
       ansible.builtin.shell: |
