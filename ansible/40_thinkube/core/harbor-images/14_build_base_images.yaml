@@ -476,9 +476,37 @@
       retries: 2
       delay: 10
 
-    # TEI base image removed — tkt-text-embeddings now uses Infinity on ai-inference-base.
-    # Infinity supports all models TEI did plus custom architectures (jina-v3, etc.).
-    # The Containerfile.j2 is kept for reference but no longer built.
+    # Text Embeddings Inference (TEI) Base Image
+    # Built from source with Blackwell (sm_121a) patches for DGX Spark
+    # ~30 minute Rust compile — only rebuild when upgrading TEI version
+
+    - name: Template TEI base Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/text-embeddings-inference-base.Containerfile.j2"
+        dest: "{{ temp_containerfiles_dir.path }}/text-embeddings-inference-base.Containerfile"
+      tags: [tei-base]
+
+    - name: Build TEI base image
+      ansible.builtin.shell: |
+        podman build --no-cache \
+                     --platform linux/arm64 \
+                     --tls-verify=true \
+                     -t {{ harbor_registry }}/library/text-embeddings-inference-base:1.9-blackwell \
+                     -f {{ temp_containerfiles_dir.path }}/text-embeddings-inference-base.Containerfile \
+                     {{ base_images_dir }}
+      register: tei_base_build
+      changed_when: true
+      tags: [tei-base]
+
+    - name: Push TEI base image
+      ansible.builtin.shell: |
+        podman push --tls-verify=true {{ harbor_registry }}/library/text-embeddings-inference-base:1.9-blackwell
+      register: tei_base_push
+      changed_when: tei_base_push.rc == 0
+      failed_when: tei_base_push.rc != 0
+      retries: 2
+      delay: 10
+      tags: [tei-base]
 
     - name: Clean up temp dockerfiles directory
       ansible.builtin.file:
@@ -571,7 +599,13 @@
             metadata:
               language: "rust"
               type: "mcp-server"
-          # TEI base image removed — tkt-text-embeddings now uses Infinity on ai-inference-base
+          - destination: "{{ harbor_registry }}/library/text-embeddings-inference-base:1.9-blackwell"
+            source: "custom-build"
+            description: "TEI v1.9.3 with Blackwell sm_121 patches for DGX Spark"
+            metadata:
+              base_image: "nvidia/cuda:13.0.0-devel-ubuntu24.04"
+              version: "1.9.3"
+              compute_cap: "121"
         manifest_category: "system"
         manifest_source: "built"
         manifest_namespace: "registry"
@@ -596,6 +630,7 @@
           Model mirror: {{ harbor_registry }}/library/model-mirror:latest
           Valkey: {{ harbor_registry }}/library/valkey:8.1.0
           tk-package-version: {{ harbor_registry }}/library/tk-package-version:latest
+          TEI base: {{ harbor_registry }}/library/text-embeddings-inference-base:1.9-blackwell
 
           These images contain common dependencies and will speed up:
           - Test execution (dependencies pre-installed)
