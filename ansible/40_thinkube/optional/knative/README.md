@@ -7,23 +7,23 @@ This directory contains playbooks for deploying Knative on the Thinkube platform
 Knative provides serverless capabilities for Kubernetes, including:
 - **Knative Serving**: Deploy and manage serverless workloads
 - **Knative Eventing**: Event-driven architecture support
-- **Kourier**: Lightweight ingress for Knative services
+- **net-gateway-api**: Routing through the main Envoy Gateway via DomainMapping
 
 ## Components Deployed
 
 - Knative Serving v1.17.0
 - Knative Eventing v1.17.1
-- Kourier v1.17.0 (ingress controller)
+- net-gateway-api v1.17.0
 - Sample Python-based test service (ARM64 + x86_64 compatible)
 
 ## Prerequisites
 
 Before deploying Knative, ensure the following components are installed:
-- Kubernetes (k8s-snap) cluster (CORE-001)
-- Ingress controllers with secondary ingress configured (CORE-002)
-- CoreDNS properly configured (CORE-003)
-- Harbor registry deployed and accessible (CORE-004)
-- Cert-manager deployed with wildcard certificate in default namespace (CORE-005)
+- Kubernetes (k8s-snap) cluster
+- Gateway API (Envoy Gateway) with `thinkube-gateway`
+- CoreDNS properly configured
+- Harbor registry deployed and accessible
+- ACME certificates deployed with wildcard certificate in default namespace
 - Environment variable `HARBOR_ROBOT_TOKEN` set for registry authentication
 
 ## Deployment Instructions
@@ -31,17 +31,17 @@ Before deploying Knative, ensure the following components are installed:
 1. **Deploy Knative**:
    ```bash
    cd ~/thinkube
-   ./scripts/run_ansible.sh ansible/40_thinkube/optional/knative/10_deploy.yaml
+   ./scripts/tk_ansible ansible/40_thinkube/optional/knative/10_deploy.yaml
    ```
 
 2. **Test the deployment**:
    ```bash
-   ./scripts/run_ansible.sh ansible/40_thinkube/optional/knative/18_test.yaml
+   ./scripts/tk_ansible ansible/40_thinkube/optional/knative/18_test.yaml
    ```
 
 3. **Rollback if needed**:
    ```bash
-   ./scripts/run_ansible.sh ansible/40_thinkube/optional/knative/19_rollback.yaml
+   ./scripts/tk_ansible ansible/40_thinkube/optional/knative/19_rollback.yaml
    ```
 
 ## Configuration
@@ -49,8 +49,11 @@ Before deploying Knative, ensure the following components are installed:
 The deployment uses these key variables from inventory:
 - `domain_name`: Base domain for the cluster
 - `harbor_registry`: Harbor registry URL for container images
+
 Knative services use DomainMapping to be accessible at:
 - `{name}.{{ domain_name }}` (e.g., `helloworld-python.thinkube.com`)
+
+All traffic routes through the main `thinkube-gateway` in `gateway-system`.
 
 ## Testing
 
@@ -58,8 +61,8 @@ The test playbook validates:
 - All Knative components are healthy
 - DNS resolution works correctly
 - Internal connectivity (via ClusterIP)
-- External connectivity (via Ingress)
-- Autoscaling functionality
+- External connectivity (via Gateway)
+- DomainMapping configuration
 - TLS/HTTPS configuration
 
 ## Troubleshooting
@@ -74,20 +77,20 @@ The test playbook validates:
    echo $HARBOR_ROBOT_TOKEN
    ```
 
-3. **DNS resolution issues**: Verify CoreDNS is properly configured and the secondary ingress IP is correct.
+3. **DNS resolution issues**: Verify CoreDNS is properly configured and the gateway IP is correct.
 
-4. **Service not accessible externally**: Check that the secondary ingress controller is running and the wildcard certificate is properly configured.
+4. **Service not accessible externally**: Check DomainMapping status and that the gateway is running.
 
 ## Architecture Notes
 
-- Uses Kourier as the Knative ingress controller
+- Uses net-gateway-api for routing through the main Envoy Gateway
+- DomainMapping provides clean URLs: `{name}.{domain}` (no subdomain)
 - Configured with mesh compatibility mode disabled for proper DNS resolution
 - Supports HTTPS by default with wildcard TLS certificates
 - Integrated with Harbor registry for private container images
-- Sample service configured with min-scale=1 to prevent cold starts
 
 ## Related Documentation
 
 - [Knative Documentation](https://knative.dev/docs/)
-- [Kourier Documentation](https://github.com/knative/net-kourier)
+- [net-gateway-api Documentation](https://github.com/knative-extensions/net-gateway-api)
 - [Thinkube Architecture](../../README.md)
