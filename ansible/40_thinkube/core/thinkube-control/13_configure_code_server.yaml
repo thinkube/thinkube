@@ -180,45 +180,40 @@
       delegate_to: localhost
       delegate_facts: true
 
-# Second play to configure Claude Code MCP on the local ansible controller
-- name: Configure Claude Code MCP integration locally
-  hosts: localhost
+# Second play to configure Claude Code MCP in code-server pod
+- name: Configure Claude Code MCP integration
+  hosts: k8s_control_plane
   gather_facts: true
-  
+
   vars:
     cicd_api_token: "{{ hostvars['localhost']['mcp_token_to_share'] }}"
-    # Use domain_name from shared facts
     control_domain_name: "{{ hostvars['localhost']['mcp_domain_to_share'] }}"
-    
+    code_server_namespace: "code-server"
+    claude_settings_path: "/home/thinkube/.claude/settings.json"
+
   tasks:
-    - name: Check if MCP config exists in project root
-      ansible.builtin.stat:
-        path: "{{ playbook_dir }}/../../../.mcp.json"
-      register: mcp_config_file
+    - name: Get code-server pod name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} -l app=code-server -o jsonpath='{.items[0].metadata.name}'
+      register: cs_pod_name
 
-    - name: Read existing MCP config from project root
-      ansible.builtin.slurp:
-        src: "{{ playbook_dir }}/../../../.mcp.json"
-      register: existing_mcp_config
-      when: mcp_config_file.stat.exists
+    - name: Read existing Claude settings
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ cs_pod_name.stdout }} -- \
+          cat {{ claude_settings_path }} 2>/dev/null || echo '{}'
+      register: claude_settings_raw
 
-    - name: Parse existing MCP config
+    - name: Parse Claude settings
       ansible.builtin.set_fact:
-        mcp_config: "{{ existing_mcp_config.content | b64decode | from_json }}"
-      when: mcp_config_file.stat.exists
+        claude_settings: "{{ claude_settings_raw.stdout | from_json }}"
 
-    - name: Initialize empty MCP config if not exists
+    - name: Update Claude settings with MCP server
       ansible.builtin.set_fact:
-        mcp_config: {}
-      when: not mcp_config_file.stat.exists
-
-    - name: Update MCP config with thinkube-control server
-      ansible.builtin.set_fact:
-        mcp_config: "{{ mcp_config | combine({'mcpServers': 
-          (mcp_config.mcpServers | default({})) | combine({
+        updated_claude_settings: "{{ claude_settings | combine({
+          'mcpServers': (claude_settings.mcpServers | default({})) | combine({
             'thinkube-control': {
               'type': 'http',
-              'url': 'https://control.' + control_domain_name + '/api/mcp/mcp/',
+              'url': 'https://control.' + control_domain_name + '/mcp',
               'headers': {
                 'Authorization': 'Bearer ' + cicd_api_token
               }
@@ -226,28 +221,17 @@
           })
         }, recursive=True) }}"
 
-    - name: Write updated MCP config to project root
-      ansible.builtin.copy:
-        content: "{{ mcp_config | to_nice_json }}"
-        dest: "{{ playbook_dir }}/../../../.mcp.json"
-        mode: '0644'
+    - name: Write updated Claude settings
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ cs_pod_name.stdout }} -- \
+          bash -c 'cat > {{ claude_settings_path }} << EOFCLAUDE
+        {{ updated_claude_settings | to_nice_json }}
+        EOFCLAUDE'
 
     - name: Display MCP configuration info
       ansible.builtin.debug:
-        msg: |
-          🤖 Claude Code MCP Configuration Complete!
-          
-          MCP Server: https://control.{{ control_domain_name }}/mcp
-          Using existing CI/CD monitoring token
-          
-          The MCP server has been configured in {{ playbook_dir }}/../../../.mcp.json
-          Restart Claude Code or run /mcp to see the available servers.
-          
-          Available MCP tools:
-          - list_templates()
-          - get_template_parameters(template_url)
-          - deploy_template(template_url, app_name, variables)
-          - get_deployment_status_by_id(deployment_id)
-          - get_deployment_logs_by_id(deployment_id)
-          - list_recent_deployments()
-          - cancel_deployment_by_id(deployment_id)
+        msg:
+          - "MCP server configured: https://control.{{ control_domain_name }}/mcp"
+          - "Token: CI/CD monitoring token (from thinkube-control namespace)"
+          - "Location: {{ claude_settings_path }}"
+          - "Restart Claude Code to pick up the new MCP server"
