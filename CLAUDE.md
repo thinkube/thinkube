@@ -96,7 +96,7 @@ Use `19_rollback.yaml` when a deployment failed and you need a clean slate, or w
 
 Deployed in dependency order:
 
-1. **infrastructure/** - k8s-snap cluster, ingress (nginx), ACME certificates, CoreDNS, GPU operator
+1. **infrastructure/** - k8s-snap cluster, Gateway API (Envoy Gateway), ACME certificates, CoreDNS, GPU operator
 2. **postgresql/** - Shared database
 3. **seaweedfs/** - S3-compatible object storage
 4. **juicefs/** - POSIX filesystem layer + MLflow gateway
