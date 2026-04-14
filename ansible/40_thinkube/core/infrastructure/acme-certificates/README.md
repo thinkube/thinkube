@@ -32,7 +32,6 @@ This is an alternative to cert-manager that provides:
 The playbook requests a single certificate covering:
 - `thinkube.com` (base domain)
 - `*.thinkube.com` (wildcard)
-- `*.kn.thinkube.com` (Knative services)
 
 ## Usage
 

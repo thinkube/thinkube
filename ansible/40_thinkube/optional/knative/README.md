@@ -49,12 +49,8 @@ Before deploying Knative, ensure the following components are installed:
 The deployment uses these key variables from inventory:
 - `domain_name`: Base domain for the cluster
 - `harbor_registry`: Harbor registry URL for container images
-- `secondary_ingress_ip_octet`: IP octet for Knative ingress
-
-The deployment automatically copies the wildcard TLS certificate from the default namespace (created by cert-manager) to the required namespaces.
-
-Knative services will be accessible at:
-- `*.kn.{{ domain_name }}` (e.g., `helloworld-go.kn.thinkube.com`)
+Knative services use DomainMapping to be accessible at:
+- `{name}.{{ domain_name }}` (e.g., `helloworld-python.thinkube.com`)
 
 ## Testing
 

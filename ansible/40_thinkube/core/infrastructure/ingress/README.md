@@ -65,15 +65,12 @@ Key variables from inventory:
 # IP Configuration
 metallb_ip_range: "10.0.191.100-10.0.191.110"
 primary_ingress_ip: "10.0.191.100"
-secondary_ingress_ip: "10.0.191.102"
 
 # Namespace Configuration
 ingress_namespace: "ingress"
-ingress_kn_namespace: "ingress-kn"
 
 # IngressClass Configuration
 primary_ingress_class: "nginx"      # Set as default
-secondary_ingress_class: "nginx-kn"
 ```
 
 ## Usage
@@ -95,9 +92,9 @@ secondary_ingress_class: "nginx-kn"
 
 ## DNS Configuration
 
-After deployment, configure DNS to point to the external IPs:
-- Primary services: `*.k8s.domain.com` → `10.0.191.100`
-- Knative services: `*.kn.domain.com` → `10.0.191.102`
+After deployment, configure DNS to point to the external IP:
+- All services: `*.domain.com` → `10.0.191.100`
+- Knative services use DomainMapping through the main gateway
 
 ## Integration with Cert-Manager
 

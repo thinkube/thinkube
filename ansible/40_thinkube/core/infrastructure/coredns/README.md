@@ -30,7 +30,6 @@ coredns/
 - `domain_name`: Base domain (e.g., "thinkube.com")
 - `dns1`: DNS server host (ZeroTier IP is used as DNS server)
 - `zerotier_subnet_prefix`: ZeroTier network prefix
-- `secondary_ingress_ip_octet`: Last octet for secondary ingress IP
 - `k8s_workers`: Group containing worker nodes
 
 ### Dependencies
@@ -59,8 +58,7 @@ coredns/
 The configuration implements:
 1. **Kubernetes Internal**: Routes `*.cluster.local` to internal kubernetes DNS
 2. **Domain Forwarding**: Forwards `*.thinkube.com` to ZeroTier DNS server
-3. **Knative Routing**: Maps `*.kn.thinkube.com` to secondary ingress IP
-4. **Hairpin Support**: Enables external access to route back to internal services
+3. **Hairpin Support**: Enables external access to route back to internal services
 5. **External Domain Resolution**: Ensures external domains resolve correctly
 
 ### Worker Node Configuration

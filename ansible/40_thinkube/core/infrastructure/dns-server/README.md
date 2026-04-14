@@ -37,8 +37,7 @@ cd ~/thinkube
 The BIND9 server is configured with:
 
 - **Wildcard domains**:
-  - `*.thinkube.com` → 10.200.0.200 (primary ingress)
-  - `*.kn.thinkube.com` → 10.200.0.201 (secondary ingress)
+  - `*.thinkube.com` → 10.200.0.200 (primary gateway)
 
 - **Specific records**:
   - `dns.thinkube.com` → 10.200.0.205

@@ -80,11 +80,9 @@ The correct order to run these playbooks is:
 
 ### MetalLB and Ingress IP Configuration
 - The ZeroTier setup assigns additional IPs to control plane node for MetalLB:
-  - `10.0.191.200` - Primary ingress controller IP
-  - `10.0.191.201` - Knative ingress controller IP
+  - `10.0.191.200` - Primary gateway IP
 - DNS wildcard records are configured to point to these IPs:
   - `*.thinkube.com` → `10.0.191.200`
-  - `*.kn.thinkube.com` → `10.0.191.201`
 
 ### DNS Configuration
 The DNS server provides the following key functions:
@@ -101,7 +99,7 @@ After running the playbooks, you can verify the setup:
 - Check assigned IPs: `zerotier-cli listnetworks | grep "10.0.191"`
 - Check DNS resolution: `dig @10.0.191.1 test.thinkube.com`
 - Test wildcard domains: `dig @10.0.191.1 anything.thinkube.com`
-- Test Knative domains: `dig @10.0.191.1 function.kn.thinkube.com`
+- Test Knative domains: `dig @10.0.191.1 function.thinkube.com`
 
 ## Environment Variables
 
