@@ -218,12 +218,96 @@
       register: netpol_patch
       changed_when: "'patched' in netpol_patch.stdout"
 
-    - name: Display network policy update
+    - name: Display network policy update (Perses)
       ansible.builtin.debug:
         msg: "✅ Prometheus network policy updated to allow Perses namespace access"
 
+    - name: Patch Prometheus network policy to allow thinkube-control namespace
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} patch networkpolicy prometheus-k8s -n monitoring --type=json -p='[
+          {
+            "op": "add",
+            "path": "/spec/ingress/-",
+            "value": {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "thinkube-control"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 9090,
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          }
+        ]'
+      register: netpol_patch_tc
+      changed_when: "'patched' in netpol_patch_tc.stdout"
+
+    - name: Display network policy update (thinkube-control)
+      ansible.builtin.debug:
+        msg: "✅ Prometheus network policy updated to allow thinkube-control namespace access"
+
     ###################################################################
-    # 10) Configure ServiceMonitors for external exporters
+    # 10) RBAC for cross-namespace scraping
+    ###################################################################
+    - name: Create Role for Prometheus to scrape gpu-operator namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: prometheus-k8s
+            namespace: gpu-operator
+            labels:
+              app.kubernetes.io/part-of: kube-prometheus
+          rules:
+            - apiGroups: [""]
+              resources: ["services", "endpoints", "pods"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: ["extensions"]
+              resources: ["ingresses"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: ["networking.k8s.io"]
+              resources: ["ingresses"]
+              verbs: ["get", "list", "watch"]
+
+    - name: Create RoleBinding for Prometheus in gpu-operator namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: prometheus-k8s
+            namespace: gpu-operator
+            labels:
+              app.kubernetes.io/part-of: kube-prometheus
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: prometheus-k8s
+          subjects:
+            - kind: ServiceAccount
+              name: prometheus-k8s
+              namespace: monitoring
+
+    - name: Display RBAC creation
+      ansible.builtin.debug:
+        msg: "✅ Prometheus RBAC created for gpu-operator namespace"
+
+    ###################################################################
+    # 11) Configure ServiceMonitors for external exporters
     ###################################################################
     - name: Create ServiceMonitor for NVIDIA DCGM Exporter
       kubernetes.core.k8s:
