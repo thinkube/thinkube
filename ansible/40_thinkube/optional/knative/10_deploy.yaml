@@ -24,7 +24,7 @@
 #   - kubeconfig: Path to kubeconfig file
 #   - harbor_registry: Harbor registry URL
 #   - admin_username: Admin username for applications
-#   - gateway_kn_name: Name of the Cilium Gateway for kn.domain_name
+#   - gateway_name: Name of the main Gateway (thinkube-gateway)
 #   - gateway_namespace: Namespace of the Cilium Gateway (default: gateway-system)
 #
 # Dependencies:
@@ -45,11 +45,6 @@
     kn_eventing_version: "1.17.1"
     # Knative configuration
     kn_namespace: kn
-    kn_subdomain: "kn"
-    # Knative domain must be the base domain (not kn.domain) so that
-    # service URLs become <name>.<namespace>.domain_name = <name>.kn.cmxela.com
-    # which matches the *.kn.<domain> gateway listener and TLS cert.
-    # Using kn.domain would produce <name>.kn.kn.domain (double kn).
     kn_domain: "{{ domain_name }}"
     
     # Namespaces
@@ -71,7 +66,7 @@
     harbor_robot_name: "kaniko"
 
     # Gateway API references (Envoy Gateway class is 'eg')
-    gateway_kn_name: "thinkube-kn-gateway"
+    gateway_name: "thinkube-gateway"
     gateway_namespace: "gateway-system"
     eg_namespace: "envoy-gateway-system"
     gateway_class: "eg"
@@ -259,19 +254,19 @@
       changed_when: false
       failed_when: wait_gw_controller.rc != 0
 
-    - name: Wait for Envoy Gateway backing service for external kn gateway
+    - name: Wait for Envoy Gateway backing service for external gateway
       ansible.builtin.shell: |
         {{ kubectl_bin }} get svc -n {{ eg_namespace }} \
-          -l "gateway.envoyproxy.io/owning-gateway-name={{ gateway_kn_name }},gateway.envoyproxy.io/owning-gateway-namespace={{ gateway_namespace }}" \
+          -l "gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }},gateway.envoyproxy.io/owning-gateway-namespace={{ gateway_namespace }}" \
           -o jsonpath='{.items[0].metadata.name}'
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: kn_gateway_svc
+      register: main_gateway_svc
       retries: 12
       delay: 10
-      until: kn_gateway_svc.stdout != ''
+      until: main_gateway_svc.stdout != ''
       changed_when: false
-      failed_when: kn_gateway_svc.rc != 0 and kn_gateway_svc.attempts | default(1) >= 12
+      failed_when: main_gateway_svc.rc != 0 and main_gateway_svc.attempts | default(1) >= 12
 
     - name: Wait for local gateway backing service to appear
       ansible.builtin.shell: |
@@ -299,8 +294,8 @@
           data:
             external-gateways: |
               - class: "{{ gateway_class }}"
-                gateway: "{{ gateway_namespace }}/{{ gateway_kn_name }}"
-                service: "{{ eg_namespace }}/{{ kn_gateway_svc.stdout }}"
+                gateway: "{{ gateway_namespace }}/{{ gateway_name }}"
+                service: "{{ eg_namespace }}/{{ main_gateway_svc.stdout }}"
                 allowed-namespaces: "*"
             local-gateways: |
               - class: "{{ gateway_class }}"
@@ -739,9 +734,25 @@
       register: service_ready_check
       changed_when: false
 
+    - name: Create DomainMapping for helloworld-python
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: serving.knative.dev/v1beta1
+          kind: DomainMapping
+          metadata:
+            name: "helloworld-python.{{ domain_name }}"
+            namespace: "{{ kn_namespace }}"
+          spec:
+            ref:
+              name: helloworld-python
+              kind: Service
+              apiVersion: serving.knative.dev/v1
+
     - name: Set sample service URLs
       ansible.builtin.set_fact:
-        sample_service_url: "https://helloworld-python.{{ kn_domain }}"
+        sample_service_url: "https://helloworld-python.{{ domain_name }}"
 
     - name: Check sample service status
       ansible.builtin.shell: |

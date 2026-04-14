@@ -21,7 +21,7 @@
 #   - domain_name: Base domain for all services
 #   - dns_external_ip_octet: Last octet for DNS external IP
 #   - primary_ingress_ip_octet: Last octet for primary ingress
-#   - secondary_ingress_ip_octet: Last octet for secondary ingress
+#   (secondary_ingress_ip_octet removed — kn subdomain eliminated)
 #
 # Dependencies:
 #   - Networking and ZeroTier must be configured
@@ -42,7 +42,6 @@
     subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     dns_external_ip: "{{ subnet_prefix }}{{ dns_external_ip_octet }}"
     primary_ingress_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
-    secondary_ingress_ip: "{{ subnet_prefix }}{{ secondary_ingress_ip_octet }}"
     control_plane_hostname: "{{ inventory_hostname }}"
     bind9_containerfile: |
       FROM ubuntu:24.04
@@ -69,7 +68,6 @@
           - domain_name is defined
           - dns_external_ip_octet is defined
           - primary_ingress_ip_octet is defined
-          - secondary_ingress_ip_octet is defined
           - network_mode is defined
         fail_msg: "Required inventory variables are not defined"
 
@@ -176,12 +174,6 @@
               file "/etc/bind/zones/db.{{ domain_name }}";
           };
 
-          // Zone for kn.{{ domain_name }}
-          zone "kn.{{ domain_name }}" {
-              type master;
-              file "/etc/bind/zones/db.kn.{{ domain_name }}";
-          };
-
     - name: Create main domain zone file
       ansible.builtin.set_fact:
         zone_main: |
@@ -205,22 +197,6 @@
           {% for host in groups['k8s_workers'] | default([]) %}
           {{ host }}  IN  A  {{ hostvars[host]['zerotier_ip'] }}
           {% endfor %}
-
-    - name: Create Knative domain zone file
-      ansible.builtin.set_fact:
-        zone_kn: |
-          $TTL    604800
-          @       IN      SOA     ns1.kn.{{ domain_name }}. admin.{{ domain_name }}. (
-                                  {{ ansible_date_time.epoch }}  ; Serial
-                                  604800          ; Refresh
-                                  86400           ; Retry
-                                  2419200         ; Expire
-                                  604800 )        ; Negative Cache TTL
-          ;
-          @       IN      NS      ns1.{{ domain_name }}.
-
-          ; Wildcard for all Knative services
-          *       IN      A       {{ secondary_ingress_ip }}
 
     # Create ConfigMaps for BIND9 configuration
     - name: Create temporary named.conf file
@@ -248,7 +224,6 @@
     - name: Set zone file names
       ansible.builtin.set_fact:
         zone_file_main: "db.{{ domain_name }}"
-        zone_file_kn: "db.kn.{{ domain_name }}"
 
     - name: Create temporary zone file for main domain
       ansible.builtin.copy:
@@ -256,17 +231,10 @@
         dest: "/tmp/{{ zone_file_main }}"
         mode: '0644'
 
-    - name: Create temporary zone file for Knative domain
-      ansible.builtin.copy:
-        content: "{{ zone_kn }}"
-        dest: "/tmp/{{ zone_file_kn }}"
-        mode: '0644'
-
     - name: Create ConfigMap for zone files
       ansible.builtin.shell: |
         {{ kubectl_bin }} create configmap bind9-zones \
           --from-file={{ zone_file_main }}=/tmp/{{ zone_file_main }} \
-          --from-file={{ zone_file_kn }}=/tmp/{{ zone_file_kn }} \
           -n {{ dns_namespace }} \
           --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
       register: create_bind9_zones
@@ -478,7 +446,6 @@
 
           Configured zones:
           - {{ domain_name }} (wildcard → {{ primary_ingress_ip }})
-          - kn.{{ domain_name }} (wildcard → {{ secondary_ingress_ip }})
 
           External forwarding to: 8.8.8.8, 8.8.4.4
 

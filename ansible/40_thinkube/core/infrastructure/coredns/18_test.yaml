@@ -19,15 +19,11 @@
 #   - domain_name: Base domain to test
 #   - dns1: DNS server node for ZeroTier DNS
 #   - zerotier_subnet_prefix: Prefix for ZeroTier network
-#   - secondary_ingress_ip_octet: Last octet for secondary ingress IP
-
 - name: Test CoreDNS configuration
   hosts: k8s_control_plane
   gather_facts: true
   vars:
     zerotier_dns_server: "{{ hostvars['dns1'].zerotier_ip }}"
-    kn_subdomain: "kn"
-    secondary_ingress_ip: "{{ zerotier_subnet_prefix }}{{ secondary_ingress_ip_octet }}"
 
   pre_tasks:
     - name: Verify required variables are defined
@@ -36,7 +32,6 @@
           - domain_name is defined
           - hostvars['dns1'].zerotier_ip is defined
           - zerotier_subnet_prefix is defined
-          - secondary_ingress_ip_octet is defined
         fail_msg: "Required inventory variables are not defined"
 
   tasks:
@@ -159,26 +154,6 @@
         success_msg: "✅ ACME challenge DNS correctly forwarded to external DNS (not ZeroTier)"
         fail_msg: "❌ ACME challenge DNS incorrectly forwarded to ZeroTier instead of external DNS"
     
-    # Test ACME challenge for kn subdomain
-    - name: Test ACME challenge for kn subdomain domain forwarding to external DNS (not ZeroTier)
-      ansible.builtin.command: >
-        {{ kubectl_bin }} exec dnsutils -- nslookup _acme-challenge.{{ kn_subdomain }}.{{ domain_name }}
-      register: acme_challenge_kn_test
-      changed_when: false
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      
-    - name: Display kn subdomain ACME challenge resolution test results
-      ansible.builtin.debug:
-        var: acme_challenge_kn_test.stdout_lines
-        
-    - name: Verify kn subdomain ACME challenge is NOT forwarded to ZeroTier
-      ansible.builtin.assert:
-        that: 
-          - "'10.200.0.' not in acme_challenge_kn_test.stdout"
-        success_msg: "✅ kn subdomain ACME challenge DNS correctly forwarded to external DNS (not ZeroTier)"
-        fail_msg: "❌ kn subdomain ACME challenge DNS incorrectly forwarded to ZeroTier instead of external DNS"
-
     # Test domain forwarding to ZeroTier
     - name: Test domain forwarding to ZeroTier DNS
       ansible.builtin.command: >
@@ -211,19 +186,6 @@
     - name: Display subdomain test results
       ansible.builtin.debug:
         var: subdomain_test.stdout_lines
-        
-    - name: Test resolution of test.kn.thinkube.com
-      ansible.builtin.command: >
-        {{ kubectl_bin }} run test-kn-{{ 99999 | random }} --rm -i --restart=Never --image=busybox:latest -- 
-        sh -c "nslookup test.{{ kn_subdomain }}.{{ domain_name }}"
-      register: kn_subdomain_test
-      changed_when: false
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-        
-    - name: Display kn subdomain test results
-      ansible.builtin.debug:
-        var: kn_subdomain_test.stdout_lines
         
     # Test resolution of specific service domains that will be used by platform components
     - name: Test common service domains resolution (wildcards)
@@ -270,7 +232,6 @@
         that:
           - "('forward ' + domain_name) in coredns_configmap.stdout"
           - "'hosts {' in coredns_configmap.stdout"
-          - "('*.' + kn_subdomain + '.' + domain_name) in coredns_configmap.stdout"
         fail_msg: "CoreDNS ConfigMap does not contain expected configuration"
 
     # Check if Knative is installed
@@ -287,16 +248,7 @@
       ansible.builtin.set_fact:
         knative_installed: "{{ knative_check.rc == 0 }}"
 
-    # Test Knative domain resolution if installed
-    - name: Test Knative domain resolution (if installed)
-      ansible.builtin.command: >
-        {{ kubectl_bin }} run test-kn-{{ 99999 | random }} --rm -i --restart=Never --image=busybox:latest -- 
-        sh -c "nslookup {{ kn_subdomain }}.{{ domain_name }} 10.152.183.10"
-      register: kn_dns_test
-      changed_when: false
-      when: knative_installed | bool
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
+    # Knative services now use DomainMapping with {name}.{domain} — no separate kn subdomain
 
     - name: Display Knative DNS test results (if installed)
       ansible.builtin.debug:
@@ -487,12 +439,6 @@
           ❌ ACME Challenge DNS: _acme-challenge.{{ domain_name }} incorrectly routed to ZeroTier
           {% endif %}
           
-          {% if acme_challenge_kn_test is defined and "10.200.0." not in acme_challenge_kn_test.stdout %}
-          ✅ KN ACME Challenge DNS: _acme-challenge.{{ kn_subdomain }}.{{ domain_name }} correctly routed to external DNS (not ZeroTier)
-          {% elif acme_challenge_kn_test is defined %}
-          ❌ KN ACME Challenge DNS: _acme-challenge.{{ kn_subdomain }}.{{ domain_name }} incorrectly routed to ZeroTier
-          {% endif %}
-          
           ZEROTIER DOMAIN RESOLUTION:
           {% if subdomain_test is defined and "Address: 10.200.0." in subdomain_test.stdout %}
           ✅ test.{{ domain_name }}: Resolves to ZeroTier address ({{ subdomain_test.stdout.split('Address: ')[1].split('\n')[0] }})
@@ -500,16 +446,10 @@
           ❌ test.{{ domain_name }}: Not resolving to ZeroTier network
           {% endif %}
           
-          {% if kn_subdomain_test is defined and "Address: 10.200.0." in kn_subdomain_test.stdout %}
-          ✅ test.{{ kn_subdomain }}.{{ domain_name }}: Resolves to ZeroTier address ({{ kn_subdomain_test.stdout.split('Address: ')[1].split('\n')[0] }})
-          {% elif kn_subdomain_test is defined %}
-          ❌ test.{{ kn_subdomain }}.{{ domain_name }}: Not resolving to ZeroTier network
-          {% endif %}
-          
           ============================================
           
-          OVERALL STATUS: {% if "thinkube.com" in dns_config.stdout or "kn.thinkube.com" in dns_config.stdout %}❌ NEEDS ATTENTION{% else %}✅ DNS CONFIGURATION IS WORKING PROPERLY{% endif %}
-          
-          {% if "thinkube.com" in dns_config.stdout or "kn.thinkube.com" in dns_config.stdout %}
+          OVERALL STATUS: {% if "thinkube.com" in dns_config.stdout %}❌ NEEDS ATTENTION{% else %}✅ DNS CONFIGURATION IS WORKING PROPERLY{% endif %}
+
+          {% if "thinkube.com" in dns_config.stdout %}
           Please fix the DNS search domains issue before proceeding with cert-manager deployment.
           {% endif %}

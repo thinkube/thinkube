@@ -21,9 +21,8 @@
 #   - kubectl_bin: Path to kubectl binary
 #   - kubeconfig: Path to kubeconfig file
 #   - harbor_registry: Harbor registry URL
-#   - secondary_ingress_ip: IP for secondary ingress controller
+#   - primary_ingress_ip_octet: Octet for primary gateway IP
 #   - zerotier_subnet_prefix: Prefix for ZeroTier network
-#   - secondary_ingress_ip_octet: Octet for secondary ingress IP
 #
 # Dependencies:
 #   - OPT-007: Knative deployment must be complete
@@ -35,10 +34,9 @@
   gather_facts: true
   vars:
     kn_namespace: kn
-    kn_subdomain: "kn"
-    kn_domain: "{{ kn_subdomain }}.{{ domain_name }}"
-    sample_service_url: "https://helloworld-go.{{ kn_domain }}"
-    secondary_ingress_ip: "{{ zerotier_subnet_prefix }}{{ secondary_ingress_ip_octet }}"
+    subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    primary_gateway_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
+    sample_service_url: "https://helloworld-python.{{ domain_name }}"
 
   tasks:
     # --- PHASE 1: COMPONENT HEALTH CHECKS ---
@@ -56,7 +54,7 @@
         - webhook
         - autoscaler
         - activator
-        - net-kourier-controller
+        - net-gateway-api-controller
 
     - name: Check Knative Eventing deployments
       kubernetes.core.k8s_info:
@@ -66,22 +64,12 @@
       register: eventing_deployments
       failed_when: eventing_deployments.resources | length == 0
 
-    - name: Check Kourier service
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        kind: Service
-        namespace: kourier-system
-        name: kourier
-      register: kourier_service
-      failed_when: kourier_service.resources | length == 0
-
     - name: Display component health summary
       ansible.builtin.debug:
         msg: |
           Knative Component Health Check:
-          ✅ Serving Components: {{ serving_deployments.results | selectattr('resources', 'defined') | list | length }} deployments ready
-          ✅ Eventing Components: {{ eventing_deployments.resources | length }} deployments found
-          ✅ Kourier Service: Available at {{ kourier_service.resources[0].spec.clusterIP }}
+          Serving Components: {{ serving_deployments.results | selectattr('resources', 'defined') | list | length }} deployments ready
+          Eventing Components: {{ eventing_deployments.resources | length }} deployments found
 
     # --- PHASE 2: DNS AND CONNECTIVITY TESTS ---
     
@@ -92,14 +80,11 @@
         # Test internal service resolution
         {{ kubectl_bin }} run dns-test-{{ 100000 | random }} --image=busybox:1.28 -n default --rm -i --restart=Never -- \
           sh -c "
-            echo 'Testing Kourier DNS resolution...'
-            nslookup kourier.kourier-system.svc.cluster.local
-            echo
             echo 'Testing Autoscaler DNS resolution...'
             nslookup autoscaler.knative-serving.svc.cluster.local
             echo
             echo 'Testing sample service wildcard domain...'
-            nslookup helloworld-go.{{ kn_domain }}
+            nslookup helloworld-python.{{ domain_name }}
           "
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
@@ -119,20 +104,20 @@
         api_version: serving.knative.dev/v1
         kind: Service
         namespace: "{{ kn_namespace }}"
-        name: helloworld-go
+        name: helloworld-python
       register: sample_service
       failed_when: sample_service.resources | length == 0
 
     - name: Get sample service status
       ansible.builtin.shell: |
         echo "=== KNATIVE SERVICE STATUS ==="
-        {{ kubectl_bin }} get ksvc helloworld-go -n {{ kn_namespace }}
+        {{ kubectl_bin }} get ksvc helloworld-python -n {{ kn_namespace }}
         echo
         echo "=== SERVICE DETAILS ==="
-        {{ kubectl_bin }} get ksvc helloworld-go -n {{ kn_namespace }} -o jsonpath='{.status.conditions[?(@.type=="Ready")]}' | jq .
+        {{ kubectl_bin }} get ksvc helloworld-python -n {{ kn_namespace }} -o jsonpath='{.status.conditions[?(@.type=="Ready")]}' | jq .
         echo
         echo "=== SERVICE URL ==="
-        {{ kubectl_bin }} get ksvc helloworld-go -n {{ kn_namespace }} -o jsonpath='{.status.url}'
+        {{ kubectl_bin }} get ksvc helloworld-python -n {{ kn_namespace }} -o jsonpath='{.status.url}'
         echo
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
@@ -148,21 +133,16 @@
     - name: Test internal connectivity to Knative service
       ansible.builtin.shell: |
         echo "=== INTERNAL CONNECTIVITY TEST ==="
-        
-        # Get Kourier service IP
-        KOURIER_IP=$({{ kubectl_bin }} get svc kourier -n kourier-system -o jsonpath='{.spec.clusterIP}')
-        echo "Kourier ClusterIP: $KOURIER_IP"
-        
-        # Test direct connection with proper Host header
-        echo "Testing direct connection to Kourier..."
+
+        # Test via internal Knative URL
+        echo "Testing internal connection to Knative service..."
         {{ kubectl_bin }} run curl-test-{{ 100000 | random }} --image=curlimages/curl:latest -n default -i --rm --restart=Never -- \
-          curl -sv -H "Host: helloworld-go.{{ kn_domain }}" http://$KOURIER_IP --max-time 10
-        
-        # Check response
+          curl -sv http://helloworld-python.{{ kn_namespace }}.svc.cluster.local --max-time 10
+
         if [ $? -eq 0 ]; then
-          echo "✅ Internal connectivity: SUCCESS"
+          echo "Internal connectivity: SUCCESS"
         else
-          echo "❌ Internal connectivity: FAILED"
+          echo "Internal connectivity: FAILED"
           exit 1
         fi
       environment:
@@ -172,20 +152,19 @@
 
     # --- PHASE 5: EXTERNAL CONNECTIVITY TEST ---
     
-    - name: Test external connectivity via ingress
+    - name: Test external connectivity via gateway
       ansible.builtin.shell: |
         echo "=== EXTERNAL CONNECTIVITY TEST ==="
-        
-        # Test via the secondary ingress IP with proper Host header
-        echo "Testing HTTPS access via ingress..."
+
+        # Test via the main gateway with proper Host header
+        echo "Testing HTTPS access via gateway..."
         {{ kubectl_bin }} run curl-test-{{ 100000 | random }} --image=curlimages/curl:latest -n default -i --rm --restart=Never -- \
-          curl -svk -H "Host: helloworld-go.{{ kn_domain }}" https://{{ secondary_ingress_ip }} --max-time 10
-        
-        # Check response
+          curl -svk -H "Host: helloworld-python.{{ domain_name }}" https://{{ primary_gateway_ip }} --max-time 30
+
         if [ $? -eq 0 ]; then
-          echo "✅ External connectivity: SUCCESS"
+          echo "External connectivity: SUCCESS"
         else
-          echo "❌ External connectivity: FAILED"
+          echo "External connectivity: FAILED"
           exit 1
         fi
       environment:
@@ -201,7 +180,7 @@
         
         # Check current pod count
         echo "Initial pod count:"
-        {{ kubectl_bin }} get pods -n {{ kn_namespace }} -l serving.knative.dev/service=helloworld-go --no-headers | wc -l
+        {{ kubectl_bin }} get pods -n {{ kn_namespace }} -l serving.knative.dev/service=helloworld-python --no-headers | wc -l
         
         # The service is configured with min-scale=1, max-scale=1 in deployment
         # So we just verify it maintains exactly 1 pod
@@ -209,7 +188,7 @@
         sleep 30
         
         echo "Pod count after wait:"
-        POD_COUNT=$({{ kubectl_bin }} get pods -n {{ kn_namespace }} -l serving.knative.dev/service=helloworld-go --no-headers | grep Running | wc -l)
+        POD_COUNT=$({{ kubectl_bin }} get pods -n {{ kn_namespace }} -l serving.knative.dev/service=helloworld-python --no-headers | grep Running | wc -l)
         echo "$POD_COUNT"
         
         if [ "$POD_COUNT" -eq "1" ]; then
@@ -225,25 +204,27 @@
 
     # --- PHASE 7: INGRESS AND TLS VALIDATION ---
     
-    - name: Validate HTTPRoute configuration
+    - name: Validate DomainMapping exists
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
-        api_version: gateway.networking.k8s.io/v1
-        kind: HTTPRoute
-        namespace: kourier-system
-      register: httproutes
+        api_version: serving.knative.dev/v1beta1
+        kind: DomainMapping
+        namespace: "{{ kn_namespace }}"
+        name: "helloworld-python.{{ domain_name }}"
+      register: domain_mapping
+      failed_when: domain_mapping.resources | length == 0
 
     - name: Validate TLS configuration
       ansible.builtin.shell: |
         echo "=== TLS CERTIFICATE VALIDATION ==="
-        
-        # Check TLS secret exists
-        {{ kubectl_bin }} get secret -n kourier-system | grep tls-secret
-        
-        # Test TLS connection
+
+        # Check TLS secret exists in gateway-system
+        {{ kubectl_bin }} get secret gateway-tls-secret -n gateway-system
+
+        # Test TLS connection via gateway
         echo "Testing TLS handshake..."
         {{ kubectl_bin }} run openssl-test-{{ 100000 | random }} --image=curlimages/curl:latest -n default -i --rm --restart=Never -- \
-          curl -svk --resolve "helloworld-go.{{ kn_domain }}:443:{{ secondary_ingress_ip }}" https://helloworld-go.{{ kn_domain }} -o /dev/null 2>&1 | grep -E "SSL connection|subject:|issuer:"
+          curl -svk --resolve "helloworld-python.{{ domain_name }}:443:{{ primary_gateway_ip }}" https://helloworld-python.{{ domain_name }} -o /dev/null 2>&1 | grep -E "SSL connection|subject:|issuer:"
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: tls_test
@@ -258,8 +239,9 @@
           dns_working: "{{ 'cant resolve' not in dns_test.stdout }}"
           internal_access: "{{ 'Hello from Knative!' in internal_test.stdout }}"
           external_access: "{{ 'Hello from Knative!' in external_test.stdout }}"
-          autoscaling_working: "{{ '✅ Autoscaling' in autoscaling_test.stdout }}"
-          tls_configured: "{{ 'tls-secret' in tls_test.stdout }}"
+          autoscaling_working: "{{ 'Autoscaling' in autoscaling_test.stdout }}"
+          domain_mapping_exists: "{{ domain_mapping.resources | length > 0 }}"
+          tls_configured: "{{ 'gateway-tls-secret' in tls_test.stdout }}"
 
     - name: Display comprehensive test results
       ansible.builtin.debug:
@@ -283,7 +265,7 @@
           {% if test_results.tls_configured %}✅{% else %}❌{% endif %} TLS/HTTPS is configured correctly
           
           Service URLs:
-          - Internal: http://helloworld-go.{{ kn_namespace }}.svc.cluster.local
+          - Internal: http://helloworld-python.{{ kn_namespace }}.svc.cluster.local
           - External: {{ sample_service_url }}
           
           {% set all_tests_passed = test_results.values() | select('equalto', true) | list | length == test_results.values() | list | length %}

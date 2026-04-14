@@ -24,7 +24,7 @@
 #
 # Variables from inventory:
 #   - domain_name, argocd_hostname
-#   - primary_ingress_ip_octet, secondary_ingress_ip_octet
+#   - primary_ingress_ip_octet
 #   - network_mode, network_cidr, zerotier_subnet_prefix
 #   - kubectl_bin, helm_bin, kubeconfig
 #
@@ -37,13 +37,11 @@
   vars:
     subnet_prefix: "{{ zerotier_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     primary_gateway_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
-    secondary_gateway_ip: "{{ subnet_prefix }}{{ secondary_ingress_ip_octet }}"
 
     eg_version: "v1.7.1"
     eg_namespace: "envoy-gateway-system"
     gateway_namespace: "gateway-system"
     gateway_name: "thinkube-gateway"
-    gateway_kn_name: "thinkube-kn-gateway"
 
     eg_images:
       - name: "docker.io/envoyproxy/gateway:{{ eg_version }}"
@@ -331,21 +329,6 @@
             tls.crt: "{{ wildcard_cert_data.data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert_data.data['tls.key'] }}"
 
-    - name: Create TLS secret for Knative gateway
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: gateway-kn-tls-secret
-            namespace: "{{ gateway_namespace }}"
-          type: kubernetes.io/tls
-          data:
-            tls.crt: "{{ wildcard_cert_data.data['tls.crt'] }}"
-            tls.key: "{{ wildcard_cert_data.data['tls.key'] }}"
-
     ###########################################################################
     # Step 8: Create main Gateway (HTTP + HTTPS + TLS passthrough + TCP ports)
     ###########################################################################
@@ -416,40 +399,7 @@
                     from: All
 
     ###########################################################################
-    # Step 9: Create Knative Gateway (HTTPS for *.kn.<domain>)
-    ###########################################################################
-    - name: Create Knative Gateway (thinkube-kn-gateway)
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: gateway.networking.k8s.io/v1
-          kind: Gateway
-          metadata:
-            name: "{{ gateway_kn_name }}"
-            namespace: "{{ gateway_namespace }}"
-          spec:
-            gatewayClassName: eg
-            addresses:
-              - type: IPAddress
-                value: "{{ secondary_gateway_ip }}"
-            listeners:
-              - name: https
-                protocol: HTTPS
-                port: 443
-                hostname: "*.kn.{{ domain_name }}"
-                tls:
-                  mode: Terminate
-                  certificateRefs:
-                    - kind: Secret
-                      name: gateway-kn-tls-secret
-                      namespace: "{{ gateway_namespace }}"
-                allowedRoutes:
-                  namespaces:
-                    from: All
-
-    ###########################################################################
-    # Step 10: HTTP → HTTPS redirect route
+    # Step 9: HTTP → HTTPS redirect route
     ###########################################################################
     - name: Create HTTP to HTTPS redirect route
       kubernetes.core.k8s:
@@ -553,18 +503,6 @@
       delay: 10
       changed_when: false
 
-    - name: Wait for Knative Gateway to have IP assigned
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get gateway {{ gateway_kn_name }} -n {{ gateway_namespace }} \
-          -o jsonpath='{.status.addresses[0].value}'
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: kn_gw_ip
-      until: kn_gw_ip.stdout == secondary_gateway_ip
-      retries: 40
-      delay: 10
-      changed_when: false
-
     ###########################################################################
     # Step 14: Display summary
     ###########################################################################
@@ -582,5 +520,4 @@
           - "  - TCP   (6379) → Valkey"
           - "  - TCP   (9000) → ClickHouse"
           - ""
-          - "Knative Gateway ({{ gateway_kn_name }}): {{ secondary_gateway_ip }}"
-          - "  - HTTPS (443)  → *.kn.{{ domain_name }}"
+          - "Knative services use DomainMapping through the main gateway"
