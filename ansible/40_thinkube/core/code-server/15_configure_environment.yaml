@@ -553,6 +553,68 @@
       ansible.builtin.debug:
         var: clone_result.stdout_lines
 
+    - name: Fetch user metadata repository
+      ansible.builtin.uri:
+        url: "https://raw.githubusercontent.com/{{ github_org }}/{{ github_org }}-metadata/main/repositories.json"
+        headers:
+          Authorization: "token {{ github_token }}"
+        return_content: yes
+      register: user_repo_metadata
+      failed_when: false
+      when: github_org is defined and github_token is defined
+
+    - name: Parse user template list for cloning
+      ansible.builtin.set_fact:
+        user_templates_to_clone: "{{ (user_repo_metadata.content | from_json).repositories | selectattr('clone_for_development', 'equalto', true) | list }}"
+      when: user_repo_metadata is defined and user_repo_metadata.status | default(0) == 200
+
+    - name: Clone user template repositories
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            set -e
+            echo '===== Cloning user template repositories ====='
+            mkdir -p /home/thinkube/user-templates
+
+            if [ -f /home/thinkube/.ssh/github_ed25519 ]; then
+              chmod 600 /home/thinkube/.ssh/github_ed25519
+
+              {% for tmpl in user_templates_to_clone %}
+              repo_name='{{ tmpl.name }}'
+              repo_full='{{ tmpl.full_name }}'
+              if [ ! -d \"/home/thinkube/user-templates/\$repo_name\" ]; then
+                echo \"Cloning \$repo_full...\"
+                GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
+                  git clone \"git@github.com:\$repo_full.git\" \"/home/thinkube/user-templates/\$repo_name\"
+              else
+                echo \"\$repo_name already exists, pulling latest changes...\"
+                cd \"/home/thinkube/user-templates/\$repo_name\"
+                git reset --hard HEAD
+                if GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' git fetch origin 2>&1; then
+                  default_branch=\$(git remote show origin 2>/dev/null | grep 'HEAD branch' | awk '{print \$NF}')
+                  echo \"Resetting to origin/\$default_branch for \$repo_name...\"
+                  git reset --hard \"origin/\$default_branch\"
+                else
+                  echo \"ERROR: Failed to fetch from origin for \$repo_name\"
+                  exit 1
+                fi
+              fi
+              {% endfor %}
+
+              echo '✅ User template repositories cloned'
+            else
+              echo 'ERROR: No SSH key found'
+              exit 1
+            fi
+          "
+      register: user_clone_result
+      when: user_templates_to_clone is defined and user_templates_to_clone | length > 0
+
+    - name: Display user template cloning output
+      ansible.builtin.debug:
+        var: user_clone_result.stdout_lines
+      when: user_clone_result is defined and user_clone_result is not skipped
+
     - name: Create symlink for tk_ansible command inside container
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
@@ -616,7 +678,7 @@
           bash -c "
             set -e
             echo '===== Configuring git SSH for cloned repositories ====='
-            for repo_dir in /home/thinkube/thinkube-platform/*; do
+            for repo_dir in /home/thinkube/thinkube-platform/* /home/thinkube/user-templates/*; do
               if [ -d \"\$repo_dir/.git\" ]; then
                 repo_name=\$(basename \$repo_dir)
                 echo \"Configuring git SSH for \$repo_name...\"
@@ -858,6 +920,12 @@
           bash -c 'cat > /home/thinkube/.vscode/settings.json << "EOF"
           {{ vscode_workspace_settings }}
           EOF'
+
+    - name: Create apps directory for workspace
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/apps"
+        state: directory
+        mode: '0755'
 
     - name: Create Thinkube workspace file
       ansible.builtin.template:
