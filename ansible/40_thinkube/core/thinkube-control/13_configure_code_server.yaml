@@ -192,7 +192,7 @@
       ansible.builtin.set_fact:
         claude_settings: "{{ claude_settings_raw.stdout | from_json }}"
 
-    - name: Update Claude settings with MCP server
+    - name: Update Claude settings with MCP servers
       ansible.builtin.set_fact:
         updated_claude_settings: "{{ claude_settings | combine({
           'mcpServers': (claude_settings.mcpServers | default({})) | combine({
@@ -202,6 +202,10 @@
               'headers': {
                 'Authorization': 'Bearer ' + cicd_api_token
               }
+            },
+            'tk-package-version': {
+              'type': 'http',
+              'url': 'https://control.' + control_domain_name + '/tk-package-version/mcp'
             }
           })
         }, recursive=True) }}"
@@ -213,11 +217,18 @@
         {{ updated_claude_settings | to_nice_json }}
         EOFCLAUDE'
 
-    - name: Register MCP server via Claude CLI
+    - name: Register thinkube-control MCP server via Claude CLI
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ cs_pod_name.stdout }} -- \
           bash -l -c "claude mcp add-json thinkube-control '{\"type\":\"http\",\"url\":\"https://control.{{ control_domain_name }}/mcp\",\"headers\":{\"Authorization\":\"Bearer {{ cicd_api_token }}\"}}'"
       register: mcp_add_result
+      failed_when: false
+
+    - name: Register tk-package-version MCP server via Claude CLI
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ cs_pod_name.stdout }} -- \
+          bash -l -c "claude mcp add-json tk-package-version '{\"type\":\"http\",\"url\":\"https://control.{{ control_domain_name }}/tk-package-version/mcp\"}'"
+      register: mcp_pkg_add_result
       failed_when: false
 
     - name: Create MCP config JSON
@@ -231,6 +242,10 @@
                 "headers": {
                   "Authorization": "Bearer {{ cicd_api_token }}"
                 }
+              },
+              "tk-package-version": {
+                "type": "http",
+                "url": "https://control.{{ control_domain_name }}/tk-package-version/mcp"
               }
             }
           }
