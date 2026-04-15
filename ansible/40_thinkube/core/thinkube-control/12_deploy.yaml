@@ -711,6 +711,25 @@
     - name: Setup git hooks in local repository
       ansible.builtin.include_tasks: tasks/setup_git_hooks.yaml
     
+    # Create MCP default API token BEFORE pushing (needed when pods start)
+    - name: Generate MCP default API token
+      ansible.builtin.set_fact:
+        mcp_default_api_token: "tk_{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Create MCP default API token secret in thinkube-control
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "mcp-default-token"
+            namespace: "thinkube-control"
+          type: Opaque
+          stringData:
+            token: "{{ mcp_default_api_token }}"
+
     # Now push to Gitea - this will trigger the webhook!
     - name: Push to Gitea repository (triggers webhook)
       ansible.builtin.include_tasks: tasks/push_to_gitea.yaml
@@ -1027,7 +1046,63 @@
       ansible.builtin.pause:
         seconds: 10
       when: backend_pods.resources | length > 0
-        
+
+    # Insert MCP default token into database (tables now exist after deployment)
+    - name: Get MCP default token from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ k8s_namespace }}"
+        name: "mcp-default-token"
+      register: mcp_token_secret
+
+    - name: Extract token and hash
+      ansible.builtin.set_fact:
+        mcp_default_api_token: "{{ mcp_token_secret.resources[0].data.token | b64decode }}"
+
+    - name: Hash the API token for database storage
+      ansible.builtin.set_fact:
+        mcp_default_api_token_hash: "{{ mcp_default_api_token | hash('sha256') }}"
+
+    - name: Generate ID for API token database entry
+      ansible.builtin.set_fact:
+        mcp_default_api_token_id: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') | replace('/', '_') | replace('+', '-') }}"
+
+    - name: Check if MCP default token already exists in database
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d thinkube_control -t -c "
+          SELECT COUNT(*) FROM api_tokens WHERE name = 'MCP Default';
+          "
+      register: mcp_token_check
+
+    - name: Create MCP default API token in database
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d thinkube_control -c "
+          INSERT INTO api_tokens (id, name, token_hash, user_id, username, is_active, scopes, created_at)
+          VALUES (
+            '{{ mcp_default_api_token_id }}',
+            'MCP Default',
+            '{{ mcp_default_api_token_hash }}',
+            'system',
+            'system',
+            true,
+            '["read", "write"]',
+            NOW()
+          );
+          "
+      when: mcp_token_check.stdout | trim | int == 0
+
     # Display setup summary
     - name: Display setup summary
       ansible.builtin.debug:
