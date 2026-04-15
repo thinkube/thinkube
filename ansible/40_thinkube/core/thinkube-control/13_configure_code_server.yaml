@@ -4,11 +4,11 @@
 ---
 # ansible/40_thinkube/core/thinkube-control/13_configure_code_server.yaml
 # Description:
-#   Configure code-server with CI/CD monitoring token after thinkube-control deployment
+#   Configure code-server with API token for CI/CD extension after thinkube-control deployment
 #   Also configures Claude Code MCP integration using the same token
 #
 # Requirements:
-#   - thinkube-control must be deployed (creates the CI/CD monitoring token)
+#   - thinkube-control must be deployed (creates the MCP default token)
 #   - code-server must be deployed
 #
 # Usage:
@@ -17,7 +17,7 @@
 #
 # 🤖 [AI-assisted]
 
-- name: Configure code-server with CI/CD monitoring token
+- name: Configure code-server with API token
   hosts: k8s_control_plane
   gather_facts: true
   
@@ -49,40 +49,25 @@
           - code_namespace.resources | length > 0
         fail_msg: "Both thinkube-control and code-server must be deployed before running this configuration"
         
-    - name: Get CI/CD monitoring token from thinkube-control namespace
+    - name: Get MCP default token from thinkube-control namespace
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
         api_version: v1
         kind: Secret
         namespace: "{{ thinkube_control_namespace }}"
-        name: "cicd-monitoring-token"
-      register: monitoring_token_secret
-      failed_when: monitoring_token_secret.resources | length == 0
-      
+        name: "mcp-default-token"
+      register: api_token_secret
+      failed_when: api_token_secret.resources | length == 0
+
     - name: Extract token value
       ansible.builtin.set_fact:
-        cicd_api_token: "{{ monitoring_token_secret.resources[0].data.token | b64decode }}"
-        
+        api_token: "{{ api_token_secret.resources[0].data.token | b64decode }}"
+
     - name: Debug variables
       ansible.builtin.debug:
         msg:
           - "domain_name: {{ domain_name }}"
-          - "cicd_api_token: {{ cicd_api_token }}"
           - "code_server_namespace: {{ code_server_namespace }}"
-          
-    - name: Copy CI/CD monitoring token to code-server namespace
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: "cicd-monitoring-token"
-            namespace: "{{ code_server_namespace }}"
-          type: Opaque
-          stringData:
-            token: "{{ cicd_api_token }}"
             
     - name: Ensure VS Code settings directory exists
       ansible.builtin.file:
@@ -122,7 +107,7 @@
           'thinkube-cicd.apiUrl': 'https://control.' + domain_name,
           'thinkube-cicd.showNotifications': true,
           'thinkube-cicd.refreshInterval': 5000,
-          'thinkube-cicd.apiToken': cicd_api_token,
+          'thinkube-cicd.apiToken': api_token,
           'terminal.integrated.env.linux': {
             'PATH': '${env:PATH}:/home/coder/.npm-global/bin:/home/coder/.local/bin'
           },
@@ -167,7 +152,7 @@
     - name: Display configuration summary
       ansible.builtin.debug:
         msg:
-          - "✅ CI/CD monitoring token successfully configured in code-server"
+          - "✅ API token successfully configured in code-server"
           - "✅ VS Code settings updated with CI/CD extension configuration"
           - "✅ code-server deployment restarted to apply changes"
           - ""
@@ -282,7 +267,7 @@
       ansible.builtin.debug:
         msg:
           - "MCP server configured: https://control.{{ control_domain_name }}/mcp"
-          - "Token: CI/CD monitoring token (from thinkube-control namespace)"
+          - "Token: MCP default token (from thinkube-control namespace)"
           - "Location: {{ claude_settings_path }}"
           - "Location: /home/thinkube/apps/.mcp.json"
           - "Location: /home/thinkube/thinkube-platform/.mcp.json"

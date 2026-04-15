@@ -7,9 +7,7 @@
 #   Deploy Harbor webhook adapter for instant image updates via direct Git updates
 #   This eliminates the 2-minute polling delay for a true "local development" experience
 #   
-#   Bootstrap capability: Can deploy before thinkube-control exists. Will initially
-#   process webhooks without CI/CD monitoring, then automatically enable full monitoring
-#   once thinkube-control creates the required token.
+#   Bootstrap capability: Can deploy before thinkube-control exists.
 #
 # Requirements:
 #   - ArgoCD deployed
@@ -30,9 +28,7 @@
 #   - CORE-009: ArgoCD deployed
 #
 # Post-deployment:
-#   - When thinkube-control deploys, it creates the CI/CD monitoring token
-#   - Webhook adapter automatically detects the token and enables full CI/CD monitoring
-#   - Final state: Fully operational CI/CD pipeline with complete monitoring
+#   - Webhook adapter processes Harbor PUSH_ARTIFACT events and updates Git repos
 #
 # 🤖 [AI-assisted]
 
@@ -45,24 +41,6 @@
     adapter_name: "harbor-webhook-adapter"
     
   tasks:
-    - name: Get CI/CD monitoring token from thinkube-control namespace
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: "thinkube-control"
-        name: "cicd-monitoring-token"
-      register: cicd_token_secret
-      failed_when: false  # Don't fail if token doesn't exist yet
-
-    - name: Extract CI/CD monitoring token
-      ansible.builtin.set_fact:
-        cicd_monitoring_token: "{{ cicd_token_secret.resources[0].data.token | b64decode if cicd_token_secret.resources else '' }}"
-
-    - name: Display CI/CD token status
-      ansible.builtin.debug:
-        msg: "CI/CD monitoring token {{ 'found' if cicd_monitoring_token else 'not found - webhook adapter will work in degraded mode' }}"
-
     - name: Get sync webhook secret if it exists
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
@@ -129,146 +107,7 @@
               PORT = int(os.environ.get('PORT', '8080'))
               SYNC_WEBHOOK_URL = os.environ.get('SYNC_WEBHOOK_URL', '')
               SYNC_WEBHOOK_SECRET = os.environ.get('SYNC_WEBHOOK_SECRET', '')
-              
-              # CI/CD Monitoring configuration
-              CICD_API_URL = os.environ.get('CICD_API_URL', 'https://control.thinkube.com/api/v1/cicd')
-              CICD_API_TOKEN = os.environ.get('CICD_API_TOKEN', '')
-              
-              # Event sending removed - using stage-based approach only
-              
-              def create_cicd_stage(pipeline_id, stage_name, component, status='RUNNING', details=None, app_name=None, tag=None):
-                  """Create a stage in CI/CD monitoring API using source-specific endpoints"""
-                  if not CICD_API_TOKEN:
-                      # During bootstrap, we can't create stages yet but will once token is available
-                      return None
-                  
-                  try:
-                      headers = {
-                          'Authorization': f'Bearer {CICD_API_TOKEN}',
-                          'Content-Type': 'application/json'
-                      }
-                      
-                      # Use source-specific endpoints based on stage type
-                      if stage_name == 'image_push' and component == 'harbor':
-                          # Harbor webhook stage endpoint
-                          stage_data = {
-                              'stageName': 'image_push',
-                              'component': 'harbor',
-                              'appName': app_name or details.get('app_name', ''),
-                              'tag': tag or details.get('tag', ''),
-                              'backend': f'{HARBOR_URL.replace("https://", "")}/thinkube/{app_name}-backend:{tag}',
-                              'frontend': f'{HARBOR_URL.replace("https://", "")}/thinkube/{app_name}-frontend:{tag}',
-                              'adapterVersion': '0.1.0'
-                          }
-                          url = f"{CICD_API_URL}/pipelines/{pipeline_id}/stages/harbor"
-                      elif stage_name == 'gitops_update' and component == 'webhook-adapter':
-                          # GitOps update stage endpoint
-                          stage_data = {
-                              'stageName': 'gitops_update',
-                              'component': 'webhook-adapter',
-                              'appName': app_name or details.get('app_name', ''),
-                              'tag': tag or details.get('tag', ''),
-                              'status': status,
-                              'adapterVersion': '0.1.0'
-                          }
-                          url = f"{CICD_API_URL}/pipelines/{pipeline_id}/stages/gitops"
-                      else:
-                          # Fallback - this shouldn't happen
-                          logger.warning(f"Unknown stage type: {stage_name}/{component}")
-                          return None
-                      
-                      response = requests.post(url, json=stage_data, headers=headers, timeout=5, verify=False)
-                      
-                      if response.status_code == 200:
-                          stage_id = response.json().get('id')
-                          logger.debug(f"Successfully created CI/CD stage: {stage_name} (ID: {stage_id})")
-                          return stage_id
-                      else:
-                          logger.warning(f"Failed to create CI/CD stage: {response.status_code} - {response.text}")
-                          return None
-                          
-                  except Exception as e:
-                      # Don't let monitoring failures break the webhook processing
-                      logger.warning(f"Error creating CI/CD stage: {e}")
-                      return None
-              
-              def update_cicd_stage(pipeline_id, stage_id, status, error_message=None, details=None):
-                  """Update a stage in CI/CD monitoring API"""
-                  if not CICD_API_TOKEN:
-                      logger.debug("CI/CD token not available yet - monitoring will auto-enable once thinkube-control creates it")
-                      return
-                  
-                  try:
-                      update_data = {
-                          'status': status
-                      }
-                      
-                      if status in ['SUCCEEDED', 'FAILED']:
-                          update_data['completedAt'] = int(time.time())
-                      
-                      if error_message:
-                          update_data['errorMessage'] = error_message
-                      
-                      if details:
-                          update_data['details'] = details
-                      
-                      headers = {
-                          'Authorization': f'Bearer {CICD_API_TOKEN}',
-                          'Content-Type': 'application/json'
-                      }
-                      
-                      # Use gitops-complete endpoint for stage updates
-                      url = f"{CICD_API_URL}/pipelines/{pipeline_id}/stages/{stage_id}/gitops-complete?status={status}"
-                      response = requests.put(url, headers=headers, timeout=5, verify=False)
-                      
-                      if response.status_code == 200:
-                          logger.debug(f"Successfully updated CI/CD stage {stage_id} to {status}")
-                      else:
-                          logger.warning(f"Failed to update CI/CD stage: {response.status_code} - {response.text}")
-                          
-                  except Exception as e:
-                      # Don't let monitoring failures break the webhook processing
-                      logger.warning(f"Error updating CI/CD stage: {e}")
-              
-              def get_pipeline_by_workflow_uid(app_name, workflow_uid):
-                  """Get pipeline ID by workflow UID (which matches the image tag)"""
-                  if not CICD_API_TOKEN:
-                      return None
-                  
-                  try:
-                      headers = {
-                          'Authorization': f'Bearer {CICD_API_TOKEN}',
-                          'Content-Type': 'application/json'
-                      }
-                      
-                      # Get pipelines for the application with the workflow UID
-                      url = f"{CICD_API_URL}/pipelines?app_name={app_name}&workflow_uid={workflow_uid}&limit=1"
-                      response = requests.get(url, headers=headers, timeout=5, verify=False)
-                      
-                      if response.status_code == 200:
-                          data = response.json()
-                          logger.debug(f"Pipeline API response type: {type(data)}, keys: {data.keys() if isinstance(data, dict) else 'not a dict'}")
-                          # The response is wrapped in an object with 'pipelines' key
-                          if isinstance(data, dict) and 'pipelines' in data:
-                              pipelines = data.get('pipelines', [])
-                              if pipelines and len(pipelines) > 0:
-                                  pipeline_id = pipelines[0].get('id')
-                                  logger.info(f"Found pipeline ID for {app_name}: {pipeline_id}")
-                                  return pipeline_id
-                              else:
-                                  logger.warning(f"No pipelines found for {app_name} in response")
-                                  return None
-                          else:
-                              logger.warning(f"Unexpected response format for {app_name}: {data}")
-                              return None
-                      
-                      logger.warning(f"Could not get pipeline ID for {app_name}: HTTP {response.status_code}")
-                      return None
-                      
-                  except Exception as e:
-                      logger.warning(f"Error getting pipeline ID: {e}")
-                      return None
-              
+
               def get_app_metadata_from_workflow(workflow_uid):
                   """Get app metadata from Argo Workflow labels using the workflow UID (tag)"""
                   try:
@@ -337,7 +176,7 @@
                       logger.error(f"Failed to check Harbor image {project}/{repo}:{tag}: {e}")
                       return False
               
-              def trigger_argocd_sync(app_name, pipeline_id=None):
+              def trigger_argocd_sync(app_name):
                   """Trigger ArgoCD sync via sync webhook"""
                   if not SYNC_WEBHOOK_URL:
                       logger.info("Sync webhook URL not configured, skipping sync trigger")
@@ -375,22 +214,14 @@
                       logger.error(f"Error triggering sync: {e}")
                       return False
               
-              def update_git_with_images(app_name, tag, containers, pipeline_id=None):
+              def update_git_with_images(app_name, tag, containers):
                   """Update git repository with new image tags"""
-                  gitops_stage_id = None
                   try:
-                      # Create GitOps update stage
-                      if pipeline_id:
-                          gitops_stage_id = create_cicd_stage(
-                              pipeline_id, 'gitops_update', 'webhook-adapter',
-                              status='RUNNING',
-                              app_name=app_name, tag=tag
-                          )
                       # Create temporary directory for git operations
                       with tempfile.TemporaryDirectory() as temp_dir:
                           repo_url = f"{GITEA_URL}/thinkube-deployments/{app_name}.git"
                           repo_dir = os.path.join(temp_dir, app_name)
-                          
+
                           # Clone repository
                           clone_cmd = [
                               'git', 'clone', '--depth', '1', '--branch', 'main',
@@ -400,22 +231,16 @@
                           result = subprocess.run(clone_cmd, capture_output=True, text=True, timeout=30)
                           if result.returncode != 0:
                               logger.error(f"Git clone failed: {result.stderr}")
-                              
-                              # Update GitOps stage as failed
-                              if pipeline_id and gitops_stage_id:
-                                  update_cicd_stage(pipeline_id, gitops_stage_id, 'FAILED',
-                                                   error_message='Git clone failed')
-                              
                               return False
-                          
+
                           # Update .argocd-source file
                           argocd_file = os.path.join(repo_dir, 'k8s', f'.argocd-source-{app_name}.yaml')
-                          
+
                           # Create/update the ArgoCD source file with new image tags
                           image_list = []
                           for container in containers:
                               image_list.append(f'{{ harbor_registry }}/thinkube/{app_name}-{container["name"]}:{tag}')
-                          
+
                           # Write updated content
                           os.makedirs(os.path.dirname(argocd_file), exist_ok=True)
                           with open(argocd_file, 'w') as f:
@@ -424,77 +249,46 @@
                               f.write('  images:\n')
                               for image in image_list:
                                   f.write(f'  - {image}\n')
-                          
+
                           # Configure git user
-                          subprocess.run(['git', 'config', 'user.name', 'harbor-webhook-adapter'], 
+                          subprocess.run(['git', 'config', 'user.name', 'harbor-webhook-adapter'],
                                        cwd=repo_dir, timeout=10)
-                          subprocess.run(['git', 'config', 'user.email', 'webhook@thinkube.com'], 
+                          subprocess.run(['git', 'config', 'user.email', 'webhook@thinkube.com'],
                                        cwd=repo_dir, timeout=10)
-                          
+
                           # Commit changes
                           subprocess.run(['git', 'add', '.'], cwd=repo_dir, timeout=10)
                           commit_msg = f"build: automatic update of {app_name} to {tag}"
-                          commit_result = subprocess.run(['git', 'commit', '-m', commit_msg], 
+                          commit_result = subprocess.run(['git', 'commit', '-m', commit_msg],
                                                        cwd=repo_dir, capture_output=True, text=True, timeout=10)
-                          
+
                           if commit_result.returncode != 0:
                               if "nothing to commit" in commit_result.stdout:
                                   logger.info(f"No changes to commit for {app_name}:{tag}")
-                                  
-                                  # Update GitOps stage as succeeded (no changes needed)
-                                  if pipeline_id and gitops_stage_id:
-                                      update_cicd_stage(pipeline_id, gitops_stage_id, 'SUCCEEDED',
-                                                       details={'app_name': app_name, 'tag': tag, 'note': 'No changes'})
-                                  
                                   return True
                               else:
                                   logger.error(f"Git commit failed: {commit_result.stderr}")
-                                  
-                                  # Send GitOps update failed event
-                                  if pipeline_id and gitops_stage_id:
-                                      update_cicd_stage(pipeline_id, gitops_stage_id, 'FAILED', 
-                                                       error_message='Git commit failed')
-                                  
                                   return False
-                          
+
                           # Push changes
-                          push_result = subprocess.run(['git', 'push'], cwd=repo_dir, 
+                          push_result = subprocess.run(['git', 'push'], cwd=repo_dir,
                                                      capture_output=True, text=True, timeout=30)
                           if push_result.returncode != 0:
                               logger.error(f"Git push failed: {push_result.stderr}")
-                              
-                              # Update GitOps stage as failed
-                              if pipeline_id and gitops_stage_id:
-                                  update_cicd_stage(pipeline_id, gitops_stage_id, 'FAILED',
-                                                  error_message='Git push failed',
-                                                  details={'app_name': app_name, 'tag': tag})
-                              
                               return False
-                          
+
                           logger.info(f"Successfully updated git for {app_name} with tag {tag}")
-                          
-                          # Update GitOps stage as succeeded
-                          if pipeline_id and gitops_stage_id:
-                              update_cicd_stage(pipeline_id, gitops_stage_id, 'SUCCEEDED',
-                                              details={'app_name': app_name, 'tag': tag})
-                          
+
                           # Trigger ArgoCD sync after Git update
-                          if trigger_argocd_sync(app_name, pipeline_id):
+                          if trigger_argocd_sync(app_name):
                               logger.info(f"Successfully triggered ArgoCD sync for {app_name}")
                           else:
                               logger.warning(f"Failed to trigger ArgoCD sync for {app_name}, but Git update succeeded")
-                          
+
                           return True
-                          
+
                   except Exception as e:
                       logger.error(f"Failed to update git: {e}")
-                      
-                      # Update GitOps stage as failed due to error
-                      if pipeline_id and gitops_stage_id:
-                          update_cicd_stage(pipeline_id, gitops_stage_id, 'FAILED',
-                                          error_message=str(e),
-                                          details={'app_name': app_name, 'tag': tag})
-                      
                       return False
               
               def process_webhook_async(webhook_data):
@@ -576,80 +370,36 @@
                                   return
                               
                               logger.info(f"Found {len(containers)} containers from WorkflowTemplate: {[c['name'] for c in containers]}")
-                              # Initialize pipeline_id as None - will be set when we find the matching tag
-                              pipeline_id = None
-                              
+
                               for resource in resources:
                                   tag = resource.get('tag', '')
                                   if tag and tag != 'latest':  # Ignore latest tags
                                       logger.info(f"Received webhook for {app_name} - {repo_name}:{tag}")
-                                      
+
                                       # Smart Detection: Check if all container images exist in Harbor
                                       try:
-                                          # Use containers from metadata we already retrieved
-                                          container_names = [c['name'] for c in containers]
-                                          
                                           # Check each container image
                                           image_status = {}
                                           for container in containers:
                                               container_name = container['name']
                                               exists = check_harbor_image('thinkube', f'{app_name}-{container_name}', tag)
                                               image_status[container_name] = exists
-                                          
+
                                           all_images_exist = all(image_status.values())
                                           logger.info(f"Image check for {app_name}:{tag} - {image_status}")
-                                          
+
                                           if all_images_exist:
-                                              logger.info(f"All {len(containers)} images found for {app_name}:{tag}, checking if already processed...")
-                                              
-                                              # Get pipeline ID using the tag (which is the workflow UID)
-                                              pipeline_id = get_pipeline_by_workflow_uid(app_name, tag)
-                                              if not pipeline_id:
-                                                  logger.warning(f"No pipeline found for {app_name} with workflow UID {tag}, processing without monitoring")
-                                              else:
-                                                  logger.info(f"Found pipeline ID {pipeline_id} for {app_name} with tag/workflow UID {tag}")
-                                              
-                                              # Check if we've already processed this tag (either image_push OR gitops_update exists)
-                                              if pipeline_id and CICD_API_TOKEN:
-                                                  already_processed = False
-                                                  try:
-                                                      headers = {
-                                                          'Authorization': f'Bearer {CICD_API_TOKEN}',
-                                                          'Content-Type': 'application/json'
-                                                      }
-                                                      stages_url = f"{CICD_API_URL}/pipelines/{pipeline_id}"
-                                                      stages_response = requests.get(stages_url, headers=headers, timeout=5, verify=False)
-                                                      if stages_response.status_code == 200:
-                                                          pipeline_data = stages_response.json()
-                                                          # Check for either image_push or gitops_update with this tag
-                                                          for stage in pipeline_data.get('stages', []):
-                                                              if stage['stageName'] in ['image_push', 'gitops_update']:
-                                                                  if stage.get('details', {}).get('tag') == tag:
-                                                                      already_processed = True
-                                                                      logger.info(f"Tag {tag} already processed (found {stage['stageName']} stage)")
-                                                                      break
-                                                  except Exception as e:
-                                                      logger.warning(f"Error checking existing stages: {e}")
-                                                  
-                                                  if not already_processed:
-                                                      image_push_stage = create_cicd_stage(
-                                                          pipeline_id, 'image_push', 'harbor',
-                                                          status='SUCCEEDED',
-                                                          app_name=app_name, tag=tag
-                                                      )
-                                                      if not image_push_stage:
-                                                          logger.error(f"Failed to create image_push stage for {app_name}:{tag}, skipping git update")
-                                                          continue
-                                              
-                                              # Update git repository with both image tags
-                                              if update_git_with_images(app_name, tag, containers, pipeline_id):
+                                              logger.info(f"All {len(containers)} images found for {app_name}:{tag}")
+
+                                              # Update git repository with image tags
+                                              if update_git_with_images(app_name, tag, containers):
                                                   logger.info(f"Successfully updated git for {app_name}:{tag}")
                                               else:
                                                   logger.error(f"Failed to update git for {app_name}:{tag}")
                                           else:
                                               missing_containers = [name for name, exists in image_status.items() if not exists]
                                               logger.info(f"Waiting for images: {missing_containers}")
-                                              
+
                                       except Exception as e:
                                           logger.error(f"Failed to process webhook for {app_name}:{tag}: {e}")
                       
@@ -712,11 +462,6 @@
                       logger.info(f"Starting webhook adapter on port {PORT}")
                       logger.info(f"Harbor URL: {HARBOR_URL}")
                       logger.info(f"Gitea URL: {GITEA_URL}")
-                      logger.info(f"CI/CD API URL: {CICD_API_URL}")
-                      logger.info(f"CI/CD monitoring enabled: {'Yes' if CICD_API_TOKEN else 'No'}")
-                      if not CICD_API_TOKEN:
-                          logger.info("Running in bootstrap mode - webhook processing active, CI/CD monitoring will auto-enable when token becomes available")
-                      
                       # Add debug logging
                       logger.info(f"Creating HTTP server on 0.0.0.0:{PORT}")
                       httpd = HTTPServer(('0.0.0.0', PORT), WebhookHandler)
@@ -819,10 +564,6 @@
                     value: "http://argocd-sync-webhook.{{ adapter_namespace }}.svc.cluster.local/sync"
                   - name: SYNC_WEBHOOK_SECRET
                     value: "{{ sync_webhook_secret | default('') }}"
-                  - name: CICD_API_URL
-                    value: "https://control.{{ domain_name }}/api/v1/cicd"
-                  - name: CICD_API_TOKEN
-                    value: "{{ cicd_monitoring_token | default('') }}"
                   ports:
                   - containerPort: 8080
                     name: http
@@ -995,12 +736,6 @@
           4. ArgoCD deploys (30 sec)
           
           Total time: ~1.5 minutes (from push to deployment)
-          
-          CI/CD Monitoring Integration:
-          - harbor_webhook_received: When webhook is received
-          - gitops_update_started: When starting to update Git
-          - gitops_update_completed: When Git push succeeds
-          - argocd_sync_triggered: When ArgoCD sync is triggered
           
           This provides a near-local development experience!
           ════════════════════════════════════════════════════════

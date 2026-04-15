@@ -56,9 +56,7 @@ The orchestrator runs playbooks in this sequence:
 3. `12_deploy.yaml` - Main thinkube-control deployment
 4. `13_configure_code_server.yaml` - Configure code-server integration
 
-Note: The webhook adapters deploy first to enable the GitOps workflow for thinkube-control itself. 
-The webhook adapter starts in bootstrap mode and automatically enables full CI/CD monitoring once 
-thinkube-control creates the required token.
+Note: The webhook adapters deploy first to enable the GitOps workflow for thinkube-control itself.
 
 The deployment process:
 1. Deploy webhook infrastructure (Harbor adapter and ArgoCD sync webhook)
@@ -73,8 +71,7 @@ The deployment process:
 10. Push to Gitea (triggers Argo Workflow via webhook)
 11. Wait for container images to be built
 12. Deploy frontend and backend via ArgoCD from Gitea
-13. Create CI/CD monitoring token for full pipeline visibility
-14. Configure code-server integration
+13. Configure code-server integration
 
 ## Testing
 
