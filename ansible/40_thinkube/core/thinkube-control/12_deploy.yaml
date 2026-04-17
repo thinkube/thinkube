@@ -1103,6 +1103,61 @@
           "
       when: mcp_token_check.stdout | trim | int == 0
 
+    # Reconcile model mirror jobs from MLflow registry
+    # After a full deploy the model_mirror_jobs table is empty, but MLflow
+    # still has all registered models. Re-populate from the MLflow DB so the
+    # UI shows the correct download status.
+    # On first install MLflow may not exist yet — check before querying.
+    - name: Check if MLflow database exists
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'mlflow';"
+      register: mlflow_db_exists
+      ignore_errors: true
+
+    - name: Get registered model IDs from MLflow
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d mlflow -tAc "
+          SELECT p.value
+          FROM registered_models rm
+          JOIN model_versions mv ON rm.name = mv.name
+          JOIN runs r ON mv.run_id = r.run_uuid
+          JOIN params p ON r.run_uuid = p.run_uuid AND p.key = 'model_id'
+          GROUP BY p.value;
+          "
+      register: mlflow_model_ids
+      when: mlflow_db_exists.stdout | default('') | trim == '1'
+      ignore_errors: true
+
+    - name: Reconcile model mirror jobs from MLflow registry
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d thinkube_control -c "
+          INSERT INTO model_mirror_jobs (id, model_id, status, workflow_name, created_at, updated_at)
+          VALUES (gen_random_uuid(), '{{ item }}', 'succeeded', 'reconciled-from-mlflow', NOW(), NOW())
+          ON CONFLICT (model_id) DO NOTHING;
+          "
+      loop: "{{ mlflow_model_ids.stdout_lines | default([]) | select | list }}"
+      when:
+        - mlflow_model_ids is defined
+        - mlflow_model_ids.stdout_lines is defined
+        - mlflow_model_ids.stdout_lines | select | list | length > 0
+      register: reconcile_models
+      changed_when: "'INSERT 0 1' in (reconcile_models.stdout | default(''))"
+
     # Display setup summary
     - name: Display setup summary
       ansible.builtin.debug:
