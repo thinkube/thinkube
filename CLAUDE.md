@@ -154,7 +154,7 @@ This repository is the source of truth. The installer clones it to `/tmp/` for e
 
 When modifying thinkube-control (the platform control plane), follow this exact workflow:
 
-1. Edit files in `/home/thinkube/thinkube-platform/thinkube-control/`
+1. Edit files in `/home/thinkube/thinkube-platform/core/thinkube-control/`
 2. Commit and push to GitHub
 3. Deploy: `./scripts/tk_ansible ansible/40_thinkube/core/thinkube-control/12_deploy_dev.yaml`
 
@@ -165,7 +165,7 @@ The deployment uses Copier to sync from GitHub to the runtime location (`/home/t
 
 ## Template Deployments (FORBIDDEN)
 
-Never deploy, redeploy, or trigger builds for template deployments (namespaces like `gptoss20`). These are only triggered through the thinkube-control UI. You may modify template source files in `/home/thinkube/thinkube-platform/tkt-*` and build/push base images, but stop after changes and let the user trigger rebuilds.
+Never deploy, redeploy, or trigger builds for template deployments (namespaces like `gptoss20`). These are only triggered through the thinkube-control UI. You may modify template source files in `/home/thinkube/thinkube-platform/templates/tkt-*` and build/push base images, but stop after changes and let the user trigger rebuilds.
 
 ## Monitoring
 

@@ -373,7 +373,7 @@
           remote_user = {{ system_username }}
           private_key_file = /host-ssh/thinkube_cluster_key
           interpreter_python = auto_silent
-          roles_path = /home/thinkube/thinkube-platform/thinkube/ansible/roles
+          roles_path = /home/thinkube/thinkube-platform/core/thinkube/ansible/roles
 
           [ssh_connection]
           ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no
@@ -494,53 +494,45 @@
 
     - name: Parse repository list for development cloning
       ansible.builtin.set_fact:
-        repos_to_clone: "{{ (repo_metadata.content | from_json).repositories | selectattr('clone_for_development', 'equalto', true) | map(attribute='full_name') | list }}"
+        repos_to_clone: "{{ (repo_metadata.content | from_json).repositories | selectattr('clone_for_development', 'equalto', true) | list }}"
       failed_when: repos_to_clone | length == 0
 
-    - name: Clone platform repositories
+    - name: Clone platform repositories into category directories
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "
             set -e
             echo '===== Cloning platform repositories ====='
 
-            # Check if SSH key exists
             if [ -f /home/thinkube/.ssh/github_ed25519 ]; then
               echo 'GitHub SSH key found at /home/thinkube/.ssh/github_ed25519'
               chmod 600 /home/thinkube/.ssh/github_ed25519
 
-              # Repository list fetched from thinkube-metadata
-              REPOS=(
-                {% for repo in repos_to_clone %}
-                '{{ repo }}'
-                {% endfor %}
-              )
-
-              echo \"Cloning {{ repos_to_clone | length }} repositories from metadata...\"
-
-              # Clone or update each repository
-              for repo in \"\${REPOS[@]}\"; do
-                repo_name=\$(basename \$repo)
-                if [ ! -d \"/home/thinkube/thinkube-platform/\$repo_name\" ]; then
-                  echo \"Cloning \$repo...\"
-                  GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
-                    git clone \"git@github.com:\$repo.git\" \"/home/thinkube/thinkube-platform/\$repo_name\"
+              {% for repo in repos_to_clone %}
+              # {{ repo.name }} -> {{ repo.category | default('misc') }}/
+              category='{{ repo.category | default('misc') }}'
+              repo_name='{{ repo.name }}'
+              repo_full='{{ repo.full_name }}'
+              mkdir -p \"/home/thinkube/thinkube-platform/\$category\"
+              if [ ! -d \"/home/thinkube/thinkube-platform/\$category/\$repo_name\" ]; then
+                echo \"Cloning \$repo_full into \$category/\$repo_name...\"
+                GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
+                  git clone \"git@github.com:\$repo_full.git\" \"/home/thinkube/thinkube-platform/\$category/\$repo_name\"
+              else
+                echo \"\$category/\$repo_name already exists, pulling latest changes...\"
+                cd \"/home/thinkube/thinkube-platform/\$category/\$repo_name\"
+                git reset --hard HEAD
+                if GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' git fetch origin 2>&1; then
+                  echo \"Resetting to origin/main for \$repo_name...\"
+                  git reset --hard origin/main
                 else
-                  echo \"\$repo_name already exists, pulling latest changes...\"
-                  cd \"/home/thinkube/thinkube-platform/\$repo_name\"
-                  # Reset any local changes to avoid merge conflicts
-                  git reset --hard HEAD
-                  # Fetch and force update to latest from origin
-                  echo \"Fetching latest from origin for \$repo_name...\"
-                  if GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' git fetch origin 2>&1; then
-                    echo \"Resetting to origin/main for \$repo_name...\"
-                    git reset --hard origin/main
-                  else
-                    echo \"ERROR: Failed to fetch from origin for \$repo_name\"
-                    exit 1
-                  fi
+                  echo \"ERROR: Failed to fetch from origin for \$repo_name\"
+                  exit 1
                 fi
-              done
+              fi
+              {% endfor %}
+
+              echo '✅ All platform repositories cloned'
             else
               echo 'ERROR: No SSH key found at /home/thinkube/.ssh/github_ed25519'
               echo 'Please ensure GitHub SSH key is properly configured'
@@ -618,12 +610,12 @@
     - name: Create symlink for tk_ansible command inside container
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "sudo ln -sf /home/thinkube/thinkube-platform/thinkube/scripts/tk_ansible /usr/local/bin/tk_ansible"
+          bash -c "sudo ln -sf /home/thinkube/thinkube-platform/core/thinkube/scripts/tk_ansible /usr/local/bin/tk_ansible"
 
     - name: Create symlink for tk_ssh command inside container
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "sudo ln -sf /home/thinkube/thinkube-platform/thinkube/scripts/tk_ssh /usr/local/bin/tk_ssh"
+          bash -c "sudo ln -sf /home/thinkube/thinkube-platform/core/thinkube/scripts/tk_ssh /usr/local/bin/tk_ssh"
 
     - name: Build hostAliases list for cluster nodes
       ansible.builtin.set_fact:
@@ -678,7 +670,7 @@
           bash -c "
             set -e
             echo '===== Configuring git SSH for cloned repositories ====='
-            for repo_dir in /home/thinkube/thinkube-platform/* /home/thinkube/user-templates/*; do
+            for repo_dir in /home/thinkube/thinkube-platform/*/* /home/thinkube/user-templates/*; do
               if [ -d \"\$repo_dir/.git\" ]; then
                 repo_name=\$(basename \$repo_dir)
                 echo \"Configuring git SSH for \$repo_name...\"
@@ -942,14 +934,14 @@
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c '
-          if [ -d "/home/thinkube/thinkube-platform/thinkube-ai-integration" ]; then
+          if [ -d "/home/thinkube/thinkube-platform/extensions/thinkube-ai-integration" ]; then
             echo "Building thinkube-ai-integration extension..."
-            cd /home/thinkube/thinkube-platform/thinkube-ai-integration
+            cd /home/thinkube/thinkube-platform/extensions/thinkube-ai-integration
             git pull || echo "Could not pull latest changes"
             npm install --production=false
             npm run compile
             rm -rf /home/thinkube/.local/share/code-server/extensions/thinkube.thinkube-ai-integration-*
-            ln -sf /home/thinkube/thinkube-platform/thinkube-ai-integration /home/thinkube/.local/share/code-server/extensions/thinkube-ai-integration
+            ln -sf /home/thinkube/thinkube-platform/extensions/thinkube-ai-integration /home/thinkube/.local/share/code-server/extensions/thinkube-ai-integration
             echo "✅ thinkube-ai-integration extension installed"
           else
             echo "❌ thinkube-ai-integration repository not found"
@@ -965,14 +957,14 @@
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c '
-          if [ -d "/home/thinkube/thinkube-platform/thinkube-cicd-monitor" ]; then
+          if [ -d "/home/thinkube/thinkube-platform/extensions/thinkube-cicd-monitor" ]; then
             echo "Building thinkube-cicd-monitor extension..."
-            cd /home/thinkube/thinkube-platform/thinkube-cicd-monitor
+            cd /home/thinkube/thinkube-platform/extensions/thinkube-cicd-monitor
             git pull || echo "Could not pull latest changes"
             npm install --production=false
             npm run compile
             rm -rf /home/thinkube/.local/share/code-server/extensions/thinkube.thinkube-cicd-monitor-*
-            ln -sf /home/thinkube/thinkube-platform/thinkube-cicd-monitor /home/thinkube/.local/share/code-server/extensions/thinkube-cicd-monitor
+            ln -sf /home/thinkube/thinkube-platform/extensions/thinkube-cicd-monitor /home/thinkube/.local/share/code-server/extensions/thinkube-cicd-monitor
             echo "✅ thinkube-cicd-monitor extension installed"
           else
             echo "❌ thinkube-cicd-monitor repository not found"
