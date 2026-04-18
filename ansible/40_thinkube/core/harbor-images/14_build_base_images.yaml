@@ -338,9 +338,11 @@
     #   retries: 2
     #   delay: 10
 
-    # TensorRT-LLM Base Image - Based on PyTorch 25.11 with TensorRT-LLM pip installed
-    # Provides FA2 + TransformerEngine optimizations with full trtllm-serve support
-    # Pre-installs openai and gradio dependencies to speed up template deployments
+    # TensorRT-LLM Base Image — architecture-aware
+    # arm64: uses DGX Spark SDK (tensorrt-llm-spark) with MXFP4, Blackwell support
+    # amd64: uses standard TensorRT-LLM release
+    # Both provide FA2 + trtllm-serve; this layer adds gradio, mlflow, openai-harmony
+    # Built per-architecture because each uses a different base image
 
     - name: Template TensorRT-LLM base Containerfile
       ansible.builtin.template:
@@ -348,22 +350,73 @@
         dest: "{{ temp_containerfiles_dir.path }}/tensorrt-llm-base.Containerfile"
       tags: [tensorrt-llm-base]
 
-    - name: Build TensorRT-LLM base image
+    - name: Define TensorRT-LLM per-arch base images
+      ansible.builtin.set_fact:
+        tensorrt_llm_arch_builds: >-
+          {%- set builds = [] -%}
+          {%- set platforms = (container_build_platforms | default('linux/' + ('arm64' if ansible_architecture == 'aarch64' else 'amd64'))).split(',') | map('trim') | list -%}
+          {%- for p in platforms -%}
+            {%- if 'arm64' in p -%}
+              {{ builds.append({'platform': 'linux/arm64', 'base': harbor_registry + '/library/tensorrt-llm-spark:latest'}) }}
+            {%- elif 'amd64' in p -%}
+              {{ builds.append({'platform': 'linux/amd64', 'base': harbor_registry + '/library/tensorrt-llm:latest'}) }}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ builds }}
+      tags: [tensorrt-llm-base]
+
+    - name: Build TensorRT-LLM base image (per-arch)
       ansible.builtin.shell: |
-        podman build --platform linux/arm64 \
+        podman build --platform {{ item.platform }} \
                      --tls-verify=true \
-                     -t {{ harbor_registry }}/library/tensorrt-llm-base:25.11 \
-                     -t {{ harbor_registry }}/library/tensorrt-llm-base:latest \
+                     --build-arg BASE_IMAGE={{ item.base }} \
+                     -t {{ harbor_registry }}/library/tensorrt-llm-base:25.11-{{ item.platform | replace('linux/', '') }} \
                      -f {{ temp_containerfiles_dir.path }}/tensorrt-llm-base.Containerfile \
                      {{ base_images_dir }}
+      loop: "{{ tensorrt_llm_arch_builds }}"
       register: tensorrt_llm_base_build
       changed_when: true
       tags: [tensorrt-llm-base]
 
-    - name: Push TensorRT-LLM base image
+    - name: Create TensorRT-LLM manifest list
       ansible.builtin.shell: |
+        # Remove existing manifests
+        podman manifest rm {{ harbor_registry }}/library/tensorrt-llm-base:25.11 2>/dev/null || true
+        podman manifest rm {{ harbor_registry }}/library/tensorrt-llm-base:latest 2>/dev/null || true
+
+        # Create manifest from per-arch images
+        podman manifest create {{ harbor_registry }}/library/tensorrt-llm-base:25.11 \
+        {% for build in tensorrt_llm_arch_builds %}
+          {{ harbor_registry }}/library/tensorrt-llm-base:25.11-{{ build.platform | replace('linux/', '') }}{{ ' \\' if not loop.last else '' }}
+        {% endfor %}
+
+        podman manifest push --tls-verify=true \
+          {{ harbor_registry }}/library/tensorrt-llm-base:25.11 \
+          docker://{{ harbor_registry }}/library/tensorrt-llm-base:25.11
+
+        # Also tag as latest
+        podman manifest create {{ harbor_registry }}/library/tensorrt-llm-base:latest \
+        {% for build in tensorrt_llm_arch_builds %}
+          {{ harbor_registry }}/library/tensorrt-llm-base:25.11-{{ build.platform | replace('linux/', '') }}{{ ' \\' if not loop.last else '' }}
+        {% endfor %}
+
+        podman manifest push --tls-verify=true \
+          {{ harbor_registry }}/library/tensorrt-llm-base:latest \
+          docker://{{ harbor_registry }}/library/tensorrt-llm-base:latest
+      when: tensorrt_llm_arch_builds | length > 1
+      register: tensorrt_llm_manifest
+      changed_when: true
+      tags: [tensorrt-llm-base]
+
+    - name: Push TensorRT-LLM base image (single-arch)
+      ansible.builtin.shell: |
+        podman tag {{ harbor_registry }}/library/tensorrt-llm-base:25.11-{{ tensorrt_llm_arch_builds[0].platform | replace('linux/', '') }} \
+                   {{ harbor_registry }}/library/tensorrt-llm-base:25.11
+        podman tag {{ harbor_registry }}/library/tensorrt-llm-base:25.11-{{ tensorrt_llm_arch_builds[0].platform | replace('linux/', '') }} \
+                   {{ harbor_registry }}/library/tensorrt-llm-base:latest
         podman push --tls-verify=true {{ harbor_registry }}/library/tensorrt-llm-base:25.11
         podman push --tls-verify=true {{ harbor_registry }}/library/tensorrt-llm-base:latest
+      when: tensorrt_llm_arch_builds | length == 1
       register: tensorrt_llm_base_push
       changed_when: tensorrt_llm_base_push.rc == 0
       failed_when: tensorrt_llm_base_push.rc != 0
