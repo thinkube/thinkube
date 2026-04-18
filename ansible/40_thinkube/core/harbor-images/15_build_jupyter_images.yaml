@@ -5,12 +5,13 @@
 # ansible/40_thinkube/core/harbor/15_build_jupyter_images.yaml
 # Description:
 #   Build and push tk-jupyter-base image to Harbor library project.
-#   This minimal image uses NVIDIA PyTorch with Flash Attention 2 support.
-#   ML packages are installed in persistent venvs on JuiceFS.
+#   Multi-arch: each architecture builds natively on a node of that architecture.
+#   No QEMU emulation — when container_build_platforms has multiple architectures,
+#   builds are delegated to matching nodes via delegate_to.
 #
 # Requirements:
 #   - Harbor registry deployed and accessible
-#   - Podman installed on the k8s-snap control plane node
+#   - Podman installed on all build nodes
 #   - Harbor admin credentials
 #   - NVIDIA PyTorch image mirrored to Harbor (13_mirror_public_images.yaml)
 #
@@ -26,6 +27,7 @@
 #
 # Variables from inventory:
 #   - harbor_registry: Harbor registry hostname
+#   - container_build_platforms: e.g., "linux/arm64" or "linux/amd64,linux/arm64"
 #   - admin_password: Admin password from environment
 #
 # Dependencies:
@@ -39,23 +41,63 @@
   vars:
     local_base_images_dir: "{{ playbook_dir }}/base-images"
     base_images_dir: "/tmp/harbor-base-images"
+    remote_containerfiles_dir: "/tmp/harbor-containerfiles"
     admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
   tasks:
     # ==========================================================================
-    # SETUP
+    # SETUP: Determine architectures and build nodes
     # ==========================================================================
+
+    - name: Parse build platforms into architecture list
+      ansible.builtin.set_fact:
+        build_architectures: >-
+          {%- set archs = [] -%}
+          {%- set platforms = (container_build_platforms | default('linux/' + ('arm64' if ansible_architecture == 'aarch64' else 'amd64'))).split(',') | map('trim') | list -%}
+          {%- for p in platforms -%}
+            {%- set arch = p | replace('linux/', '') -%}
+            {{ archs.append(arch) or '' }}
+          {%- endfor -%}
+          {{ archs }}
+
+    - name: Map each architecture to a build node from inventory
+      ansible.builtin.set_fact:
+        arch_build_nodes: >-
+          {%- set nodes = {} -%}
+          {%- for arch in build_architectures -%}
+            {%- set inv_group = 'x86_64' if arch == 'amd64' else arch -%}
+            {%- set candidates = groups.get(inv_group, []) | intersect(groups.get('k8s_cluster', [])) -%}
+            {%- if candidates | length > 0 -%}
+              {%- set _ = nodes.update({arch: candidates[0]}) -%}
+            {%- else -%}
+              {%- set _ = nodes.update({arch: inventory_hostname}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ nodes }}
+        is_multi_arch: "{{ build_architectures | length > 1 }}"
+
+    - name: Display build configuration
+      ansible.builtin.debug:
+        msg: >-
+          Architectures: {{ build_architectures | join(', ') }}.
+          Multi-arch: {{ is_multi_arch }}.
+          Build nodes: {{ arch_build_nodes }}
+
+    # ==========================================================================
+    # SETUP: Build context and Harbor login
+    # ==========================================================================
+
     - name: Create build context directory
       ansible.builtin.file:
         path: "{{ base_images_dir }}"
         state: directory
         mode: '0755'
 
-    - name: Create temp directory for templated Containerfiles
-      ansible.builtin.tempfile:
+    - name: Create Containerfiles directory
+      ansible.builtin.file:
+        path: "{{ remote_containerfiles_dir }}"
         state: directory
-        suffix: jupyter-containerfiles
-      register: temp_containerfiles_dir
+        mode: '0755'
 
     - name: Template Thinkube environment file for Jupyter images
       ansible.builtin.template:
@@ -93,57 +135,122 @@
         dest: "{{ base_images_dir }}/thinkube_models.py"
         mode: '0644'
 
-    - name: Login to Harbor
-      ansible.builtin.shell: |
-        echo {{ admin_password }} | podman login {{ harbor_registry }} -u admin --password-stdin --tls-verify=true
-      changed_when: false
-      no_log: true
-
     - name: Template startup.sh for Jupyter images
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/startup.sh.j2"
         dest: "{{ base_images_dir }}/startup.sh"
 
-    # ==========================================================================
-    # BUILD tk-jupyter-base
-    # ==========================================================================
     - name: Template tk-jupyter-base Containerfile
       ansible.builtin.template:
         src: "{{ local_base_images_dir }}/tk-jupyter-base.Containerfile.j2"
-        dest: "{{ temp_containerfiles_dir.path }}/tk-jupyter-base.Containerfile"
+        dest: "{{ remote_containerfiles_dir }}/tk-jupyter-base.Containerfile"
 
-    - name: Build tk-jupyter-base image
-      ansible.builtin.shell: |
-        podman build --platform {{ container_build_platforms | default('linux/amd64,linux/arm64') }} \
-                     --tls-verify=true \
-                     --build-arg CACHE_BUST=$(date +%s) \
-                     -t {{ harbor_registry }}/library/tk-jupyter-base:latest \
-                     -f {{ temp_containerfiles_dir.path }}/tk-jupyter-base.Containerfile \
-                     {{ base_images_dir }}
-      register: tk_jupyter_base_build
-      changed_when: true
+    # ==========================================================================
+    # PREPARE: Ensure podman and Harbor login on all build nodes
+    # ==========================================================================
 
-    - name: Push tk-jupyter-base image
+    - name: Ensure podman installed on all build nodes
+      ansible.builtin.apt:
+        name: podman
+        state: present
+        update_cache: yes
+      become: true
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      when: ansible_os_family == "Debian"
+
+    - name: Login to Harbor on all build nodes
       ansible.builtin.shell: |
-        podman push --tls-verify=true {{ harbor_registry }}/library/tk-jupyter-base:latest
-      register: tk_jupyter_base_push
-      changed_when: tk_jupyter_base_push.rc == 0
-      failed_when: tk_jupyter_base_push.rc != 0
-      retries: 2
-      delay: 10
+        echo {{ admin_password }} | podman login {{ harbor_registry }} -u admin --password-stdin --tls-verify=true
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      changed_when: false
+      no_log: true
+
+    # ==========================================================================
+    # DISTRIBUTE: Copy build context and Containerfiles to remote build nodes
+    # ==========================================================================
+
+    - name: Create directories on remote build nodes
+      ansible.builtin.file:
+        path: "{{ item[1] }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ item[0].value }}"
+      loop: "{{ arch_build_nodes | dict2items | product([base_images_dir, remote_containerfiles_dir]) | list }}"
+      loop_control:
+        label: "{{ item[0].key }}: {{ item[1] }}"
+      when: is_multi_arch and item[0].value != inventory_hostname
+
+    - name: Sync build context to remote build nodes
+      ansible.posix.synchronize:
+        src: "{{ base_images_dir }}/"
+        dest: "{{ base_images_dir }}/"
+        mode: push
+        rsync_opts:
+          - "--archive"
+          - "--compress"
+          - "--delete"
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      when: is_multi_arch and item.value != inventory_hostname
+
+    - name: Sync Containerfiles to remote build nodes
+      ansible.posix.synchronize:
+        src: "{{ remote_containerfiles_dir }}/"
+        dest: "{{ remote_containerfiles_dir }}/"
+        mode: push
+        rsync_opts:
+          - "--archive"
+          - "--compress"
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      when: is_multi_arch and item.value != inventory_hostname
+
+    # ==========================================================================
+    # BUILD tk-jupyter-base
+    # ==========================================================================
+
+    - name: Build tk-jupyter-base
+      ansible.builtin.include_tasks: _build_native_image.yaml
+      vars:
+        image_name: "{{ harbor_registry }}/library/tk-jupyter-base"
+        image_tags: ["latest"]
+        containerfile: "tk-jupyter-base.Containerfile"
+        build_context: "{{ base_images_dir }}"
+        extra_build_args: "--build-arg CACHE_BUST={{ ansible_date_time.epoch }}"
 
     # ==========================================================================
     # CLEANUP
     # ==========================================================================
-    - name: Clean up temp containerfiles directory
+
+    - name: Clean up Containerfiles directory
       ansible.builtin.file:
-        path: "{{ temp_containerfiles_dir.path }}"
+        path: "{{ remote_containerfiles_dir }}"
         state: absent
-      when: temp_containerfiles_dir.path is defined
+
+    - name: Clean up Containerfiles on remote build nodes
+      ansible.builtin.file:
+        path: "{{ remote_containerfiles_dir }}"
+        state: absent
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      when: is_multi_arch and item.value != inventory_hostname
 
     # ==========================================================================
     # MANIFEST
     # ==========================================================================
+
     - name: Create manifest for tk-jupyter-base
       include_role:
         name: container_deployment/image_manifest
@@ -172,6 +279,10 @@
           ════════════════════════════════════════════════════════
 
           Image: {{ harbor_registry }}/library/tk-jupyter-base:latest
+
+          Architectures: {{ build_architectures | join(', ') }}
+          Multi-arch: {{ is_multi_arch }}
+          Build nodes: {{ arch_build_nodes }}
 
           Base: NVIDIA PyTorch 25.04 with Flash Attention 2 support
           User: thinkube (UID 1000)

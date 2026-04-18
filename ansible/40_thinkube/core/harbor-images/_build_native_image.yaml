@@ -1,0 +1,93 @@
+---
+# _build_native_image.yaml
+# Reusable tasks for building container images natively on architecture-matching nodes.
+# No QEMU emulation — each architecture builds on a node of that architecture.
+#
+# Required variables (passed by caller):
+#   image_name: Full image name without tag (e.g., "registry.example.com/library/python-base")
+#   image_tags: List of tags (e.g., ["3.12-slim"]). First tag used for per-arch builds.
+#   containerfile: Filename of the Containerfile (must exist in remote_containerfiles_dir)
+#   build_context: Path to the build context directory on each build node
+#
+# Optional variables:
+#   extra_build_args: Additional --build-arg flags as a string (e.g., "--build-arg FOO=bar")
+#   no_cache: Set to true to add --no-cache flag
+#
+# Expected variables from parent playbook:
+#   arch_build_nodes: Dict mapping arch -> hostname (e.g., {"arm64": "tkspark", "amd64": "node-a"})
+#   is_multi_arch: Boolean — whether multiple architectures are configured
+#   remote_containerfiles_dir: Path to Containerfiles directory on build nodes
+#   harbor_registry: Harbor registry hostname
+
+- name: "{{ image_name | regex_replace('.*/','') }} — build (single-arch)"
+  ansible.builtin.shell: |
+    podman build {{ '--no-cache' if no_cache | default(false) else '' }} \
+                 --tls-verify=true \
+                 {{ extra_build_args | default('') }} \
+                 {% for tag in image_tags %}
+                 -t {{ image_name }}:{{ tag }} \
+                 {% endfor %}
+                 -f {{ remote_containerfiles_dir }}/{{ containerfile }} \
+                 {{ build_context }}
+  register: _build_result
+  changed_when: true
+  when: not is_multi_arch
+
+- name: "{{ image_name | regex_replace('.*/','') }} — push (single-arch)"
+  ansible.builtin.shell: |
+    podman push --tls-verify=true {{ image_name }}:{{ item }}
+  loop: "{{ image_tags }}"
+  register: _push_result
+  changed_when: true
+  failed_when: _push_result.rc != 0
+  retries: 2
+  delay: 10
+  when: not is_multi_arch
+
+- name: "{{ image_name | regex_replace('.*/','') }} — build natively on {{ item.key }}"
+  ansible.builtin.shell: |
+    podman build {{ '--no-cache' if no_cache | default(false) else '' }} \
+                 --platform linux/{{ item.key }} \
+                 --tls-verify=true \
+                 {{ extra_build_args | default('') }} \
+                 -t {{ image_name }}:{{ image_tags[0] }}-{{ item.key }} \
+                 -f {{ remote_containerfiles_dir }}/{{ containerfile }} \
+                 {{ build_context }}
+  delegate_to: "{{ item.value }}"
+  loop: "{{ arch_build_nodes | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} on {{ item.value }}"
+  register: _build_arch_result
+  changed_when: true
+  when: is_multi_arch
+
+- name: "{{ image_name | regex_replace('.*/','') }} — push per-arch from {{ item.key }}"
+  ansible.builtin.shell: |
+    podman push --tls-verify=true {{ image_name }}:{{ image_tags[0] }}-{{ item.key }}
+  delegate_to: "{{ item.value }}"
+  loop: "{{ arch_build_nodes | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} on {{ item.value }}"
+  register: _push_arch_result
+  changed_when: true
+  failed_when: _push_arch_result.rc != 0
+  retries: 2
+  delay: 10
+  when: is_multi_arch
+
+- name: "{{ image_name | regex_replace('.*/','') }} — create manifest list"
+  ansible.builtin.shell: |
+    {% for tag in image_tags %}
+    podman manifest rm {{ image_name }}:{{ tag }} 2>/dev/null || true
+    podman manifest create {{ image_name }}:{{ tag }} \
+    {% for arch in arch_build_nodes.keys() %}
+      {{ image_name }}:{{ image_tags[0] }}-{{ arch }}{{ ' \\' if not loop.last else '' }}
+    {% endfor %}
+
+    podman manifest push --tls-verify=true \
+      {{ image_name }}:{{ tag }} \
+      docker://{{ image_name }}:{{ tag }}
+    {% endfor %}
+  register: _manifest_result
+  changed_when: true
+  when: is_multi_arch
