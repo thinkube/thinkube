@@ -654,34 +654,40 @@ singleuser:
           done
 
           # Register custom venvs (built via thinkube-control, synced to all GPU nodes)
-          # Only register custom venvs that match the current architecture (via .arch file)
+          # Venvs are stored at custom/<name>/<arch>/ for multi-arch support
+          # Falls back to custom/<name>/ (legacy flat layout) if no arch subdir exists
           CUSTOM_VENVS_DIR="$VENVS_BASE/custom"
           if [ -d "$CUSTOM_VENVS_DIR" ]; then
-            for venv in "$CUSTOM_VENVS_DIR"/*/; do
-              if [ -d "$venv" ] && [ -f "$venv/bin/python" ]; then
-                VENV_NAME=$(basename "$venv")
+            for venv_dir in "$CUSTOM_VENVS_DIR"/*/; do
+              [ -d "$venv_dir" ] || continue
+              VENV_NAME=$(basename "$venv_dir")
 
-                # Check architecture marker for multi-arch support
+              # New layout: custom/<name>/<arch>/
+              ARCH_VENV="$venv_dir/$ARCH_DIR"
+              if [ -d "$ARCH_VENV" ] && [ -f "$ARCH_VENV/bin/python" ]; then
+                DISPLAY_NAME="$VENV_NAME (custom, $ARCH_DIR)"
+                echo "Registering custom kernel: $VENV_NAME as '$DISPLAY_NAME'"
+                "$ARCH_VENV/bin/python" -m ipykernel install \
+                  --prefix="$VENVS_BASE" \
+                  --name="$VENV_NAME" \
+                  --display-name="$DISPLAY_NAME" \
+                  2>/dev/null || echo "  Note: kernel may already be registered"
+                continue
+              fi
+
+              # Legacy layout: custom/<name>/ with .arch file
+              if [ -f "$venv_dir/bin/python" ]; then
                 VENV_ARCH=""
-                if [ -f "$venv/.arch" ]; then
-                  VENV_ARCH=$(cat "$venv/.arch" 2>/dev/null || echo "")
+                if [ -f "$venv_dir/.arch" ]; then
+                  VENV_ARCH=$(cat "$venv_dir/.arch" 2>/dev/null || echo "")
                 fi
-
-                # Skip if venv was built for different architecture
                 if [ -n "$VENV_ARCH" ] && [ "$VENV_ARCH" != "$ARCH_DIR" ]; then
                   echo "Skipping custom kernel $VENV_NAME - built for $VENV_ARCH, current arch is $ARCH_DIR"
                   continue
                 fi
-
-                # Register kernel with architecture info
-                DISPLAY_NAME="$VENV_NAME (custom"
-                if [ -n "$VENV_ARCH" ]; then
-                  DISPLAY_NAME="$DISPLAY_NAME, $VENV_ARCH"
-                fi
-                DISPLAY_NAME="$DISPLAY_NAME)"
-
+                DISPLAY_NAME="$VENV_NAME (custom${VENV_ARCH:+, $VENV_ARCH})"
                 echo "Registering custom kernel: $VENV_NAME as '$DISPLAY_NAME'"
-                "$venv/bin/python" -m ipykernel install \
+                "$venv_dir/bin/python" -m ipykernel install \
                   --prefix="$VENVS_BASE" \
                   --name="$VENV_NAME" \
                   --display-name="$DISPLAY_NAME" \
