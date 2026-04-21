@@ -209,7 +209,47 @@
       loop: "{{ arch_build_nodes | dict2items }}"
       loop_control:
         label: "{{ item.key }} ({{ item.value }})"
-      when: ansible_os_family == "Debian"
+      tags: [always]
+
+    - name: Ensure build nodes can resolve {{ domain_name }} via CoreDNS
+      block:
+        - name: Create systemd-resolved conf directory on build nodes
+          ansible.builtin.file:
+            path: /etc/systemd/resolved.conf.d
+            state: directory
+            mode: '0755'
+          become: true
+          delegate_to: "{{ item.value }}"
+          loop: "{{ arch_build_nodes | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value }})"
+
+        - name: Configure DNS forwarding for {{ domain_name }} on build nodes
+          ansible.builtin.copy:
+            dest: /etc/systemd/resolved.conf.d/coredns-external.conf
+            content: |
+              [Resolve]
+              DNS={{ zerotier_subnet_prefix }}{{ dns_external_ip_octet }}
+              Domains=~{{ domain_name }}
+            mode: '0644'
+          become: true
+          delegate_to: "{{ item.value }}"
+          loop: "{{ arch_build_nodes | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value }})"
+          register: _resolved_config
+
+        - name: Restart systemd-resolved on build nodes
+          ansible.builtin.systemd:
+            name: systemd-resolved
+            state: restarted
+          become: true
+          delegate_to: "{{ item.value }}"
+          loop: "{{ arch_build_nodes | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value }})"
+          when: _resolved_config.changed
+      when: is_multi_arch
       tags: [always]
 
     - name: Login to Harbor on all build nodes
