@@ -541,12 +541,26 @@
       listen: reload_ufw
       changed_when: true
 
-- name: Verify Cluster Status
+- name: Pin Critical Services and Verify Cluster Status
   hosts: k8s_control_plane
   become: true
   gather_facts: false
 
   tasks:
+    - name: Pin CoreDNS to control plane node
+      ansible.builtin.command: >
+        k8s kubectl -n kube-system patch deployment coredns
+        --type=merge
+        -p '{"spec":{"template":{"spec":{"nodeSelector":{"node-role.kubernetes.io/control-plane":""}}}}}'
+      register: coredns_pin
+      changed_when: "'patched' in coredns_pin.stdout"
+
+    - name: Wait for CoreDNS rollout after pinning
+      ansible.builtin.command: >
+        k8s kubectl -n kube-system rollout status deployment/coredns --timeout=120s
+      when: coredns_pin.changed
+      changed_when: false
+
     - name: Get all cluster nodes
       ansible.builtin.command: k8s kubectl get nodes -o wide
       register: all_nodes

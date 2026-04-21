@@ -72,8 +72,23 @@
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
 
-    # MetalLB is now enabled in the k8s-snap installation playbook
-    # CoreDNS configuration starts here
+    - name: Pin CoreDNS to control plane node
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system patch deployment coredns
+        --type=merge
+        -p '{"spec":{"template":{"spec":{"nodeSelector":{"node-role.kubernetes.io/control-plane":""}}}}}'
+      register: coredns_pin
+      changed_when: "'patched' in coredns_pin.stdout"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Wait for CoreDNS rollout after pinning
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system rollout status deployment/coredns --timeout=120s
+      when: coredns_pin.changed
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
 
     # Configure k8s-snap DNS upstream to use BIND9
     # This persists across restarts and prevents k8s-snap from resetting the config
