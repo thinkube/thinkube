@@ -31,6 +31,9 @@
 
   vars:
     k8s_channel: "1.35-classic/stable"
+    k8s_snap_revisions:
+      amd64: "5046"
+      arm64: "5049"
     user: "{{ system_username }}"
     user_home: "/home/{{ user }}"
     kubectl_wrapper_path: "{{ user_home }}/.local/bin/kubectl"
@@ -160,11 +163,16 @@
       failed_when: false
       changed_when: false
 
-    - name: Install k8s-snap on workers
-      ansible.builtin.command: snap install k8s --classic --channel={{ k8s_channel }}
+    - name: Install k8s-snap on workers (pinned revision)
+      ansible.builtin.command: snap install k8s --classic --revision={{ k8s_snap_revisions[ansible_architecture | regex_replace('x86_64', 'amd64') | regex_replace('aarch64', 'arm64')] }}
       when: k8s_snap_check.rc != 0
       register: snap_install_result
       changed_when: "'installed' in snap_install_result.stdout"
+
+    - name: Hold k8s snap to prevent auto-updates
+      ansible.builtin.command: snap refresh --hold k8s
+      changed_when: true
+      when: k8s_snap_check.rc != 0
 
     # ===========================
     # kubectl and helm Wrapper Scripts
@@ -356,8 +364,53 @@
 
   vars:
     control_plane_host: "{{ groups['k8s_control_plane'][0] }}"
+    k8s_stable_ip: "172.16.0.1"
 
   tasks:
+    # ===========================
+    # Route to Control Plane Stable IP
+    # ===========================
+    - name: Get control plane ZeroTier IP
+      ansible.builtin.set_fact:
+        control_plane_zt_ip: "{{ hostvars[control_plane_host]['ansible_host'] }}"
+
+    - name: Check if route to k8s stable IP exists
+      ansible.builtin.command: ip route show {{ k8s_stable_ip }}/32
+      register: route_check
+      failed_when: false
+      changed_when: false
+
+    - name: Add route to k8s stable IP via control plane ZeroTier
+      ansible.builtin.command: ip route add {{ k8s_stable_ip }}/32 via {{ control_plane_zt_ip }}
+      when: k8s_stable_ip not in (route_check.stdout | default(''))
+
+    - name: Create persistent route via systemd service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Route to k8s control plane via ZeroTier
+          After=zerotier-one.service network-online.target
+          Wants=zerotier-one.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStartPre=/bin/sleep 5
+          ExecStart=/sbin/ip route replace {{ k8s_stable_ip }}/32 via {{ control_plane_zt_ip }}
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/k8s-control-plane-route.service
+        mode: '0644'
+      when: k8s_stable_ip not in (route_check.stdout | default(''))
+
+    - name: Enable k8s control plane route service
+      ansible.builtin.systemd:
+        name: k8s-control-plane-route
+        enabled: true
+        daemon_reload: true
+      when: k8s_stable_ip not in (route_check.stdout | default(''))
+
     # ===========================
     # Check if Already Joined
     # ===========================
