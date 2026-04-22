@@ -51,6 +51,15 @@
         fail_msg: "HARBOR_ROBOT_TOKEN not found in {{ ansible_facts.env.HOME }}/.env"
         success_msg: "Harbor robot token is available"
 
+    - name: Get admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+        harbor_admin_user: "admin"
+
+    - name: Parse build platforms into architecture list
+      ansible.builtin.set_fact:
+        build_architectures: "{{ (container_build_platforms | default('linux/' + ('arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64'))).split(',') | map('trim') | map('replace', 'linux/', '') | list }}"
+
     # ========================================================================
     # FETCH IMAGE LIST FROM THINKUBE-METADATA
     # ========================================================================
@@ -66,16 +75,16 @@
       ansible.builtin.set_fact:
         mirror_catalog: "{{ (metadata_response.content | from_json).images }}"
 
-    - name: Display catalog info
-      ansible.builtin.debug:
-        msg: "Fetched {{ mirror_catalog | length }} images from thinkube-metadata"
-
     - name: Build mirror_images list with full destination paths
       ansible.builtin.set_fact:
-        mirror_images: "{{ mirror_images | default([]) + [{'source': item.source, 'destination': harbor_registry + '/' + library_project + '/' + item.destination_name, 'description': item.description | default('')}] }}"
+        mirror_images: "{{ mirror_images | default([]) + [{'source': item.source, 'destination': harbor_registry + '/' + library_project + '/' + item.destination_name, 'description': item.description | default(''), 'architectures': item.architectures | default(build_architectures)}] }}"
       loop: "{{ mirror_catalog }}"
       loop_control:
         label: "{{ item.source }}"
+
+    - name: Display image list info
+      ansible.builtin.debug:
+        msg: "Mirroring {{ mirror_images | length }} images (architectures: {{ build_architectures }})"
 
   tasks:
     - name: Check if crane is installed
@@ -89,11 +98,6 @@
         chmod +x /usr/local/bin/crane
       become: true
       when: not crane_bin.stat.exists
-
-    - name: Get admin password from environment
-      ansible.builtin.set_fact:
-        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
-        harbor_admin_user: "admin"
 
     - name: Create library project in Harbor
       ansible.builtin.uri:
@@ -112,10 +116,6 @@
         validate_certs: true
         status_code: [201, 409]
 
-    - name: Parse build platforms into architecture list
-      ansible.builtin.set_fact:
-        build_architectures: "{{ (container_build_platforms | default('linux/' + ('arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64'))).split(',') | map('trim') | map('replace', 'linux/', '') | list }}"
-
     - name: Loop through images and mirror them to Harbor
       include_tasks: "{{ playbook_dir }}/../../../roles/container_deployment/image_mirror/tasks/main.yaml"
       vars:
@@ -125,7 +125,7 @@
         harbor_api_password: "{{ admin_password }}"
         harbor_push_user: "{{ harbor_robot_user }}"
         harbor_push_password: "{{ harbor_robot_token }}"
-        required_architectures: "{{ build_architectures }}"
+        required_architectures: "{{ item.architectures | default(build_architectures) }}"
       loop: "{{ mirror_images }}"
       loop_control:
         label: "{{ item.description if item.description is defined else item.destination }}"
@@ -151,6 +151,6 @@
           - "Total images mirrored: {{ mirror_images | length }}"
           - "Source: thinkube-metadata (GitHub)"
           - "Library project: {{ library_project }}"
-          - "Mirror tool: skopeo copy --all (multi-arch)"
+          - "Mirror tool: podman pull/push + crane manifest (multi-arch)"
           - "Image manifest created for thinkube-control discovery"
           - "----------------------------------------"
