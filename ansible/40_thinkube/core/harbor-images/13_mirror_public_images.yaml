@@ -78,49 +78,11 @@
         label: "{{ item.source }}"
 
   tasks:
-    - name: Check if podman is available
-      ansible.builtin.command: which podman
-      register: podman_check
-      changed_when: false
-      failed_when: false
-
-    - name: Check if docker is available
-      ansible.builtin.command: which docker
-      register: docker_check
-      changed_when: false
-      failed_when: false
-
-    - name: Set container runtime
-      ansible.builtin.set_fact:
-        container_runtime: "{{ 'podman' if podman_check.rc == 0 else 'docker' }}"
-      failed_when: podman_check.rc != 0 and docker_check.rc != 0
-
-    - name: Ensure container runtime is available
-      ansible.builtin.assert:
-        that:
-          - container_runtime is defined
-        fail_msg: "Neither podman nor docker is available"
-        success_msg: "Using {{ container_runtime }} as container runtime"
-
-    - name: Get remote home directory
-      ansible.builtin.shell: echo $HOME
-      register: user_home
-      changed_when: false
-
-    - name: Test auth.json presence
-      ansible.builtin.stat:
-        path: "{{ user_home.stdout }}/.config/containers/auth.json"
-      register: auth_file
-
-    - name: Test registry connection with auth file
-      ansible.builtin.command: "{{ container_runtime }} login --get-login {{ harbor_registry }}"
-      register: harbor_login
-      changed_when: false
-      failed_when: false
-
-    - name: Debug login status
-      ansible.builtin.debug:
-        msg: "Login {{ 'succeeded' if harbor_login.rc == 0 else 'failed but continuing' }}"
+    - name: Ensure skopeo is installed
+      ansible.builtin.apt:
+        name: skopeo
+        state: present
+      become: true
 
     - name: Get admin password from environment
       ansible.builtin.set_fact:
@@ -144,16 +106,6 @@
         validate_certs: true
         status_code: [201, 409]
 
-    - name: Login to Harbor registry
-      ansible.builtin.command: >
-        {{ container_runtime }} login {{ harbor_registry }}
-        --username {{ harbor_robot_user }}
-        --password {{ harbor_robot_token }}
-        --tls-verify=true
-      register: harbor_login
-      changed_when: "'Login Succeeded' in harbor_login.stdout"
-      no_log: false
-
     - name: Loop through images and mirror them to Harbor
       include_tasks: "{{ playbook_dir }}/../../../roles/container_deployment/image_mirror/tasks/main.yaml"
       vars:
@@ -166,12 +118,6 @@
         label: "{{ item.description if item.description is defined else item.destination }}"
       tags:
         - mirror
-
-    - name: Logout from Harbor registry
-      ansible.builtin.command: >-
-        {{ container_runtime }} logout {{ harbor_registry }}
-      changed_when: false
-      failed_when: false
 
     - name: Create image manifest for thinkube-control discovery
       include_role:
