@@ -27,7 +27,7 @@
   hosts: k8s_control_plane
   gather_facts: true
   vars:
-    env_file_path: "{{ ansible_env.HOME }}/.env"
+    env_file_path: "{{ ansible_facts.env.HOME }}/.env"
     harbor_robot_user: "robot$thinkube"
     library_project: "library"
     metadata_url: "https://raw.githubusercontent.com/thinkube/thinkube-metadata/main/mirror_images.json"
@@ -35,7 +35,7 @@
   pre_tasks:
     - name: Get robot token from env file
       ansible.builtin.shell: |
-        grep HARBOR_ROBOT_TOKEN {{ ansible_env.HOME }}/.env | cut -d= -f2
+        grep HARBOR_ROBOT_TOKEN {{ ansible_facts.env.HOME }}/.env | cut -d= -f2
       register: robot_token_cmd
       changed_when: false
       failed_when: robot_token_cmd.rc != 0
@@ -48,7 +48,7 @@
       ansible.builtin.assert:
         that:
           - harbor_robot_token | length > 0
-        fail_msg: "HARBOR_ROBOT_TOKEN not found in {{ ansible_env.HOME }}/.env"
+        fail_msg: "HARBOR_ROBOT_TOKEN not found in {{ ansible_facts.env.HOME }}/.env"
         success_msg: "Harbor robot token is available"
 
     # ========================================================================
@@ -72,16 +72,10 @@
 
     - name: Build mirror_images list with full destination paths
       ansible.builtin.set_fact:
-        mirror_images: >-
-          {%- set images = [] -%}
-          {%- for img in mirror_catalog -%}
-            {{ images.append({
-              'source': img.source,
-              'destination': harbor_registry + '/' + library_project + '/' + img.destination_name,
-              'description': img.description
-            }) or '' }}
-          {%- endfor -%}
-          {{ images }}
+        mirror_images: "{{ _built_images | default([]) + [{'source': item.source, 'destination': harbor_registry + '/' + library_project + '/' + item.destination_name, 'description': item.description | default('')}] }}"
+      loop: "{{ mirror_catalog }}"
+      loop_control:
+        label: "{{ item.source }}"
 
   tasks:
     - name: Check if podman is available
