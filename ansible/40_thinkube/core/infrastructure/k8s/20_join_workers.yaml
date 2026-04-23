@@ -526,8 +526,19 @@
         - not (already_joined | bool)
         - join_token is defined
 
+    - name: Create k8s join configuration
+      ansible.builtin.copy:
+        content: |
+          containerd-base-dir: /var/lib/k8s-containerd
+        dest: /tmp/k8s-join-config.yaml
+        mode: '0644'
+      become: true
+      when:
+        - not (already_joined | bool)
+        - join_token is defined
+
     - name: Join worker to cluster
-      ansible.builtin.command: k8s join-cluster {{ join_token }}
+      ansible.builtin.command: k8s join-cluster {{ join_token }} --file /tmp/k8s-join-config.yaml
       register: join_result
       changed_when: "'joined' in join_result.stdout.lower() or join_result.rc == 0"
       failed_when:
@@ -537,6 +548,38 @@
       when:
         - not (already_joined | bool)
         - join_token is defined
+      become: true
+
+    - name: Clean up join configuration
+      ansible.builtin.file:
+        path: /tmp/k8s-join-config.yaml
+        state: absent
+      become: true
+
+    - name: Create containerd config directory
+      ansible.builtin.file:
+        path: /etc/containerd/conf.d
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Create k8s-snap runc runtime config for GPU compatibility
+      ansible.builtin.copy:
+        content: |
+          version = 2
+
+          [plugins]
+            [plugins."io.containerd.grpc.v1.cri"]
+              [plugins."io.containerd.grpc.v1.cri".containerd]
+                default_runtime_name = "runc"
+
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                    runtime_type = "io.containerd.runc.v2"
+                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                      SystemdCgroup = true
+        dest: /etc/containerd/conf.d/00-k8s-runc.toml
+        mode: '0644'
       become: true
 
     - name: Wait for worker to appear in cluster
