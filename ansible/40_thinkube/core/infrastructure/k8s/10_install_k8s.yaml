@@ -218,13 +218,6 @@
         comment: 'Cilium VXLAN'
       become: true
 
-    - name: Allow Cilium WireGuard port (51871/udp)
-      community.general.ufw:
-        rule: allow
-        port: '51871'
-        proto: udp
-        comment: 'Cilium WireGuard encryption'
-      become: true
 
     - name: Allow traffic on cilium_host interface
       community.general.ufw:
@@ -425,29 +418,35 @@
       changed_when: false
 
     # ===========================
-    # Enable Cilium WireGuard Encryption
+    # Patch Cilium ConfigMap (Device Exclusion)
     # ===========================
-    # k8s-snap 1.35 does not expose WireGuard via its configuration layer,
-    # so we patch the Cilium ConfigMap directly after bootstrap.
-    # The k8sd reconciler does not manage the enable-wireguard key,
-    # so this patch persists across reconciliation cycles.
-    - name: Enable WireGuard encryption in Cilium ConfigMap
+    # Cilium auto-detects all interfaces with IPs, including ZeroTier (zt*).
+    # Its cil_from_netdev BPF program intercepts LoadBalancer VIP traffic on
+    # the ZeroTier interface and blackholes it (see cilium/cilium#44982).
+    # We restrict devices to physical/cluster interfaces so kube-proxy can
+    # DNAT overlay traffic normally.
+    #
+    # WireGuard is intentionally NOT enabled: inter-node traffic already
+    # traverses the ZeroTier overlay which provides AES-256-GCM encryption.
+    # Cilium WireGuard on top adds no security benefit and breaks pod-to-pod
+    # networking when the control plane uses a dummy interface (k8s0).
+    - name: Patch Cilium ConfigMap (exclude ZeroTier from BPF devices)
       ansible.builtin.command: >
         k8s kubectl patch configmap cilium-config -n kube-system
-        --type merge -p '{"data":{"enable-wireguard":"true","enable-wireguard-userspace-fallback":"false"}}'
+        --type merge -p '{"data":{"devices":"k8s0 en+ eth+ wl+ bond+"}}'
       become: true
-      register: wireguard_patch
-      changed_when: "'patched' in wireguard_patch.stdout"
-      failed_when: wireguard_patch.rc != 0
+      register: cilium_patch
+      changed_when: "'patched' in cilium_patch.stdout"
+      failed_when: cilium_patch.rc != 0
 
-    - name: Restart Cilium DaemonSet to apply WireGuard config
+    - name: Restart Cilium DaemonSet to apply config
       ansible.builtin.command: k8s kubectl rollout restart daemonset/cilium -n kube-system
       become: true
       register: cilium_restart
       changed_when: cilium_restart.rc == 0
       failed_when: cilium_restart.rc != 0
 
-    - name: Wait for Cilium to be ready after WireGuard restart
+    - name: Wait for Cilium to be ready after config restart
       ansible.builtin.command: k8s kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=300s
       become: true
       register: cilium_wg_wait
@@ -455,13 +454,6 @@
       delay: 10
       until: cilium_wg_wait.rc == 0
       changed_when: false
-
-    - name: Verify WireGuard is active in Cilium
-      ansible.builtin.command: k8s kubectl get configmap cilium-config -n kube-system -o jsonpath='{.data.enable-wireguard}'
-      become: true
-      register: wg_verify
-      changed_when: false
-      failed_when: wg_verify.stdout != "true"
 
     - name: Verify node is ready
       ansible.builtin.command: k8s kubectl get nodes
