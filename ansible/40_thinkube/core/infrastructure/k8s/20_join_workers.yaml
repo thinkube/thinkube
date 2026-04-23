@@ -26,7 +26,6 @@
 
 - name: Prepare Worker Nodes
   hosts: k8s_workers
-  become: true
   gather_facts: true
 
   vars:
@@ -58,6 +57,7 @@
       register: docker_service
       failed_when: false
       changed_when: false
+      become: true
 
     - name: Stop and disable Docker (DGX Spark ships with Docker pre-installed)
       ansible.builtin.systemd:
@@ -65,6 +65,7 @@
         state: stopped
         enabled: false
       when: docker_service.status is defined and docker_service.status.LoadState == 'loaded'
+      become: true
 
     # ===========================
     # UFW Firewall Configuration
@@ -74,6 +75,7 @@
         name: ufw
         state: present
         update_cache: true
+      become: true
 
     - name: Configure UFW default forward policy to ACCEPT (required for k8s networking)
       ansible.builtin.lineinfile:
@@ -82,6 +84,7 @@
         line: 'DEFAULT_FORWARD_POLICY="ACCEPT"'
         backup: true
       notify: reload_ufw
+      become: true
 
     - name: Allow SSH (22/tcp)
       community.general.ufw:
@@ -89,6 +92,7 @@
         port: '22'
         proto: tcp
         comment: 'SSH access'
+      become: true
 
     - name: Allow kubelet API port (10250/tcp)
       community.general.ufw:
@@ -96,6 +100,7 @@
         port: '10250'
         proto: tcp
         comment: 'k8s kubelet'
+      become: true
 
     - name: Allow Cilium health port (4240/tcp)
       community.general.ufw:
@@ -103,6 +108,7 @@
         port: '4240'
         proto: tcp
         comment: 'Cilium networking'
+      become: true
 
     - name: Allow Cilium VXLAN port (8472/udp)
       community.general.ufw:
@@ -110,18 +116,21 @@
         port: '8472'
         proto: udp
         comment: 'Cilium VXLAN'
+      become: true
 
     - name: Allow traffic on cilium_host interface
       community.general.ufw:
         rule: allow
         interface: cilium_host
         direction: in
+      become: true
 
     - name: Allow outbound traffic on cilium_host interface
       community.general.ufw:
         rule: allow
         interface: cilium_host
         direction: out
+      become: true
 
     - name: Allow all traffic on ZeroTier interfaces (overlay networking)
       community.general.ufw:
@@ -129,6 +138,7 @@
         interface: "zt+"
         direction: in
         comment: 'ZeroTier overlay network'
+      become: true
 
     - name: Allow outbound traffic on ZeroTier interfaces
       community.general.ufw:
@@ -136,6 +146,7 @@
         interface: "zt+"
         direction: out
         comment: 'ZeroTier overlay network'
+      become: true
 
     - name: Allow SSH from ZeroTier subnet
       community.general.ufw:
@@ -144,15 +155,18 @@
         port: '22'
         proto: tcp
         comment: 'SSH from ZeroTier overlay'
+      become: true
 
     - name: Enable UFW
       community.general.ufw:
         state: enabled
+      become: true
 
     - name: Reload UFW to apply forward policy
       ansible.builtin.command: ufw reload
       changed_when: true
       when: ufw_forward_policy_changed | default(false)
+      become: true
 
     # ===========================
     # k8s-snap Installation
@@ -162,17 +176,20 @@
       register: k8s_snap_check
       failed_when: false
       changed_when: false
+      become: true
 
     - name: Install k8s-snap on workers (pinned revision)
       ansible.builtin.command: snap install k8s --classic --revision={{ k8s_snap_revisions[ansible_facts['architecture'] | regex_replace('x86_64', 'amd64') | regex_replace('aarch64', 'arm64')] }}
       when: k8s_snap_check.rc != 0
       register: snap_install_result
       changed_when: "'installed' in snap_install_result.stdout"
+      become: true
 
     - name: Hold k8s snap to prevent auto-updates
       ansible.builtin.command: snap refresh --hold k8s
       changed_when: true
       when: k8s_snap_check.rc != 0
+      become: true
 
     # ===========================
     # kubectl and helm Wrapper Scripts
@@ -184,6 +201,7 @@
         owner: "{{ user }}"
         group: "{{ user }}"
         mode: '0755'
+      become: true
       become_user: "{{ user }}"
 
     - name: Create kubectl wrapper script
@@ -196,6 +214,7 @@
         owner: "{{ user }}"
         group: "{{ user }}"
         mode: '0755'
+      become: true
       become_user: "{{ user }}"
 
     - name: Create helm wrapper script
@@ -208,6 +227,7 @@
         owner: "{{ user }}"
         group: "{{ user }}"
         mode: '0755'
+      become: true
       become_user: "{{ user }}"
 
     # ===========================
@@ -355,10 +375,10 @@
       ansible.builtin.command: ufw reload
       listen: reload_ufw
       changed_when: true
+      become: true
 
 - name: Join Workers to Cluster
   hosts: k8s_workers
-  become: true
   gather_facts: true
   serial: 1  # Join workers one at a time to avoid race conditions
 
@@ -382,10 +402,12 @@
       register: route_check
       failed_when: false
       changed_when: false
+      become: true
 
     - name: Add route to k8s stable IP via control plane ZeroTier
       ansible.builtin.command: ip route add {{ k8s_stable_ip }}/32 via {{ control_plane_zt_ip }}
       when: k8s_stable_ip not in (route_check.stdout | default(''))
+      become: true
 
     - name: Create persistent route via systemd service
       ansible.builtin.copy:
@@ -406,6 +428,7 @@
         dest: /etc/systemd/system/k8s-control-plane-route.service
         mode: '0644'
       when: k8s_stable_ip not in (route_check.stdout | default(''))
+      become: true
 
     - name: Enable k8s control plane route service
       ansible.builtin.systemd:
@@ -413,6 +436,7 @@
         enabled: true
         daemon_reload: true
       when: k8s_stable_ip not in (route_check.stdout | default(''))
+      become: true
 
     # ===========================
     # Check if Already Joined
@@ -422,6 +446,7 @@
       register: worker_k8s_status
       failed_when: false
       changed_when: false
+      become: true
 
     - name: Check local k8s state
       ansible.builtin.set_fact:
@@ -437,6 +462,7 @@
     - name: Check if node exists in control plane
       ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }} --no-headers
       delegate_to: "{{ control_plane_host }}"
+      become: true
       register: node_in_cluster
       failed_when: false
       changed_when: false
@@ -454,6 +480,7 @@
 
     - name: Reset stale k8s state (node removed from cluster but local state remains)
       when: needs_reset | bool
+      become: true
       block:
         - name: Display reset message
           ansible.builtin.debug:
@@ -479,6 +506,7 @@
     - name: Generate join token from control plane
       ansible.builtin.command: k8s get-join-token {{ inventory_hostname }} --worker
       delegate_to: "{{ control_plane_host }}"
+      become: true
       register: join_token_output
       changed_when: false
       when: not (already_joined | bool)
@@ -509,10 +537,12 @@
       when:
         - not (already_joined | bool)
         - join_token is defined
+      become: true
 
     - name: Wait for worker to appear in cluster
       ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }}
       delegate_to: "{{ control_plane_host }}"
+      become: true
       register: node_check
       retries: 30
       delay: 10
@@ -523,6 +553,7 @@
     - name: Wait for worker node to become Ready
       ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
       delegate_to: "{{ control_plane_host }}"
+      become: true
       register: node_ready
       retries: 60
       delay: 10
@@ -540,6 +571,7 @@
       ansible.builtin.command: ufw reload
       listen: reload_ufw
       changed_when: true
+      become: true
 
 - name: Pin Critical Services and Verify Cluster Status
   hosts: k8s_control_plane
