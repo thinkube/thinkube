@@ -1,0 +1,70 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 11_update_ssh_for_workers.yaml
+# Non-destructive SSH config update for new worker nodes.
+# Distributes the control plane's cluster key to workers and
+# updates SSH config on the control plane so it can reach workers.
+#
+# Called by the add-node flow after workers join the cluster.
+# Unlike 10_setup_ssh_keys.yaml, this does NOT regenerate keys.
+#
+# Usage:
+#   ./scripts/tk_ansible ansible/00_initial_setup/11_update_ssh_for_workers.yaml -l vilanova1,vilanova2
+#
+# The -l (limit) restricts which workers get the key. The control
+# plane SSH config is always regenerated for ALL baremetal hosts.
+
+- name: Distribute control plane SSH key to new workers
+  hosts: k8s_workers:&baremetal
+  gather_facts: false
+  become: false
+  vars:
+    ssh_key_name: "thinkube_cluster_key"
+
+  tasks:
+    - name: Read control plane public key
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      ansible.builtin.slurp:
+        src: "{{ hostvars[groups['k8s_control_plane'][0]].ansible_user_dir | default('/home/' + (system_username | default('alexmc'))) }}/.ssh/{{ ssh_key_name }}.pub"
+      register: cp_pubkey
+      run_once: true
+
+    - name: Add control plane key to worker authorized_keys
+      ansible.builtin.authorized_key:
+        user: "{{ ansible_user_id | default(system_username | default('alexmc')) }}"
+        key: "{{ cp_pubkey.content | b64decode }}"
+        state: present
+
+- name: Update SSH config on control plane for all baremetal hosts
+  hosts: k8s_control_plane
+  gather_facts: true
+  become: false
+  vars:
+    ssh_key_name: "thinkube_cluster_key"
+
+  tasks:
+    - name: Regenerate baremetal SSH config block
+      ansible.builtin.blockinfile:
+        path: "{{ ansible_user_dir }}/.ssh/config"
+        marker: "# {mark}-THINKUBE-BAREMETAL"
+        create: true
+        mode: '0600'
+        block: |
+          {% for host in groups['baremetal'] if host != inventory_hostname %}
+          Host {{ host }}
+            HostName {{ hostvars[host]['ansible_host'] }}
+            User {{ ansible_user_id }}
+            IdentityFile {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+
+          {% endfor %}
+
+    - name: Verify SSH to new workers
+      ansible.builtin.command: >
+        ssh -o ConnectTimeout=5 -o BatchMode=yes
+        {{ item }} echo ok
+      loop: "{{ groups['k8s_workers'] | default([]) | intersect(groups['baremetal'] | default([])) }}"
+      changed_when: false
