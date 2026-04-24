@@ -37,18 +37,20 @@
         - kubeconfig
         - kubectl_bin
 
-    - name: Check if any DGX Spark nodes exist
+    - name: Identify DGX Spark nodes
       ansible.builtin.set_fact:
-        has_dgx_spark: >-
-          {{ groups.get('baremetal_gpus', [])
-             | map('extract', hostvars, 'gpu_model')
-             | select('defined')
-             | select('search', 'DGX Spark|GB10')
-             | list | length > 0 }}
+        dgx_spark_nodes: >-
+          {%- set nodes = [] -%}
+          {%- for host in groups.get('baremetal_gpus', []) -%}
+            {%- if hostvars[host].get('gpu_model', '') is search('DGX Spark|GB10') -%}
+              {%- set _ = nodes.append(host) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ nodes }}
 
     - name: Skip if no DGX Spark in cluster
       ansible.builtin.meta: end_play
-      when: not has_dgx_spark
+      when: dgx_spark_nodes | length == 0
 
   vars:
     gpu_operator_namespace: gpu-operator
@@ -62,7 +64,7 @@
       failed_when: gpu_ns_check.rc != 0
       changed_when: false
 
-    - name: Create time-slicing ConfigMap
+    - name: Create time-slicing ConfigMap with per-node profiles
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
         apiVersion: v1
@@ -71,7 +73,14 @@
           name: {{ time_slicing_config_name }}
           namespace: {{ gpu_operator_namespace }}
         data:
-          any: |-
+          default: |-
+            version: v1
+            sharing:
+              timeSlicing:
+                resources:
+                - name: nvidia.com/gpu
+                  replicas: 1
+          dgx-spark: |-
             version: v1
             flags:
               migStrategy: none
@@ -86,17 +95,16 @@
       register: configmap_result
       changed_when: "'created' in configmap_result.stdout or 'configured' in configmap_result.stdout"
 
-    - name: Get current ClusterPolicy
-      ansible.builtin.command: "{{ kubectl_bin }} get clusterpolicy cluster-policy -o json"
-      register: current_clusterpolicy
-      changed_when: false
-      failed_when: current_clusterpolicy.rc != 0
+    - name: Label DGX Spark nodes for time-slicing profile
+      ansible.builtin.command: >
+        {{ kubectl_bin }} label node {{ item }}
+        nvidia.com/device-plugin.config=dgx-spark --overwrite
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ dgx_spark_nodes }}"
+      changed_when: true
 
-    - name: Check if device plugin config is already set
-      ansible.builtin.set_fact:
-        config_already_set: "{{ (current_clusterpolicy.stdout | from_json).spec.devicePlugin.config.name | default('') == time_slicing_config_name }}"
-
-    - name: Patch ClusterPolicy to use time-slicing config
+    - name: Patch ClusterPolicy to use per-node time-slicing config
       ansible.builtin.shell: |
         {{ kubectl_bin }} patch clusterpolicy cluster-policy --type='json' -p='[
           {
@@ -104,13 +112,12 @@
             "path": "/spec/devicePlugin/config",
             "value": {
               "name": "{{ time_slicing_config_name }}",
-              "default": "any"
+              "default": "default"
             }
           }
         ]'
       register: patch_result
       changed_when: "'patched' in patch_result.stdout"
-      when: not config_already_set
 
     - name: Wait for device plugin pods to restart
       ansible.builtin.pause:
