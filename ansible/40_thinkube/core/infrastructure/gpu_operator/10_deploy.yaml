@@ -10,7 +10,8 @@
 #
 # Requirements:
 #   - Canonical Kubernetes (k8s-snap) >= 1.34
-#   - NVIDIA drivers >= 470.x already installed on GPU host(s)
+#   - NVIDIA-compatible GPU (Volta or newer)
+#   - No active display on nouveau (will block installation)
 #   - kubectl CLI (provided by k8s-snap)
 #   - Helm >= 3.7.0
 #   - jq (for JSON parsing)
@@ -57,6 +58,72 @@
         state: restarted
       become: true
       when: gpu_model is defined and ('DGX Spark' in gpu_model or 'GB10' in gpu_model)
+
+    - name: Check if NVIDIA driver is already installed
+      ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+      register: nvidia_smi_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install NVIDIA driver (non-DGX nodes only)
+      when:
+        - nvidia_smi_check.rc != 0
+        - gpu_model is not defined or ('DGX Spark' not in gpu_model and 'GB10' not in gpu_model)
+      become: true
+      block:
+        - name: Install ubuntu-drivers-common
+          ansible.builtin.apt:
+            name: ubuntu-drivers-common
+            state: present
+            update_cache: true
+
+        - name: Blacklist nouveau driver
+          ansible.builtin.copy:
+            content: |
+              blacklist nouveau
+              options nouveau modeset=0
+            dest: /etc/modprobe.d/blacklist-nouveau.conf
+            mode: '0644'
+
+        - name: Unload nouveau if loaded and not in use
+          ansible.builtin.shell: |
+            if lsmod | grep -q '^nouveau '; then
+              refcnt=$(lsmod | awk '/^nouveau / {print $3}')
+              if [ "$refcnt" -gt 0 ] 2>/dev/null; then
+                echo "NOUVEAU_IN_USE"
+                exit 1
+              fi
+              modprobe -r nouveau
+              echo "NOUVEAU_UNLOADED"
+            else
+              echo "NOUVEAU_NOT_LOADED"
+            fi
+          register: nouveau_result
+          changed_when: "'NOUVEAU_UNLOADED' in nouveau_result.stdout"
+          failed_when: "'NOUVEAU_IN_USE' in nouveau_result.stdout"
+
+        - name: Update initramfs
+          ansible.builtin.command: update-initramfs -u
+          changed_when: false
+
+        - name: Install NVIDIA GPU driver
+          ansible.builtin.command: ubuntu-drivers install --gpgpu
+          register: driver_install
+          changed_when: "'is already installed' not in driver_install.stdout"
+
+        - name: Load NVIDIA kernel module
+          community.general.modprobe:
+            name: nvidia
+            state: present
+
+        - name: Verify NVIDIA driver is working
+          ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+          register: nvidia_verify
+          changed_when: false
+
+        - name: Display installed driver version
+          ansible.builtin.debug:
+            msg: "NVIDIA driver {{ nvidia_verify.stdout | trim }} installed successfully"
 
     # When driver.enabled=false, GPU operator components wait for
     # /run/nvidia/validations/host-driver-ready. Since /run is tmpfs,
