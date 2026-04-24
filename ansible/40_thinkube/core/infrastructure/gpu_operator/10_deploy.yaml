@@ -183,6 +183,36 @@
       when: not validation_marker.stat.exists
 
 # ===========================
+# Play 1.5: Remove stale gpu.deploy override labels from GPU nodes
+# ===========================
+# Previous add-node runs may have set gpu.deploy.*=false on nodes with
+# compatible GPUs. The operator's own validator (host-driver-ready marker)
+# handles DaemonSet sequencing — explicit false labels are only needed on
+# nodes WITHOUT compatible GPUs (set by add-node for incompatible/no-GPU
+# nodes). This play cleans up stale overrides so DaemonSets can schedule.
+- name: Clean stale GPU operator override labels
+  hosts: k8s_control_plane
+  become: false
+
+  tasks:
+    - name: Remove gpu.deploy override labels from GPU nodes
+      ansible.builtin.command: >
+        {{ kubectl_bin }} label node {{ item }}
+        nvidia.com/gpu.deploy.container-toolkit-
+        nvidia.com/gpu.deploy.dcgm-
+        nvidia.com/gpu.deploy.dcgm-exporter-
+        nvidia.com/gpu.deploy.device-plugin-
+        nvidia.com/gpu.deploy.driver-
+        nvidia.com/gpu.deploy.gpu-feature-discovery-
+        nvidia.com/gpu.deploy.node-status-exporter-
+        nvidia.com/gpu.deploy.operator-validator-
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ groups['baremetal_gpus'] | default([]) }}"
+      changed_when: true
+      failed_when: false
+
+# ===========================
 # Play 2: Cluster-wide GPU Operator install
 # ===========================
 - name: Install NVIDIA GPU Operator
