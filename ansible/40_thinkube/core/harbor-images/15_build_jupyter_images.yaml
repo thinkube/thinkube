@@ -51,29 +51,15 @@
 
     - name: Parse build platforms into architecture list
       ansible.builtin.set_fact:
-        build_architectures: >-
-          {%- set archs = [] -%}
-          {%- set platforms = (container_build_platforms | default('linux/' + ('arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64'))).split(',') | map('trim') | list -%}
-          {%- for p in platforms -%}
-            {%- set arch = p | replace('linux/', '') -%}
-            {{ archs.append(arch) or '' }}
-          {%- endfor -%}
-          {{ archs }}
+        build_architectures: "{{ (container_build_platforms | default('linux/' + ('arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64'))).split(',') | map('trim') | map('replace', 'linux/', '') | list }}"
 
     - name: Map each architecture to a build node from inventory
       ansible.builtin.set_fact:
-        arch_build_nodes: >-
-          {%- set nodes = {} -%}
-          {%- for arch in build_architectures -%}
-            {%- set inv_group = 'x86_64' if arch == 'amd64' else arch -%}
-            {%- set candidates = groups.get(inv_group, []) | intersect(groups.get('k8s_cluster', [])) -%}
-            {%- if candidates | length > 0 -%}
-              {%- set _ = nodes.update({arch: candidates[0]}) -%}
-            {%- else -%}
-              {%- set _ = nodes.update({arch: inventory_hostname}) -%}
-            {%- endif -%}
-          {%- endfor -%}
-          {{ nodes }}
+        arch_build_nodes: "{{ arch_build_nodes | default({}) | combine({item: ((groups.get('x86_64' if item == 'amd64' else item, []) | intersect(groups.get('k8s_cluster', []))) or [inventory_hostname])[0] }) }}"
+      loop: "{{ build_architectures }}"
+
+    - name: Set multi-arch flag
+      ansible.builtin.set_fact:
         is_multi_arch: "{{ build_architectures | length > 1 }}"
 
     - name: Display build configuration
