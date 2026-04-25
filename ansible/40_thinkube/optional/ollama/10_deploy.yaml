@@ -37,9 +37,6 @@
     ollama_host: "{{ ollama_hostname | default('ollama.' + domain_name) }}"
     tls_secret_name: "ollama-tls-secret"
 
-    # Storage settings
-    ollama_storage_size: "100Gi"
-
   tasks:
     ###########################################################################
     # Step 1: Create Namespace and TLS Secret
@@ -83,36 +80,17 @@
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
 
     ###########################################################################
-    # Step 2: Create PVC for Ollama model storage
+    # Step 2: Create PV and PVC for JuiceFS MLflow access
     ###########################################################################
-    - name: Create PVC for Ollama model storage
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: ollama-data-pvc
-            namespace: "{{ k8s_namespace }}"
-          spec:
-            accessModes:
-              - ReadWriteOnce
-            resources:
-              requests:
-                storage: "{{ ollama_storage_size }}"
-
-    ###########################################################################
-    # Step 3: Create PV and PVC for JuiceFS MLflow access
-    ###########################################################################
-    # IMPORTANT: Create a static PV that mounts the SAME JuiceFS volume that
-    # JupyterHub uses. This allows Ollama to access:
-    #   - Models mirrored from HuggingFace (via thinkube-control)
-    #   - Fine-tuned models created in JupyterHub
+    # Ollama uses a SINGLE JuiceFS volume for both MLflow model artifacts and
+    # its own model blob storage (OLLAMA_MODELS=/mlflow-models/.ollama/models).
+    # This allows ollama create to hard-link GGUFs from MLflow instead of
+    # copying them, eliminating model duplication.
     #
     # Path mapping:
     #   JupyterHub:  /home/thinkube/thinkube/mlflow/
     #   Ollama:      /mlflow-models/
+    #   Ollama blobs: /mlflow-models/.ollama/models/
     #
     - name: Create static PV for MLflow access (mounts same JuiceFS volume)
       kubernetes.core.k8s:
@@ -163,7 +141,7 @@
                 storage: 1Ti
 
     ###########################################################################
-    # Step 4: Deploy Ollama StatefulSet
+    # Step 3: Deploy Ollama StatefulSet
     ###########################################################################
     - name: Deploy Ollama StatefulSet
       kubernetes.core.k8s:
@@ -204,7 +182,7 @@
                         protocol: TCP
                     env:
                       - name: OLLAMA_MODELS
-                        value: /root/.ollama/models
+                        value: /mlflow-models/.ollama/models
                       - name: OLLAMA_HOST
                         value: "0.0.0.0:11434"
                     resources:
@@ -217,8 +195,6 @@
                         memory: "64Gi"
                         nvidia.com/gpu: "1"
                     volumeMounts:
-                      - name: ollama-data
-                        mountPath: /root/.ollama
                       - name: mlflow-models
                         mountPath: /mlflow-models
                     readinessProbe:
@@ -234,15 +210,12 @@
                       initialDelaySeconds: 60
                       periodSeconds: 30
                 volumes:
-                  - name: ollama-data
-                    persistentVolumeClaim:
-                      claimName: ollama-data-pvc
                   - name: mlflow-models
                     persistentVolumeClaim:
                       claimName: ollama-mlflow-pvc
 
     ###########################################################################
-    # Step 5: Create Ollama Service
+    # Step 4: Create Ollama Service
     ###########################################################################
     - name: Create Ollama Service
       kubernetes.core.k8s:
@@ -268,7 +241,7 @@
                 name: http
 
     ###########################################################################
-    # Step 6: Create Ollama Ingress
+    # Step 5: Create Ollama HTTPRoute
     ###########################################################################
     - name: Create Ollama HTTPRoute
       kubernetes.core.k8s:
@@ -299,7 +272,7 @@
                   request: "3600s"
 
     ###########################################################################
-    # Step 7: Wait for Ollama to be ready
+    # Step 6: Wait for Ollama to be ready
     ###########################################################################
     - name: Wait for Ollama pod to be ready
       kubernetes.core.k8s_info:
@@ -315,7 +288,7 @@
       delay: 10
 
     ###########################################################################
-    # Step 8: Display deployment summary
+    # Step 7: Display deployment summary
     ###########################################################################
     - name: Display deployment summary
       ansible.builtin.debug:
@@ -327,11 +300,13 @@
           - "External URL: https://{{ ollama_host }}"
           - "GPU: Scheduled on nodes with nvidia.com/gpu.present=true"
           - "=========================================================="
-          - "Mounted Volumes:"
-          - "  - /root/.ollama: Ollama model storage ({{ ollama_storage_size }})"
-          - "  - /mlflow-models: JuiceFS MLflow (for fine-tuned GGUF models)"
+          - "Storage: Single JuiceFS volume (hard-link enabled)"
+          - "  - /mlflow-models: MLflow artifacts + Ollama blobs"
+          - "  - OLLAMA_MODELS=/mlflow-models/.ollama/models"
+          - "  - ollama create hard-links GGUFs (zero duplication)"
           - "=========================================================="
           - "Path Mapping:"
-          - "  JupyterHub: /home/thinkube/thinkube/mlflow/.staging/"
-          - "  Ollama:     /mlflow-models/.staging/"
+          - "  JupyterHub:    /home/thinkube/thinkube/mlflow/"
+          - "  Ollama models: /mlflow-models/.ollama/models/"
+          - "  MLflow GGUFs:  /mlflow-models/.staging/ and /mlflow-models/artifacts/"
           - "=========================================================="

@@ -32,8 +32,16 @@ After installation, the following environment variables are injected into Jupyte
 
 ## Model Storage Architecture
 
+Ollama uses a **single JuiceFS volume** for both MLflow model artifacts and its own
+blob storage (`OLLAMA_MODELS=/mlflow-models/.ollama/models`). Because both paths are
+on the same filesystem, `ollama create` hard-links GGUFs from MLflow instead of
+copying them — zero model duplication.
+
 ```
-JuiceFS MLflow Volume (shared storage)
+JuiceFS MLflow Volume (single mount at /mlflow-models)
+├── .ollama/models/              ← Ollama blob storage (hard-linked from artifacts)
+│   ├── blobs/
+│   └── manifests/
 ├── .staging/                    ← Fine-tuned GGUF models from notebooks
 │   └── {model-name}/
 │       └── unsloth.Q4_K_M.gguf
@@ -43,6 +51,7 @@ JuiceFS MLflow Volume (shared storage)
 
 JupyterHub Pod mount:  /home/thinkube/thinkube/mlflow
 Ollama Pod mount:      /mlflow-models
+Ollama blobs:          /mlflow-models/.ollama/models (same filesystem → hard links)
 ```
 
 ## Usage in Notebooks
