@@ -211,6 +211,46 @@
         label: "{{ item.key }} ({{ item.value }})"
       tags: [always]
 
+    - name: Configure podman registries on all build nodes
+      block:
+        - name: Ensure containers config directory exists on build nodes
+          ansible.builtin.file:
+            path: /etc/containers
+            state: directory
+            mode: '0755'
+          become: true
+          delegate_to: "{{ item.value }}"
+          loop: "{{ arch_build_nodes | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value }})"
+
+        - name: Write registries.conf on build nodes
+          ansible.builtin.copy:
+            dest: /etc/containers/registries.conf
+            content: |
+              unqualified-search-registries = ["{{ harbor_registry }}"]
+
+              [[registry]]
+              location = "{{ harbor_registry }}"
+              insecure = false
+
+              [[registry]]
+              location = "docker.io"
+
+              [[registry]]
+              location = "quay.io"
+
+              [[registry]]
+              location = "ghcr.io"
+            mode: '0644'
+          become: true
+          delegate_to: "{{ item.value }}"
+          loop: "{{ arch_build_nodes | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value }})"
+      when: is_multi_arch
+      tags: [always]
+
     - name: Ensure build nodes can resolve {{ domain_name }} via CoreDNS
       block:
         - name: Create systemd-resolved conf directory on build nodes
@@ -280,34 +320,27 @@
       tags: [always]
 
     - name: Sync build context to remote build nodes
-      ansible.posix.synchronize:
-        src: "{{ base_images_dir }}/"
-        dest: "{{ base_images_dir }}/"
-        mode: push
-        rsync_opts:
-          - "--archive"
-          - "--compress"
-          - "--delete"
-      delegate_to: "{{ item.value }}"
+      ansible.builtin.shell: |
+        tar -czf - -C {{ base_images_dir }} . | \
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          {{ item.value }} 'tar -xzf - -C {{ base_images_dir }}'
       loop: "{{ arch_build_nodes | dict2items }}"
       loop_control:
         label: "{{ item.key }} ({{ item.value }})"
       when: is_multi_arch and item.value != inventory_hostname
+      changed_when: true
       tags: [always]
 
     - name: Sync Containerfiles to remote build nodes
-      ansible.posix.synchronize:
-        src: "{{ remote_containerfiles_dir }}/"
-        dest: "{{ remote_containerfiles_dir }}/"
-        mode: push
-        rsync_opts:
-          - "--archive"
-          - "--compress"
-      delegate_to: "{{ item.value }}"
+      ansible.builtin.shell: |
+        tar -czf - -C {{ remote_containerfiles_dir }} . | \
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          {{ item.value }} 'tar -xzf - -C {{ remote_containerfiles_dir }}'
       loop: "{{ arch_build_nodes | dict2items }}"
       loop_control:
         label: "{{ item.key }} ({{ item.value }})"
       when: is_multi_arch and item.value != inventory_hostname
+      changed_when: true
       tags: [always]
 
     # ========================================================================
