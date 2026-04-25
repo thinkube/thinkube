@@ -12,12 +12,18 @@
 # Optional variables:
 #   extra_build_args: Additional --build-arg flags as a string (e.g., "--build-arg FOO=bar")
 #   no_cache: Set to true to add --no-cache flag
+#   force_rebuild: Set to true to rebuild even if image already exists in Harbor
 #
 # Expected variables from parent playbook:
 #   arch_build_nodes: Dict mapping arch -> hostname (e.g., {"arm64": "tkspark", "amd64": "node-a"})
 #   is_multi_arch: Boolean — whether multiple architectures are configured
 #   remote_containerfiles_dir: Path to Containerfiles directory on build nodes
 #   harbor_registry: Harbor registry hostname
+#   admin_password: Harbor admin password
+
+# ============================================================================
+# SINGLE-ARCH BUILD (unchanged)
+# ============================================================================
 
 - name: "Build image (single-arch)"
   ansible.builtin.shell: |
@@ -44,6 +50,45 @@
   delay: 10
   when: not is_multi_arch
 
+# ============================================================================
+# MULTI-ARCH: CHECK EXISTING IMAGES
+# ============================================================================
+
+- name: "Check existing per-arch images in Harbor"
+  ansible.builtin.uri:
+    url: "https://{{ harbor_registry }}/api/v2.0/projects/{{ (image_name | replace(harbor_registry + '/', '')).split('/')[0] }}/repositories/{{ (image_name | replace(harbor_registry + '/', '')).split('/')[1:] | join('/') }}/artifacts/{{ image_tags[0] }}-{{ item.key }}"
+    method: GET
+    headers:
+      Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
+    validate_certs: true
+    status_code: [200, 404]
+  loop: "{{ arch_build_nodes | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: _arch_exists
+  when: is_multi_arch and not (force_rebuild | default(false))
+
+- name: "Determine architectures needing build"
+  ansible.builtin.set_fact:
+    _archs_to_build: >-
+      {%- if force_rebuild | default(false) -%}
+        {{ arch_build_nodes | dict2items }}
+      {%- else -%}
+        {{ _arch_exists.results | selectattr('status', 'defined') | selectattr('status', 'equalto', 404) | map(attribute='item') | list }}
+      {%- endif -%}
+  when: is_multi_arch
+
+- name: "Display build plan"
+  ansible.builtin.debug:
+    msg: >-
+      {{ image_name }}: building {{ _archs_to_build | map(attribute='key') | list | join(', ') | default('nothing') }},
+      skipping {{ (arch_build_nodes.keys() | list | length) - (_archs_to_build | length) }} existing arch(es).
+  when: is_multi_arch
+
+# ============================================================================
+# MULTI-ARCH: BUILD AND PUSH ONLY MISSING ARCHITECTURES
+# ============================================================================
+
 - name: "Build image per-arch"
   ansible.builtin.shell: |
     podman build {{ '--no-cache' if no_cache | default(false) else '' }} \
@@ -54,18 +99,18 @@
                  -f {{ remote_containerfiles_dir }}/{{ containerfile }} \
                  {{ build_context }}
   delegate_to: "{{ item.value }}"
-  loop: "{{ arch_build_nodes | dict2items }}"
+  loop: "{{ _archs_to_build }}"
   loop_control:
     label: "{{ item.key }} on {{ item.value }}"
   register: _build_arch_result
   changed_when: true
-  when: is_multi_arch
+  when: is_multi_arch and (_archs_to_build | length > 0)
 
 - name: "Push image per-arch"
   ansible.builtin.shell: |
     podman push --tls-verify=true {{ image_name }}:{{ image_tags[0] }}-{{ item.key }}
   delegate_to: "{{ item.value }}"
-  loop: "{{ arch_build_nodes | dict2items }}"
+  loop: "{{ _archs_to_build }}"
   loop_control:
     label: "{{ item.key }} on {{ item.value }}"
   register: _push_arch_result
@@ -73,7 +118,11 @@
   failed_when: _push_arch_result.rc != 0
   retries: 2
   delay: 10
-  when: is_multi_arch
+  when: is_multi_arch and (_archs_to_build | length > 0)
+
+# ============================================================================
+# MULTI-ARCH: CREATE MANIFEST (all architectures, pulls existing from Harbor)
+# ============================================================================
 
 - name: "Render manifest script"
   ansible.builtin.template:
