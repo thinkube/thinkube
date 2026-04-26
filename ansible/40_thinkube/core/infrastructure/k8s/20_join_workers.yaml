@@ -582,6 +582,40 @@
         mode: '0644'
       become: true
 
+    # k8s-snap defaults workers to --root-dir="/var/lib/kubelet" but uses
+    # /var/snap/k8s/common/var/lib/kubelet on the control plane. CSI drivers
+    # (JuiceFS, rawfile) are deployed with kubeletDir set to the snap path,
+    # so the worker kubelet must match or CSI registration fails silently.
+    - name: Read current kubelet args
+      ansible.builtin.slurp:
+        src: /var/snap/k8s/common/args/kubelet
+      register: kubelet_args_raw
+      become: true
+
+    - name: Fix kubelet root-dir to match control plane (snap path)
+      ansible.builtin.replace:
+        path: /var/snap/k8s/common/args/kubelet
+        regexp: '--root-dir="/var/lib/kubelet"'
+        replace: '--root-dir="/var/snap/k8s/common/var/lib/kubelet"'
+      register: kubelet_rootdir_fix
+      become: true
+      when: '"/var/lib/kubelet"' in (kubelet_args_raw.content | b64decode)
+
+    - name: Ensure kubelet CSI directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /var/snap/k8s/common/var/lib/kubelet/plugins_registry
+        - /var/snap/k8s/common/var/lib/kubelet/csi-plugins
+      become: true
+
+    - name: Restart k8s snap to apply kubelet root-dir change
+      ansible.builtin.command: snap restart k8s
+      become: true
+      when: kubelet_rootdir_fix is changed
+
     - name: Wait for worker to appear in cluster
       ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }}
       delegate_to: "{{ control_plane_host }}"
