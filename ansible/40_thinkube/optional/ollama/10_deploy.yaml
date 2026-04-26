@@ -4,7 +4,7 @@
 ---
 # ansible/40_thinkube/optional/ollama/10_deploy.yaml
 # Description:
-#   Deploy Ollama fast LLM inference server with GPU acceleration
+#   Deploy Ollama fast LLM inference server as a DaemonSet on all GPU nodes
 #   Mounts JuiceFS MLflow volume for accessing fine-tuned GGUF models
 #
 # Requirements:
@@ -25,7 +25,7 @@
 #   - harbor_registry: Harbor registry URL
 #   - primary_ingress_class: Primary ingress class name
 #
-# Note: Scheduled on GPU nodes via nvidia.com/gpu.present label
+# Note: Scheduled on GPU nodes via nodeAffinity (gpu.present=true AND gpu.count>0)
 #
 
 - name: Deploy Ollama with GPU and JuiceFS MLflow access
@@ -141,15 +141,27 @@
                 storage: 1Ti
 
     ###########################################################################
-    # Step 3: Deploy Ollama StatefulSet
+    # Step 3: Remove old StatefulSet (migrated to DaemonSet)
     ###########################################################################
-    - name: Deploy Ollama StatefulSet
+    - name: Remove old Ollama StatefulSet if present
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: StatefulSet
+        name: ollama
+        namespace: "{{ k8s_namespace }}"
+      ignore_errors: true
+
+    ###########################################################################
+    # Step 4: Deploy Ollama DaemonSet on all GPU nodes
+    ###########################################################################
+    - name: Deploy Ollama DaemonSet
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
           apiVersion: apps/v1
-          kind: StatefulSet
+          kind: DaemonSet
           metadata:
             name: ollama
             namespace: "{{ k8s_namespace }}"
@@ -159,8 +171,6 @@
               app.kubernetes.io/component: inference
               thinkube.io/component: ollama
           spec:
-            serviceName: ollama
-            replicas: 1
             selector:
               matchLabels:
                 app: ollama
@@ -170,8 +180,17 @@
                   app: ollama
                   app.kubernetes.io/name: ollama
               spec:
-                nodeSelector:
-                  nvidia.com/gpu.present: "true"
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                        - matchExpressions:
+                            - key: nvidia.com/gpu.present
+                              operator: In
+                              values: ["true"]
+                            - key: nvidia.com/gpu.count
+                              operator: Gt
+                              values: ["0"]
                 containers:
                   - name: ollama
                     image: "{{ harbor_registry }}/{{ library_project | default('library') }}/ollama:latest"
@@ -215,7 +234,7 @@
                       claimName: ollama-mlflow-pvc
 
     ###########################################################################
-    # Step 4: Create Ollama Service
+    # Step 5: Create Ollama Service
     ###########################################################################
     - name: Create Ollama Service
       kubernetes.core.k8s:
@@ -241,7 +260,7 @@
                 name: http
 
     ###########################################################################
-    # Step 5: Create Ollama HTTPRoute
+    # Step 6: Create Ollama HTTPRoute
     ###########################################################################
     - name: Create Ollama HTTPRoute
       kubernetes.core.k8s:
@@ -272,32 +291,35 @@
                   request: "3600s"
 
     ###########################################################################
-    # Step 6: Wait for Ollama to be ready
+    # Step 7: Wait for Ollama to be ready
     ###########################################################################
-    - name: Wait for Ollama pod to be ready
+    - name: Wait for Ollama DaemonSet to be ready
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
-        kind: StatefulSet
+        kind: DaemonSet
         name: ollama
         namespace: "{{ k8s_namespace }}"
-      register: ollama_sts
+      register: ollama_ds
       until: >-
-        ollama_sts.resources | length > 0 and
-        (ollama_sts.resources[0].status.readyReplicas | default(0)) == 1
+        ollama_ds.resources | length > 0 and
+        (ollama_ds.resources[0].status.numberReady | default(0)) ==
+        (ollama_ds.resources[0].status.desiredNumberScheduled | default(0)) and
+        (ollama_ds.resources[0].status.desiredNumberScheduled | default(0)) > 0
       retries: 30
       delay: 10
 
     ###########################################################################
-    # Step 7: Display deployment summary
+    # Step 8: Display deployment summary
     ###########################################################################
     - name: Display deployment summary
       ansible.builtin.debug:
         msg:
-          - "Ollama deployed successfully!"
+          - "Ollama deployed successfully as DaemonSet!"
           - "=========================================================="
           - "Namespace: {{ k8s_namespace }}"
           - "Service: ollama.{{ k8s_namespace }}.svc.cluster.local:11434"
           - "External URL: https://{{ ollama_host }}"
+          - "Pods: {{ ollama_ds.resources[0].status.desiredNumberScheduled }} (one per GPU node)"
           - "GPU: Scheduled on nodes with nvidia.com/gpu.present=true"
           - "=========================================================="
           - "Storage: Single JuiceFS volume (hard-link enabled)"
