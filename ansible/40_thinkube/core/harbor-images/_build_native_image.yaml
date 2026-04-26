@@ -86,10 +86,10 @@
   when: is_multi_arch
 
 # ============================================================================
-# MULTI-ARCH: BUILD AND PUSH ONLY MISSING ARCHITECTURES
+# MULTI-ARCH: BUILD AND PUSH IN PARALLEL ACROSS NODES
 # ============================================================================
 
-- name: "Build image per-arch"
+- name: "Build image per-arch (parallel)"
   ansible.builtin.shell: |
     podman build {{ '--no-cache' if no_cache | default(false) else '' }} \
                  --platform linux/{{ item.key }} \
@@ -102,22 +102,50 @@
   loop: "{{ _archs_to_build }}"
   loop_control:
     label: "{{ item.key }} on {{ item.value }}"
-  register: _build_arch_result
+  async: 7200
+  poll: 0
+  register: _build_async
   changed_when: true
   when: is_multi_arch and (_archs_to_build | length > 0)
 
-- name: "Push image per-arch"
+- name: "Wait for all arch builds to complete"
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  delegate_to: "{{ item.item.value }}"
+  loop: "{{ _build_async.results | selectattr('ansible_job_id', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.item.key }} on {{ item.item.value }}"
+  register: _build_arch_result
+  until: _build_arch_result.finished
+  retries: 240
+  delay: 30
+  when: is_multi_arch and (_archs_to_build | length > 0)
+
+- name: "Push image per-arch (parallel)"
   ansible.builtin.shell: |
     podman push --tls-verify=true {{ image_name }}:{{ image_tags[0] }}-{{ item.key }}
   delegate_to: "{{ item.value }}"
   loop: "{{ _archs_to_build }}"
   loop_control:
     label: "{{ item.key }} on {{ item.value }}"
-  register: _push_arch_result
+  async: 3600
+  poll: 0
+  register: _push_async
   changed_when: true
-  failed_when: _push_arch_result.rc != 0
-  retries: 2
-  delay: 10
+  when: is_multi_arch and (_archs_to_build | length > 0)
+
+- name: "Wait for all arch pushes to complete"
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  delegate_to: "{{ item.item.value }}"
+  loop: "{{ _push_async.results | selectattr('ansible_job_id', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.item.key }} on {{ item.item.value }}"
+  register: _push_arch_result
+  until: _push_arch_result.finished
+  retries: 120
+  delay: 30
+  failed_when: _push_arch_result.failed is defined and _push_arch_result.failed
   when: is_multi_arch and (_archs_to_build | length > 0)
 
 # ============================================================================
