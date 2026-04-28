@@ -4,7 +4,8 @@
 ---
 # ansible/40_thinkube/optional/ollama/10_deploy.yaml
 # Description:
-#   Deploy Ollama fast LLM inference server as a DaemonSet on all GPU nodes
+#   Deploy Ollama inference server as a Deployment with replicas: 0
+#   Pods are created at runtime by the LLM Gateway targeting specific nodes/GPUs
 #   Mounts JuiceFS MLflow volume for accessing fine-tuned GGUF models
 #
 # Requirements:
@@ -25,10 +26,10 @@
 #   - harbor_registry: Harbor registry URL
 #   - primary_ingress_class: Primary ingress class name
 #
-# Note: Scheduled on GPU nodes via nodeAffinity (gpu.present=true AND gpu.count>0)
+# Note: Deployed with replicas: 0. The LLM Gateway creates pods targeting specific nodes/GPUs.
 #
 
-- name: Deploy Ollama with GPU and JuiceFS MLflow access
+- name: Deploy Ollama with JuiceFS MLflow access (replicas 0, gateway-managed)
   hosts: k8s_control_plane
   gather_facts: true
 
@@ -141,7 +142,7 @@
                 storage: 1Ti
 
     ###########################################################################
-    # Step 3: Remove old StatefulSet (migrated to DaemonSet)
+    # Step 3: Remove old StatefulSet and DaemonSet (migrated to Deployment)
     ###########################################################################
     - name: Remove old Ollama StatefulSet if present
       kubernetes.core.k8s:
@@ -152,16 +153,27 @@
         namespace: "{{ k8s_namespace }}"
       ignore_errors: true
 
+    - name: Remove old Ollama DaemonSet if present
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: DaemonSet
+        name: ollama
+        namespace: "{{ k8s_namespace }}"
+      ignore_errors: true
+
     ###########################################################################
-    # Step 4: Deploy Ollama DaemonSet on all GPU nodes
+    # Step 4: Deploy Ollama Deployment with replicas: 0
+    # Pods are created at runtime by the LLM Gateway, which sets nodeSelector
+    # and GPU resource requests per pod based on user selection.
     ###########################################################################
-    - name: Deploy Ollama DaemonSet
+    - name: Deploy Ollama Deployment (replicas 0)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
         definition:
           apiVersion: apps/v1
-          kind: DaemonSet
+          kind: Deployment
           metadata:
             name: ollama
             namespace: "{{ k8s_namespace }}"
@@ -171,6 +183,7 @@
               app.kubernetes.io/component: inference
               thinkube.io/component: ollama
           spec:
+            replicas: 0
             selector:
               matchLabels:
                 app: ollama
@@ -180,17 +193,6 @@
                   app: ollama
                   app.kubernetes.io/name: ollama
               spec:
-                affinity:
-                  nodeAffinity:
-                    requiredDuringSchedulingIgnoredDuringExecution:
-                      nodeSelectorTerms:
-                        - matchExpressions:
-                            - key: nvidia.com/gpu.present
-                              operator: In
-                              values: ["true"]
-                            - key: nvidia.com/gpu.count
-                              operator: Gt
-                              values: ["0"]
                 containers:
                   - name: ollama
                     image: "{{ harbor_registry }}/{{ library_project | default('library') }}/ollama:latest"
@@ -210,11 +212,9 @@
                       requests:
                         cpu: "2"
                         memory: "8Gi"
-                        nvidia.com/gpu: "1"
                       limits:
                         cpu: "8"
                         memory: "128Gi"
-                        nvidia.com/gpu: "1"
                     volumeMounts:
                       - name: mlflow-models
                         mountPath: /mlflow-models
@@ -293,22 +293,16 @@
                   request: "3600s"
 
     ###########################################################################
-    # Step 7: Wait for Ollama to be ready
+    # Step 7: Verify Deployment exists (replicas: 0, no pods expected)
     ###########################################################################
-    - name: Wait for Ollama DaemonSet to be ready
+    - name: Verify Ollama Deployment exists
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
-        kind: DaemonSet
+        kind: Deployment
         name: ollama
         namespace: "{{ k8s_namespace }}"
-      register: ollama_ds
-      until: >-
-        ollama_ds.resources | length > 0 and
-        (ollama_ds.resources[0].status.numberReady | default(0)) ==
-        (ollama_ds.resources[0].status.desiredNumberScheduled | default(0)) and
-        (ollama_ds.resources[0].status.desiredNumberScheduled | default(0)) > 0
-      retries: 30
-      delay: 10
+      register: ollama_deploy
+      failed_when: ollama_deploy.resources | length == 0
 
     ###########################################################################
     # Step 8: Display deployment summary
@@ -316,21 +310,15 @@
     - name: Display deployment summary
       ansible.builtin.debug:
         msg:
-          - "Ollama deployed successfully as DaemonSet!"
+          - "Ollama deployed successfully (replicas: 0, gateway-managed)!"
           - "=========================================================="
           - "Namespace: {{ k8s_namespace }}"
           - "Service: ollama.{{ k8s_namespace }}.svc.cluster.local:11434"
           - "External URL: https://{{ ollama_host }}"
-          - "Pods: {{ ollama_ds.resources[0].status.desiredNumberScheduled }} (one per GPU node)"
-          - "GPU: Scheduled on nodes with nvidia.com/gpu.present=true"
+          - "Replicas: 0 (LLM Gateway creates pods on demand)"
           - "=========================================================="
           - "Storage: Single JuiceFS volume (hard-link enabled)"
           - "  - /mlflow-models: MLflow artifacts + Ollama blobs"
           - "  - OLLAMA_MODELS=/mlflow-models/.ollama/models"
           - "  - ollama create hard-links GGUFs (zero duplication)"
-          - "=========================================================="
-          - "Path Mapping:"
-          - "  JupyterHub:    /home/thinkube/thinkube/mlflow/"
-          - "  Ollama models: /mlflow-models/.ollama/models/"
-          - "  MLflow GGUFs:  /mlflow-models/.staging/ and /mlflow-models/artifacts/"
           - "=========================================================="
