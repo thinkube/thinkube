@@ -9,16 +9,16 @@
 #   Adds MetalLB IP range to control plane node for service access
 #
 # Requirements:
-#   - ZeroTier must already be installed and configured via tk-node-setup/bootstrap.sh
+#   - ZeroTier must already be installed and configured (via 05_install_zerotier.yaml or the installer)
 #   - Nodes must already be joined and authorized in ZeroTier network
 #   - Environment variables for ZEROTIER_NETWORK_ID and ZEROTIER_API_TOKEN
 #
 # Variables:
 #   - zerotier_network_id: ZeroTier network ID from inventory
 #   - zerotier_api_token: ZeroTier API token from inventory
-#   - zerotier_ip: Static IP address for each node (from inventory)
+#   - overlay_ip: Static overlay IP for each node (from inventory)
 #   - metallb_ip_start_octet, metallb_ip_end_octet: MetalLB IP range octets
-#   - zerotier_subnet_prefix: Network prefix for MetalLB IPs
+#   - overlay_subnet_prefix: Network prefix for MetalLB IPs
 #
 # Run with:
 #   ./scripts/run_ansible.sh ansible/30_networking/10_setup_zerotier.yaml
@@ -43,7 +43,7 @@
       ansible.builtin.fail:
         msg: |
           ZeroTier is not installed on {{ inventory_hostname }}.
-          Please run tk-node-setup/bootstrap.sh first to install and configure ZeroTier.
+          Run 05_install_zerotier.yaml first, or use the ZeroTier setup step in the installer.
       when: zerotier_installed.rc != 0
 
     - name: Check ZeroTier service status
@@ -57,7 +57,7 @@
       ansible.builtin.fail:
         msg: |
           ZeroTier service is not running on {{ inventory_hostname }}.
-          Please run tk-node-setup/bootstrap.sh first.
+          Run 05_install_zerotier.yaml first, or use the ZeroTier setup step in the installer.
       when: zerotier_service.rc != 0
 
     - name: Configure ZeroTier to exclude k8s interfaces from peer discovery
@@ -109,7 +109,7 @@
       ansible.builtin.fail:
         msg: |
           Node {{ inventory_hostname }} is not joined to ZeroTier network {{ zerotier_network_id }}.
-          Please run tk-node-setup/bootstrap.sh first.
+          Run 05_install_zerotier.yaml first, or use the ZeroTier setup step in the installer.
       when: zerotier_network_id not in zerotier_networks.stdout
 
     - name: Display ZeroTier verification status
@@ -121,7 +121,7 @@
           ════════════════════════════════════════════════════════════════════════
 
           Node ID: {{ zerotier_node_id }}
-          Expected IP: {{ hostvars[inventory_hostname]['zerotier_ip'] | default('auto-assigned') }}
+          Expected IP: {{ hostvars[inventory_hostname]['overlay_ip'] | default('auto-assigned') }}
 
           ZeroTier is installed and running. Proceeding with routing configuration...
           ════════════════════════════════════════════════════════════════════════
@@ -183,13 +183,13 @@
     # Phase 3: Add MetalLB IP range to control plane node
     - name: Prepare IP assignments for node
       ansible.builtin.set_fact:
-        base_ip_assignments: ["{{ hostvars[inventory_hostname]['zerotier_ip'] }}"]
+        base_ip_assignments: ["{{ hostvars[inventory_hostname]['overlay_ip'] }}"]
         additional_ips: []
 
     # For the control plane node, add full MetalLB IP range
     - name: Generate MetalLB IP range for control plane
       ansible.builtin.set_fact:
-        metallb_ips: "{{ metallb_ips | default([]) + [zerotier_subnet_prefix ~ item | string] }}"
+        metallb_ips: "{{ metallb_ips | default([]) + [overlay_subnet_prefix ~ item | string] }}"
       loop: "{{ range(metallb_ip_start_octet | int, metallb_ip_end_octet | int + 1) | list }}"
       when: inventory_hostname in groups['k8s_control_plane'] | default([])
 
@@ -272,7 +272,7 @@
           Node ID: {{ zerotier_node_id }}
           Assigned IPs:
           {% for ip in ip_assignments %}
-          - {{ ip }}{% if ip == hostvars[inventory_hostname]['zerotier_ip'] %} (primary){% endif %}
+          - {{ ip }}{% if ip == hostvars[inventory_hostname]['overlay_ip'] %} (primary){% endif %}
           {% endfor %}
 
           ════════════════════════════════════════════════════════
@@ -350,7 +350,7 @@
           Authorized Nodes: {{ authorized_count }}/{{ groups['overlay_nodes'] | default([]) | length }}
 
           {% for node in groups['overlay_nodes'] | default([]) %}
-          - {{ node }}: {{ hostvars[node]['zerotier_ip'] }}
+          - {{ node }}: {{ hostvars[node]['overlay_ip'] }}
           {% endfor %}
 
           Configuration Summary:

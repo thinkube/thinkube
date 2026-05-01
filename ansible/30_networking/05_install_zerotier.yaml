@@ -1,0 +1,314 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 05_install_zerotier.yaml - Install and configure ZeroTier on cluster nodes
+#
+# Purpose:
+#   Installs ZeroTier on nodes that don't have it, joins them to the network,
+#   authorizes via ZeroTier Central API, and configures firewall/IP forwarding.
+#   Run BEFORE 10_setup_zerotier.yaml (which handles MetalLB VIP routing).
+#
+# Requirements:
+#   - SSH access to all target nodes (key-based auth via ssh-setup)
+#   - ZeroTier network already created at my.zerotier.com
+#   - Valid ZeroTier API token with network admin permissions
+#
+# Variables:
+#   - zerotier_network_id: ZeroTier network ID (from inventory or extra_vars)
+#   - zerotier_api_token: ZeroTier API token (from inventory or extra_vars)
+#   - overlay_ip: Target overlay IP for each host (host-level variable)
+#
+# Run with:
+#   Used by the installer's zerotier-setup page via WebSocket playbook streaming.
+#   Can also be run manually:
+#   ./scripts/tk_ansible ansible/30_networking/05_install_zerotier.yaml
+
+- name: Install and Configure ZeroTier on All Nodes
+  hosts: overlay_nodes
+  gather_facts: true
+  serial: 1
+  become: true
+
+  vars:
+    zerotier_central_url: "https://api.zerotier.com/api/v1"
+    stale_member_threshold_days: 30
+
+  tasks:
+    # Phase 1: Check existing ZeroTier state
+    - name: Check if ZeroTier CLI is installed
+      ansible.builtin.command: which zerotier-cli
+      register: zt_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Check existing ZeroTier network membership
+      ansible.builtin.shell: |
+        zerotier-cli listnetworks 2>/dev/null | grep {{ zerotier_network_id }} | awk '{print $NF}' | cut -d/ -f1
+      register: zt_existing_ip
+      changed_when: false
+      failed_when: false
+      when: zt_installed.rc == 0
+
+    - name: Set existing configuration facts
+      ansible.builtin.set_fact:
+        zt_already_configured: "{{ zt_installed.rc == 0 and zt_existing_ip.stdout | default('') | length > 0 }}"
+        zt_current_ip: "{{ zt_existing_ip.stdout | default('') }}"
+
+    - name: Display existing ZeroTier status
+      ansible.builtin.debug:
+        msg: "ZeroTier already configured on {{ inventory_hostname }} with IP {{ zt_current_ip }} — skipping installation"
+      when: zt_already_configured | bool
+
+    # Phase 2: Install ZeroTier (skip if already configured)
+    - name: Install ZeroTier
+      when: not (zt_already_configured | bool)
+      block:
+        - name: Download and run ZeroTier installer
+          ansible.builtin.shell: curl -s https://install.zerotier.com | bash
+          args:
+            creates: /usr/sbin/zerotier-cli
+          register: zt_install_result
+
+        - name: Enable and start ZeroTier service
+          ansible.builtin.systemd:
+            name: zerotier-one
+            enabled: yes
+            state: started
+
+        - name: Wait for ZeroTier service to initialize
+          ansible.builtin.pause:
+            seconds: 3
+
+    # Phase 3: Configure local.conf (always, even if already installed)
+    - name: Configure ZeroTier to exclude k8s interfaces from peer discovery
+      ansible.builtin.copy:
+        dest: /var/lib/zerotier-one/local.conf
+        content: |
+          {
+            "settings": {
+              "interfacePrefixBlacklist": ["cilium", "cni", "lxc", "veth"]
+            }
+          }
+        mode: '0644'
+      register: zt_local_conf
+
+    - name: Restart ZeroTier if local.conf changed
+      ansible.builtin.systemd:
+        name: zerotier-one
+        state: restarted
+      when: zt_local_conf.changed
+
+    - name: Wait for ZeroTier after restart
+      ansible.builtin.pause:
+        seconds: 3
+      when: zt_local_conf.changed
+
+    # Phase 4: Join network (skip if already joined)
+    - name: Check if already joined to target network
+      ansible.builtin.shell: zerotier-cli listnetworks 2>/dev/null
+      register: zt_networks
+      changed_when: false
+      failed_when: false
+
+    - name: Join ZeroTier network
+      ansible.builtin.command: zerotier-cli join {{ zerotier_network_id }}
+      when: zerotier_network_id not in (zt_networks.stdout | default(''))
+      register: zt_join_result
+
+    - name: Wait for network join to propagate
+      ansible.builtin.pause:
+        seconds: 3
+      when: zt_join_result is changed
+
+    # Phase 5: Get node ID
+    - name: Get ZeroTier node ID
+      ansible.builtin.command: zerotier-cli info
+      register: zt_info
+      changed_when: false
+      failed_when: zt_info.rc != 0
+
+    - name: Extract node ID
+      ansible.builtin.set_fact:
+        zerotier_node_id: "{{ zt_info.stdout.split()[2] }}"
+
+    - name: Validate node ID format
+      ansible.builtin.assert:
+        that:
+          - zerotier_node_id | length == 10
+        fail_msg: "Invalid ZeroTier node ID: {{ zerotier_node_id }}"
+
+    # Phase 6: Clean up stale members holding target IP (API call from localhost)
+    - name: Get all ZeroTier network members
+      ansible.builtin.uri:
+        url: "{{ zerotier_central_url }}/network/{{ zerotier_network_id }}/member"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ zerotier_api_token }}"
+        status_code: 200
+        validate_certs: yes
+      register: zt_members
+      delegate_to: localhost
+      become: false
+
+    - name: Find stale members holding target IP
+      ansible.builtin.set_fact:
+        stale_members: >-
+          {{
+            zt_members.json | selectattr('nodeId', 'ne', zerotier_node_id)
+            | selectattr('config.ipAssignments', 'defined')
+            | selectattr('config.ipAssignments', 'contains', hostvars[inventory_hostname]['overlay_ip'])
+            | list
+          }}
+
+    - name: Remove stale members offline for more than {{ stale_member_threshold_days }} days
+      ansible.builtin.uri:
+        url: "{{ zerotier_central_url }}/network/{{ zerotier_network_id }}/member/{{ item.nodeId }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ zerotier_api_token }}"
+        status_code: [200, 204]
+        validate_certs: yes
+      delegate_to: localhost
+      become: false
+      loop: "{{ stale_members }}"
+      when:
+        - item.lastOnline is defined
+        - (ansible_date_time.epoch | int * 1000) - (item.lastOnline | int) > (stale_member_threshold_days * 86400000)
+      loop_control:
+        label: "{{ item.nodeId }} (last online: {{ '%Y-%m-%d' | strftime((item.lastOnline | int / 1000) | int) }})"
+
+    # Phase 7: Authorize member and assign IP via ZeroTier Central API
+    - name: Authorize node and assign ZeroTier IP
+      ansible.builtin.uri:
+        url: "{{ zerotier_central_url }}/network/{{ zerotier_network_id }}/member/{{ zerotier_node_id }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ zerotier_api_token }}"
+          Content-Type: "application/json"
+        body: |
+          {
+            "name": "{{ inventory_hostname }}",
+            "description": "Configured by thinkube installer",
+            "config": {
+              "authorized": true,
+              "ipAssignments": ["{{ hostvars[inventory_hostname]['overlay_ip'] }}"],
+              "noAutoAssignIps": true
+            }
+          }
+        body_format: json
+        status_code: [200, 201]
+        validate_certs: yes
+      register: zt_authorize
+      delegate_to: localhost
+      become: false
+
+    # Phase 8: Configure firewall and IP forwarding
+    - name: Enable IP forwarding via sysctl
+      ansible.builtin.sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    - name: Allow ZeroTier traffic forwarding (inbound)
+      ansible.builtin.iptables:
+        action: insert
+        chain: FORWARD
+        in_interface: zt+
+        jump: ACCEPT
+      failed_when: false
+
+    - name: Allow ZeroTier traffic forwarding (outbound)
+      ansible.builtin.iptables:
+        action: insert
+        chain: FORWARD
+        out_interface: zt+
+        jump: ACCEPT
+      failed_when: false
+
+    - name: Persist iptables rules
+      ansible.builtin.shell: |
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+          netfilter-persistent save
+        elif command -v iptables-save >/dev/null 2>&1; then
+          iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+      changed_when: true
+      failed_when: false
+
+    - name: Allow ZeroTier UDP port through UFW
+      community.general.ufw:
+        rule: allow
+        port: '9993'
+        proto: udp
+        comment: 'ZeroTier overlay network'
+      failed_when: false
+
+    - name: Allow all traffic on ZeroTier interface through UFW
+      ansible.builtin.shell: |
+        zt_iface=$(ip -o link show | grep -o 'zt[a-z0-9]*' | head -1)
+        if [ -n "$zt_iface" ] && command -v ufw >/dev/null 2>&1; then
+          ufw allow in on "$zt_iface" comment 'ZeroTier overlay - trusted network'
+        fi
+      changed_when: true
+      failed_when: false
+
+    # Phase 9: Wait for ZeroTier IP to be assigned and reachable
+    - name: Wait for ZeroTier network to show assigned IP
+      ansible.builtin.shell: |
+        zerotier-cli listnetworks 2>/dev/null | grep {{ zerotier_network_id }} | awk '{print $NF}' | cut -d/ -f1
+      register: zt_assigned_ip
+      until: zt_assigned_ip.stdout == hostvars[inventory_hostname]['overlay_ip']
+      retries: 20
+      delay: 3
+      changed_when: false
+
+    - name: Display installation result
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          ZeroTier Installation Complete for {{ inventory_hostname }}
+          ════════════════════════════════════════════════════════
+
+          Node ID: {{ zerotier_node_id }}
+          ZeroTier IP: {{ hostvars[inventory_hostname]['overlay_ip'] }}
+          Status: Authorized and connected
+
+          ════════════════════════════════════════════════════════
+
+# Final verification: test connectivity between all nodes over ZeroTier
+- name: Verify ZeroTier Connectivity
+  hosts: overlay_nodes[0]
+  gather_facts: false
+
+  tasks:
+    - name: Test ZeroTier connectivity to all nodes
+      ansible.builtin.command: ping -c 1 -W 3 {{ hostvars[item]['overlay_ip'] }}
+      loop: "{{ groups['overlay_nodes'] }}"
+      register: zt_ping_results
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+      become: false
+
+    - name: Display connectivity results
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════════════════════
+          ZeroTier Network Connectivity Verification
+          ════════════════════════════════════════════════════════════════════════
+
+          {% for result in zt_ping_results.results %}
+          - {{ result.item }}: {{ hostvars[result.item]['overlay_ip'] }} — {{ 'OK' if result.rc == 0 else 'UNREACHABLE' }}
+          {% endfor %}
+
+          ════════════════════════════════════════════════════════════════════════
+
+    - name: Fail if any node is unreachable over ZeroTier
+      ansible.builtin.fail:
+        msg: "Some nodes are not reachable over ZeroTier. Check the connectivity results above."
+      when: zt_ping_results.results | selectattr('rc', 'ne', 0) | list | length > 0

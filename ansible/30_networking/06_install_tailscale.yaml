@@ -1,0 +1,199 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 06_install_tailscale.yaml - Install and configure Tailscale on cluster nodes
+#
+# Purpose:
+#   Installs Tailscale on nodes that don't have it, joins the tailnet,
+#   and configures firewall/IP forwarding.
+#   Run BEFORE 11_setup_tailscale.yaml (which handles MetalLB VIP routing).
+#
+# Requirements:
+#   - SSH access to all target nodes (key-based auth via ssh-setup)
+#   - Tailscale auth key (from https://login.tailscale.com/admin/settings/keys)
+#   - Tailscale API token for route management
+#
+# Variables:
+#   - tailscale_auth_key: Tailscale auth key (from inventory or extra_vars)
+#   - tailscale_api_token: Tailscale API token (from inventory or extra_vars)
+#
+# Run with:
+#   Used by the installer's overlay-setup page via WebSocket playbook streaming.
+#   Can also be run manually:
+#   ./scripts/tk_ansible ansible/30_networking/06_install_tailscale.yaml
+
+- name: Install and Configure Tailscale on All Nodes
+  hosts: overlay_nodes
+  gather_facts: true
+  serial: 1
+  become: true
+
+  tasks:
+    # Phase 1: Check existing Tailscale state
+    - name: Check if Tailscale is installed
+      ansible.builtin.command: which tailscale
+      register: ts_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Check existing Tailscale connection
+      ansible.builtin.command: tailscale status --json
+      register: ts_existing_status
+      changed_when: false
+      failed_when: false
+      when: ts_installed.rc == 0
+
+    - name: Set existing configuration facts
+      ansible.builtin.set_fact:
+        ts_already_configured: >-
+          {{
+            ts_installed.rc == 0 and
+            ts_existing_status.stdout is defined and
+            (ts_existing_status.stdout | from_json).BackendState | default('') == 'Running'
+          }}
+        ts_current_ip: >-
+          {{
+            (ts_existing_status.stdout | from_json).Self.TailscaleIPs[0] | default('')
+            if ts_installed.rc == 0 and ts_existing_status.stdout is defined and ts_existing_status.stdout | length > 0
+            else ''
+          }}
+
+    - name: Display existing Tailscale status
+      ansible.builtin.debug:
+        msg: "Tailscale already configured on {{ inventory_hostname }} with IP {{ ts_current_ip }} — skipping installation"
+      when: ts_already_configured | bool
+
+    # Phase 2: Install Tailscale (skip if already configured)
+    - name: Install Tailscale
+      when: not (ts_already_configured | bool)
+      block:
+        - name: Download and run Tailscale installer
+          ansible.builtin.shell: curl -fsSL https://tailscale.com/install.sh | sh
+          args:
+            creates: /usr/bin/tailscale
+          register: ts_install_result
+
+        - name: Enable and start Tailscale service
+          ansible.builtin.systemd:
+            name: tailscaled
+            enabled: yes
+            state: started
+
+        - name: Wait for Tailscale service to initialize
+          ansible.builtin.pause:
+            seconds: 3
+
+    # Phase 3: Join tailnet (skip if already connected)
+    - name: Connect to Tailscale tailnet
+      ansible.builtin.command: >
+        tailscale up
+        --authkey={{ tailscale_auth_key }}
+        --hostname={{ inventory_hostname }}
+        --accept-routes
+      when: not (ts_already_configured | bool)
+      register: ts_join_result
+
+    - name: Wait for Tailscale connection to establish
+      ansible.builtin.pause:
+        seconds: 5
+      when: ts_join_result is changed
+
+    # Phase 4: Get assigned Tailscale IP
+    - name: Get Tailscale status
+      ansible.builtin.command: tailscale status --json
+      register: ts_status
+      changed_when: false
+      failed_when: ts_status.rc != 0
+
+    - name: Extract Tailscale IP and device info
+      ansible.builtin.set_fact:
+        ts_assigned_ip: "{{ (ts_status.stdout | from_json).Self.TailscaleIPs[0] }}"
+        ts_device_id: "{{ (ts_status.stdout | from_json).Self.ID }}"
+        ts_hostname: "{{ (ts_status.stdout | from_json).Self.DNSName }}"
+
+    - name: Verify Tailscale IP was assigned
+      ansible.builtin.assert:
+        that:
+          - ts_assigned_ip is defined
+          - ts_assigned_ip | length > 0
+          - ts_assigned_ip != 'pending'
+        fail_msg: "Tailscale IP not assigned for {{ inventory_hostname }}"
+
+    # Phase 5: Configure firewall and IP forwarding
+    - name: Enable IP forwarding via sysctl
+      ansible.builtin.sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    - name: Allow Tailscale UDP port through UFW
+      community.general.ufw:
+        rule: allow
+        port: '41641'
+        proto: udp
+        comment: 'Tailscale overlay network'
+      failed_when: false
+
+    - name: Allow all traffic on Tailscale interface through UFW
+      ansible.builtin.shell: |
+        ts_iface=$(ip -o link show | grep -o 'tailscale[0-9]*' | head -1)
+        if [ -n "$ts_iface" ] && command -v ufw >/dev/null 2>&1; then
+          ufw allow in on "$ts_iface" comment 'Tailscale overlay - trusted network'
+        fi
+      changed_when: true
+      failed_when: false
+
+    - name: Display installation result
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          Tailscale Installation Complete for {{ inventory_hostname }}
+          ════════════════════════════════════════════════════════
+
+          Device ID: {{ ts_device_id }}
+          Tailscale IP: {{ ts_assigned_ip }}
+          Hostname: {{ ts_hostname }}
+          Status: Connected to tailnet
+
+          ════════════════════════════════════════════════════════
+
+# Final verification: test connectivity between all nodes over Tailscale
+- name: Verify Tailscale Connectivity
+  hosts: overlay_nodes[0]
+  gather_facts: false
+
+  tasks:
+    - name: Test Tailscale connectivity to all nodes
+      ansible.builtin.command: >
+        ping -c 1 -W 3
+        {{ (hostvars[item]['ts_assigned_ip']) if hostvars[item]['ts_assigned_ip'] is defined
+           else hostvars[item]['overlay_ip'] }}
+      loop: "{{ groups['overlay_nodes'] }}"
+      register: ts_ping_results
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+      become: false
+
+    - name: Display connectivity results
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════════════════════
+          Tailscale Network Connectivity Verification
+          ════════════════════════════════════════════════════════════════════════
+
+          {% for result in ts_ping_results.results %}
+          - {{ result.item }}: {{ hostvars[result.item]['ts_assigned_ip'] | default(hostvars[result.item]['overlay_ip'] | default('unknown')) }} — {{ 'OK' if result.rc == 0 else 'UNREACHABLE' }}
+          {% endfor %}
+
+          ════════════════════════════════════════════════════════════════════════
+
+    - name: Fail if any node is unreachable over Tailscale
+      ansible.builtin.fail:
+        msg: "Some nodes are not reachable over Tailscale. Check the connectivity results above."
+      when: ts_ping_results.results | selectattr('rc', 'ne', 0) | list | length > 0

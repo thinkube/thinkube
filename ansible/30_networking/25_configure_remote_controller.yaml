@@ -17,8 +17,8 @@
 #   ./scripts/run_ansible.sh ansible/30_networking/25_configure_remote_controller.yaml
 #
 # Variables from inventory:
-#   - zerotier_subnet_prefix: ZeroTier network prefix (e.g., 10.0.191.)
-#   - zerotier_ip: ZeroTier IP for each host
+#   - overlay_subnet_prefix: Overlay network prefix (e.g., 192.168.191.)
+#   - overlay_ip: Overlay IP for each host
 #   - domain_name: Domain name for the cluster
 #
 # Dependencies:
@@ -55,7 +55,7 @@
     - name: Get local ZeroTier IP
       ansible.builtin.shell: |
         ip addr show | grep -o "192\.168\.191\.[0-9]\+" | head -n1
-      register: local_zerotier_ip
+      register: local_overlay_ip
       changed_when: false
       
     - name: Display controller ZeroTier configuration
@@ -66,8 +66,8 @@
           Remote Controller Configuration
           ════════════════════════════════════════════════════════
           
-          Controller ZeroTier IP: {{ local_zerotier_ip.stdout }}
-          Expected Controller IP: {{ hostvars['controller']['zerotier_ip'] }}
+          Controller Overlay IP: {{ local_overlay_ip.stdout }}
+          Expected Controller IP: {{ hostvars['controller']['overlay_ip'] }}
           
           This playbook will configure:
           1. SSH access via ZeroTier IPs
@@ -109,16 +109,16 @@
           
           {% for host in groups['baremetal'] %}
           Host {{ host }}-zt
-            HostName {{ hostvars[host]['zerotier_ip'] }}
+            HostName {{ hostvars[host]['overlay_ip'] }}
             User {{ system_username }}
             IdentityFile {{ lookup('env', 'HOME') }}/.ssh/{{ ssh_key_name }}
             StrictHostKeyChecking no
             UserKnownHostsFile /dev/null
           
           {% endfor %}
-          {% for host in groups['lxd_containers'] if hostvars[host]['zerotier_enabled'] | default(false) %}
+          {% for host in groups['lxd_containers'] if hostvars[host]['overlay_ip'] is defined %}
           Host {{ host }}-zt
-            HostName {{ hostvars[host]['zerotier_ip'] }}
+            HostName {{ hostvars[host]['overlay_ip'] }}
             User {{ system_username }}
             IdentityFile {{ lookup('env', 'HOME') }}/.ssh/{{ ssh_key_name }}
             StrictHostKeyChecking no
@@ -187,14 +187,14 @@
               network_gateway: "{{ network_gateway }}"
               zerotier_network_id: "{{ zerotier_network_id }}"
               zerotier_api_token: "{{ zerotier_api_token }}"
-              zerotier_cidr: "{{ zerotier_cidr }}"
+              overlay_cidr: "{{ overlay_cidr }}"
               dns_servers: {{ dns_servers | to_json }}
               dns_search_domains: {{ dns_search_domains | default([]) | to_json }}
               lxd_network_name: "{{ lxd_network_name }}"
               lxd_network_ipv4_address: "{{ lxd_network_ipv4_address }}"
               lxd_network_ipv6_address: "{{ lxd_network_ipv6_address }}"
               internal_gateway: "{{ internal_gateway }}"
-              zerotier_subnet_prefix: "{{ zerotier_subnet_prefix }}"
+              overlay_subnet_prefix: "{{ overlay_subnet_prefix }}"
               primary_ingress_ip_octet: "{{ primary_ingress_ip_octet }}"
               secondary_ingress_ip_octet: "{{ secondary_ingress_ip_octet }}"
               primary_ingress_ip: "{{ primary_ingress_ip }}"
@@ -224,11 +224,10 @@
                 hosts:
           {% for host in groups['baremetal'] %}
                   {{ host }}:
-                    ansible_host: "{{ hostvars[host]['zerotier_ip'] }}"
+                    ansible_host: "{{ hostvars[host]['overlay_ip'] }}"
                     lan_ip: "{{ hostvars[host]['lan_ip'] }}"
-                    zerotier_ip: "{{ hostvars[host]['zerotier_ip'] }}"
+                    overlay_ip: "{{ hostvars[host]['overlay_ip'] }}"
                     arch: "{{ hostvars[host]['arch'] }}"
-                    zerotier_enabled: {{ hostvars[host]['zerotier_enabled'] }}
           {% if 'configure_gpu_passthrough' in hostvars[host] %}
                     configure_gpu_passthrough: {{ hostvars[host]['configure_gpu_passthrough'] }}
           {% endif %}
@@ -279,7 +278,7 @@
                     hosts:
           {% for host in groups['dns_vms'] %}
                       {{ host }}:
-                        ansible_host: "{{ hostvars[host]['zerotier_ip'] }}"
+                        ansible_host: "{{ hostvars[host]['overlay_ip'] }}"
                         parent_host: "{{ hostvars[host]['parent_host'] }}"
                         memory: "{{ hostvars[host]['memory'] }}"
                         cpu_cores: {{ hostvars[host]['cpu_cores'] }}
@@ -287,8 +286,7 @@
                         arch: "{{ hostvars[host]['arch'] }}"
                         lan_ip: "{{ hostvars[host]['lan_ip'] }}"
                         internal_ip: "{{ hostvars[host]['internal_ip'] }}"
-                        zerotier_ip: "{{ hostvars[host]['zerotier_ip'] }}"
-                        zerotier_enabled: {{ hostvars[host]['zerotier_enabled'] }}
+                        overlay_ip: "{{ hostvars[host]['overlay_ip'] }}"
                         gpu_passthrough: {{ hostvars[host]['gpu_passthrough'] }}
           {% endfor %}
                   microk8s_containers:
@@ -299,7 +297,7 @@
                         hosts:
           {% for host in groups['workers'] if host in groups['lxd_containers'] %}
                           {{ host }}:
-                            ansible_host: "{{ hostvars[host]['zerotier_ip'] }}"
+                            ansible_host: "{{ hostvars[host]['overlay_ip'] }}"
                             parent_host: "{{ hostvars[host]['parent_host'] }}"
                             memory: "{{ hostvars[host]['memory'] }}"
                             cpu_cores: {{ hostvars[host]['cpu_cores'] }}
@@ -307,8 +305,7 @@
                             arch: "{{ hostvars[host]['arch'] }}"
                             lan_ip: "{{ hostvars[host]['lan_ip'] }}"
                             internal_ip: "{{ hostvars[host]['internal_ip'] }}"
-                            zerotier_ip: "{{ hostvars[host]['zerotier_ip'] }}"
-                            zerotier_enabled: {{ hostvars[host]['zerotier_enabled'] }}
+                            overlay_ip: "{{ hostvars[host]['overlay_ip'] }}"
                             gpu_passthrough: {{ hostvars[host]['gpu_passthrough'] }}
           {% if 'pci_slot' in hostvars[host] %}
                             pci_slot: "{{ hostvars[host]['pci_slot'] }}"
@@ -327,8 +324,7 @@
                     ansible_connection: "local"
                     ansible_host: "127.0.0.1"
                     lan_ip: "127.0.0.1"
-                    zerotier_ip: "{{ hostvars['controller']['zerotier_ip'] }}"
-                    zerotier_enabled: true
+                    overlay_ip: "{{ hostvars['controller']['overlay_ip'] }}"
                     arch: "{{ hostvars['controller']['arch'] }}"
               
               # Include any other groups as needed
@@ -345,7 +341,7 @@
     # Phase 4: Test connectivity
     - name: Test SSH connectivity to nodes via ZeroTier
       ansible.builtin.shell: |
-        echo "Testing connection to {{ item }}-zt ({{ hostvars[item]['zerotier_ip'] }})..."
+        echo "Testing connection to {{ item }}-zt ({{ hostvars[item]['overlay_ip'] }})..."
         ssh -o ConnectTimeout=5 {{ item }}-zt "echo 'Successfully connected to {{ item }} via ZeroTier'"
       register: ssh_test_results
       loop: "{{ groups['baremetal'] }}"
@@ -377,11 +373,11 @@
       ansible.builtin.debug:
         msg: |
           DNS Configuration:
-          - ZeroTier DNS Server: {{ hostvars[groups['dns_servers'][0]]['zerotier_ip'] }}
+          - ZeroTier DNS Server: {{ hostvars[groups['dns_servers'][0]]['overlay_ip'] }}
           - Domain: {{ domain_name }}
           
           To use ZeroTier DNS, configure your resolver to use:
-          {{ hostvars[groups['dns_servers'][0]]['zerotier_ip'] }}
+          {{ hostvars[groups['dns_servers'][0]]['overlay_ip'] }}
           
     # Phase 6: Create helper scripts
     - name: Create ZeroTier connectivity script
