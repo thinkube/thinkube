@@ -352,23 +352,27 @@
                               spec = wft_data.get('spec', {})
                               templates = spec.get('templates', [])
                               
-                              # Find build tasks to identify containers
+                              # Find build tasks to identify unique containers.
+                              # Multi-arch builds have multiple tasks (build-inference-amd64,
+                              # build-inference-arm64) sharing the same container_name param.
+                              seen_containers = set()
                               for template in templates:
-                                  # Check for both template names used by different apps
                                   if template.get('name') in ['ci-cd-pipeline', 'build-and-push']:
                                       dag = template.get('dag', {})
                                       tasks = dag.get('tasks', [])
                                       for task in tasks:
                                           task_name = task.get('name', '')
-                                          # Skip non-build tasks
                                           if task_name.startswith('build-') and task_name not in ['build-pipeline', 'build-and-push']:
-                                              container_name = task_name.replace('build-', '')
-                                              containers.append({'name': container_name})
-                              
+                                              task_args = {a['name']: a['value'] for a in task.get('arguments', {}).get('parameters', [])}
+                                              container_name = task_args.get('container_name') or task_name.replace('build-', '')
+                                              if container_name not in seen_containers:
+                                                  seen_containers.add(container_name)
+                                                  containers.append({'name': container_name})
+
                               if not containers:
                                   logger.error(f"No container build tasks found in WorkflowTemplate for {app_name}")
                                   return
-                              
+
                               logger.info(f"Found {len(containers)} containers from WorkflowTemplate: {[c['name'] for c in containers]}")
 
                               for resource in resources:
