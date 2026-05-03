@@ -6,7 +6,7 @@
 #
 # Purpose:
 #   Configures routing and firewall for ZeroTier overlay network on cluster nodes
-#   Adds MetalLB IP range to control plane node for service access
+#   Adds the load balancer IP range to the control plane node for service access
 #
 # Requirements:
 #   - ZeroTier must already be installed and configured (via 05_install_zerotier.yaml or the installer)
@@ -17,8 +17,8 @@
 #   - zerotier_network_id: ZeroTier network ID from inventory
 #   - zerotier_api_token: ZeroTier API token from inventory
 #   - overlay_ip: Static overlay IP for each node (from inventory)
-#   - metallb_ip_start_octet, metallb_ip_end_octet: MetalLB IP range octets
-#   - overlay_subnet_prefix: Network prefix for MetalLB IPs
+#   - lb_ip_start_octet, lb_ip_end_octet: load balancer IP range octets
+#   - overlay_subnet_prefix: Network prefix for load balancer IPs
 #
 # Run with:
 #   ./scripts/run_ansible.sh ansible/30_networking/10_setup_zerotier.yaml
@@ -180,22 +180,22 @@
           become: true
       when: '"baremetal" in group_names'
 
-    # Phase 3: Add MetalLB IP range to control plane node
+    # Phase 3: Add load balancer IP range to control plane node
     - name: Prepare IP assignments for node
       ansible.builtin.set_fact:
         base_ip_assignments: ["{{ hostvars[inventory_hostname]['overlay_ip'] }}"]
         additional_ips: []
 
-    # For the control plane node, add full MetalLB IP range
-    - name: Generate MetalLB IP range for control plane
+    # For the control plane node, add the full load balancer IP range
+    - name: Generate load balancer IP range for control plane
       ansible.builtin.set_fact:
-        metallb_ips: "{{ metallb_ips | default([]) + [overlay_subnet_prefix ~ item | string] }}"
-      loop: "{{ range(metallb_ip_start_octet | int, metallb_ip_end_octet | int + 1) | list }}"
+        lb_ips: "{{ lb_ips | default([]) + [overlay_subnet_prefix ~ item | string] }}"
+      loop: "{{ range(lb_ip_start_octet | int, lb_ip_end_octet | int + 1) | list }}"
       when: inventory_hostname in groups['k8s_control_plane'] | default([])
 
-    - name: Add MetalLB IPs to additional_ips
+    - name: Add load balancer IPs to additional_ips
       ansible.builtin.set_fact:
-        additional_ips: "{{ additional_ips + (metallb_ips | default([])) }}"
+        additional_ips: "{{ additional_ips + (lb_ips | default([])) }}"
       when: inventory_hostname in groups['k8s_control_plane'] | default([])
 
     # Generate the full list of IP assignments
@@ -210,7 +210,7 @@
           IP assignments for {{ inventory_hostname }}:
           {{ ip_assignments | to_yaml }}
 
-    - name: Update node IP assignments for MetalLB
+    - name: Update node IP assignments for load balancer
       ansible.builtin.uri:
         url: "{{ zerotier_central_url }}/network/{{ zerotier_network_id }}/member/{{ zerotier_node_id }}"
         method: POST
@@ -356,6 +356,6 @@
           Configuration Summary:
           - IP forwarding: Enabled on all nodes
           - Firewall: FORWARD rules configured for ZeroTier
-          - MetalLB IPs: Added to control plane node
+          - Load balancer IPs: Added to control plane node
 
           ════════════════════════════════════════════════════════════════════════

@@ -8,7 +8,7 @@
 #   - Installs k8s snap package
 #   - Installs kubectl and helm binaries (no sudo required)
 #   - Creates k8s-hostpath StorageClass (alias to csi-rawfile-default)
-#   - Enables Cilium load balancer (built-in replacement for MetalLB)
+#   - Enables Cilium load balancer (built into k8s-snap; no MetalLB used)
 #
 # Requirements:
 #   - Ubuntu 24.04 LTS
@@ -801,12 +801,32 @@
             mode: '0644'
 
     # ===========================
-    # Cilium Load Balancer (replaces MetalLB)
+    # Cilium Load Balancer (k8s-snap built-in; no MetalLB used)
     # ===========================
+    # Backward-compat shim: accept the legacy metallb_ip_*_octet variable
+    # names if they are defined and the new lb_ip_*_octet ones are not. Lets
+    # existing inventories upgrade without immediately reissuing them.
+    - name: Alias legacy metallb_ip_*_octet vars to lb_ip_*_octet
+      ansible.builtin.set_fact:
+        lb_ip_start_octet: "{{ lb_ip_start_octet | default(metallb_ip_start_octet) }}"
+        lb_ip_end_octet: "{{ lb_ip_end_octet | default(metallb_ip_end_octet) }}"
+      when: metallb_ip_start_octet is defined or metallb_ip_end_octet is defined
+
+    - name: Warn when legacy metallb_ip_*_octet vars are in use
+      ansible.builtin.debug:
+        msg: >-
+          DEPRECATION: metallb_ip_*_octet has been renamed to lb_ip_*_octet
+          (Thinkube uses Cilium's built-in load balancer, never MetalLB).
+          Update your inventory; the legacy names will be removed in a
+          future release.
+      when:
+        - metallb_ip_start_octet is defined or metallb_ip_end_octet is defined
+        - lb_ip_start_octet == (metallb_ip_start_octet | default(lb_ip_start_octet))
+
     - name: Build load balancer IP range variables
       ansible.builtin.set_fact:
-        lb_ip_range_start: "{{ overlay_subnet_prefix }}{{ metallb_ip_start_octet }}"
-        lb_ip_range_end: "{{ overlay_subnet_prefix }}{{ metallb_ip_end_octet }}"
+        lb_ip_range_start: "{{ overlay_subnet_prefix }}{{ lb_ip_start_octet }}"
+        lb_ip_range_end: "{{ overlay_subnet_prefix }}{{ lb_ip_end_octet }}"
 
     - name: Enable Cilium load balancer
       ansible.builtin.command: k8s enable load-balancer

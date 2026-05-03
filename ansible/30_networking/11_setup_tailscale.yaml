@@ -5,22 +5,23 @@
 # 11_setup_tailscale.yaml - Configure Tailscale overlay network routing for Thinkube
 #
 # Purpose:
-#   Configures subnet routing on control plane for MetalLB IP range via Tailscale API
-#   Auto-approves routes using Tailscale API (no manual intervention)
-#   Enables IP forwarding on control plane for traffic routing
+#   Configures subnet routing on control plane for the Cilium load balancer
+#   IP range via Tailscale API. Auto-approves routes using Tailscale API
+#   (no manual intervention). Enables IP forwarding on control plane for
+#   traffic routing.
 #
 # Key Architecture:
 #   - Each node gets automatic IP from 100.x.x.x range (assigned by Tailscale)
-#   - Control plane advertises MetalLB subnet (e.g., 192.168.191.50/27)
+#   - Control plane advertises load balancer subnet (e.g., 192.168.191.50/27)
 #   - Tailscale API auto-approves the subnet route
-#   - Worker nodes route MetalLB traffic through control plane
+#   - Worker nodes route load balancer traffic through control plane
 #
 # Requirements:
 #   - Tailscale must already be installed and configured (via 06_install_tailscale.yaml or the installer)
 #   - Nodes must already be joined to the tailnet
 #   - tailscale_auth_key: Auth key from inventory (for re-joining if needed)
 #   - tailscale_api_token: API token for auto-approving routes
-#   - metallb_ip_start_octet, metallb_ip_end_octet: MetalLB IP range
+#   - lb_ip_start_octet, lb_ip_end_octet: load balancer IP range
 #   - overlay_subnet_prefix: Network prefix (used for overlay CIDR)
 #
 # Run with:
@@ -89,13 +90,13 @@
           Tailscale is installed and connected. Proceeding with routing configuration...
           ════════════════════════════════════════════════════════════════════════
 
-    # Phase 2: Configure MetalLB subnet routing on control plane
-    - name: Calculate MetalLB subnet CIDR
+    # Phase 2: Configure load balancer subnet routing on control plane
+    - name: Calculate load balancer subnet CIDR
       ansible.builtin.set_fact:
-        metallb_cidr: "{{ overlay_subnet_prefix }}{{ metallb_ip_start_octet }}/27"
+        lb_cidr: "{{ overlay_subnet_prefix }}{{ lb_ip_start_octet }}/27"
       when: inventory_hostname in groups['k8s_control_plane'] | default([])
 
-    - name: Check if control plane is advertising MetalLB routes
+    - name: Check if control plane is advertising load balancer routes
       ansible.builtin.command: tailscale status --json
       register: current_routes_check
       changed_when: false
@@ -106,14 +107,14 @@
         current_advertised_routes: "{{ (current_routes_check.stdout | from_json).Self.AllowedIPs | default([]) }}"
       when: inventory_hostname in groups['k8s_control_plane'] | default([])
 
-    - name: Update tailscale to advertise MetalLB subnet (if not already)
+    - name: Update tailscale to advertise load balancer subnet (if not already)
       ansible.builtin.command: >
         tailscale set
-        --advertise-routes={{ metallb_cidr }}
+        --advertise-routes={{ lb_cidr }}
         --accept-routes
       when:
         - inventory_hostname in groups['k8s_control_plane'] | default([])
-        - metallb_cidr not in current_advertised_routes | default([])
+        - lb_cidr not in current_advertised_routes | default([])
       register: tailscale_update
       changed_when: true
 
@@ -122,7 +123,7 @@
         seconds: 5
       when: tailscale_update is changed
 
-    - name: Auto-approve MetalLB subnet routes via Tailscale API
+    - name: Auto-approve load balancer subnet routes via Tailscale API
       ansible.builtin.uri:
         url: "{{ tailscale_api_url }}/device/{{ tailscale_device_id }}/routes"
         method: POST
@@ -131,7 +132,7 @@
           Content-Type: "application/json"
         body:
           routes:
-            - "{{ metallb_cidr }}"
+            - "{{ lb_cidr }}"
         body_format: json
         status_code: [200, 201]
         validate_certs: yes
@@ -163,7 +164,7 @@
           Device ID: {{ tailscale_device_id }}
 
           Control Plane Status:
-          - Advertising subnet: {{ metallb_cidr }}
+          - Advertising subnet: {{ lb_cidr }}
           - Route approval: {% if route_approval.status == 200 or route_approval.status == 201 %}✅ Auto-approved via API{% else %}⚠️  Check Tailscale admin console{% endif %}
           - IP forwarding: Enabled
 
@@ -213,11 +214,11 @@
 
           Configuration Summary:
           - IP forwarding: Enabled on control plane
-          - MetalLB subnet: Advertised and routed via control plane
-          - All nodes: Accepting routes for seamless MetalLB access
+          - Load balancer subnet: Advertised and routed via control plane
+          - All nodes: Accepting routes for seamless load balancer access
 
           NEXT STEPS:
-          1. Verify MetalLB services are accessible via Tailscale IPs
+          1. Verify load balancer services are accessible via Tailscale IPs
           2. Continue with Kubernetes deployment
 
           ════════════════════════════════════════════════════════════════════════

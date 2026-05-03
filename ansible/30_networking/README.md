@@ -10,7 +10,7 @@ This directory contains playbooks for configuring ZeroTier networking and DNS se
   - Installs ZeroTier package on all nodes in `zerotier_nodes` group one at a time
   - Joins each node to the ZeroTier network
   - Automatically authorizes nodes and assigns IPs via the ZeroTier API
-  - Assigns additional IPs for MetalLB and ingress services on control plane nodes
+  - Assigns additional IPs for the Cilium load balancer and ingress services on control plane nodes
   - Configures IP forwarding and firewall rules
   - Maintains existing network-wide settings to preserve other ZeroTier nodes
   - Processes one node at a time from start to finish
@@ -41,7 +41,7 @@ This directory contains playbooks for configuring ZeroTier networking and DNS se
   - Sets up wildcard records for service access
   - Creates Knative subdomain (kn.domain.com) for serverless applications
   - Configures resolver settings and DNS forwarders
-  - Points wildcard domains to appropriate MetalLB ingress IPs
+  - Points wildcard domains to the Cilium load balancer ingress IPs
 
 ### 25_configure_dns_clients.yaml
 - **Purpose**: Configures DNS resolution on all nodes
@@ -78,8 +78,8 @@ The correct order to run these playbooks is:
 
 ## Special Configurations
 
-### MetalLB and Ingress IP Configuration
-- The ZeroTier setup assigns additional IPs to control plane node for MetalLB:
+### Load Balancer and Ingress IP Configuration
+- The ZeroTier setup assigns additional IPs to the control plane node for the Cilium load balancer:
   - `10.0.191.200` - Primary gateway IP
 - DNS wildcard records are configured to point to these IPs:
   - `*.thinkube.com` → `10.0.191.200`
