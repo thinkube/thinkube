@@ -20,7 +20,11 @@
 # Variables from inventory:
 #   - domain_name: Base domain for all services
 #   - dns_external_ip_octet: Last octet for DNS external IP
-#   - primary_ingress_ip_octet: Last octet for primary ingress
+#   - primary_ingress_ip_octet: Last octet for primary ingress (ZeroTier mode)
+#   - overlay_provider: 'zerotier' (default) or 'tailscale'
+#   - gateway_namespace, gateway_name (group_vars/k8s.yml): identify the
+#     Envoy Gateway Service whose LoadBalancer IP the operator populates
+#     when overlay_provider == 'tailscale'.
 #   (secondary_ingress_ip_octet removed — kn subdomain eliminated)
 #
 # Dependencies:
@@ -70,6 +74,62 @@
           - primary_ingress_ip_octet is defined
           - network_mode is defined
         fail_msg: "Required inventory variables are not defined"
+
+    # The wildcard A record in the BIND9 zone needs the IP that external
+    # clients should hit for *.{{ domain_name }}. In ZeroTier mode that's
+    # the static primary_ingress_ip the user picked. In Tailscale mode the
+    # Tailscale Operator provisions a tailnet IP for the Envoy Gateway
+    # Service after gateway-api/10_deploy.yaml runs — so we have to
+    # discover it dynamically before templating the zone.
+    - name: Discover Envoy Gateway Service tailnet IP (Tailscale mode)
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc -n envoy-gateway-system
+        -l gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }},gateway.envoyproxy.io/owning-gateway-namespace={{ gateway_namespace }}
+        -o jsonpath={.items[0].status.loadBalancer.ingress[0].ip}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: tailnet_gateway_ip_lookup
+      changed_when: false
+      retries: 30
+      delay: 10
+      until:
+        - tailnet_gateway_ip_lookup.rc == 0
+        - tailnet_gateway_ip_lookup.stdout | length > 0
+      failed_when: false
+      when: overlay_provider | default('zerotier') == 'tailscale'
+
+    - name: Fail with actionable message if the operator did not assign a tailnet IP
+      ansible.builtin.fail:
+        msg: |
+          The Tailscale Operator did not populate
+          Service.status.loadBalancer.ingress on the Envoy Gateway Service
+          (label selector
+            gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }},
+            gateway.envoyproxy.io/owning-gateway-namespace={{ gateway_namespace }})
+          within the timeout. Likely causes:
+
+            1. The Tailscale Operator pods aren't running. Check:
+                 {{ kubectl_bin }} get pods -n tailscale
+                 {{ kubectl_bin }} logs -n tailscale deployment/operator
+
+            2. The OAuth client lacks the required scopes (Devices/Core
+               write + Keys/Auth Keys write) or the tag tag:k8s-operator.
+               Re-create it in Tailscale Admin → Trust credentials and
+               re-run the configuration step in the installer.
+
+            3. The tagOwners are missing from your tailnet policy file.
+               The installer's verify-API-token step adds them via the
+               ACL API; re-run that step to re-apply.
+      when:
+        - overlay_provider | default('zerotier') == 'tailscale'
+        - (tailnet_gateway_ip_lookup.stdout | default('') | length == 0)
+
+    - name: Set effective gateway IP for the BIND9 wildcard
+      ansible.builtin.set_fact:
+        effective_gateway_ip: >-
+          {{ tailnet_gateway_ip_lookup.stdout
+             if overlay_provider | default('zerotier') == 'tailscale'
+             else primary_ingress_ip }}
 
   tasks:
     - name: Create DNS namespace
@@ -189,7 +249,7 @@
           ns1     IN      A       {{ dns_external_ip }}
 
           ; Wildcard for all subdomains
-          *       IN      A       {{ primary_ingress_ip }}
+          *       IN      A       {{ effective_gateway_ip }}
 
           ; Specific entries for infrastructure
           dns     IN      A       {{ dns_external_ip }}
@@ -445,7 +505,7 @@
           Internal Service: bind9-internal.{{ dns_namespace }}.svc.cluster.local
 
           Configured zones:
-          - {{ domain_name }} (wildcard → {{ primary_ingress_ip }})
+          - {{ domain_name }} (wildcard → {{ effective_gateway_ip }})
 
           External forwarding to: 8.8.8.8, 8.8.4.4
 
