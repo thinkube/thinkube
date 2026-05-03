@@ -33,6 +33,24 @@ This directory contains playbooks for configuring ZeroTier networking and DNS se
   - Optionally uninstalls ZeroTier
   - Preserves the ZeroTier network itself for other nodes
 
+### 12_install_tailscale_operator.yaml
+- **Purpose**: Installs the Tailscale Kubernetes Operator (Tailscale mode only)
+- **When it runs**: Only when `overlay_provider == 'tailscale'` — no-ops otherwise
+- **What it does**:
+  - Adds the Tailscale Helm repository
+  - Installs the `tailscale-operator` Helm chart in the `tailscale` namespace
+  - Passes the OAuth Client ID and Secret (collected by the installer) as Helm values
+  - Waits for the `operator` deployment to become available
+- **Requirements**:
+  - An OAuth client created at Tailscale Admin → Trust credentials with scopes
+    Devices/Core (R+W) and Keys/Auth Keys (R+W), tagged `tag:k8s-operator`.
+    The installer adds the matching `tagOwners` to the tailnet policy file
+    via the Tailscale ACL API before this playbook runs.
+- **Position in chain**: After `06_install_tailscale.yaml` and
+  `11_setup_tailscale.yaml`. Once the operator is running, Services
+  annotated with `tailscale.com/expose: "true"` become tailnet devices
+  reachable from any device on the tailnet.
+
 ### 20_setup_dns.yaml
 - **Purpose**: Sets up DNS server for service discovery
 - **What it does**:

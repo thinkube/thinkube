@@ -1,0 +1,119 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 12_install_tailscale_operator.yaml - Install the Tailscale Kubernetes Operator
+#
+# Purpose:
+#   In Tailscale overlay mode, install the Tailscale Kubernetes Operator
+#   into the cluster so that Services annotated with tailscale.com/expose
+#   become tailnet devices reachable from any device on the tailnet.
+#   Replaces the brittle subnet-route workaround (advertised by the control
+#   plane) with a per-Service or shared-Gateway tailnet device managed by
+#   the operator.
+#
+#   This playbook is a no-op when overlay_provider != 'tailscale'.
+#
+# Requirements:
+#   - Kubernetes installed and running (Canonical k8s-snap)
+#   - The host running this playbook has the user-level helm + kubectl
+#     binaries (helm_bin, kubectl_bin from inventory)
+#   - The user has created an OAuth client in the Tailscale admin's Trust
+#     credentials page with scopes Devices/Core (R+W) and Keys/Auth Keys
+#     (R+W), tagged tag:k8s-operator. The installer puts the corresponding
+#     tagOwners in place via the Tailscale ACL API before this point.
+#
+# Variables:
+#   - overlay_provider: 'tailscale' or 'zerotier' (skip if not tailscale)
+#   - tailscale_oauth_client_id: from inventory (originates in installer)
+#   - tailscale_oauth_client_secret: from inventory (originates in installer)
+#   - kubectl_bin, helm_bin, kubeconfig: from inventory/group_vars/k8s.yml
+#
+# Run with:
+#   ./scripts/tk_ansible ansible/30_networking/12_install_tailscale_operator.yaml
+
+- name: Install Tailscale Kubernetes Operator
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+
+  vars:
+    operator_namespace: "tailscale"
+    operator_release: "tailscale-operator"
+    operator_repo_name: "tailscale"
+    operator_repo_url: "https://pkgs.tailscale.com/helmcharts"
+    operator_deployment: "operator"
+
+  tasks:
+    - name: Skip when overlay provider is not Tailscale
+      ansible.builtin.meta: end_play
+      when: overlay_provider | default('zerotier') != 'tailscale'
+
+    - name: Verify required Tailscale OAuth credentials are present
+      ansible.builtin.assert:
+        that:
+          - tailscale_oauth_client_id is defined
+          - tailscale_oauth_client_id | length > 0
+          - tailscale_oauth_client_secret is defined
+          - tailscale_oauth_client_secret | length > 0
+        fail_msg: >-
+          tailscale_oauth_client_id and tailscale_oauth_client_secret are
+          required to install the Tailscale Operator. Generate an OAuth
+          client at Tailscale Admin → Trust credentials → +Credential →
+          OAuth (Devices/Core R+W, Keys/Auth Keys R+W, tag k8s-operator)
+          and re-run the configuration step in the installer.
+
+    - name: Add the Tailscale Helm repository
+      ansible.builtin.command: >
+        {{ helm_bin }} repo add {{ operator_repo_name }} {{ operator_repo_url }}
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+      failed_when:
+        - helm_repo_add.rc != 0
+        - "'already exists' not in helm_repo_add.stderr"
+
+    - name: Refresh the Helm repository index
+      ansible.builtin.command: "{{ helm_bin }} repo update {{ operator_repo_name }}"
+      changed_when: false
+
+    - name: Install or upgrade the Tailscale Operator
+      ansible.builtin.command: >
+        {{ helm_bin }} upgrade --install {{ operator_release }}
+        {{ operator_repo_name }}/tailscale-operator
+        --namespace={{ operator_namespace }}
+        --create-namespace
+        --set-string oauth.clientId={{ tailscale_oauth_client_id }}
+        --set-string oauth.clientSecret={{ tailscale_oauth_client_secret }}
+        --wait
+        --kubeconfig {{ kubeconfig }}
+      register: helm_install
+      changed_when: true
+      no_log: true
+
+    - name: Wait for the operator deployment to become available
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status deployment/{{ operator_deployment }}
+        -n {{ operator_namespace }} --timeout=180s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    - name: Display install summary
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          ✅ Tailscale Kubernetes Operator installed
+          ════════════════════════════════════════════════════════
+
+          Namespace:  {{ operator_namespace }}
+          Release:    {{ operator_release }}
+          Deployment: {{ operator_deployment }}
+
+          Annotate any Service of type LoadBalancer with
+            tailscale.com/expose: "true"
+          and an optional
+            tailscale.com/hostname: "<name>"
+          to expose it on the tailnet via this operator.
+
+          ════════════════════════════════════════════════════════
