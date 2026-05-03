@@ -803,31 +803,50 @@
     # ===========================
     # Cilium Load Balancer (k8s-snap built-in; no MetalLB used)
     # ===========================
-    - name: Build load balancer IP range variables
+    # Only enabled in ZeroTier mode. Cilium's L2 LB uses ARP announcements
+    # to claim VIPs on the node subnet, which requires an L2 broadcast
+    # domain — fine on a ZeroTier overlay (L2), broken on a Tailscale
+    # overlay (L3). In Tailscale mode the Tailscale Operator
+    # (40_thinkube/core/infrastructure/tailscale-operator) provisions
+    # tailnet IPs for Services instead, so this step is skipped entirely.
+    - name: Build Cilium load balancer IP range variables
       ansible.builtin.set_fact:
         lb_ip_range_start: "{{ overlay_subnet_prefix }}{{ lb_ip_start_octet }}"
         lb_ip_range_end: "{{ overlay_subnet_prefix }}{{ lb_ip_end_octet }}"
+      when: overlay_provider | default('zerotier') == 'zerotier'
 
     - name: Enable Cilium load balancer
       ansible.builtin.command: k8s enable load-balancer
       become: true
       register: lb_enable
       changed_when: "'Enabled' in lb_enable.stdout or 'enabled' in lb_enable.stdout"
+      when: overlay_provider | default('zerotier') == 'zerotier'
 
     - name: Configure Cilium load balancer IP range and L2 mode
       ansible.builtin.command: k8s set load-balancer.cidrs="{{ lb_ip_range_start }}-{{ lb_ip_range_end }}" load-balancer.l2-mode=true
       become: true
       register: lb_config
       changed_when: true
+      when: overlay_provider | default('zerotier') == 'zerotier'
 
     - name: Wait for load balancer to be ready
       ansible.builtin.pause:
         seconds: 10
         prompt: "Waiting for Cilium load balancer to initialize..."
+      when: overlay_provider | default('zerotier') == 'zerotier'
 
-    - name: Show load balancer status
+    - name: Show load balancer status (ZeroTier mode)
       ansible.builtin.debug:
         msg: "Cilium load balancer is configured with IP range {{ lb_ip_range_start }}-{{ lb_ip_range_end }}"
+      when: overlay_provider | default('zerotier') == 'zerotier'
+
+    - name: Skip Cilium load balancer (Tailscale mode)
+      ansible.builtin.debug:
+        msg: >-
+          overlay_provider is 'tailscale' — Cilium L2 load balancer is not
+          enabled. The Tailscale Operator will provision tailnet IPs for
+          Services exposed via tailscale.com/expose annotations.
+      when: overlay_provider | default('zerotier') == 'tailscale'
 
   handlers:
     - name: reload_ufw

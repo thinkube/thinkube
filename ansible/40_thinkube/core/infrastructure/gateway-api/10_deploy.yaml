@@ -27,6 +27,9 @@
 #   - primary_ingress_ip_octet
 #   - network_mode, network_cidr, overlay_subnet_prefix
 #   - kubectl_bin, helm_bin, kubeconfig
+#   - overlay_provider: 'zerotier' (default) or 'tailscale'
+#   - gateway_hostname (Tailscale only): tailnet hostname for the
+#     shared cluster Gateway. Defaults to "{{ cluster_name }}-gw".
 #
 # 🤖 [AI-assisted]
 
@@ -42,6 +45,7 @@
     eg_namespace: "envoy-gateway-system"
     gateway_namespace: "gateway-system"
     gateway_name: "thinkube-gateway"
+    gateway_hostname: "{{ gateway_hostname | default((cluster_name | default('thinkube')) ~ '-gw') }}"
 
     eg_images:
       - name: "docker.io/envoyproxy/gateway:{{ eg_version }}"
@@ -238,6 +242,29 @@
     ###########################################################################
     # Step 5: Create EnvoyProxy resource (imagePullPolicy for data plane)
     ###########################################################################
+    - name: Build base EnvoyProxy provider.kubernetes spec
+      ansible.builtin.set_fact:
+        envoy_proxy_kubernetes:
+          envoyDeployment:
+            container:
+              imagePullPolicy: IfNotPresent
+
+    # In Tailscale mode the operator exposes the Envoy Gateway Service as a
+    # tailnet device. The annotations have to live on the Service the proxy
+    # creates, which is configured here via envoyService.
+    - name: Annotate EnvoyProxy Service for Tailscale Operator
+      ansible.builtin.set_fact:
+        envoy_proxy_kubernetes: >-
+          {{ envoy_proxy_kubernetes | combine({
+               'envoyService': {
+                 'annotations': {
+                   'tailscale.com/expose': 'true',
+                   'tailscale.com/hostname': gateway_hostname,
+                 },
+               },
+             }) }}
+      when: overlay_provider | default('zerotier') == 'tailscale'
+
     - name: Create EnvoyProxy resource for Thinkube
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -251,10 +278,7 @@
           spec:
             provider:
               type: Kubernetes
-              kubernetes:
-                envoyDeployment:
-                  container:
-                    imagePullPolicy: IfNotPresent
+              kubernetes: "{{ envoy_proxy_kubernetes }}"
 
     ###########################################################################
     # Step 6: Create GatewayClass pointing to Envoy Gateway
@@ -332,6 +356,74 @@
     ###########################################################################
     # Step 8: Create main Gateway (HTTP + HTTPS + TLS passthrough + TCP ports)
     ###########################################################################
+    - name: Build base Gateway spec (listeners only)
+      ansible.builtin.set_fact:
+        gateway_spec:
+          gatewayClassName: eg
+          listeners:
+            - name: http
+              protocol: HTTP
+              port: 80
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: https
+              protocol: HTTPS
+              port: 443
+              hostname: "*.{{ domain_name }}"
+              tls:
+                mode: Terminate
+                certificateRefs:
+                  - kind: Secret
+                    name: gateway-tls-secret
+                    namespace: "{{ gateway_namespace }}"
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: postgres
+              protocol: TCP
+              port: 5432
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: gitea-ssh
+              protocol: TCP
+              port: 2222
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: nats
+              protocol: TCP
+              port: 4222
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: valkey
+              protocol: TCP
+              port: 6379
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: clickhouse
+              protocol: TCP
+              port: 9000
+              allowedRoutes:
+                namespaces:
+                  from: All
+
+    # In ZeroTier mode the user assigns a fixed overlay IP to the Gateway and
+    # Cilium's L2 LB announces it. In Tailscale mode the Tailscale operator
+    # provisions a tailnet IP for the Service, so we omit addresses entirely
+    # and let the Service stay LoadBalancer-pending until the operator
+    # populates Service.status.loadBalancer.ingress.
+    - name: Add explicit address for ZeroTier mode
+      ansible.builtin.set_fact:
+        gateway_spec: >-
+          {{ gateway_spec | combine({
+               'addresses': [{'type': 'IPAddress', 'value': primary_gateway_ip}],
+             }) }}
+      when: overlay_provider | default('zerotier') == 'zerotier'
+
     - name: Create main Gateway (thinkube-gateway)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -342,61 +434,7 @@
           metadata:
             name: "{{ gateway_name }}"
             namespace: "{{ gateway_namespace }}"
-          spec:
-            gatewayClassName: eg
-            addresses:
-              - type: IPAddress
-                value: "{{ primary_gateway_ip }}"
-            listeners:
-              - name: http
-                protocol: HTTP
-                port: 80
-                allowedRoutes:
-                  namespaces:
-                    from: All
-              - name: https
-                protocol: HTTPS
-                port: 443
-                hostname: "*.{{ domain_name }}"
-                tls:
-                  mode: Terminate
-                  certificateRefs:
-                    - kind: Secret
-                      name: gateway-tls-secret
-                      namespace: "{{ gateway_namespace }}"
-                allowedRoutes:
-                  namespaces:
-                    from: All
-              - name: postgres
-                protocol: TCP
-                port: 5432
-                allowedRoutes:
-                  namespaces:
-                    from: All
-              - name: gitea-ssh
-                protocol: TCP
-                port: 2222
-                allowedRoutes:
-                  namespaces:
-                    from: All
-              - name: nats
-                protocol: TCP
-                port: 4222
-                allowedRoutes:
-                  namespaces:
-                    from: All
-              - name: valkey
-                protocol: TCP
-                port: 6379
-                allowedRoutes:
-                  namespaces:
-                    from: All
-              - name: clickhouse
-                protocol: TCP
-                port: 9000
-                allowedRoutes:
-                  namespaces:
-                    from: All
+          spec: "{{ gateway_spec }}"
 
     ###########################################################################
     # Step 9: HTTP → HTTPS redirect route

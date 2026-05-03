@@ -2,43 +2,45 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-# 11_setup_tailscale.yaml - Configure Tailscale overlay network routing for Thinkube
+# 11_setup_tailscale.yaml - Verify Tailscale tailnet membership on overlay nodes
 #
 # Purpose:
-#   Configures subnet routing on control plane for the Cilium load balancer
-#   IP range via Tailscale API. Auto-approves routes using Tailscale API
-#   (no manual intervention). Enables IP forwarding on control plane for
-#   traffic routing.
+#   Sanity-check that every node in `overlay_nodes` has Tailscale installed
+#   and joined the tailnet. Runs after 06_install_tailscale.yaml and before
+#   the Kubernetes install in 40_thinkube/, so a misconfigured node fails
+#   here rather than later.
 #
-# Key Architecture:
-#   - Each node gets automatic IP from 100.x.x.x range (assigned by Tailscale)
-#   - Control plane advertises load balancer subnet (e.g., 192.168.191.50/27)
-#   - Tailscale API auto-approves the subnet route
-#   - Worker nodes route load balancer traffic through control plane
+#   The previous version of this playbook configured a subnet-route
+#   workaround so the Cilium load balancer's L2 announcements could be
+#   reached over Tailscale's L3 mesh (the control plane advertised a /27
+#   subnet, the Tailscale API auto-approved it, and IP forwarding was
+#   enabled). That whole pattern made the control plane a single point of
+#   failure for all service traffic. It has been replaced by the Tailscale
+#   Kubernetes Operator (40_thinkube/core/infrastructure/tailscale-operator)
+#   which exposes Services on the tailnet directly via per-Service or
+#   shared-Gateway tailnet devices.
 #
 # Requirements:
-#   - Tailscale must already be installed and configured (via 06_install_tailscale.yaml or the installer)
-#   - Nodes must already be joined to the tailnet
-#   - tailscale_auth_key: Auth key from inventory (for re-joining if needed)
-#   - tailscale_api_token: API token for auto-approving routes
-#   - lb_ip_start_octet, lb_ip_end_octet: load balancer IP range
-#   - overlay_subnet_prefix: Network prefix (used for overlay CIDR)
+#   - Tailscale already installed and connected via 06_install_tailscale.yaml
+#
+# Variables:
+#   - overlay_provider: must be 'tailscale' (no-op otherwise)
 #
 # Run with:
 #   ./scripts/run_ansible.sh ansible/30_networking/11_setup_tailscale.yaml
 
-- name: Configure Tailscale Routing
+- name: Verify Tailscale tailnet membership on overlay nodes
   hosts: overlay_nodes
-  gather_facts: true
-  become: true
-  serial: 1  # Process one host at a time
-
-  vars:
-    tailscale_api_url: "https://api.tailscale.com/api/v2"
+  gather_facts: false
+  become: false
+  serial: 1
 
   tasks:
-    # Phase 1: Verify Tailscale is installed and running (fail fast if bootstrap.sh wasn't run)
-    - name: Check if Tailscale is installed
+    - name: Skip when overlay provider is not Tailscale
+      ansible.builtin.meta: end_play
+      when: overlay_provider | default('zerotier') != 'tailscale'
+
+    - name: Check that the tailscale CLI is installed
       ansible.builtin.command: which tailscale
       register: tailscale_installed
       changed_when: false
@@ -48,177 +50,67 @@
       ansible.builtin.fail:
         msg: |
           Tailscale is not installed on {{ inventory_hostname }}.
-          Run 06_install_tailscale.yaml first, or use the overlay setup step in the installer.
+          Run 06_install_tailscale.yaml first, or use the overlay setup step
+          in the installer.
       when: tailscale_installed.rc != 0
 
-    - name: Check Tailscale status
-      ansible.builtin.command: tailscale status
-      register: tailscale_status
+    - name: Read Tailscale status JSON
+      ansible.builtin.command: tailscale status --json
+      register: tailscale_status_raw
       changed_when: false
-      failed_when: false
+      failed_when: tailscale_status_raw.rc != 0
+
+    - name: Parse Tailscale device info
+      ansible.builtin.set_fact:
+        tailscale_status: "{{ tailscale_status_raw.stdout | from_json }}"
 
     - name: Fail if not connected to tailnet
       ansible.builtin.fail:
         msg: |
-          Node {{ inventory_hostname }} is not connected to Tailscale tailnet.
-          Run 06_install_tailscale.yaml first, or use the overlay setup step in the installer.
-      when: "'Logged out' in tailscale_status.stdout or tailscale_status.rc != 0"
+          Node {{ inventory_hostname }} is not in the Running BackendState
+          on the tailnet (current: {{ tailscale_status.BackendState | default('unknown') }}).
+          Run 06_install_tailscale.yaml or rejoin manually with `tailscale up`.
+      when: tailscale_status.BackendState | default('') != 'Running'
 
-    - name: Get Tailscale device info
-      ansible.builtin.command: tailscale status --json
-      register: tailscale_status_json
-      changed_when: false
-
-    - name: Parse Tailscale device information
-      ansible.builtin.set_fact:
-        tailscale_device_id: "{{ (tailscale_status_json.stdout | from_json).Self.ID }}"
-        tailscale_ip: "{{ (tailscale_status_json.stdout | from_json).Self.TailscaleIPs[0] }}"
-        tailscale_hostname: "{{ (tailscale_status_json.stdout | from_json).Self.DNSName }}"
-
-    - name: Display Tailscale verification status
-      ansible.builtin.debug:
-        msg: |
-
-          ════════════════════════════════════════════════════════════════════════
-          ✅ Tailscale Verification for {{ inventory_hostname }}
-          ════════════════════════════════════════════════════════════════════════
-
-          Device ID: {{ tailscale_device_id }}
-          Tailscale IP: {{ tailscale_ip }}
-          Hostname: {{ tailscale_hostname }}
-
-          Tailscale is installed and connected. Proceeding with routing configuration...
-          ════════════════════════════════════════════════════════════════════════
-
-    # Phase 2: Configure load balancer subnet routing on control plane
-    - name: Calculate load balancer subnet CIDR
-      ansible.builtin.set_fact:
-        lb_cidr: "{{ overlay_subnet_prefix }}{{ lb_ip_start_octet }}/27"
-      when: inventory_hostname in groups['k8s_control_plane'] | default([])
-
-    - name: Check if control plane is advertising load balancer routes
-      ansible.builtin.command: tailscale status --json
-      register: current_routes_check
-      changed_when: false
-      when: inventory_hostname in groups['k8s_control_plane'] | default([])
-
-    - name: Parse current advertised routes
-      ansible.builtin.set_fact:
-        current_advertised_routes: "{{ (current_routes_check.stdout | from_json).Self.AllowedIPs | default([]) }}"
-      when: inventory_hostname in groups['k8s_control_plane'] | default([])
-
-    - name: Update tailscale to advertise load balancer subnet (if not already)
-      ansible.builtin.command: >
-        tailscale set
-        --advertise-routes={{ lb_cidr }}
-        --accept-routes
-      when:
-        - inventory_hostname in groups['k8s_control_plane'] | default([])
-        - lb_cidr not in current_advertised_routes | default([])
-      register: tailscale_update
-      changed_when: true
-
-    - name: Wait for route advertisement to register
-      ansible.builtin.pause:
-        seconds: 5
-      when: tailscale_update is changed
-
-    - name: Auto-approve load balancer subnet routes via Tailscale API
-      ansible.builtin.uri:
-        url: "{{ tailscale_api_url }}/device/{{ tailscale_device_id }}/routes"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ tailscale_api_token }}"
-          Content-Type: "application/json"
-        body:
-          routes:
-            - "{{ lb_cidr }}"
-        body_format: json
-        status_code: [200, 201]
-        validate_certs: yes
-      register: route_approval
-      delegate_to: localhost
-      when: inventory_hostname in groups['k8s_control_plane'] | default([])
-      failed_when: false
-
-    # Phase 3: Configure IP forwarding on control plane (required for subnet routing)
-    - name: Enable IP forwarding
-      ansible.builtin.sysctl:
-        name: net.ipv4.ip_forward
-        value: '1'
-        sysctl_set: yes
-        state: present
-        reload: yes
-      when: inventory_hostname in groups['k8s_control_plane'] | default([])
-
-    # Phase 4: Display configuration status
-    - name: Display Tailscale configuration (control plane)
+    - name: Display per-node tailnet membership
       ansible.builtin.debug:
         msg: |
 
           ════════════════════════════════════════════════════════
-          ✅ Tailscale Configuration Complete ({{ inventory_hostname }})
+          ✅ Tailscale verified for {{ inventory_hostname }}
           ════════════════════════════════════════════════════════
 
-          Tailscale IP: {{ tailscale_ip }}
-          Device ID: {{ tailscale_device_id }}
-
-          Control Plane Status:
-          - Advertising subnet: {{ lb_cidr }}
-          - Route approval: {% if route_approval.status == 200 or route_approval.status == 201 %}✅ Auto-approved via API{% else %}⚠️  Check Tailscale admin console{% endif %}
-          - IP forwarding: Enabled
+          Device ID:  {{ tailscale_status.Self.ID }}
+          Tailnet IP: {{ tailscale_status.Self.TailscaleIPs[0] }}
+          DNS Name:   {{ tailscale_status.Self.DNSName }}
 
           ════════════════════════════════════════════════════════
-      when: inventory_hostname in groups['k8s_control_plane'] | default([])
 
-    - name: Display Tailscale configuration (worker)
-      ansible.builtin.debug:
-        msg: |
-
-          ════════════════════════════════════════════════════════
-          ✅ Tailscale Configuration Complete ({{ inventory_hostname }})
-          ════════════════════════════════════════════════════════
-
-          Tailscale IP: {{ tailscale_ip }}
-          Device ID: {{ tailscale_device_id }}
-
-          Worker Node Status:
-          - Connected to tailnet
-          - Accepting routes from control plane
-
-          ════════════════════════════════════════════════════════
-      when: inventory_hostname not in groups['k8s_control_plane'] | default([])
-
-# Final phase: Verify network-wide configuration
-- name: Verify Tailscale Network Configuration
-  hosts: baremetal[0]
+- name: Tailscale verification summary
+  hosts: overlay_nodes[0]
   gather_facts: false
 
-  vars:
-    tailscale_api_url: "https://api.tailscale.com/api/v2"
-
   tasks:
-    - name: Display Tailscale setup completion message
+    - name: Skip summary when overlay provider is not Tailscale
+      ansible.builtin.meta: end_play
+      when: overlay_provider | default('zerotier') != 'tailscale'
+
+    - name: Display Tailscale verification summary
       ansible.builtin.debug:
         msg: |
 
           ════════════════════════════════════════════════════════════════════════
-          ✅ Tailscale Network Configuration Complete
+          ✅ All overlay nodes verified on the tailnet
           ════════════════════════════════════════════════════════════════════════
 
-          Connected Nodes: {{ groups['overlay_nodes'] | length }}
+          Verified Nodes: {{ groups['overlay_nodes'] | length }}
 
           {% for node in groups['overlay_nodes'] %}
-          - {{ node }}: Connected to tailnet
+          - {{ node }}: Connected
           {% endfor %}
 
-          Configuration Summary:
-          - IP forwarding: Enabled on control plane
-          - Load balancer subnet: Advertised and routed via control plane
-          - All nodes: Accepting routes for seamless load balancer access
-
-          NEXT STEPS:
-          1. Verify load balancer services are accessible via Tailscale IPs
-          2. Continue with Kubernetes deployment
+          Service exposure on the tailnet is handled by the Tailscale
+          Kubernetes Operator (deployed by
+          40_thinkube/core/infrastructure/tailscale-operator/10_deploy.yaml).
 
           ════════════════════════════════════════════════════════════════════════
