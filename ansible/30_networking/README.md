@@ -1,147 +1,142 @@
-# ZeroTier and DNS Network Configuration
+# Overlay Networks (ZeroTier / Tailscale)
 
-This directory contains playbooks for configuring ZeroTier networking and DNS services for the Thinkube platform.
+Playbooks that install and configure the cluster's overlay network on each
+host before Kubernetes is brought up. The overlay choice is driven by the
+inventory variable `overlay_provider` (`zerotier` or `tailscale`),
+collected from the user by the installer.
+
+> **Note on naming:** despite this directory's history (it was originally
+> ZeroTier-and-DNS-only), DNS is no longer here — BIND9 and CoreDNS are in
+> `../40_thinkube/core/infrastructure/dns-server/` and `coredns/` because
+> they need a working Kubernetes cluster.
 
 ## Playbook Overview
 
-### 10_setup_zerotier.yaml
-- **Purpose**: Complete ZeroTier setup in a single playbook
-- **What it does**:
-  - Installs ZeroTier package on all nodes in `zerotier_nodes` group one at a time
-  - Joins each node to the ZeroTier network
-  - Automatically authorizes nodes and assigns IPs via the ZeroTier API
-  - Assigns additional IPs for the Cilium load balancer and ingress services on control plane nodes
-  - Configures IP forwarding and firewall rules
-  - Maintains existing network-wide settings to preserve other ZeroTier nodes
-  - Processes one node at a time from start to finish
-  - Uses `serial: 1` to ensure each node is fully configured before moving to the next
+### `05_install_zerotier.yaml`
+- **When:** `overlay_provider == 'zerotier'`
+- Installs the ZeroTier package on every node in `overlay_nodes`, joins
+  them to the configured ZeroTier network, and authorises each node via
+  the ZeroTier Central API.
 
-### 18_test_zerotier.yaml
-- **Purpose**: Tests ZeroTier connectivity between nodes
-- **What it does**:
-  - Verifies ZeroTier is properly installed and running
-  - Tests connectivity between nodes over ZeroTier network
-  - Validates that routes are properly configured
-  - Performs network performance tests using iperf3
-  - Reports comprehensive test results with detailed diagnostics
+### `06_install_tailscale.yaml`
+- **When:** `overlay_provider == 'tailscale'`
+- Installs the Tailscale package on every node in `overlay_nodes` and
+  brings each one up against the configured tailnet using the
+  `tailscale_auth_key` from inventory.
 
-### 19_reset_zerotier.yaml
-- **Purpose**: Rolls back ZeroTier configuration if needed
-- **What it does**:
-  - Leaves the ZeroTier network on all nodes
-  - Removes specified nodes from the network
-  - Optionally uninstalls ZeroTier
-  - Preserves the ZeroTier network itself for other nodes
+### `10_setup_zerotier.yaml`
+- **When:** `overlay_provider == 'zerotier'`
+- Configures routing and firewall rules for the ZeroTier overlay on
+  every node. Adds the Cilium load balancer IP range
+  (`lb_ip_start_octet` … `lb_ip_end_octet`) as additional IPs on the
+  control plane node so Cilium L2 mode can announce them. Processes one
+  node at a time (`serial: 1`).
 
-### 20_setup_dns.yaml
-- **Purpose**: Sets up DNS server for service discovery
-- **What it does**:
-  - Installs bind9 DNS server on the dns1 VM
-  - Configures DNS zones and records for the main domain
-  - Sets up wildcard records for service access
-  - Creates Knative subdomain (kn.domain.com) for serverless applications
-  - Configures resolver settings and DNS forwarders
-  - Points wildcard domains to the Cilium load balancer ingress IPs
+### `11_setup_tailscale.yaml`
+- **When:** `overlay_provider == 'tailscale'`
+- Verifies that every node in `overlay_nodes` is in
+  `BackendState=Running` on the tailnet and fails fast otherwise.
+  Mostly a sanity check between `06_install_tailscale.yaml` and the k8s
+  install — the previous subnet-route workaround was removed in favour
+  of the Tailscale Kubernetes Operator (see below).
 
-### 25_configure_dns_clients.yaml
-- **Purpose**: Configures DNS resolution on all nodes
-- **What it does**:
-  - Configures all nodes to use the ZeroTier DNS server
-  - Sets up systemd-resolved with proper domain routing
-  - Ensures MicroK8s nodes use CoreDNS for internal resolution
-  - Verifies DNS resolution works on all nodes
+### `18_test_zerotier.yaml`
+- Tests ZeroTier connectivity between nodes and reports diagnostics.
 
-### 28_test_dns.yaml
-- **Purpose**: Tests DNS resolution across all nodes
-- **What it does**:
-  - Verifies DNS server is running and reachable
-  - Tests domain name resolution for all key domains
-  - Validates wildcard records for services and Knative
-  - Gracefully handles network connectivity issues
-  - Provides detailed diagnostics for troubleshooting
+### `19_reset_zerotier.yaml`
+- Leaves the ZeroTier network on the selected nodes and optionally
+  uninstalls the package. Used when a deployment failed and you need a
+  clean slate; preserves the ZeroTier network for any other members.
 
-### 29_reset_dns.yaml
-- **Purpose**: Rolls back DNS configuration if needed
-- **What it does**:
-  - Removes bind9 configuration and zone files
-  - Restores default resolver settings
-  - Optionally reinstalls bind9 with clean configuration
+### `25_configure_remote_controller.yaml`
+- Configures the installer host (the "controller", run on a machine
+  separate from the cluster) to reach the cluster over the overlay.
+  Both providers supported.
 
 ## Order of Execution
 
-The correct order to run these playbooks is:
+The installer's deploy queue (`deploy.tsx`) drives the order. Roughly:
 
-1. **Setup**: `10_setup_zerotier.yaml` - Complete ZeroTier installation and configuration
-2. **Test**: `18_test_zerotier.yaml` - Verify ZeroTier connectivity
-3. **Setup**: `20_setup_dns.yaml` - Configure DNS server
-4. **Test**: `28_test_dns.yaml` - Verify DNS resolution
+```
+... env / SSH setup ...
+05_install_zerotier.yaml      OR   06_install_tailscale.yaml
+10_setup_zerotier.yaml        OR   11_setup_tailscale.yaml
+... k8s install ...
+40_thinkube/core/infrastructure/k8s/10_install_k8s.yaml
+40_thinkube/core/infrastructure/tailscale-operator/10_deploy.yaml  (Tailscale only)
+40_thinkube/core/infrastructure/acme-certificates/10_deploy.yaml
+40_thinkube/core/infrastructure/gateway-api/10_deploy.yaml
+40_thinkube/core/infrastructure/dns-server/10_deploy.yaml
+40_thinkube/core/infrastructure/coredns/10_deploy.yaml
+40_thinkube/core/infrastructure/coredns/15_configure_node_dns.yaml
+... services ...
+```
 
-## Special Configurations
+`gateway-api` runs before `dns-server` because in Tailscale mode the
+dns-server playbook reads the operator-assigned tailnet IP from the
+Envoy Gateway Service status.
 
-### Load Balancer and Ingress IP Configuration
-- The ZeroTier setup assigns additional IPs to the control plane node for the Cilium load balancer:
-  - `10.0.191.200` - Primary gateway IP
-- DNS wildcard records are configured to point to these IPs:
-  - `*.thinkube.com` → `10.0.191.200`
+## Provider-Specific Notes
 
-### DNS Configuration
-The DNS server provides the following key functions:
-- Forward DNS for the `thinkube.com` domain
-- Wildcard DNS for dynamically created services
-- Special subdomain for Knative serverless applications
-- External DNS resolution for internet domains
+### ZeroTier mode
+- Cilium's k8s-snap built-in load balancer (L2 mode) claims static IPs
+  from the user-defined overlay subnet. The control plane advertises
+  the load-balancer IP range so the rest of the network can route to it.
+- Inventory carries `overlay_cidr`, `overlay_subnet_prefix`,
+  `lb_ip_start_octet` / `lb_ip_end_octet`,
+  `primary_ingress_ip_octet`, `dns_external_ip_octet`, per-host
+  `overlay_ip`.
 
-## Testing and Validation
+### Tailscale mode
+- Cilium L2 LB is **disabled** at install time (it can't traverse
+  Tailscale's L3 mesh).
+- The Tailscale Kubernetes Operator
+  (`../40_thinkube/core/infrastructure/tailscale-operator/`) is
+  installed inside the cluster. Services that need a public-ish IP get
+  `tailscale.com/expose: "true"` + `tailscale.com/hostname` annotations
+  and the operator provisions a tailnet device for each. The Envoy
+  Gateway Service and `bind9-external` are exposed this way; their IPs
+  are discovered at deploy time from
+  `Service.status.loadBalancer.ingress`.
+- Inventory carries `tailscale_auth_key`, `tailscale_api_token`,
+  `tailscale_oauth_client_id`, `tailscale_oauth_client_secret`, and an
+  optional `gateway_hostname` (defaults to `<cluster_name>-gw`).
 
-After running the playbooks, you can verify the setup:
-- Check ZeroTier membership: `zerotier-cli listnetworks`
-- Check node authorization status: `zerotier-cli listnetworks | grep "OK"`
-- Check assigned IPs: `zerotier-cli listnetworks | grep "10.0.191"`
-- Check DNS resolution: `dig @10.0.191.1 test.thinkube.com`
-- Test wildcard domains: `dig @10.0.191.1 anything.thinkube.com`
-- Test Knative domains: `dig @10.0.191.1 function.thinkube.com`
+The full design + status is tracked in
+`thinkube-installer/TAILSCALE_OPERATOR_MIGRATION.md`.
 
 ## Environment Variables
 
-Make sure to set the following environment variables before running the playbooks:
-- `ZEROTIER_NETWORK_ID`: Your ZeroTier network ID
-- `ZEROTIER_API_TOKEN`: Your ZeroTier API token for Central access
+The installer writes credentials into `~/.env` for you. If you're
+running these playbooks by hand, set the relevant ones for your
+provider:
 
-You can set these by adding them to your `~/.env` file:
+ZeroTier:
 ```bash
-export ZEROTIER_NETWORK_ID=93afae59634c1a70
-export ZEROTIER_API_TOKEN=your_api_token_here
+export ZEROTIER_NETWORK_ID=...
+export ZEROTIER_API_TOKEN=...
 ```
 
-## Known Issues and Troubleshooting
+Tailscale:
+```bash
+export TAILSCALE_AUTH_KEY=tskey-auth-...
+export TAILSCALE_API_TOKEN=tskey-api-...
+export TAILSCALE_OAUTH_CLIENT_ID=...
+export TAILSCALE_OAUTH_CLIENT_SECRET=tskey-client-...
+```
 
-### ZeroTier Connectivity Issues
-- ICMP (ping) may be blocked between some ZeroTier nodes
-- Adjust firewall settings if needed to allow UDP port 9993 for ZeroTier traffic
-- Ensure each node has properly assigned IPs with `zerotier-cli listnetworks`
+## Known Issues
 
-### DNS Resolution Issues
-- UDP port 53 traffic may be blocked between nodes
-- The DNS test playbook may show connectivity failures even if DNS is working
-- Try using the DNS server directly from each node with: `dig @10.0.191.1 thinkube.com`
+### ZeroTier
+- ICMP between members may be blocked depending on UFW config; allow
+  UDP 9993 if peers can't see each other.
+- `zerotier-cli listnetworks` should show `OK` for every assigned IP.
 
-## Lessons Learned
-
-### ZeroTier Configuration
-- **Use caution with Central API**: The ZeroTier API can make global changes that affect all nodes
-- **Serial execution**: Process one node at a time with `serial: 1` for more reliable results
-- **Flow-based approach**: Complete all operations for one node before moving to the next
-- **Preserve existing settings**: Avoid modifying network-wide settings that may affect other nodes
-
-### DNS Server Configuration
-- **Bind9 service**: After configuration, always reload the Bind9 service
-- **Zone file newlines**: Ensure zone files end with newlines to avoid bind9 warnings
-- **UDP traffic**: DNS requires UDP port 53 traffic to be allowed between nodes
-- **Check logs**: Use `journalctl -u named` to check for Bind9 issues
-- **Test from server**: Verify resolution on the DNS server itself first
-
-### Playbook Design
-- **Check mode support**: Ensure playbooks work in check mode with appropriate `check_mode: false`
-- **Fail-fast approach**: Use early checks to ensure requirements are met
-- **Graceful degradation**: Handle connectivity issues without failing the playbook
-- **Detailed diagnostics**: Provide clear error messages and troubleshooting recommendations
+### Tailscale
+- The OAuth client *cannot* be created via the Tailscale API — that's
+  the one manual step in the configuration flow. The installer
+  surfaces a guided walkthrough.
+- If the operator never assigns the Gateway IP, check
+  `kubectl logs -n tailscale deployment/operator` and verify the OAuth
+  client has `Devices/Core` (R+W) and `Keys/Auth Keys` (R+W) scopes
+  with the `tag:k8s-operator` tag.

@@ -140,7 +140,41 @@ Variables are defined in inventory group vars (`/home/thinkube/.ansible/inventor
 - `kubeconfig` - Path to kubeconfig
 - `kubectl_bin`, `helm_bin` - Binary paths under `~/.local/bin/`
 - `keycloak_realm: thinkube` - Shared SSO realm
+- `overlay_provider` - Either `zerotier` or `tailscale` (chosen in the installer)
 - `zerotier_subnet_prefix` - Network prefix for all cluster IPs
+
+### Overlay Provider Differences
+
+The deployment branches on `overlay_provider`:
+
+- **ZeroTier mode**: Cilium's k8s-snap built-in load balancer (L2 mode)
+  claims static IPs from the user-defined overlay subnet. Inventory carries
+  `overlay_cidr`, `overlay_subnet_prefix`, `lb_ip_start_octet` /
+  `lb_ip_end_octet`, `primary_ingress_ip_octet`, `dns_external_ip_octet`,
+  per-host `overlay_ip`. *(The legacy `metallb_*` names were renamed to
+  `lb_*` in commit `712b12f`. No MetalLB is or was ever deployed — the
+  load balancer is Cilium.)*
+
+- **Tailscale mode**: Cilium L2 LB is **disabled** (can't traverse
+  Tailscale's L3 mesh). The Tailscale Kubernetes Operator is installed in
+  the `tailscale` namespace by
+  `40_thinkube/core/infrastructure/tailscale-operator/10_deploy.yaml`.
+  Services that need a public-ish IP get
+  `tailscale.com/expose: "true"` + `tailscale.com/hostname` annotations
+  and the operator provisions a tailnet device for each. The Envoy
+  Gateway Service and `bind9-external` are exposed this way; their IPs
+  are discovered at deploy time from `Service.status.loadBalancer.ingress`
+  by `dns-server/10_deploy.yaml` (which also blocks until the Operator
+  has assigned the Gateway IP), `coredns/10_deploy.yaml`,
+  `coredns/15_configure_node_dns.yaml`, and
+  `harbor-images/14_build_base_images.yaml`. Inventory carries
+  `tailscale_auth_key`, `tailscale_api_token`,
+  `tailscale_oauth_client_id`, `tailscale_oauth_client_secret`, and an
+  optional `gateway_hostname` (defaults to `<cluster_name>-gw`); the
+  ZeroTier-only variables are *not* emitted.
+
+The full design and migration plan is in
+`thinkube-installer/TAILSCALE_OPERATOR_MIGRATION.md`.
 
 ### Playbook Patterns
 
