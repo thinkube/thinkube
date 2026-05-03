@@ -44,7 +44,6 @@
     # Determine subnet prefix based on network mode
     subnet_prefix: "{{ overlay_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     primary_gateway_ip: "{{ subnet_prefix }}{{ primary_ingress_ip_octet }}"
-    coredns_external_ip: "{{ subnet_prefix }}{{ dns_external_ip_octet }}"  # From inventory configuration
 
   pre_tasks:
     - name: Verify required variables are defined
@@ -60,6 +59,34 @@
           - network_mode == 'local' or overlay_subnet_prefix is defined
           - network_mode == 'overlay' or network_cidr is defined
         fail_msg: "Required inventory variables are not defined"
+
+    # Discover the IP that bind9-external is reachable on. ZeroTier mode:
+    # the static value Cilium L2 LB advertises. Tailscale mode: the
+    # operator-assigned tailnet IP. Either way it must already be in
+    # Service status by now (dns-server runs before this playbook).
+    - name: Read coredns_external_ip from bind9-external Service status
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc bind9-external -n dns-system
+        -o jsonpath={.status.loadBalancer.ingress[0].ip}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: bind9_lookup
+      changed_when: false
+      failed_when:
+        - bind9_lookup.rc != 0
+        - "'NotFound' not in bind9_lookup.stderr"
+
+    - name: Fail if bind9-external has no LoadBalancer IP yet
+      ansible.builtin.fail:
+        msg: |
+          bind9-external Service in namespace dns-system has no
+          status.loadBalancer.ingress[0].ip. The dns-server playbook
+          must run successfully before this one.
+      when: bind9_lookup.stdout | default('') | length == 0
+
+    - name: Set coredns_external_ip from discovered Service IP
+      ansible.builtin.set_fact:
+        coredns_external_ip: "{{ bind9_lookup.stdout }}"
 
   tasks:
     # CoreDNS is enabled by default in k8s-snap, just verify it's running

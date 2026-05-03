@@ -8,8 +8,11 @@
 #   This should be run AFTER the BIND9 DNS server is deployed
 #
 # Requirements:
-#   - BIND9 DNS server must be deployed (dns-server/10_deploy.yaml)
-#   - DNS external IP (10.0.191.205) must be configured
+#   - BIND9 DNS server must be deployed (dns-server/10_deploy.yaml). The
+#     bind9-external Service must already have a LoadBalancer ingress IP —
+#     either statically allocated by Cilium L2 LB (ZeroTier mode) or
+#     dynamically by the Tailscale Operator (Tailscale mode). The IP is
+#     discovered from Service status in pre_tasks.
 #
 # Usage:
 #   cd ~/thinkube
@@ -19,14 +22,44 @@
   hosts: all
   gather_facts: true
   become: false
-  
+
   vars:
     # Determine subnet prefix based on network mode
     subnet_prefix: "{{ overlay_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
-    coredns_external_ip: "{{ subnet_prefix }}{{ dns_external_ip_octet }}"  # From inventory configuration
     k8s_cluster_domain: "cluster.local"
     coredns_cluster_ip: "10.152.183.10"  # Standard CoreDNS cluster IP
-    
+
+  pre_tasks:
+    # The address every node will be told to use for DNS is the IP that
+    # bind9-external is actually reachable on — the value Cilium L2 LB
+    # claimed in ZeroTier mode, or the tailnet IP the Tailscale Operator
+    # assigned in Tailscale mode. Read it from Service status so we
+    # don't drift from whatever the cluster actually has. Delegated to
+    # the control plane because most nodes don't have kubectl.
+    - name: Read bind9-external IP from Service status
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc bind9-external -n dns-system
+        -o jsonpath={.status.loadBalancer.ingress[0].ip}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: bind9_lookup
+      changed_when: false
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      run_once: true
+
+    - name: Fail if bind9-external has no LoadBalancer IP yet
+      ansible.builtin.fail:
+        msg: |
+          bind9-external Service in namespace dns-system has no
+          status.loadBalancer.ingress[0].ip. The dns-server playbook
+          must run successfully before this one.
+      when: bind9_lookup.stdout | default('') | length == 0
+      run_once: true
+
+    - name: Set coredns_external_ip from the discovered IP
+      ansible.builtin.set_fact:
+        coredns_external_ip: "{{ bind9_lookup.stdout }}"
+
   tasks:
     # Get CoreDNS IP from Kubernetes
     - name: Get CoreDNS service IP

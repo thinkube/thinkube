@@ -234,31 +234,8 @@
               file "/etc/bind/zones/db.{{ domain_name }}";
           };
 
-    - name: Create main domain zone file
-      ansible.builtin.set_fact:
-        zone_main: |
-          $TTL    604800
-          @       IN      SOA     ns1.{{ domain_name }}. admin.{{ domain_name }}. (
-                                  {{ ansible_date_time.epoch }}  ; Serial
-                                  604800          ; Refresh
-                                  86400           ; Retry
-                                  2419200         ; Expire
-                                  604800 )        ; Negative Cache TTL
-          ;
-          @       IN      NS      ns1.{{ domain_name }}.
-          ns1     IN      A       {{ dns_external_ip }}
-
-          ; Wildcard for all subdomains
-          *       IN      A       {{ effective_gateway_ip }}
-
-          ; Specific entries for infrastructure
-          dns     IN      A       {{ dns_external_ip }}
-          {{ control_plane_hostname }}  IN  A  {{ hostvars[control_plane_hostname]['overlay_ip'] }}
-          {% for host in groups['k8s_workers'] | default([]) %}
-          {{ host }}  IN  A  {{ hostvars[host]['overlay_ip'] }}
-          {% endfor %}
-
-    # Create ConfigMaps for BIND9 configuration
+    # Create the named.conf + zones.conf ConfigMap (no IP-dependent content)
+    # so it can be mounted by the Deployment later.
     - name: Create temporary named.conf file
       ansible.builtin.copy:
         content: "{{ named_conf }}"
@@ -280,6 +257,137 @@
           --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
       register: create_bind9_config
       changed_when: "'created' in create_bind9_config.stdout or 'configured' in create_bind9_config.stdout"
+
+    # Create the bind9-external Service before the Deployment so we can
+    # discover the IP it will be reachable on (Cilium L2 LB or the Tailscale
+    # operator) and template the zone file with the correct ns1 / dns A
+    # records before BIND9 starts serving them.
+    - name: Create bind9-external Service (ZeroTier mode — Cilium L2 LB)
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: bind9-external
+          namespace: {{ dns_namespace }}
+          labels:
+            app: bind9
+        spec:
+          type: LoadBalancer
+          loadBalancerIP: {{ dns_external_ip }}
+          selector:
+            app: bind9
+          ports:
+          - name: dns-udp
+            port: 53
+            targetPort: 53
+            protocol: UDP
+          - name: dns-tcp
+            port: 53
+            targetPort: 53
+            protocol: TCP
+        EOF
+      register: create_lb_service
+      changed_when: "'created' in create_lb_service.stdout or 'configured' in create_lb_service.stdout"
+      when: overlay_provider | default('zerotier') == 'zerotier'
+
+    - name: Create bind9-external Service (Tailscale mode — operator-exposed)
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: bind9-external
+          namespace: {{ dns_namespace }}
+          labels:
+            app: bind9
+          annotations:
+            tailscale.com/expose: "true"
+            tailscale.com/hostname: "{{ cluster_name | default('thinkube') }}-dns"
+        spec:
+          type: LoadBalancer
+          selector:
+            app: bind9
+          ports:
+          - name: dns-udp
+            port: 53
+            targetPort: 53
+            protocol: UDP
+          - name: dns-tcp
+            port: 53
+            targetPort: 53
+            protocol: TCP
+        EOF
+      register: create_lb_service_tailscale
+      changed_when: "'created' in create_lb_service_tailscale.stdout or 'configured' in create_lb_service_tailscale.stdout"
+      when: overlay_provider | default('zerotier') == 'tailscale'
+
+    - name: Create bind9-internal ClusterIP Service
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: bind9-internal
+          namespace: {{ dns_namespace }}
+          labels:
+            app: bind9
+        spec:
+          type: ClusterIP
+          selector:
+            app: bind9
+          ports:
+          - name: dns-udp
+            port: 53
+            targetPort: 53
+            protocol: UDP
+          - name: dns-tcp
+            port: 53
+            targetPort: 53
+            protocol: TCP
+        EOF
+      register: create_clusterip_service
+      changed_when: "'created' in create_clusterip_service.stdout or 'configured' in create_clusterip_service.stdout"
+
+    - name: Wait for bind9-external LoadBalancer IP to be assigned
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get service bind9-external -n {{ dns_namespace }} -o json
+      register: lb_service_json
+      until: (lb_service_json.stdout | from_json).status.loadBalancer.ingress is defined
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Capture the IP that bind9-external is reachable on
+      ansible.builtin.set_fact:
+        bind9_advertised_ip: "{{ (lb_service_json.stdout | from_json).status.loadBalancer.ingress[0].ip }}"
+
+    # Now that we know the IP that ns1 / dns will resolve to, build the zone
+    # file. ZeroTier mode: bind9_advertised_ip == dns_external_ip. Tailscale
+    # mode: bind9_advertised_ip is the operator-assigned tailnet IP.
+    - name: Create main domain zone file
+      ansible.builtin.set_fact:
+        zone_main: |
+          $TTL    604800
+          @       IN      SOA     ns1.{{ domain_name }}. admin.{{ domain_name }}. (
+                                  {{ ansible_date_time.epoch }}  ; Serial
+                                  604800          ; Refresh
+                                  86400           ; Retry
+                                  2419200         ; Expire
+                                  604800 )        ; Negative Cache TTL
+          ;
+          @       IN      NS      ns1.{{ domain_name }}.
+          ns1     IN      A       {{ bind9_advertised_ip }}
+
+          ; Wildcard for all subdomains
+          *       IN      A       {{ effective_gateway_ip }}
+
+          ; Specific entries for infrastructure
+          dns     IN      A       {{ bind9_advertised_ip }}
+          {{ control_plane_hostname }}  IN  A  {{ hostvars[control_plane_hostname]['overlay_ip'] }}
+          {% for host in groups['k8s_workers'] | default([]) %}
+          {{ host }}  IN  A  {{ hostvars[host]['overlay_ip'] }}
+          {% endfor %}
 
     - name: Set zone file names
       ansible.builtin.set_fact:
@@ -384,77 +492,11 @@
       register: deploy_bind9
       changed_when: "'created' in deploy_bind9.stdout or 'configured' in deploy_bind9.stdout"
 
-    # Create LoadBalancer service for external DNS access
-    - name: Create BIND9 LoadBalancer service
-      ansible.builtin.shell: |
-        cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: v1
-        kind: Service
-        metadata:
-          name: bind9-external
-          namespace: {{ dns_namespace }}
-          labels:
-            app: bind9
-        spec:
-          type: LoadBalancer
-          loadBalancerIP: {{ dns_external_ip }}
-          selector:
-            app: bind9
-          ports:
-          - name: dns-udp
-            port: 53
-            targetPort: 53
-            protocol: UDP
-          - name: dns-tcp
-            port: 53
-            targetPort: 53
-            protocol: TCP
-        EOF
-      register: create_lb_service
-      changed_when: "'created' in create_lb_service.stdout or 'configured' in create_lb_service.stdout"
-
-    # Also create a ClusterIP service for internal use
-    - name: Create BIND9 ClusterIP service
-      ansible.builtin.shell: |
-        cat <<EOF | {{ kubectl_bin }} apply -f -
-        apiVersion: v1
-        kind: Service
-        metadata:
-          name: bind9-internal
-          namespace: {{ dns_namespace }}
-          labels:
-            app: bind9
-        spec:
-          type: ClusterIP
-          selector:
-            app: bind9
-          ports:
-          - name: dns-udp
-            port: 53
-            targetPort: 53
-            protocol: UDP
-          - name: dns-tcp
-            port: 53
-            targetPort: 53
-            protocol: TCP
-        EOF
-      register: create_clusterip_service
-      changed_when: "'created' in create_clusterip_service.stdout or 'configured' in create_clusterip_service.stdout"
-
     - name: Wait for BIND9 deployment to be ready
       ansible.builtin.shell: |
         {{ kubectl_bin }} get deployment bind9 -n {{ dns_namespace }} -o json
       register: bind9_deployment_json
       until: (bind9_deployment_json.stdout | from_json).status.readyReplicas | default(0) == 1
-      retries: 30
-      delay: 10
-      changed_when: false
-
-    - name: Wait for LoadBalancer IP to be assigned
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get service bind9-external -n {{ dns_namespace }} -o json
-      register: lb_service_json
-      until: (lb_service_json.stdout | from_json).status.loadBalancer.ingress is defined
       retries: 30
       delay: 10
       changed_when: false
@@ -494,14 +536,13 @@
         - "/tmp/bind9-named.conf"
         - "/tmp/bind9-zones.conf"
         - "/tmp/{{ zone_file_main }}"
-        - "/tmp/{{ zone_file_kn }}"
 
     - name: Display summary message
       ansible.builtin.debug:
         msg: |
           BIND9 DNS Server has been successfully deployed!
 
-          External DNS Service: {{ dns_external_ip }}:53
+          External DNS Service: {{ bind9_advertised_ip }}:53
           Internal Service: bind9-internal.{{ dns_namespace }}.svc.cluster.local
 
           Configured zones:
@@ -510,7 +551,7 @@
           External forwarding to: 8.8.8.8, 8.8.4.4
 
           To test DNS resolution:
-          dig @{{ dns_external_ip }} test.{{ domain_name }}
-          dig @{{ dns_external_ip }} google.com
+          dig @{{ bind9_advertised_ip }} test.{{ domain_name }}
+          dig @{{ bind9_advertised_ip }} google.com
 
           Next step: Update nodes to use this DNS server
