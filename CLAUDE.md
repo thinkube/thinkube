@@ -150,7 +150,7 @@ The deployment branches on `overlay_provider`:
 - **ZeroTier mode**: Cilium's k8s-snap built-in load balancer (L2 mode)
   claims static IPs from the user-defined overlay subnet. Inventory carries
   `overlay_cidr`, `overlay_subnet_prefix`, `lb_ip_start_octet` /
-  `lb_ip_end_octet`, `primary_ingress_ip_octet`, `dns_external_ip_octet`,
+  `lb_ip_end_octet`, `primary_gateway_ip_octet`, `dns_external_ip_octet`,
   per-host `overlay_ip`. *(The legacy `metallb_*` names were renamed to
   `lb_*` in commit `712b12f`. No MetalLB is or was ever deployed — the
   load balancer is Cilium.)*

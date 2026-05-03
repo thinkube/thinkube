@@ -84,7 +84,7 @@ Envoy Gateway Service status.
   the load-balancer IP range so the rest of the network can route to it.
 - Inventory carries `overlay_cidr`, `overlay_subnet_prefix`,
   `lb_ip_start_octet` / `lb_ip_end_octet`,
-  `primary_ingress_ip_octet`, `dns_external_ip_octet`, per-host
+  `primary_gateway_ip_octet`, `dns_external_ip_octet`, per-host
   `overlay_ip`.
 
 ### Tailscale mode
