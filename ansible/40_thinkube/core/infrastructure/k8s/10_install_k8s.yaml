@@ -22,9 +22,10 @@
 #   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s/10_install_k8s.yaml
 #
 # Variables from inventory:
-#   - system_username: User to install kubectl/helm for
-#   - domain_name: Domain name for services
-#   - overlay_subnet_prefix: ZeroTier network subnet prefix
+#   - system_username:        User to install kubectl/helm for
+#   - domain_name:            Domain name for services
+#   - overlay_provider:       'zerotier' or 'tailscale' (selects networking branch)
+#   - overlay_subnet_prefix:  ZeroTier network subnet prefix (ZeroTier mode only)
 #
 # 🤖 [AI-assisted]
 
@@ -53,7 +54,18 @@
       loop:
         - system_username
         - domain_name
+        - overlay_provider
+
+    - name: Verify ZeroTier-specific variables exist (ZeroTier mode only)
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined (required when overlay_provider is 'zerotier')"
+      when:
+        - overlay_provider == 'zerotier'
+        - vars[item] is not defined
+      loop:
         - overlay_subnet_prefix
+        - lb_ip_start_octet
+        - lb_ip_end_octet
 
     - name: Verify OS is Ubuntu 24.04
       ansible.builtin.fail:
@@ -248,6 +260,11 @@
         direction: out
       become: true
 
+    # Overlay-network firewall rules. Tailscale's daemon configures its
+    # own UFW rules during install (see 06_install_tailscale.yaml — it
+    # opens UDP/41641 and trusts the tailscale0 interface), so we don't
+    # repeat them here. ZeroTier needs explicit allow rules for the
+    # interface family and an SSH-from-overlay rule keyed on the subnet.
     - name: Allow all traffic on ZeroTier interfaces (overlay networking)
       community.general.ufw:
         rule: allow
@@ -255,6 +272,7 @@
         direction: in
         comment: 'ZeroTier overlay network'
       become: true
+      when: overlay_provider == 'zerotier'
 
     - name: Allow outbound traffic on ZeroTier interfaces
       community.general.ufw:
@@ -263,6 +281,7 @@
         direction: out
         comment: 'ZeroTier overlay network'
       become: true
+      when: overlay_provider == 'zerotier'
 
     - name: Allow SSH from ZeroTier subnet
       community.general.ufw:
@@ -272,6 +291,7 @@
         proto: tcp
         comment: 'SSH from ZeroTier overlay'
       become: true
+      when: overlay_provider == 'zerotier'
 
     - name: Enable UFW
       community.general.ufw:
@@ -884,8 +904,8 @@
           - "Network Configuration:"
           - "- k8s API bound to {{ k8s_stable_ip }} (dummy interface k8s0)"
           - "- Location-independent: works regardless of physical network"
-          - "- Zero latency for local access (no ZeroTier overhead)"
-          - "- Remote access still available via ZeroTier overlay"
+          - "- Zero latency for local access (no overlay overhead)"
+          - "- Remote access via {{ 'ZeroTier' if overlay_provider == 'zerotier' else 'Tailscale' }} overlay"
           - "==============================================="
           - "Next Steps:"
           - "1. Join worker nodes: ansible/40_thinkube/core/infrastructure/k8s/20_join_workers.yaml"

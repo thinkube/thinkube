@@ -43,7 +43,11 @@
     bind9_image_name: "localhost/thinkube-bind9:latest"
     bind9_build_dir: "/tmp/thinkube-bind9-build"
     # Determine subnet prefix based on network mode
-    subnet_prefix: "{{ overlay_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    # Subnet prefix and the static IPs derived from it are only meaningful
+    # in ZeroTier mode (Cilium L2 LB pre-pins these from the overlay
+    # subnet). In Tailscale mode the operator assigns each Service's IP
+    # at runtime and we discover them via Service.status.loadBalancer.ingress.
+    subnet_prefix: "{{ overlay_subnet_prefix if overlay_provider == 'zerotier' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     dns_external_ip: "{{ subnet_prefix }}{{ dns_external_ip_octet }}"
     primary_gateway_ip: "{{ subnet_prefix }}{{ primary_gateway_ip_octet }}"
     control_plane_hostname: "{{ inventory_hostname }}"
@@ -70,10 +74,18 @@
       ansible.builtin.assert:
         that:
           - domain_name is defined
+          - network_mode is defined
+          - overlay_provider is defined
+        fail_msg: "Required inventory variables are not defined"
+
+    - name: Verify ZeroTier-specific variables are defined (ZeroTier mode only)
+      ansible.builtin.assert:
+        that:
           - dns_external_ip_octet is defined
           - primary_gateway_ip_octet is defined
-          - network_mode is defined
-        fail_msg: "Required inventory variables are not defined"
+          - overlay_subnet_prefix is defined
+        fail_msg: "ZeroTier-mode inventory variables are missing"
+      when: overlay_provider == 'zerotier'
 
     # The wildcard A record in the BIND9 zone needs the IP that external
     # clients should hit for *.{{ domain_name }}. In ZeroTier mode that's

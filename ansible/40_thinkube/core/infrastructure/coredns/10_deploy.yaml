@@ -41,8 +41,11 @@
     ca_cert: "{{ cert_dir }}/ca.crt"
     ca_key: "{{ cert_dir }}/ca.key"
     knative_enabled: false  # Explicitly set to false for CoreDNS setup
-    # Determine subnet prefix based on network mode
-    subnet_prefix: "{{ overlay_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    # Subnet prefix is only meaningful in ZeroTier mode (Cilium L2 LB picks
+    # IPs from the overlay subnet). In Tailscale mode the operator assigns
+    # IPs and coredns_external_ip is discovered from Service status below,
+    # so we don't construct primary_gateway_ip from a prefix here.
+    subnet_prefix: "{{ overlay_subnet_prefix if overlay_provider == 'zerotier' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     primary_gateway_ip: "{{ subnet_prefix }}{{ primary_gateway_ip_octet }}"
 
   pre_tasks:
@@ -51,14 +54,20 @@
         that:
           - domain_name is defined
           - network_mode is defined
+          - overlay_provider is defined
+          - groups['k8s_workers'] is defined
+        fail_msg: "Required inventory variables are not defined"
+
+    - name: Verify ZeroTier-specific variables are defined (ZeroTier mode only)
+      ansible.builtin.assert:
+        that:
+          - overlay_subnet_prefix is defined
           - primary_gateway_ip_octet is defined
           - dns_external_ip_octet is defined
           - lb_ip_start_octet is defined
           - lb_ip_end_octet is defined
-          - groups['k8s_workers'] is defined
-          - network_mode == 'local' or overlay_subnet_prefix is defined
-          - network_mode == 'overlay' or network_cidr is defined
-        fail_msg: "Required inventory variables are not defined"
+        fail_msg: "ZeroTier-mode inventory variables are missing"
+      when: overlay_provider == 'zerotier'
 
     # Discover the IP that bind9-external is reachable on. ZeroTier mode:
     # the static value Cilium L2 LB advertises. Tailscale mode: the

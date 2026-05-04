@@ -40,7 +40,11 @@
   become: false
   gather_facts: false
   vars:
-    subnet_prefix: "{{ overlay_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    # primary_gateway_ip is only meaningful in ZeroTier mode (Cilium L2 LB
+    # pins the Service to this address). In Tailscale mode the Tailscale
+    # Operator picks the Service's tailnet IP at runtime, so we read it
+    # back from Gateway status below instead of comparing to a known value.
+    subnet_prefix: "{{ overlay_subnet_prefix if overlay_provider == 'zerotier' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     primary_gateway_ip: "{{ subnet_prefix }}{{ primary_gateway_ip_octet }}"
 
     eg_version: "v1.7.1"
@@ -530,6 +534,9 @@
     ###########################################################################
     # Step 13: Wait for Gateways to receive IP addresses
     ###########################################################################
+    # ZeroTier mode pre-pins primary_gateway_ip via Cilium L2 LB, so we
+    # wait for the Gateway to come up with that exact address. Tailscale
+    # mode lets the operator pick from 100.64.0.0/10 — wait for any IP.
     - name: Wait for main Gateway to have IP assigned
       ansible.builtin.shell: |
         {{ kubectl_bin }} get gateway {{ gateway_name }} -n {{ gateway_namespace }} \
@@ -537,7 +544,9 @@
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: primary_gw_ip
-      until: primary_gw_ip.stdout == primary_gateway_ip
+      until: >-
+        (overlay_provider == 'zerotier' and primary_gw_ip.stdout == primary_gateway_ip)
+        or (overlay_provider == 'tailscale' and primary_gw_ip.stdout | length > 0)
       retries: 40
       delay: 10
       changed_when: false
@@ -550,7 +559,7 @@
         msg:
           - "Envoy Gateway {{ eg_version }} deployed successfully"
           - ""
-          - "Main Gateway ({{ gateway_name }}): {{ primary_gateway_ip }}"
+          - "Main Gateway ({{ gateway_name }}): {{ primary_gw_ip.stdout }}"
           - "  - HTTP  (80)   → HTTPS redirect"
           - "  - HTTPS (443)  → TLS termination (*.{{ domain_name }})"
           - "  - TCP   (5432) → PostgreSQL"

@@ -19,8 +19,9 @@
 #   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s-snap/20_join_workers.yaml
 #
 # Variables from inventory:
-#   - system_username: User to configure kubectl/helm wrappers for
-#   - overlay_subnet_prefix: ZeroTier network subnet prefix
+#   - system_username:        User to configure kubectl/helm wrappers for
+#   - overlay_provider:       'zerotier' or 'tailscale' (selects firewall branch)
+#   - overlay_subnet_prefix:  ZeroTier network subnet prefix (ZeroTier mode only)
 #
 # 🤖 [AI-assisted]
 
@@ -45,6 +46,15 @@
       when: lookup('ansible.builtin.vars', item, default='__undefined__') == '__undefined__'
       loop:
         - system_username
+        - overlay_provider
+
+    - name: Verify ZeroTier-specific variables exist (ZeroTier mode only)
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined (required when overlay_provider is 'zerotier')"
+      when:
+        - overlay_provider == 'zerotier'
+        - lookup('ansible.builtin.vars', item, default='__undefined__') == '__undefined__'
+      loop:
         - overlay_subnet_prefix
 
   tasks:
@@ -132,6 +142,11 @@
         direction: out
       become: true
 
+    # Overlay-network firewall rules. Tailscale's installer (see
+    # 06_install_tailscale.yaml) already opens UDP/41641 and trusts the
+    # tailscale0 interface, so we don't repeat them here. ZeroTier needs
+    # explicit allow rules for the interface family and an SSH-from-overlay
+    # rule keyed on the subnet.
     - name: Allow all traffic on ZeroTier interfaces (overlay networking)
       community.general.ufw:
         rule: allow
@@ -139,6 +154,7 @@
         direction: in
         comment: 'ZeroTier overlay network'
       become: true
+      when: overlay_provider == 'zerotier'
 
     - name: Allow outbound traffic on ZeroTier interfaces
       community.general.ufw:
@@ -147,6 +163,7 @@
         direction: out
         comment: 'ZeroTier overlay network'
       become: true
+      when: overlay_provider == 'zerotier'
 
     - name: Allow SSH from ZeroTier subnet
       community.general.ufw:
@@ -156,6 +173,7 @@
         proto: tcp
         comment: 'SSH from ZeroTier overlay'
       become: true
+      when: overlay_provider == 'zerotier'
 
     - name: Enable UFW
       community.general.ufw:
