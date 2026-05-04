@@ -93,11 +93,16 @@
     # Tailscale Operator provisions a tailnet IP for the Envoy Gateway
     # Service after gateway-api/10_deploy.yaml runs — so we have to
     # discover it dynamically before templating the zone.
+    # The Tailscale operator writes BOTH a hostname entry and an IP
+    # entry into status.loadBalancer.ingress, but it puts the hostname
+    # first — so `ingress[0].ip` is empty. Use `ingress[*].ip` so
+    # kubectl walks the array and yields whichever entries have a
+    # non-empty .ip field.
     - name: Discover Envoy Gateway Service tailnet IP (Tailscale mode)
       ansible.builtin.command: >
         {{ kubectl_bin }} get svc -n envoy-gateway-system
         -l gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }},gateway.envoyproxy.io/owning-gateway-namespace={{ gateway_namespace }}
-        -o jsonpath={.items[0].status.loadBalancer.ingress[0].ip}
+        -o jsonpath={.items[0].status.loadBalancer.ingress[*].ip}
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: tailnet_gateway_ip_lookup
@@ -365,18 +370,31 @@
       register: create_clusterip_service
       changed_when: "'created' in create_clusterip_service.stdout or 'configured' in create_clusterip_service.stdout"
 
+    # Wait for at least one ingress entry to have an .ip field. In
+    # Tailscale mode the operator emits both a hostname entry and an
+    # IP entry, and the hostname entry usually shows up first — so
+    # `ingress is defined` is true before the IP is actually populated.
     - name: Wait for bind9-external LoadBalancer IP to be assigned
       ansible.builtin.shell: |
         {{ kubectl_bin }} get service bind9-external -n {{ dns_namespace }} -o json
       register: lb_service_json
-      until: (lb_service_json.stdout | from_json).status.loadBalancer.ingress is defined
+      until: >-
+        (lb_service_json.stdout | from_json).status.loadBalancer.ingress
+        | default([])
+        | selectattr('ip', 'defined')
+        | list
+        | length > 0
       retries: 30
       delay: 10
       changed_when: false
 
     - name: Capture the IP that bind9-external is reachable on
       ansible.builtin.set_fact:
-        bind9_advertised_ip: "{{ (lb_service_json.stdout | from_json).status.loadBalancer.ingress[0].ip }}"
+        bind9_advertised_ip: >-
+          {{ ((lb_service_json.stdout | from_json).status.loadBalancer.ingress
+              | selectattr('ip', 'defined')
+              | map(attribute='ip')
+              | list)[0] }}
 
     # Now that we know the IP that ns1 / dns will resolve to, build the zone
     # file. ZeroTier mode: bind9_advertised_ip == dns_external_ip. Tailscale
