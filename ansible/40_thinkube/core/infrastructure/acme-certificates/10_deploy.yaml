@@ -50,6 +50,8 @@
     letsencrypt_server: "letsencrypt"
     tls_crt_path: "{{ cert_dir }}/{{ domain_name }}/fullchain.cer"
     tls_key_path: "{{ cert_dir }}/{{ domain_name }}/{{ domain_name }}.key"
+    hook_script_dir: "{{ cert_dir }}/scripts"
+    hook_script_path: "{{ cert_dir }}/scripts/sync-k8s-tls.sh"
     # kubectl_bin and kubeconfig inherited from inventory
 
   tasks:
@@ -210,11 +212,93 @@
           - "Certificate expiry check: {{ 'Valid' if cert_expiry_check.rc | default(1) == 0 else 'Needs renewal' if cert_file.stat.exists else 'N/A' }}"
           - "Needs renewal: {{ needs_renewal }}"
 
-    # Don't wire --reloadcmd here. The sync-k8s-tls.sh script is created
-    # later by 15_configure_renewal_hook.yaml; on first issue it doesn't
-    # exist yet and acme.sh would fail when it tries to run the reload.
-    # The k8s TLS secret is updated below as a normal playbook task; the
-    # reloadcmd is registered later for future cron-triggered renewals.
+    # The renewal hook script must exist BEFORE `acme.sh --issue`, because
+    # acme.sh runs the --reloadcmd immediately after installing the cert
+    # files. Without this, the very first issue fails even though Let's
+    # Encrypt has already issued the cert. (15_configure_renewal_hook.yaml
+    # later re-installs this same script — leaving the duplication for
+    # idempotency: this playbook is self-sufficient if anyone runs it
+    # standalone.)
+    - name: Create renewal hook script directory
+      ansible.builtin.file:
+        path: "{{ hook_script_dir }}"
+        state: directory
+        mode: '0750'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      become: true
+
+    - name: Install renewal hook script (sync wildcard cert to k8s TLS secrets)
+      ansible.builtin.copy:
+        dest: "{{ hook_script_path }}"
+        mode: '0750'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        content: |
+          #!/usr/bin/env bash
+          # sync-k8s-tls.sh — Sync renewed wildcard cert to all Kubernetes TLS secrets
+          # Called by acme.sh --reloadcmd after certificate renewal.
+          #
+          # Safety: only patches secrets whose tls.crt SANs match the new
+          # wildcard cert's SANs. Non-wildcard TLS secrets are never touched.
+
+          set -euo pipefail
+
+          KUBECTL="{{ kubectl_bin }}"
+          KUBECONFIG="{{ kubeconfig }}"
+          export KUBECONFIG
+
+          TLS_CRT="{{ tls_crt_path }}"
+          TLS_KEY="{{ tls_key_path }}"
+          LOG_TAG="sync-k8s-tls"
+
+          log() { logger -t "$LOG_TAG" "$*"; echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
+
+          NEW_CRT_B64=$(base64 -w0 < "$TLS_CRT")
+          NEW_KEY_B64=$(base64 -w0 < "$TLS_KEY")
+
+          SECRETS=$($KUBECTL get secrets --all-namespaces \
+            --field-selector type=kubernetes.io/tls \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.data.tls\.crt}{"\n"}{end}')
+
+          UPDATED=0
+          SKIPPED=0
+
+          while IFS=' ' read -r ns name old_crt_b64; do
+            [ -z "$ns" ] && continue
+
+            if [ "$old_crt_b64" = "$NEW_CRT_B64" ]; then
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            OLD_SANS=$(echo "$old_crt_b64" | base64 -d 2>/dev/null | \
+              openssl x509 -noout -ext subjectAltName 2>/dev/null | \
+              grep -oP 'DNS:[^,]+' | sort || true)
+            NEW_SANS=$(openssl x509 -in "$TLS_CRT" -noout -ext subjectAltName 2>/dev/null | \
+              grep -oP 'DNS:[^,]+' | sort || true)
+
+            if [ "$OLD_SANS" != "$NEW_SANS" ]; then
+              log "SKIP $ns/$name — different SANs"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            $KUBECTL patch secret "$name" -n "$ns" \
+              --type='json' \
+              -p="[
+                {\"op\": \"replace\", \"path\": \"/data/tls.crt\", \"value\": \"$NEW_CRT_B64\"},
+                {\"op\": \"replace\", \"path\": \"/data/tls.key\", \"value\": \"$NEW_KEY_B64\"}
+              ]" >/dev/null
+
+            log "UPDATED $ns/$name"
+            UPDATED=$((UPDATED + 1))
+          done <<< "$SECRETS"
+
+          log "Done: $UPDATED secrets updated, $SKIPPED skipped"
+          log "TLS secrets updated — Cilium Gateway will reload certificates automatically"
+      become: true
+
     - name: Issue new SSL certificate
       ansible.builtin.shell: |
         {{ acme_home }}/acme.sh --issue --dns dns_cf \
@@ -222,7 +306,8 @@
         --keylength ec-256 \
         --cert-file {{ cert_dir }}/{{ domain_name }}/{{ domain_name }}.cer \
         --key-file {{ tls_key_path }} \
-        --fullchain-file {{ tls_crt_path }}
+        --fullchain-file {{ tls_crt_path }} \
+        --reloadcmd "{{ hook_script_path }}"
       environment:
         CF_Token: "{{ cloudflare_api_token }}"
       when: needs_renewal
