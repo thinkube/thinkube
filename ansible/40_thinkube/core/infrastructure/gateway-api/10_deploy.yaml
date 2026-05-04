@@ -245,15 +245,8 @@
       changed_when: false
 
     ###########################################################################
-    # Step 5: Create EnvoyProxy resource (imagePullPolicy for data plane)
+    # Step 5: Create EnvoyProxy resource
     ###########################################################################
-    - name: Build base EnvoyProxy provider.kubernetes spec
-      ansible.builtin.set_fact:
-        envoy_proxy_kubernetes:
-          envoyDeployment:
-            container:
-              imagePullPolicy: IfNotPresent
-
     # In Tailscale mode the operator exposes the Envoy Gateway Service on
     # the tailnet. We use `spec.loadBalancerClass: tailscale` (NOT the
     # `tailscale.com/expose` annotation): the LoadBalancerClass path is
@@ -261,23 +254,29 @@
     # into Service.status.loadBalancer.ingress, which is what Envoy
     # Gateway watches to mark the Gateway "Programmed". The hostname
     # annotation pins the device's tailnet name to gateway_hostname.
-    - name: Configure EnvoyProxy Service for Tailscale Operator
+    - name: Build EnvoyProxy provider.kubernetes spec
       ansible.builtin.set_fact:
         envoy_proxy_kubernetes: >-
-          {{ envoy_proxy_kubernetes | combine({
+          {{ {} if overlay_provider != 'tailscale' else {
                'envoyService': {
                  'loadBalancerClass': 'tailscale',
                  'annotations': {
                    'tailscale.com/hostname': gateway_hostname,
                  },
                },
-             }) }}
-      when: overlay_provider == 'tailscale'
+             } }}
 
+    # Server-side apply with force_conflicts so a re-run fully replaces
+    # any stale field (e.g. an old `tailscale.com/expose` annotation from
+    # a pre-loadBalancerClass deployment). Default `state: present` does
+    # a strategic-merge patch and would leave the obsolete annotation in
+    # place, which prevented the Service from being recreated correctly.
     - name: Create EnvoyProxy resource for Thinkube
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: present
+        apply: true
+        force_conflicts: true
         definition:
           apiVersion: gateway.envoyproxy.io/v1alpha1
           kind: EnvoyProxy
@@ -288,6 +287,37 @@
             provider:
               type: Kubernetes
               kubernetes: "{{ envoy_proxy_kubernetes }}"
+
+    # Service.spec.loadBalancerClass is immutable, so an existing Envoy
+    # Gateway Service from a prior deploy that lacked it (or had the
+    # wrong class) cannot be updated in place. Delete it here so Envoy
+    # Gateway recreates it from the EnvoyProxy spec above. No-op when
+    # the Service is already correct or absent.
+    - name: Reconcile Envoy Gateway Service if loadBalancerClass mismatch
+      when: overlay_provider == 'tailscale'
+      block:
+        - name: Read current loadBalancerClass on Envoy Gateway Service
+          ansible.builtin.shell: |
+            {{ kubectl_bin }} get svc -n {{ eg_namespace }} \
+              -l gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }} \
+              -o jsonpath='{.items[0].spec.loadBalancerClass}' 2>/dev/null || true
+          environment:
+            KUBECONFIG: "{{ kubeconfig }}"
+          register: existing_lb_class
+          changed_when: false
+          failed_when: false
+
+        - name: Delete stale Envoy Gateway Service so it recreates with loadBalancerClass
+          ansible.builtin.shell: |
+            {{ kubectl_bin }} delete svc -n {{ eg_namespace }} \
+              -l gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }}
+          environment:
+            KUBECONFIG: "{{ kubeconfig }}"
+          when:
+            - existing_lb_class.stdout is defined
+            - existing_lb_class.stdout != ''
+            - existing_lb_class.stdout != 'tailscale'
+          changed_when: true
 
     ###########################################################################
     # Step 6: Create GatewayClass pointing to Envoy Gateway
