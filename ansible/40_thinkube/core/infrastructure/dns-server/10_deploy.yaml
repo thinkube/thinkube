@@ -399,6 +399,13 @@
     # Now that we know the IP that ns1 / dns will resolve to, build the zone
     # file. ZeroTier mode: bind9_advertised_ip == dns_external_ip. Tailscale
     # mode: bind9_advertised_ip is the operator-assigned tailnet IP.
+    #
+    # Per-host A records map <hostname>.<domain> to:
+    #   - ZeroTier mode: the node's overlay_ip (static, picked by user)
+    #   - Tailscale mode: the node's lan_ip — Tailscale's MagicDNS already
+    #     covers <hostname>.<tailnet>.ts.net for tailnet-side clients, so
+    #     in-domain records here serve LAN-side clients (and the LAN IP is
+    #     what every node sets ansible_host to in TS mode anyway).
     - name: Create main domain zone file
       ansible.builtin.set_fact:
         zone_main: |
@@ -418,9 +425,10 @@
 
           ; Specific entries for infrastructure
           dns     IN      A       {{ bind9_advertised_ip }}
-          {{ control_plane_hostname }}  IN  A  {{ hostvars[control_plane_hostname]['overlay_ip'] }}
+          {% set host_ip_key = 'overlay_ip' if overlay_provider == 'zerotier' else 'lan_ip' %}
+          {{ control_plane_hostname }}  IN  A  {{ hostvars[control_plane_hostname][host_ip_key] }}
           {% for host in groups['k8s_workers'] | default([]) %}
-          {{ host }}  IN  A  {{ hostvars[host]['overlay_ip'] }}
+          {{ host }}  IN  A  {{ hostvars[host][host_ip_key] }}
           {% endfor %}
 
     - name: Set zone file names
