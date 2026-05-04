@@ -507,29 +507,36 @@
     ###########################################################################
     # Step 12: Create TCPRoutes (referencing thinkube-gateway)
     ###########################################################################
+    # The TCPRoute CRD requires backendRefs[].port to be an integer.
+    # Going through kubernetes.core.k8s with `port: "{{ x | int }}"` was
+    # still producing a string in the request body (the module's
+    # serializer doesn't preserve the int type through the templated
+    # dict). Rendering the YAML as plain text and piping it to
+    # `kubectl apply -f -` avoids the issue entirely — kubectl parses
+    # the unquoted scalar `{{ item.backend_port }}` as an integer.
     - name: Create TCPRoutes for each TCP service
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: gateway.networking.k8s.io/v1alpha2
-          kind: TCPRoute
-          metadata:
-            name: "{{ item.name }}"
-            namespace: "{{ gateway_namespace }}"
-          spec:
-            parentRefs:
-              - name: "{{ gateway_name }}"
-                namespace: "{{ gateway_namespace }}"
-                sectionName: "{{ item.name }}"
-            rules:
-              - backendRefs:
-                  - name: "{{ item.backend_service }}"
-                    namespace: "{{ item.backend_namespace }}"
-                    # backendRefs[].port must be an integer in the CRD;
-                    # the YAML-quoted Jinja above produces a string, so
-                    # explicitly coerce with | int.
-                    port: "{{ item.backend_port | int }}"
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: gateway.networking.k8s.io/v1alpha2
+        kind: TCPRoute
+        metadata:
+          name: {{ item.name }}
+          namespace: {{ gateway_namespace }}
+        spec:
+          parentRefs:
+            - name: {{ gateway_name }}
+              namespace: {{ gateway_namespace }}
+              sectionName: {{ item.name }}
+          rules:
+            - backendRefs:
+                - name: {{ item.backend_service }}
+                  namespace: {{ item.backend_namespace }}
+                  port: {{ item.backend_port }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: tcproute_apply
+      changed_when: "'created' in tcproute_apply.stdout or 'configured' in tcproute_apply.stdout"
       loop: "{{ tcp_services }}"
       loop_control:
         label: "{{ item.name }}"
