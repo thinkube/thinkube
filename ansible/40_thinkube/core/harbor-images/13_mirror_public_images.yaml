@@ -81,12 +81,43 @@
       ansible.builtin.set_fact:
         mirror_catalog: "{{ (metadata_response.content | from_json).images }}"
 
+    # Build mirror_images, filtering out entries whose declared
+    # architectures don't overlap what this cluster actually runs. Keeps
+    # us from pulling/pushing huge arm64 images (e.g. tensorrt-llm-spark)
+    # on an amd64-only cluster, where they could never be scheduled.
+    # When an entry's architecture list intersects build_architectures
+    # only partially, narrow it to the intersection so the per-arch
+    # mirror loop only does the work that's actually needed.
     - name: Build mirror_images list with full destination paths
       ansible.builtin.set_fact:
-        mirror_images: "{{ mirror_images | default([]) + [{'source': item.source, 'destination': harbor_registry + '/' + library_project + '/' + item.destination_name, 'description': item.description | default(''), 'architectures': item.architectures | default(build_architectures)}] }}"
+        mirror_images: >-
+          {{
+            mirror_images | default([]) + (
+              [{
+                'source': item.source,
+                'destination': harbor_registry ~ '/' ~ library_project ~ '/' ~ item.destination_name,
+                'description': item.description | default(''),
+                'architectures': effective_archs,
+              }] if effective_archs | length > 0 else []
+            )
+          }}
+      vars:
+        effective_archs: "{{ (item.architectures | default(build_architectures)) | intersect(build_architectures) | list }}"
       loop: "{{ mirror_catalog }}"
       loop_control:
         label: "{{ item.source }}"
+
+    - name: Display skipped images (architecture not present in cluster)
+      ansible.builtin.debug:
+        msg: >-
+          Skipping {{ item.source }} → {{ item.destination_name }}
+          (declared architectures {{ item.architectures }}; cluster runs {{ build_architectures }})
+      loop: "{{ mirror_catalog }}"
+      loop_control:
+        label: "{{ item.source }}"
+      when:
+        - item.architectures is defined
+        - (item.architectures | intersect(build_architectures) | list | length) == 0
 
     - name: Display image list info
       ansible.builtin.debug:
