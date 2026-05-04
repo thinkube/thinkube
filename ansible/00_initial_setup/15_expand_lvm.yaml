@@ -1,0 +1,94 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 15_expand_lvm.yaml - Reclaim wasted disk on Ubuntu Server LVM installs
+#
+# Purpose:
+#   Ubuntu Server's installer defaults the root logical volume to ~100 GB
+#   even on much larger disks, leaving the rest of the volume group as
+#   unused free space. Detect that case on every cluster node and grow
+#   the root LV (plus filesystem) to use the full VG. No-op for nodes
+#   that aren't on LVM or that already use the full VG.
+#
+#   Same approach as thinkube-control's add-node flow
+#   (backend/app/services/node_manager.py::expand_lvm).
+#
+# Run with:
+#   ./scripts/run_ansible.sh ansible/00_initial_setup/15_expand_lvm.yaml
+
+- name: Expand root LVM to use the full volume group
+  hosts: baremetal
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Find the device backing /
+      ansible.builtin.shell: |
+        set -o pipefail
+        df / | tail -1 | awk '{print $1}'
+      args:
+        executable: /bin/bash
+      register: root_device
+      changed_when: false
+
+    - name: Skip when root is not on an LVM logical volume
+      ansible.builtin.meta: end_host
+      when: not root_device.stdout.startswith('/dev/mapper/')
+
+    - name: Look up the LV's volume group and free space
+      ansible.builtin.shell: |
+        set -o pipefail
+        vg=$(lvs --noheadings -o vg_name {{ root_device.stdout }} | tr -d ' ')
+        if [ -z "$vg" ]; then
+          echo "0 "
+          exit 0
+        fi
+        free_gb=$(vgs --noheadings --nosuffix --units g -o vg_free "$vg" | tr -d ' ' | cut -d. -f1)
+        echo "$free_gb $vg"
+      args:
+        executable: /bin/bash
+      register: vg_lookup
+      changed_when: false
+
+    - name: Parse the lookup result
+      ansible.builtin.set_fact:
+        vg_free_gb: "{{ vg_lookup.stdout.split()[0] | int }}"
+        vg_name: "{{ (vg_lookup.stdout.split() + [''])[1] }}"
+
+    - name: Skip when the volume group has no significant free space
+      ansible.builtin.meta: end_host
+      when: vg_free_gb | int <= 10
+
+    - name: Extend the root logical volume to use all free extents
+      ansible.builtin.command: lvextend -l +100%FREE {{ root_device.stdout }}
+      register: lvextend_result
+      changed_when: "'Size of logical volume' in lvextend_result.stdout"
+
+    - name: Detect filesystem type
+      ansible.builtin.command: blkid -s TYPE -o value {{ root_device.stdout }}
+      register: fs_type
+      changed_when: false
+
+    - name: Grow ext{2,3,4} filesystem
+      ansible.builtin.command: resize2fs {{ root_device.stdout }}
+      when: fs_type.stdout in ['ext2', 'ext3', 'ext4']
+
+    - name: Grow xfs filesystem
+      ansible.builtin.command: xfs_growfs /
+      when: fs_type.stdout == 'xfs'
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          ✅ {{ inventory_hostname }}: LVM expanded
+          ════════════════════════════════════════════════════════
+
+          Volume group:    {{ vg_name }}
+          Logical volume:  {{ root_device.stdout }}
+          Reclaimed:       {{ vg_free_gb }} GB
+          Filesystem:      {{ fs_type.stdout }}
+
+          ════════════════════════════════════════════════════════
