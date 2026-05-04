@@ -428,24 +428,46 @@
       changed_when: "'STATUS: deployed' in argo_events_deploy.stdout"
     # --- End Argo Events installation ---
 
-    - name: Patch workflow controller ClusterRole to add workflowtaskresults create permission
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} patch clusterrole argo-workflows-workflow-controller --type=json -p='[
-          {
-            "op": "add",
-            "path": "/rules/-",
-            "value": {
-              "apiGroups": ["argoproj.io"],
-              "resources": ["workflowtaskresults", "workflowtaskresults/finalizers"],
-              "verbs": ["create", "list", "watch", "deletecollection"]
-            }
-          }
-        ]'
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: patch_result
-      changed_when: "'patched' in patch_result.stdout"
-      failed_when: patch_result.rc != 0 and 'already exists' not in patch_result.stderr
+    - name: Grant workflow controller full verbs on workflowtaskresults
+      # Workflow pods (e.g. for artifact reporting / step status) need to
+      # patch workflowtaskresults; without 'patch' / 'update' / 'get' /
+      # 'delete' the controller logs 'forbidden' and the workflow fails
+      # mid-step. Server-side apply the full rule each run, so re-runs
+      # converge regardless of prior partial patches.
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        apply: true
+        force_conflicts: true
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: argo-workflows-workflow-controller-workflowtaskresults
+          rules:
+            - apiGroups: ["argoproj.io"]
+              resources: ["workflowtaskresults", "workflowtaskresults/finalizers"]
+              verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+
+    - name: Bind the workflowtaskresults ClusterRole to the workflow controller SA
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        apply: true
+        force_conflicts: true
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: argo-workflows-workflow-controller-workflowtaskresults
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: argo-workflows-workflow-controller-workflowtaskresults
+          subjects:
+            - kind: ServiceAccount
+              name: argo-workflows-workflow-controller
+              namespace: "{{ argo_namespace }}"
 
     - name: Wait for Argo Workflows pods to be ready
       ansible.builtin.shell: |
