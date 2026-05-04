@@ -1,0 +1,158 @@
+# Copyright 2025 Alejandro Martinez Corria and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Test playbook for kubelet memory protection configuration
+# Description:
+#   Verifies kubelet is configured with resource reservations and eviction thresholds
+#   Tests include:
+#   - system-reserved and kube-reserved are set
+#   - Eviction thresholds are configured
+#   - Node allocatable is less than capacity (proving reservations work)
+#
+# Usage:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/k8s/16_test_kubelet_protection.yaml
+
+- name: Test Kubelet Memory Protection Configuration
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  tasks:
+    - name: Read kubelet args file
+      ansible.builtin.slurp:
+        src: /var/snap/k8s/common/args/kubelet
+      register: kubelet_args_raw
+      become: true
+
+    - name: Parse kubelet args
+      ansible.builtin.set_fact:
+        kubelet_args: "{{ kubelet_args_raw.content | b64decode }}"
+
+    - name: Verify system-reserved is configured
+      ansible.builtin.assert:
+        that:
+          - "'--system-reserved=' in kubelet_args"
+          - "'memory=4Gi' in kubelet_args"
+        fail_msg: "system-reserved is not configured in kubelet args"
+        success_msg: "system-reserved is configured correctly"
+
+    - name: Verify kube-reserved is configured
+      ansible.builtin.assert:
+        that:
+          - "'--kube-reserved=' in kubelet_args"
+        fail_msg: "kube-reserved is not configured in kubelet args"
+        success_msg: "kube-reserved is configured correctly"
+
+    - name: Verify eviction-hard is configured
+      ansible.builtin.assert:
+        that:
+          - "'--eviction-hard=' in kubelet_args"
+          - "'memory.available<2Gi' in kubelet_args"
+        fail_msg: "eviction-hard is not configured in kubelet args"
+        success_msg: "eviction-hard is configured correctly"
+
+    - name: Verify eviction-soft is configured
+      ansible.builtin.assert:
+        that:
+          - "'--eviction-soft=' in kubelet_args"
+          - "'memory.available<4Gi' in kubelet_args"
+        fail_msg: "eviction-soft is not configured in kubelet args"
+        success_msg: "eviction-soft is configured correctly"
+
+    - name: Verify enforce-node-allocatable is configured
+      ansible.builtin.assert:
+        that:
+          - "'--enforce-node-allocatable=' in kubelet_args"
+        fail_msg: "enforce-node-allocatable is not configured in kubelet args"
+        success_msg: "enforce-node-allocatable is configured correctly"
+
+    - name: Get node allocatable memory
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get node {{ inventory_hostname }}
+        -o jsonpath='{.status.allocatable.memory}'
+      register: node_allocatable_memory
+      changed_when: false
+
+    - name: Get node capacity memory
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get node {{ inventory_hostname }}
+        -o jsonpath='{.status.capacity.memory}'
+      register: node_capacity_memory
+      changed_when: false
+
+    - name: Display node memory info
+      ansible.builtin.debug:
+        msg: >
+          Node {{ inventory_hostname }}:
+          Capacity={{ node_capacity_memory.stdout }},
+          Allocatable={{ node_allocatable_memory.stdout }}.
+          Reservations should reduce allocatable by ~6Gi from capacity.
+
+    - name: Verify allocatable is less than capacity
+      ansible.builtin.assert:
+        that:
+          - node_allocatable_memory.stdout != node_capacity_memory.stdout
+        fail_msg: >
+          Allocatable ({{ node_allocatable_memory.stdout }}) equals
+          capacity ({{ node_capacity_memory.stdout }}) - reservations not active
+        success_msg: >
+          Allocatable ({{ node_allocatable_memory.stdout }}) is less than
+          capacity ({{ node_capacity_memory.stdout }}) - reservations are active
+
+- name: Test Kubelet Memory Protection on Workers
+  hosts: k8s_workers
+  gather_facts: false
+
+  tasks:
+    - name: Read kubelet args file
+      ansible.builtin.slurp:
+        src: /var/snap/k8s/common/args/kubelet
+      register: kubelet_args_raw
+      become: true
+
+    - name: Parse kubelet args
+      ansible.builtin.set_fact:
+        kubelet_args: "{{ kubelet_args_raw.content | b64decode }}"
+
+    - name: Verify system-reserved is configured on worker
+      ansible.builtin.assert:
+        that:
+          - "'--system-reserved=' in kubelet_args"
+          - "'memory=4Gi' in kubelet_args"
+        fail_msg: "system-reserved is not configured on worker kubelet"
+        success_msg: "system-reserved is configured correctly on worker"
+
+    - name: Verify eviction-hard is configured on worker
+      ansible.builtin.assert:
+        that:
+          - "'--eviction-hard=' in kubelet_args"
+          - "'memory.available<2Gi' in kubelet_args"
+        fail_msg: "eviction-hard is not configured on worker kubelet"
+        success_msg: "eviction-hard is configured correctly on worker"
+
+    - name: Get worker node allocatable memory
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get node {{ inventory_hostname }}
+        -o jsonpath='{.status.allocatable.memory}'
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      register: node_allocatable_memory
+      changed_when: false
+
+    - name: Get worker node capacity memory
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get node {{ inventory_hostname }}
+        -o jsonpath='{.status.capacity.memory}'
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      register: node_capacity_memory
+      changed_when: false
+
+    - name: Verify worker allocatable is less than capacity
+      ansible.builtin.assert:
+        that:
+          - node_allocatable_memory.stdout != node_capacity_memory.stdout
+        fail_msg: >
+          Worker allocatable ({{ node_allocatable_memory.stdout }}) equals
+          capacity ({{ node_capacity_memory.stdout }}) - reservations not active
+        success_msg: >
+          Worker allocatable ({{ node_allocatable_memory.stdout }}) is less than
+          capacity ({{ node_capacity_memory.stdout }}) - reservations are active

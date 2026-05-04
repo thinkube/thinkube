@@ -548,6 +548,13 @@
       ansible.builtin.copy:
         content: |
           containerd-base-dir: /var/lib/k8s-containerd
+          extra-node-kubelet-args:
+            --system-reserved: "memory=4Gi,cpu=500m"
+            --kube-reserved: "memory=2Gi,cpu=500m"
+            --eviction-hard: "memory.available<2Gi,nodefs.available<10%"
+            --eviction-soft: "memory.available<4Gi,nodefs.available<15%"
+            --eviction-soft-grace-period: "memory.available=30s,nodefs.available=1m"
+            --enforce-node-allocatable: "pods,system-reserved,kube-reserved"
         dest: /tmp/k8s-join-config.yaml
         mode: '0644'
       become: true
@@ -619,6 +626,34 @@
       become: true
       when: '"/var/lib/kubelet"' in (kubelet_args_raw.content | b64decode)
 
+    # Ensure kubelet resource protection args are set (for workers that
+    # joined before these args were added to the join config)
+    - name: Ensure kubelet memory protection args are set
+      ansible.builtin.lineinfile:
+        path: /var/snap/k8s/common/args/kubelet
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - regexp: '--system-reserved='
+          line: '--system-reserved="memory=4Gi,cpu=500m"'
+        - regexp: '--kube-reserved='
+          line: '--kube-reserved="memory=2Gi,cpu=500m"'
+        - regexp: '--eviction-hard='
+          line: '--eviction-hard="memory.available<2Gi,nodefs.available<10%"'
+        - regexp: '--eviction-soft='
+          line: '--eviction-soft="memory.available<4Gi,nodefs.available<15%"'
+        - regexp: '--eviction-soft-grace-period='
+          line: '--eviction-soft-grace-period="memory.available=30s,nodefs.available=1m"'
+        - regexp: '--enforce-node-allocatable='
+          line: '--enforce-node-allocatable="pods,system-reserved,kube-reserved"'
+      register: kubelet_resource_args_fix
+      become: true
+
+    - name: Restart k8s snap to apply kubelet resource protection args
+      ansible.builtin.command: snap restart k8s
+      become: true
+      when: kubelet_resource_args_fix is changed
+
     - name: Ensure kubelet CSI directories exist
       ansible.builtin.file:
         path: "{{ item }}"
@@ -632,7 +667,9 @@
     - name: Restart k8s snap to apply kubelet root-dir change
       ansible.builtin.command: snap restart k8s
       become: true
-      when: kubelet_rootdir_fix is changed
+      when:
+        - kubelet_rootdir_fix is changed
+        - kubelet_resource_args_fix is not changed  # avoid double restart
 
     - name: Wait for worker to appear in cluster
       ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }}

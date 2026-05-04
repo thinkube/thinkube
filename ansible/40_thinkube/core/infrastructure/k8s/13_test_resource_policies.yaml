@@ -1,0 +1,178 @@
+# Copyright 2025 Alejandro Martinez Corria and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Test playbook for cluster resource policies
+# Description:
+#   Verifies PriorityClasses, LimitRanges, and ResourceQuotas are configured
+#
+# Usage:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/k8s/13_test_resource_policies.yaml
+
+- name: Test Cluster Resource Policies
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  tasks:
+    # =========================================================================
+    # PriorityClasses
+    # =========================================================================
+
+    - name: Get PriorityClasses
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get priorityclasses
+        -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.value}{"\n"}{end}'
+      register: priority_classes
+      changed_when: false
+
+    - name: Verify thinkube PriorityClasses exist
+      ansible.builtin.assert:
+        that:
+          - "'thinkube-critical' in priority_classes.stdout"
+          - "'thinkube-platform' in priority_classes.stdout"
+          - "'thinkube-workload' in priority_classes.stdout"
+          - "'thinkube-batch' in priority_classes.stdout"
+        fail_msg: "Missing thinkube PriorityClasses"
+        success_msg: "All 4 thinkube PriorityClasses are configured"
+
+    - name: Verify thinkube-workload is globalDefault
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get priorityclass thinkube-workload
+        -o jsonpath='{.globalDefault}'
+      register: workload_default
+      changed_when: false
+
+    - name: Assert thinkube-workload is globalDefault
+      ansible.builtin.assert:
+        that:
+          - workload_default.stdout == 'true'
+        fail_msg: "thinkube-workload is not set as globalDefault"
+        success_msg: "thinkube-workload is the globalDefault PriorityClass"
+
+    # =========================================================================
+    # LimitRanges
+    # =========================================================================
+
+    - name: Get all LimitRanges
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get limitranges -A
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}'
+      register: limit_ranges
+      changed_when: false
+
+    - name: Display namespaces with LimitRanges
+      ansible.builtin.debug:
+        msg: "Namespaces with LimitRanges: {{ limit_ranges.stdout_lines | unique | sort | join(', ') }}"
+
+    - name: Verify LimitRanges exist in core namespaces
+      ansible.builtin.assert:
+        that:
+          - "'{{ gateway_namespace }}' in limit_ranges.stdout"
+          - "'{{ postgres_namespace }}' in limit_ranges.stdout"
+          - "'{{ harbor_namespace }}' in limit_ranges.stdout"
+          - "'{{ argocd_namespace }}' in limit_ranges.stdout"
+        fail_msg: "Missing LimitRanges in core namespaces"
+        success_msg: "LimitRanges configured in core namespaces"
+
+    # =========================================================================
+    # ResourceQuotas
+    # =========================================================================
+
+    - name: Get all ResourceQuotas
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get resourcequotas -A
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}'
+      register: resource_quotas
+      changed_when: false
+
+    - name: Display namespaces with ResourceQuotas
+      ansible.builtin.debug:
+        msg: "Namespaces with ResourceQuotas: {{ resource_quotas.stdout_lines | unique | sort | join(', ') }}"
+
+    - name: Verify ResourceQuotas exist in core namespaces
+      ansible.builtin.assert:
+        that:
+          - "'{{ gateway_namespace }}' in resource_quotas.stdout"
+          - "'{{ postgres_namespace }}' in resource_quotas.stdout"
+          - "'{{ harbor_namespace }}' in resource_quotas.stdout"
+          - "'{{ argocd_namespace }}' in resource_quotas.stdout"
+        fail_msg: "Missing ResourceQuotas in core namespaces"
+        success_msg: "ResourceQuotas configured in core namespaces"
+
+    # =========================================================================
+    # Functional test: verify LimitRange applies defaults
+    # =========================================================================
+
+    - name: Create test namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: test-resource-policies
+
+    - name: Apply LimitRange to test namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: LimitRange
+          metadata:
+            name: default-resources
+            namespace: test-resource-policies
+          spec:
+            limits:
+              - type: Container
+                default:
+                  memory: "256Mi"
+                  cpu: "250m"
+                defaultRequest:
+                  memory: "64Mi"
+                  cpu: "25m"
+
+    - name: Create test pod without resource spec
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-limitrange-defaults
+            namespace: test-resource-policies
+          spec:
+            containers:
+              - name: test
+                image: busybox
+                command: ["sleep", "10"]
+            restartPolicy: Never
+
+    - name: Wait for test pod to be created
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get pod test-limitrange-defaults
+        -n test-resource-policies
+        -o jsonpath='{.spec.containers[0].resources.limits.memory}'
+      register: test_pod_limits
+      changed_when: false
+      retries: 5
+      delay: 2
+      until: test_pod_limits.stdout != ''
+
+    - name: Verify LimitRange applied default limits
+      ansible.builtin.assert:
+        that:
+          - test_pod_limits.stdout == '256Mi'
+        fail_msg: >
+          LimitRange did not apply defaults.
+          Expected 256Mi, got {{ test_pod_limits.stdout }}
+        success_msg: "LimitRange correctly applied default memory limit of 256Mi"
+
+    - name: Clean up test namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: Namespace
+        name: test-resource-policies
