@@ -144,6 +144,38 @@
         EOF
       changed_when: true
 
+    # Resolve the gateway IP that auth.<domain> should resolve to from
+    # inside the Keycloak pod. ZeroTier mode: a static IP picked by the
+    # user (overlay_subnet_prefix + primary_gateway_ip_octet). Tailscale
+    # mode: the operator-assigned tailnet IP, read from the Gateway
+    # resource's status.addresses.
+    - name: Resolve Keycloak hostAliases gateway IP
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get gateway thinkube-gateway -n gateway-system \
+          -o jsonpath='{.status.addresses[?(@.type=="IPAddress")].value}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gateway_ip_lookup
+      changed_when: false
+      when: overlay_provider == 'tailscale'
+
+    - name: Set Keycloak hostAliases gateway IP fact
+      ansible.builtin.set_fact:
+        keycloak_gateway_ip: >-
+          {{ overlay_subnet_prefix ~ primary_gateway_ip_octet
+             if overlay_provider == 'zerotier'
+             else gateway_ip_lookup.stdout }}
+
+    - name: Fail if Tailscale mode could not resolve a gateway IP
+      ansible.builtin.fail:
+        msg: |
+          Could not read an IPAddress from gateway thinkube-gateway in
+          gateway-system. The gateway-api playbook must run successfully
+          before keycloak.
+      when:
+        - overlay_provider == 'tailscale'
+        - keycloak_gateway_ip | length == 0
+
     - name: Create Keycloak deployment
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
@@ -165,7 +197,7 @@
                 app: keycloak
             spec:
               hostAliases:
-                - ip: "{{ overlay_subnet_prefix }}{{ primary_gateway_ip_octet }}"
+                - ip: "{{ keycloak_gateway_ip }}"
                   hostnames:
                     - "{{ keycloak_hostname }}"
               containers:
