@@ -37,36 +37,9 @@
       changed_when: false
       failed_when: false
 
-    - name: Check existing Tailscale connection
-      ansible.builtin.command: tailscale status --json
-      register: ts_existing_status
-      changed_when: false
-      failed_when: false
-      when: ts_installed.rc == 0
-
-    - name: Set existing configuration facts
-      ansible.builtin.set_fact:
-        ts_already_configured: >-
-          {{
-            ts_installed.rc == 0 and
-            ts_existing_status.stdout is defined and
-            (ts_existing_status.stdout | from_json).BackendState | default('') == 'Running'
-          }}
-        ts_current_ip: >-
-          {{
-            (ts_existing_status.stdout | from_json).Self.TailscaleIPs[0] | default('')
-            if ts_installed.rc == 0 and ts_existing_status.stdout is defined and ts_existing_status.stdout | length > 0
-            else ''
-          }}
-
-    - name: Display existing Tailscale status
-      ansible.builtin.debug:
-        msg: "Tailscale already configured on {{ inventory_hostname }} with IP {{ ts_current_ip }} — skipping installation"
-      when: ts_already_configured | bool
-
-    # Phase 2: Install Tailscale (skip if already configured)
+    # Phase 2: Install Tailscale if missing
     - name: Install Tailscale
-      when: not (ts_already_configured | bool)
+      when: ts_installed.rc != 0
       block:
         - name: Download and run Tailscale installer
           ansible.builtin.shell: curl -fsSL https://tailscale.com/install.sh | sh
@@ -84,27 +57,35 @@
           ansible.builtin.pause:
             seconds: 3
 
-    # Phase 3: Join tailnet (skip if already connected)
-    - name: Connect to Tailscale tailnet
+    # Phase 3: Bring the tailnet connection up. `tailscale up` is idempotent
+    # — it's a no-op when the daemon is already authed and online with the
+    # same parameters, and it kicks a stale/offline daemon back to life. We
+    # ALWAYS run it because trusting "BackendState=Running" misses the case
+    # where the coordination connection has died and Self.Online is false.
+    - name: Connect to Tailscale tailnet (idempotent — recovers stale daemons)
       ansible.builtin.command: >
         tailscale up
         --authkey={{ tailscale_auth_key }}
         --hostname={{ inventory_hostname }}
         --accept-routes
-      when: not (ts_already_configured | bool)
       register: ts_join_result
+      changed_when: ts_join_result.stdout != "" or ts_join_result.stderr != ""
 
-    - name: Wait for Tailscale connection to establish
-      ansible.builtin.pause:
-        seconds: 5
-      when: ts_join_result is changed
-
-    # Phase 4: Get assigned Tailscale IP
-    - name: Get Tailscale status
+    # Phase 4: Wait for the daemon to actually report Online to the
+    # coordination server. Without this, peer addresses haven't been
+    # learned yet and the cross-node ping in the next play fails.
+    - name: Wait for Tailscale to report Online
       ansible.builtin.command: tailscale status --json
       register: ts_status
       changed_when: false
-      failed_when: ts_status.rc != 0
+      until:
+        - ts_status.rc == 0
+        - ts_status.stdout | length > 0
+        - (ts_status.stdout | from_json).BackendState == 'Running'
+        - (ts_status.stdout | from_json).Self.Online | default(false) | bool
+        - (ts_status.stdout | from_json).Self.TailscaleIPs | default([]) | length > 0
+      retries: 30
+      delay: 2
 
     - name: Extract Tailscale IP and device info
       ansible.builtin.set_fact:
@@ -112,13 +93,10 @@
         ts_device_id: "{{ (ts_status.stdout | from_json).Self.ID }}"
         ts_hostname: "{{ (ts_status.stdout | from_json).Self.DNSName }}"
 
-    - name: Verify Tailscale IP was assigned
-      ansible.builtin.assert:
-        that:
-          - ts_assigned_ip is defined
-          - ts_assigned_ip | length > 0
-          - ts_assigned_ip != 'pending'
-        fail_msg: "Tailscale IP not assigned for {{ inventory_hostname }}"
+    - name: Surface any Tailscale health warnings
+      ansible.builtin.debug:
+        msg: "Tailscale health warnings on {{ inventory_hostname }}: {{ (ts_status.stdout | from_json).Health }}"
+      when: (ts_status.stdout | from_json).Health | default([]) | length > 0
 
     # Phase 5: Configure firewall and IP forwarding
     - name: Enable IP forwarding via sysctl
@@ -161,23 +139,29 @@
 
           ════════════════════════════════════════════════════════
 
-# Final verification: test connectivity between all nodes over Tailscale
+# Final verification: test connectivity between all nodes over Tailscale.
+# Peer mesh convergence is asynchronous — the coordination server has to
+# push each node's endpoints to the others and direct paths get negotiated
+# on demand. So retry the ping for up to ~60s instead of failing on the
+# first miss.
 - name: Verify Tailscale Connectivity
   hosts: overlay_nodes[0]
   gather_facts: false
 
   tasks:
-    - name: Test Tailscale connectivity to all nodes
+    - name: Wait for each node to be reachable over Tailscale
       ansible.builtin.command: >
         ping -c 1 -W 3
-        {{ (hostvars[item]['ts_assigned_ip']) if hostvars[item]['ts_assigned_ip'] is defined
-           else hostvars[item]['overlay_ip'] }}
+        {{ hostvars[item]['ts_assigned_ip'] }}
       loop: "{{ groups['overlay_nodes'] }}"
       register: ts_ping_results
       changed_when: false
-      failed_when: false
+      until: ts_ping_results.rc == 0
+      retries: 20
+      delay: 3
       delegate_to: localhost
       become: false
+      failed_when: false
 
     - name: Display connectivity results
       ansible.builtin.debug:
@@ -188,12 +172,16 @@
           ════════════════════════════════════════════════════════════════════════
 
           {% for result in ts_ping_results.results %}
-          - {{ result.item }}: {{ hostvars[result.item]['ts_assigned_ip'] | default(hostvars[result.item]['overlay_ip'] | default('unknown')) }} — {{ 'OK' if result.rc == 0 else 'UNREACHABLE' }}
+          - {{ result.item }}: {{ hostvars[result.item]['ts_assigned_ip'] }} — {{ 'OK' if result.rc == 0 else 'UNREACHABLE' }}
           {% endfor %}
 
           ════════════════════════════════════════════════════════════════════════
 
-    - name: Fail if any node is unreachable over Tailscale
+    - name: Fail if any node is still unreachable after retries
       ansible.builtin.fail:
-        msg: "Some nodes are not reachable over Tailscale. Check the connectivity results above."
+        msg: |
+          Tailscale peer connectivity did not converge after retries. Likely causes:
+            - One of the nodes can't reach controlplane.tailscale.com (check outbound HTTPS)
+            - UDP 41641 blocked between nodes by an upstream firewall
+            - Node still showing health warnings in `tailscale status` output above
       when: ts_ping_results.results | selectattr('rc', 'ne', 0) | list | length > 0
