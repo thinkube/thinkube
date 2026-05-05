@@ -57,7 +57,47 @@
           ansible.builtin.pause:
             seconds: 3
 
-    # Phase 3: Bring the tailnet connection up. `tailscale up` is idempotent
+    # Phase 3: Clean up stale tailnet devices before connecting.
+    # When a server is wiped and reinstalled, the old device entry stays on
+    # the tailnet. `tailscale up --hostname=vilanova2` then registers a new
+    # device as `vilanova2-2` instead of reusing the name. We delete any
+    # stale device with the same hostname via the API before connecting, but
+    # only when the daemon isn't already authed and running (i.e., fresh
+    # install or post-wipe).
+    - name: Check current Tailscale daemon state
+      ansible.builtin.command: tailscale status --json
+      register: ts_daemon_state
+      changed_when: false
+      failed_when: false
+
+    - name: Remove stale tailnet devices matching our hostname
+      when: >
+        ts_daemon_state.rc != 0 or
+        ts_daemon_state.stdout | length == 0 or
+        (ts_daemon_state.stdout | from_json).BackendState != 'Running'
+      block:
+        - name: Fetch all tailnet devices
+          ansible.builtin.uri:
+            url: "https://api.tailscale.com/api/v2/tailnet/-/devices"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ tailscale_api_token }}"
+          register: ts_all_devices
+          delegate_to: localhost
+          become: false
+
+        - name: Delete stale devices matching our hostname
+          ansible.builtin.uri:
+            url: "https://api.tailscale.com/api/v2/device/{{ item.nodeId }}"
+            method: DELETE
+            headers:
+              Authorization: "Bearer {{ tailscale_api_token }}"
+            status_code: [200, 204]
+          loop: "{{ ts_all_devices.json.devices | selectattr('hostname', 'equalto', inventory_hostname) | list }}"
+          delegate_to: localhost
+          become: false
+
+    # Phase 4: Bring the tailnet connection up. `tailscale up` is idempotent
     # — it's a no-op when the daemon is already authed and online with the
     # same parameters, and it kicks a stale/offline daemon back to life. We
     # ALWAYS run it because trusting "BackendState=Running" misses the case
@@ -71,7 +111,7 @@
       register: ts_join_result
       changed_when: ts_join_result.stdout != "" or ts_join_result.stderr != ""
 
-    # Phase 4: Wait for the daemon to actually report Online to the
+    # Phase 5: Wait for the daemon to actually report Online to the
     # coordination server. Without this, peer addresses haven't been
     # learned yet and the cross-node ping in the next play fails.
     - name: Wait for Tailscale to report Online
@@ -98,7 +138,7 @@
         msg: "Tailscale health warnings on {{ inventory_hostname }}: {{ (ts_status.stdout | from_json).Health }}"
       when: (ts_status.stdout | from_json).Health | default([]) | length > 0
 
-    # Phase 5: Configure firewall and IP forwarding
+    # Phase 6: Configure firewall and IP forwarding
     - name: Enable IP forwarding via sysctl
       ansible.builtin.sysctl:
         name: net.ipv4.ip_forward
