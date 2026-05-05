@@ -199,6 +199,34 @@
       register: k8s_binary
       become: true
 
+    # Before purging a broken snap, stop kubelet and unmount any lingering
+    # CSI/kubelet mounts. Otherwise `snap remove --purge` fails with
+    # "device or resource busy" on rawfile-csi globalmount mounts.
+    - name: Stop kubelet to release CSI mounts (broken snap cleanup)
+      ansible.builtin.systemd:
+        name: snap.k8s.kubelet.service
+        state: stopped
+      when: not k8s_binary.stat.exists
+      failed_when: false
+      become: true
+
+    - name: Find lingering kubelet/CSI mounts (broken snap cleanup)
+      ansible.builtin.shell: |
+        grep -E '/var/snap/k8s/common/var/lib/kubelet[^ ]*' /proc/mounts | awk '{print $2}' | sort -r
+      register: stale_kubelet_mounts_purge
+      when: not k8s_binary.stat.exists
+      changed_when: false
+      failed_when: false
+      become: true
+
+    - name: Unmount lingering kubelet/CSI mounts (broken snap cleanup)
+      ansible.builtin.command: "umount {{ item }}"
+      loop: "{{ stale_kubelet_mounts_purge.stdout_lines | default([]) }}"
+      when: not k8s_binary.stat.exists
+      failed_when: false
+      changed_when: true
+      become: true
+
     - name: Purge broken k8s-snap before reinstall
       ansible.builtin.command: snap remove k8s --purge
       when: not k8s_binary.stat.exists
