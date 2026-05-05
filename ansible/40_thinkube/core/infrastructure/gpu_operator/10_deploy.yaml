@@ -213,6 +213,84 @@
       failed_when: false
 
 # ===========================
+# Detect GPU compute capability and disable operator on pre-Volta nodes
+# ===========================
+# Project policy: only Volta+ (compute capability >= 7.0) is supported.
+# NFD detects any NVIDIA GPU regardless of compatibility, so we need to
+# explicitly tag pre-Volta nodes with `nvidia.com/gpu.deploy.*=false`
+# labels to prevent the operator's DaemonSets (NFD worker, driver,
+# toolkit, device-plugin, DCGM, GFD, validator) from scheduling on them.
+# Mirrors thinkube-control's disable_gpu_operator_on_node logic so both
+# add-node paths converge on the same end state.
+- name: Detect GPU compute capability on baremetal GPU nodes
+  hosts: baremetal_gpus
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Query GPU compute capability via nvidia-smi
+      ansible.builtin.command:
+        cmd: nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+      register: compute_cap_result
+      changed_when: false
+      failed_when: false
+
+    - name: Set fact for highest compute capability on this node
+      ansible.builtin.set_fact:
+        gpu_compute_cap: "{{ (compute_cap_result.stdout_lines | default([]) | map('trim') | map('float') | list | max | default(0.0)) if compute_cap_result.rc == 0 else 0.0 }}"
+        gpu_supported: "{{ (compute_cap_result.rc == 0) and ((compute_cap_result.stdout_lines | default([]) | map('trim') | map('float') | list | max | default(0.0)) >= 7.0) }}"
+
+    - name: Show compute capability and support status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: compute_cap={{ gpu_compute_cap }},
+          supported={{ gpu_supported }}
+          (policy: Volta+, compute_cap >= 7.0)
+
+- name: Disable GPU operator on pre-Volta nodes
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Build list of supported GPU nodes (compute_cap >= 7.0)
+      ansible.builtin.set_fact:
+        supported_gpu_nodes: >-
+          {{
+            groups['baremetal_gpus'] | default([])
+            | map('extract', hostvars)
+            | selectattr('gpu_supported', 'equalto', true)
+            | map(attribute='inventory_hostname')
+            | list
+          }}
+
+    - name: Build list of unsupported GPU nodes
+      ansible.builtin.set_fact:
+        unsupported_gpu_nodes: "{{ (groups['baremetal_gpus'] | default([])) | difference(supported_gpu_nodes) }}"
+
+    - name: Display unsupported nodes (will be excluded from GPU operator)
+      ansible.builtin.debug:
+        msg: >-
+          Pre-Volta / unsupported GPU nodes (operator will skip):
+          {{ unsupported_gpu_nodes | default([]) | join(', ') | default('none', true) }}
+
+    - name: Apply gpu.deploy=false labels on unsupported nodes
+      ansible.builtin.command: >
+        {{ kubectl_bin }} label node {{ item }} --overwrite
+        nvidia.com/gpu.deploy.container-toolkit=false
+        nvidia.com/gpu.deploy.dcgm=false
+        nvidia.com/gpu.deploy.dcgm-exporter=false
+        nvidia.com/gpu.deploy.device-plugin=false
+        nvidia.com/gpu.deploy.driver=false
+        nvidia.com/gpu.deploy.gpu-feature-discovery=false
+        nvidia.com/gpu.deploy.node-status-exporter=false
+        nvidia.com/gpu.deploy.operator-validator=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ unsupported_gpu_nodes | default([]) }}"
+      changed_when: true
+
+# ===========================
 # Play 2: Cluster-wide GPU Operator install
 # ===========================
 - name: Install NVIDIA GPU Operator
