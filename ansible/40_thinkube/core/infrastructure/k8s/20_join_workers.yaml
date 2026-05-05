@@ -189,16 +189,26 @@
     # ===========================
     # k8s-snap Installation
     # ===========================
+    # Detect whether k8s-snap is actually usable. `snap list k8s` returns 0
+    # even for a broken/disabled snap (e.g. left behind by a failed
+    # `snap remove --purge`), but the `k8s` binary may not exist. Test for
+    # the binary itself.
     - name: Check if k8s-snap is already installed
-      ansible.builtin.command: snap list k8s
-      register: k8s_snap_check
+      ansible.builtin.stat:
+        path: /snap/bin/k8s
+      register: k8s_binary
+      become: true
+
+    - name: Purge broken k8s-snap before reinstall
+      ansible.builtin.command: snap remove k8s --purge
+      when: not k8s_binary.stat.exists
       failed_when: false
-      changed_when: false
+      changed_when: true
       become: true
 
     - name: Install k8s-snap on workers (pinned revision)
       ansible.builtin.command: snap install k8s --classic --revision={{ k8s_snap_revisions[ansible_facts['architecture'] | regex_replace('x86_64', 'amd64') | regex_replace('aarch64', 'arm64')] }}
-      when: k8s_snap_check.rc != 0
+      when: not k8s_binary.stat.exists
       register: snap_install_result
       changed_when: "'installed' in snap_install_result.stdout"
       become: true
@@ -206,7 +216,7 @@
     - name: Hold k8s snap to prevent auto-updates
       ansible.builtin.command: snap refresh --hold k8s
       changed_when: true
-      when: k8s_snap_check.rc != 0
+      when: not k8s_binary.stat.exists
       become: true
 
     # ===========================
