@@ -366,12 +366,28 @@
         dest: "{{ temp_dir.path }}/values.yaml"
         mode: '0644'
 
-    # Step 8: Deploy JupyterHub using Helm
+    # Pre-fetch the chart tarball with retries — kubernetes.core.helm has no
+    # built-in retry on chart fetch, and hub.jupyter.org/helm-chart returns
+    # transient EOFs frequently enough that interactive installs fail. Pull
+    # once with backoff, then install from the local file. Tracked in #9.
+    - name: Pre-fetch JupyterHub chart tarball (retries on transient network errors)
+      ansible.builtin.command: >-
+        {{ helm_bin }} pull {{ helm_repo_name }}/jupyterhub
+        --version {{ jupyterhub_version }}
+        --destination {{ temp_dir.path }}
+      register: helm_pull
+      retries: 5
+      delay: 10
+      until: helm_pull.rc == 0
+      changed_when: helm_pull.rc == 0
+
+    # Step 8: Deploy JupyterHub using Helm (from the locally pre-fetched
+    # tarball — no live chart download during install).
     - name: Deploy JupyterHub
       kubernetes.core.helm:
         binary_path: "{{ helm_bin }}"
         name: jupyterhub
-        chart_ref: "{{ helm_repo_name }}/jupyterhub"
+        chart_ref: "{{ temp_dir.path }}/jupyterhub-{{ jupyterhub_version }}.tgz"
         release_namespace: "{{ jupyterhub_namespace }}"
         create_namespace: false
         kubeconfig: "{{ kubeconfig }}"
@@ -380,7 +396,6 @@
         wait: true
         wait_timeout: 10m
         state: present
-        chart_version: "{{ jupyterhub_version }}"
 
     # Step 9: Create Ingress for JupyterHub
     - name: Create JupyterHub HTTPRoute
