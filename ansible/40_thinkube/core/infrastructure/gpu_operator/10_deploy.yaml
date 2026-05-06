@@ -391,21 +391,26 @@
         seconds: 30
         prompt: "Waiting for GPU operator to initialize pods..."
 
-    - name: Wait for nvidia-container-toolkit daemonset to be running
+    - name: Wait for nvidia-container-toolkit daemonset on all GPU nodes
       ansible.builtin.shell: |
+        expected={{ supported_gpu_nodes | length }}
         i=1
-        while [ $i -le 60 ]; do
-          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -l app=nvidia-container-toolkit-daemonset --field-selector=status.phase=Running -o json | jq '.items | length')
-          if [ "$count" -ge 1 ]; then
-            echo "✓ nvidia-container-toolkit daemonset is running"
+        while [ $i -le 90 ]; do
+          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} \
+            -l app=nvidia-container-toolkit-daemonset \
+            --field-selector=status.phase=Running -o json | jq '.items | length')
+          if [ "$count" -ge "$expected" ]; then
+            echo "✓ All $count/$expected nvidia-container-toolkit pods running"
             exit 0
           fi
-          echo "Waiting for nvidia-container-toolkit daemonset... (attempt $i/60)"
+          echo "Waiting for nvidia-container-toolkit... $count/$expected (attempt $i/90)"
           sleep 5
           i=$((i + 1))
         done
-        echo "ERROR: nvidia-container-toolkit-daemonset not running"
+        echo "ERROR: Only $count/$expected toolkit pods running after timeout"
         exit 1
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       register: toolkit_wait
       changed_when: false
 
@@ -470,41 +475,49 @@
               nvidia.com/gpu: 1
 
   tasks:
-    - name: Wait for critical GPU operator pods
+    - name: Wait for critical GPU operator pods on all GPU nodes
       ansible.builtin.shell: |
+        expected={{ supported_gpu_nodes | length }}
+
         device_ready=false
         i=1
-        while [ $i -le 30 ]; do
-          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -l app=nvidia-device-plugin-daemonset --field-selector=status.phase=Running -o json | jq '.items | length')
-          if [ "$count" -ge 1 ]; then
+        while [ $i -le 60 ]; do
+          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} \
+            -l app=nvidia-device-plugin-daemonset \
+            --field-selector=status.phase=Running -o json | jq '.items | length')
+          if [ "$count" -ge "$expected" ]; then
             device_ready=true
             break
           fi
-          echo "Waiting for nvidia-device-plugin-daemonset pods... (attempt $i/30)"
+          echo "Waiting for device-plugin... $count/$expected (attempt $i/60)"
           sleep 5
           i=$((i + 1))
         done
 
         toolkit_ready=false
         i=1
-        while [ $i -le 30 ]; do
-          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -l app=nvidia-container-toolkit-daemonset --field-selector=status.phase=Running -o json | jq '.items | length')
-          if [ "$count" -ge 1 ]; then
+        while [ $i -le 60 ]; do
+          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} \
+            -l app=nvidia-container-toolkit-daemonset \
+            --field-selector=status.phase=Running -o json | jq '.items | length')
+          if [ "$count" -ge "$expected" ]; then
             toolkit_ready=true
             break
           fi
-          echo "Waiting for nvidia-container-toolkit-daemonset pods... (attempt $i/30)"
+          echo "Waiting for toolkit... $count/$expected (attempt $i/60)"
           sleep 5
           i=$((i + 1))
         done
 
         if [ "$device_ready" = "true" ] && [ "$toolkit_ready" = "true" ]; then
-          echo "✓ All critical GPU operator pods are running"
+          echo "✓ All critical GPU operator pods running on $expected node(s)"
           exit 0
         else
-          echo "ERROR: GPU operator pods did not become ready in time"
+          echo "ERROR: GPU operator pods not ready on all $expected node(s)"
           exit 1
         fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       register: wait_result
       changed_when: false
 
