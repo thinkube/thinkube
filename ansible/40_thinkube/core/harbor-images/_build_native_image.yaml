@@ -3,6 +3,10 @@
 # Reusable tasks for building container images natively on architecture-matching nodes.
 # No QEMU emulation — each architecture builds on a node of that architecture.
 #
+# Always uses per-arch tags (e.g., image:tag-amd64) and creates a manifest list,
+# even for single-architecture clusters. This ensures correct incremental behavior
+# when new architectures are added later.
+#
 # Required variables (passed by caller):
 #   image_name: Full image name without tag (e.g., "registry.example.com/library/python-base")
 #   image_tags: List of tags (e.g., ["3.12-slim"]). First tag used for per-arch builds.
@@ -16,42 +20,12 @@
 #
 # Expected variables from parent playbook:
 #   arch_build_nodes: Dict mapping arch -> hostname (e.g., {"arm64": "tkspark", "amd64": "node-a"})
-#   is_multi_arch: Boolean — whether multiple architectures are configured
 #   remote_containerfiles_dir: Path to Containerfiles directory on build nodes
 #   harbor_registry: Harbor registry hostname
 #   admin_password: Harbor admin password
 
 # ============================================================================
-# SINGLE-ARCH BUILD (unchanged)
-# ============================================================================
-
-- name: "Build image (single-arch)"
-  ansible.builtin.shell: |
-    podman build {{ '--no-cache' if no_cache | default(false) else '' }} \
-                 --tls-verify=true \
-                 {{ extra_build_args | default('') }} \
-                 {% for tag in image_tags %}
-                 -t {{ image_name }}:{{ tag }} \
-                 {% endfor %}
-                 -f {{ remote_containerfiles_dir }}/{{ containerfile }} \
-                 {{ build_context }}
-  register: _build_result
-  changed_when: true
-  when: not is_multi_arch
-
-- name: "Push image (single-arch)"
-  ansible.builtin.shell: |
-    podman push --tls-verify=true {{ image_name }}:{{ item }}
-  loop: "{{ image_tags }}"
-  register: _push_result
-  changed_when: true
-  failed_when: _push_result.rc != 0
-  retries: 2
-  delay: 10
-  when: not is_multi_arch
-
-# ============================================================================
-# MULTI-ARCH: CHECK EXISTING IMAGES
+# CHECK EXISTING IMAGES
 # ============================================================================
 
 - name: "Check existing per-arch images in Harbor"
@@ -66,7 +40,7 @@
   loop_control:
     label: "{{ item.key }}"
   register: _arch_exists
-  when: is_multi_arch and not (force_rebuild | default(false))
+  when: not (force_rebuild | default(false))
 
 - name: "Determine architectures needing build"
   ansible.builtin.set_fact:
@@ -76,17 +50,15 @@
       {%- else -%}
         {{ _arch_exists.results | selectattr('status', 'defined') | selectattr('status', 'equalto', 404) | map(attribute='item') | list }}
       {%- endif -%}
-  when: is_multi_arch
 
 - name: "Display build plan"
   ansible.builtin.debug:
     msg: >-
       {{ image_name }}: building {{ _archs_to_build | map(attribute='key') | list | join(', ') | default('nothing') }},
       skipping {{ (arch_build_nodes.keys() | list | length) - (_archs_to_build | length) }} existing arch(es).
-  when: is_multi_arch
 
 # ============================================================================
-# MULTI-ARCH: BUILD AND PUSH IN PARALLEL ACROSS NODES
+# BUILD AND PUSH IN PARALLEL ACROSS NODES
 # ============================================================================
 
 - name: "Build image per-arch (parallel)"
@@ -106,7 +78,7 @@
   poll: 0
   register: _build_async
   changed_when: true
-  when: is_multi_arch and (_archs_to_build | length > 0)
+  when: _archs_to_build | length > 0
 
 - name: "Wait for all arch builds to complete"
   ansible.builtin.async_status:
@@ -119,11 +91,11 @@
   until: _build_arch_result.finished
   retries: 240
   delay: 30
-  when: is_multi_arch and (_archs_to_build | length > 0)
+  when: _archs_to_build | length > 0
 
 - name: "Push image per-arch (parallel)"
   ansible.builtin.shell: |
-    podman push --tls-verify=true {{ image_name }}:{{ image_tags[0] }}-{{ item.key }}
+    podman push --tls-verify=true --creds=admin:{{ admin_password }} {{ image_name }}:{{ image_tags[0] }}-{{ item.key }}
   delegate_to: "{{ item.value }}"
   loop: "{{ _archs_to_build }}"
   loop_control:
@@ -132,7 +104,8 @@
   poll: 0
   register: _push_async
   changed_when: true
-  when: is_multi_arch and (_archs_to_build | length > 0)
+  no_log: true
+  when: _archs_to_build | length > 0
 
 - name: "Wait for all arch pushes to complete"
   ansible.builtin.async_status:
@@ -146,10 +119,10 @@
   retries: 120
   delay: 30
   failed_when: _push_arch_result.failed is defined and _push_arch_result.failed
-  when: is_multi_arch and (_archs_to_build | length > 0)
+  when: _archs_to_build | length > 0
 
 # ============================================================================
-# MULTI-ARCH: CREATE MANIFEST (all architectures, pulls existing from Harbor)
+# CREATE MANIFEST (all architectures, pulls existing from Harbor)
 # ============================================================================
 
 - name: "Render manifest script"
@@ -157,10 +130,10 @@
     src: templates/create_manifest_list.sh.j2
     dest: /tmp/{{ image_name | regex_replace('.*/','') }}-manifest.sh
     mode: '0755'
-  when: is_multi_arch and (_archs_to_build | length > 0)
+  when: _archs_to_build | length > 0
 
 - name: "Create manifest list"
   ansible.builtin.command: /tmp/{{ image_name | regex_replace('.*/','') }}-manifest.sh
   register: _manifest_result
   changed_when: true
-  when: is_multi_arch and (_archs_to_build | length > 0)
+  when: _archs_to_build | length > 0
