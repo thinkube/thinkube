@@ -218,11 +218,27 @@ hub:
                       'default': (i == jupyterhub_config['default_gpu_count'])
                   }
 
+              # Build per-node resource limits for the dynamic form
+              # DGX Spark (GB10) uses time-sliced virtual GPUs — cap to 1
+              import json
+              node_limits = {}
+              for node in resources:
+                  physical_gpus = len(node.get('gpu_details', []))
+                  total_gpus = node['capacity']['gpu']
+                  # Time-sliced: virtual count > physical count → cap to 1
+                  max_node_gpus = 1 if (total_gpus > physical_gpus and physical_gpus > 0) else total_gpus
+                  node_limits[node['name']] = {
+                      'cpu': int(node['capacity']['cpu']),
+                      'memory': parse_memory_to_gb(node['capacity']['memory']),
+                      'gpu': max_node_gpus
+                  }
+              logger.info(f"Node limits for form: {node_limits}")
+
               # Create a single "Resource Selection" profile
               # Image is fixed to tk-jupyter-base (venvs provide different Python environments)
               profile = {
                   'display_name': 'Thinkube AI Lab',
-                  'description': 'Select compute resources (Python environments available via kernel selection)',
+                  'description': f'Select compute resources (Python environments available via kernel selection)<!--NODE_LIMITS:{json.dumps(node_limits)}-->',
                   'default': True,
                   'profile_options': {
                       'node': {
@@ -380,6 +396,168 @@ hub:
         {{ super() }}
         <link rel="stylesheet" href="{{ static_url('css/thinkube.css') }}" type="text/css"/>
         {% endblock %}{% endraw %}
+
+    thinkube-spawn-form:
+      mountPath: /usr/local/share/jupyterhub/custom-templates/form.html
+      stringData: |
+        {% raw %}<style>{% include 'style.css' %}</style>
+        <div class="form-group" id="kubespawner-profiles-list">
+          {%- for profile in profile_list %}
+            <label for="profile-item-{{ profile.slug }}"
+                   class="profile js-profile-label">
+              <div class="radio">
+                <input type="radio"
+                       name="profile"
+                       id="profile-item-{{ profile.slug }}"
+                       value="{{ profile.slug }}"
+                       {% if profile.default %}checked{% endif %} />
+              </div>
+              <div>
+                <h3>{{ profile.display_name }}</h3>
+                {%- if profile.description %}<p>{{ profile.description }}</p>{%- endif %}
+                {%- if profile.profile_options %}
+                  <div>
+                    {%- for k, option in profile.profile_options.items() %}
+                      <div class="js-options-container">
+                        <div class="option">
+                          <label for="profile-option-{{ profile.slug }}--{{ k }}"
+                                 class="js-profile-option-label">{{ option.display_name }}</label>
+                          <select name="profile-option-{{ profile.slug }}--{{ k }}"
+                                  class="form-control js-profile-option-select"
+                                  data-option-key="{{ k }}">
+                            {%- for k, choice in option['choices'].items() %}
+                              <option value="{{ k }}" {% if choice.default %}selected{% endif %}>{{ choice.display_name }}</option>
+                            {%- endfor %}
+                            {%- if option['unlisted_choice']['enabled'] %}
+                              <option value="unlisted-choice">{{ option['unlisted_choice']['display_name_in_choices'] }}</option>
+                            {%- endif %}
+                          </select>
+                        </div>
+                        {%- if option['unlisted_choice']['enabled'] %}
+                          <div class="option hidden js-other-input-container">
+                            <label for="profile-option-{{ profile.slug }}--{{ k }}--unlisted-choice">
+                              {{ option['unlisted_choice']['display_name'] }}
+                            </label>
+                            <input data-name="profile-option-{{ profile.slug }}--{{ k }}--unlisted-choice"
+                                   {%- if option['unlisted_choice']['validation_regex'] %}
+                                   pattern="{{ option['unlisted_choice']['validation_regex'] }}"
+                                   {%- endif %}
+                                   title="{{ option['unlisted_choice']['validation_message'] }}"
+                                   class="form-control js-other-input" />
+                          </div>
+                        {%- endif %}
+                      </div>
+                    {%- endfor %}
+                  </div>
+                {%- endif %}
+              </div>
+            </label>
+          {%- endfor %}
+        </div>
+        <script>
+          // Standard KubeSpawner form behavior
+          $('.js-profile-option-select, .js-profile-option-label').click(function() {
+            $(this).parents('.js-profile-label')
+              .find('input[type=radio]')
+              .prop('checked', true);
+          });
+
+          $('.js-profile-option-select').change(function() {
+            const selectionValue = $(this).val();
+            const $otherInputContainer = $(this).parents('.js-options-container').find('.js-other-input-container');
+            const $otherInput = $(this).parents('.js-options-container').find('.js-other-input');
+            if (selectionValue === 'unlisted-choice') {
+              $(this).data('name', $(this).attr('name'));
+              $(this).removeAttr('name');
+              $otherInput.attr('name', $otherInput.data('name'));
+              $otherInputContainer.removeClass('hidden');
+            } else {
+              $otherInput.removeAttr('name');
+              $(this).attr('name', $(this).data('name'));
+              $otherInputContainer.addClass('hidden');
+            }
+          });
+
+          // Thinkube: node-aware resource filtering
+          $(document).ready(function() {
+            // Extract per-node limits embedded in the profile description
+            var nodeLimits = {};
+            var desc = $('#kubespawner-profiles-list .profile p').text();
+            var match = desc.match(/<!--NODE_LIMITS:(.*?)-->/);
+            if (!match) {
+              // Try from HTML content (description may contain HTML comment)
+              var html = $('#kubespawner-profiles-list .profile p').html() || '';
+              match = html.match(/<!--NODE_LIMITS:(.*?)-->/);
+            }
+            if (match) {
+              try { nodeLimits = JSON.parse(match[1]); } catch(e) {}
+            }
+
+            var $nodeSelect = $('select[data-option-key="node"]');
+            var $gpuSelect = $('select[data-option-key="enable_gpu"]');
+            var $cpuSelect = $('select[data-option-key="cpu"]');
+            var $memSelect = $('select[data-option-key="memory"]');
+
+            // Store all original options
+            var allGpuOptions = $gpuSelect.find('option').clone();
+            var allCpuOptions = $cpuSelect.find('option').clone();
+            var allMemOptions = $memSelect.find('option').clone();
+
+            function updateOptionsForNode() {
+              var node = $nodeSelect.val();
+              var limits = nodeLimits[node];
+              if (!limits) return;
+
+              // Filter GPU options
+              var currentGpu = $gpuSelect.val();
+              $gpuSelect.empty();
+              allGpuOptions.each(function() {
+                if (parseInt($(this).val()) <= limits.gpu) {
+                  $gpuSelect.append($(this).clone());
+                }
+              });
+              if (parseInt(currentGpu) > limits.gpu) {
+                $gpuSelect.val(String(limits.gpu));
+              } else {
+                $gpuSelect.val(currentGpu);
+              }
+
+              // Filter CPU options
+              var currentCpu = $cpuSelect.val();
+              $cpuSelect.empty();
+              allCpuOptions.each(function() {
+                if (parseInt($(this).val()) <= limits.cpu) {
+                  $cpuSelect.append($(this).clone());
+                }
+              });
+              if (parseInt(currentCpu) > limits.cpu) {
+                $cpuSelect.val(String(limits.cpu));
+              } else {
+                $cpuSelect.val(currentCpu);
+              }
+
+              // Filter memory options
+              var currentMem = parseInt($memSelect.val());
+              $memSelect.empty();
+              allMemOptions.each(function() {
+                if (parseInt($(this).val()) <= limits.memory) {
+                  $memSelect.append($(this).clone());
+                }
+              });
+              if (currentMem > limits.memory) {
+                $memSelect.val(limits.memory + 'G');
+              } else {
+                $memSelect.val(currentMem + 'G');
+              }
+            }
+
+            $nodeSelect.change(updateOptionsForNode);
+
+            // Trigger on page load
+            $('.js-profile-option-select').trigger('change');
+            updateOptionsForNode();
+          });
+        </script>{% endraw %}
 
     thinkube-css:
       mountPath: /usr/local/share/jupyterhub/static/css/thinkube.css
