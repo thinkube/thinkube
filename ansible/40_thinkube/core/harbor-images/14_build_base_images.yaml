@@ -75,9 +75,30 @@
         build_architectures: "{{ (container_build_platforms | default('linux/' + ('arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64'))).split(',') | map('trim') | map('replace', 'linux/', '') | list }}"
       tags: [always]
 
+    # Prefer the orchestrator (control plane) as the build node when its
+    # architecture matches the target — building locally avoids an SSH hop
+    # and a build-context sync. Only fall back to picking a worker from
+    # the architecture's inventory group when the orchestrator can't serve
+    # this arch (e.g. amd64 control plane + arm64 worker, building arm64).
     - name: Map each architecture to a build node from inventory
       ansible.builtin.set_fact:
-        arch_build_nodes: "{{ arch_build_nodes | default({}) | combine({item: ((groups.get('x86_64' if item == 'amd64' else item, []) | intersect(groups.get('k8s_cluster', []))) or [inventory_hostname])[0] }) }}"
+        arch_build_nodes: >-
+          {{
+            arch_build_nodes | default({}) | combine({
+              item: (
+                [inventory_hostname]
+                if _orch_arch == item
+                else ((groups.get('x86_64' if item == 'amd64' else item, [])
+                       | intersect(groups.get('k8s_cluster', [])))
+                      or [inventory_hostname])
+              )[0]
+            })
+          }}
+      vars:
+        _orch_arch: >-
+          {{ 'amd64' if ansible_facts['architecture'] == 'x86_64'
+             else ('arm64' if ansible_facts['architecture'] == 'aarch64'
+                   else ansible_facts['architecture']) }}
       loop: "{{ build_architectures }}"
       tags: [always]
 
