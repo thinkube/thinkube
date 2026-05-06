@@ -238,7 +238,8 @@ hub:
               # Image is fixed to tk-jupyter-base (venvs provide different Python environments)
               profile = {
                   'display_name': 'Thinkube AI Lab',
-                  'description': f'Select compute resources (Python environments available via kernel selection)<!--NODE_LIMITS:{json.dumps(node_limits)}-->',
+                  'description': 'Select compute resources (Python environments available via kernel selection)',
+                  'node_limits': node_limits,
                   'default': True,
                   'profile_options': {
                       'node': {
@@ -363,6 +364,8 @@ hub:
 
       # Custom template directory (searched before default templates)
       c.JupyterHub.template_paths = ['/usr/local/share/jupyterhub/custom-templates']
+      # Custom spawner form template (node-aware resource filtering)
+      c.KubeSpawner.additional_profile_form_template_paths = ['/usr/local/share/jupyterhub/custom-templates']
 
   # Network policy configuration
   # Disable default network policy - we'll create a custom one that allows ingress controller access
@@ -401,6 +404,11 @@ hub:
       mountPath: /usr/local/share/jupyterhub/custom-templates/form.html
       stringData: |
         {% raw %}<style>{% include 'style.css' %}</style>
+        {%- for profile in profile_list %}
+          {%- if profile.node_limits %}
+            <script type="application/json" id="thinkube-node-limits">{{ profile.node_limits | tojson }}</script>
+          {%- endif %}
+        {%- endfor %}
         <div class="form-group" id="kubespawner-profiles-list">
           {%- for profile in profile_list %}
             <label for="profile-item-{{ profile.slug }}"
@@ -480,18 +488,10 @@ hub:
 
           // Thinkube: node-aware resource filtering
           $(document).ready(function() {
-            // Extract per-node limits embedded in the profile description
             var nodeLimits = {};
-            var desc = $('#kubespawner-profiles-list .profile p').text();
-            var match = desc.match(/<!--NODE_LIMITS:(.*?)-->/);
-            if (!match) {
-              // Try from HTML content (description may contain HTML comment)
-              var html = $('#kubespawner-profiles-list .profile p').html() || '';
-              match = html.match(/<!--NODE_LIMITS:(.*?)-->/);
-            }
-            if (match) {
-              try { nodeLimits = JSON.parse(match[1]); } catch(e) {}
-            }
+            try {
+              nodeLimits = JSON.parse($('#thinkube-node-limits').text());
+            } catch(e) {}
 
             var $nodeSelect = $('select[data-option-key="node"]');
             var $gpuSelect = $('select[data-option-key="enable_gpu"]');
