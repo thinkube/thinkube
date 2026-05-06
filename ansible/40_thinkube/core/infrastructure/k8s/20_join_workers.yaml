@@ -699,16 +699,69 @@
       changed_when: false
       when: not (already_joined | bool)
 
-    - name: Wait for worker node to become Ready
-      ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
-      delegate_to: "{{ control_plane_host }}"
-      become: true
-      register: node_ready
-      retries: 60
-      delay: 10
-      until: node_ready.stdout == 'True'
-      changed_when: false
+    # Wait up to ~2 min for Ready. If the cilium-agent pod's emptyDir is
+    # wedged on first schedule (CrashLoopBackOff with the "Non-existent
+    # configuration directory /tmp/cilium/config-map" fatal), the node
+    # never recovers on its own — but force-deleting that pod once makes
+    # kubelet recreate it cleanly. Self-heal that single case via
+    # block/rescue so users never have to kubectl into a wedged join.
+    - name: Wait for worker node to become Ready (with cilium self-heal fallback)
       when: not (already_joined | bool)
+      block:
+        - name: Wait for worker node to become Ready
+          ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+          delegate_to: "{{ control_plane_host }}"
+          become: true
+          register: node_ready
+          retries: 12
+          delay: 10
+          until: node_ready.stdout == 'True'
+          changed_when: false
+
+      rescue:
+        - name: Inspect cilium pods on stuck node
+          ansible.builtin.command: >
+            k8s kubectl -n kube-system get pod -l k8s-app=cilium
+            --field-selector spec.nodeName={{ inventory_hostname }}
+            -o json
+          delegate_to: "{{ control_plane_host }}"
+          become: true
+          register: cilium_pods_json
+          changed_when: false
+
+        - name: Identify wedged cilium pod (not ready, restartCount >= 2)
+          ansible.builtin.set_fact:
+            wedged_cilium_pod: >-
+              {{
+                (cilium_pods_json.stdout | from_json | json_query(
+                  'items[?status.containerStatuses[?name==`cilium-agent` && ready==`false` && restartCount>=`2`]].metadata.name'
+                )) | first | default('')
+              }}
+
+        - name: Force-delete wedged cilium pod so kubelet recreates it cleanly
+          ansible.builtin.command: >
+            k8s kubectl -n kube-system delete pod {{ wedged_cilium_pod }} --force --grace-period=0
+          delegate_to: "{{ control_plane_host }}"
+          become: true
+          when: wedged_cilium_pod | length > 0
+
+        - name: Fail if no wedged cilium pod was found (different root cause)
+          ansible.builtin.fail:
+            msg: >-
+              Worker {{ inventory_hostname }} did not become Ready within 2 minutes
+              and no wedged cilium pod was found to self-heal. Investigate the
+              node's CNI / kubelet state on the control plane.
+          when: wedged_cilium_pod | length == 0
+
+        - name: Wait for worker node to become Ready (after cilium self-heal)
+          ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+          delegate_to: "{{ control_plane_host }}"
+          become: true
+          register: node_ready_post_heal
+          retries: 30
+          delay: 10
+          until: node_ready_post_heal.stdout == 'True'
+          changed_when: false
 
     - name: Display worker join status
       ansible.builtin.debug:
