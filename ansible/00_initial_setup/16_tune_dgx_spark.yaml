@@ -1,0 +1,110 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 16_tune_dgx_spark.yaml — Apply DGX Spark unified-memory host tuning
+#
+# Purpose:
+#   The DGX Spark (NVIDIA GB10) shares its 128 GB pool between CPU and
+#   GPU. Default kernel paging behavior — aggressive swapping and large
+#   dirty-page write-back queues — fights inference workloads for that
+#   pool and amplifies "memory creep" symptoms reported on the NVIDIA
+#   DGX Spark forum. Applying two sysctl knobs measurably stabilizes
+#   long-running inference on Spark hardware:
+#
+#     vm.swappiness   = 1        (avoid paging anonymous memory out of RAM
+#                                  while inference is using GPU-mapped pages)
+#     vm.dirty_bytes  = 268435456 (256 MB cap on dirty page-cache before
+#                                  forced write-back; smaller bursts =
+#                                  smoother memory pressure)
+#
+#   Source: https://forums.developer.nvidia.com/t/memory-creep-on-dgx-spark-where-your-128-gb-actually-goes-and-how-to-stop-it/364886
+#
+# Detection:
+#   Runs against `baremetal`, but each host self-checks via DMI product
+#   name and nvidia-smi. Non-Spark nodes end_host and apply nothing.
+#
+# Idempotent. Re-runnable from the installer or thinkube-control's
+# add-node flow.
+#
+# Run with:
+#   ./scripts/run_ansible.sh ansible/00_initial_setup/16_tune_dgx_spark.yaml
+
+- name: Apply DGX Spark unified-memory host tuning
+  hosts: baremetal
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Read DMI product name (for DGX Spark identification)
+      ansible.builtin.slurp:
+        src: /sys/class/dmi/id/product_name
+      register: dmi_product
+      failed_when: false
+
+    - name: Probe nvidia-smi for GPU model (fallback signal)
+      ansible.builtin.command: nvidia-smi --query-gpu=name --format=csv,noheader
+      register: nvidia_probe
+      failed_when: false
+      changed_when: false
+
+    - name: Determine whether this host is a DGX Spark
+      ansible.builtin.set_fact:
+        is_dgx_spark: >-
+          {{
+            ((dmi_product.content | default('') | b64decode) is search('DGX Spark'))
+            or
+            ((nvidia_probe.stdout | default('')) is search('GB10'))
+          }}
+
+    - name: Skip nodes that are not DGX Spark
+      ansible.builtin.meta: end_host
+      when: not is_dgx_spark
+
+    - name: Write Thinkube DGX Spark sysctl drop-in
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-thinkube-dgx-spark.conf
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          # Thinkube — DGX Spark unified-memory tuning
+          # Stabilizes long-running inference on the GB10 platform.
+          # See: https://forums.developer.nvidia.com/t/memory-creep-on-dgx-spark-where-your-128-gb-actually-goes-and-how-to-stop-it/364886
+          vm.swappiness = 1
+          vm.dirty_bytes = 268435456
+      register: sysctl_drop_in
+
+    - name: Reload sysctl from drop-ins
+      ansible.builtin.command: sysctl --system
+      when: sysctl_drop_in.changed
+      changed_when: true
+
+    - name: Verify applied sysctl values
+      ansible.builtin.shell: |
+        set -o pipefail
+        printf "vm.swappiness=%s\nvm.dirty_bytes=%s\n" \
+          "$(sysctl -n vm.swappiness)" \
+          "$(sysctl -n vm.dirty_bytes)"
+      args:
+        executable: /bin/bash
+      register: sysctl_verify
+      changed_when: false
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          ✅ {{ inventory_hostname }}: DGX Spark host tuning applied
+          ════════════════════════════════════════════════════════
+
+          GPU:        {{ nvidia_probe.stdout | default('') | trim }}
+          Drop-in:    /etc/sysctl.d/99-thinkube-dgx-spark.conf
+          Verified:
+          {{ sysctl_verify.stdout | indent(4, true) }}
+
+          Mitigates unified-memory pressure on GB10.
+          See: forums.developer.nvidia.com/t/364886
+
+          ════════════════════════════════════════════════════════
