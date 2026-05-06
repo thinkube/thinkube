@@ -17,8 +17,17 @@
 #     vm.dirty_bytes  = 268435456 (256 MB cap on dirty page-cache before
 #                                  forced write-back; smaller bursts =
 #                                  smoother memory pressure)
+#     swap disabled              (prevents the death-spiral where GPU
+#                                  allocations exhaust RAM → kernel swaps
+#                                  pages to disk → GPU touches swapped
+#                                  pages → system freezes indefinitely.
+#                                  With swap off, the OOM killer fires
+#                                  immediately and kills the offending
+#                                  process instead of freezing the node.)
 #
-#   Source: https://forums.developer.nvidia.com/t/memory-creep-on-dgx-spark-where-your-128-gb-actually-goes-and-how-to-stop-it/364886
+#   Sources:
+#     https://forums.developer.nvidia.com/t/memory-creep-on-dgx-spark-where-your-128-gb-actually-goes-and-how-to-stop-it/364886
+#     https://forums.developer.nvidia.com/t/dgx-spark-becomes-unresponsive-zombie-instead-of-throwing-cuda-oom/353752
 #
 # Detection:
 #   Runs against `baremetal`, but each host self-checks via DMI product
@@ -61,6 +70,39 @@
       ansible.builtin.meta: end_host
       when: not is_dgx_spark
 
+    # ------------------------------------------------------------------
+    # SWAP: Disable to prevent unified-memory death-spiral
+    # ------------------------------------------------------------------
+    # On GB10, GPU allocations bypass cgroups and consume from the shared
+    # 128 GB pool. With swap enabled, exhaustion triggers indefinite
+    # thrashing instead of OOM-killing the offending process.
+    # See: https://forums.developer.nvidia.com/t/353752
+
+    - name: Disable all active swap
+      ansible.builtin.command: swapoff -a
+      changed_when: true
+      failed_when: false
+
+    - name: Remove swap entries from /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\s+swap\s+.*)$'
+        replace: '# \1  # disabled by thinkube (DGX Spark unified-memory protection)'
+      register: fstab_swap
+
+    - name: Disable any systemd swap units
+      ansible.builtin.shell: |
+        for unit in $(systemctl list-unit-files --type=swap --no-legend | awk '{print $1}'); do
+          systemctl disable --now "$unit" 2>/dev/null || true
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    # ------------------------------------------------------------------
+    # SYSCTL: Unified-memory tuning
+    # ------------------------------------------------------------------
+
     - name: Write Thinkube DGX Spark sysctl drop-in
       ansible.builtin.copy:
         dest: /etc/sysctl.d/99-thinkube-dgx-spark.conf
@@ -91,6 +133,12 @@
       register: sysctl_verify
       changed_when: false
 
+    - name: Verify swap is disabled
+      ansible.builtin.command: swapon --show
+      register: swap_verify
+      changed_when: false
+      failed_when: false
+
     - name: Display result
       ansible.builtin.debug:
         msg: |
@@ -101,10 +149,12 @@
 
           GPU:        {{ nvidia_probe.stdout | default('') | trim }}
           Drop-in:    /etc/sysctl.d/99-thinkube-dgx-spark.conf
+          Swap:       {{ 'DISABLED ✓' if swap_verify.stdout == '' else 'WARNING: still active' }}
           Verified:
           {{ sysctl_verify.stdout | indent(4, true) }}
 
           Mitigates unified-memory pressure on GB10.
-          See: forums.developer.nvidia.com/t/364886
+          - Swap disabled to prevent OOM freeze (forums.developer.nvidia.com/t/353752)
+          - Sysctl tuning for memory creep (forums.developer.nvidia.com/t/364886)
 
           ════════════════════════════════════════════════════════
