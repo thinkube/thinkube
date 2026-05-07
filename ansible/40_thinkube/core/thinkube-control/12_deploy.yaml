@@ -940,34 +940,23 @@
           - Resources: {{ argocd_app.resources[0].status.resources | default([]) | length }}
       when: argocd_app.resources | length > 0
 
-    # Verify deployments are actually running
-    - name: Verify backend deployment is running
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: Deployment
-        namespace: "{{ k8s_namespace }}"
-        name: "thinkube-control-backend"
-      register: backend_deployment
-      until:
-        - backend_deployment.resources | length > 0
-        - backend_deployment.resources[0].status.replicas | default(0) == backend_deployment.resources[0].status.readyReplicas | default(-1)
-      retries: 8
-      delay: 10
+    # Wait for the deployments to roll out. `kubectl rollout status` returns
+    # as soon as the rollout actually completes, and surfaces real failures
+    # (ImagePullBackOff, CrashLoopBackOff, etc.) via the deployment condition
+    # instead of polling for a full timeout. The 5-min ceiling covers a fresh
+    # install where the kaniko build, Harbor push, ArgoCD sync, and image pull
+    # all happen serially after this point.
+    - name: Wait for backend deployment rollout
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status deployment/thinkube-control-backend
+        -n {{ k8s_namespace }} --timeout=300s
+      changed_when: false
 
-    - name: Verify frontend deployment is running
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: Deployment
-        namespace: "{{ k8s_namespace }}"
-        name: "thinkube-control-frontend"
-      register: frontend_deployment
-      until:
-        - frontend_deployment.resources | length > 0
-        - frontend_deployment.resources[0].status.replicas | default(0) == frontend_deployment.resources[0].status.readyReplicas | default(-1)
-      retries: 8
-      delay: 10
+    - name: Wait for frontend deployment rollout
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status deployment/thinkube-control-frontend
+        -n {{ k8s_namespace }} --timeout=300s
+      changed_when: false
       
     # Set default Git configuration values
     - name: Set default Git configuration values if not provided
