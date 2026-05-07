@@ -106,10 +106,19 @@
       delay: 10
       until: helm_repo_update.rc == 0
 
-    - name: Generate S3 credentials
+    - name: Check for existing S3 credentials
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret seaweedfs-s3-config -n {{ seaweedfs_namespace }} -o jsonpath='{.data.secret_key}' 2>/dev/null | base64 -d
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: existing_s3_key
+      failed_when: false
+      changed_when: false
+
+    - name: Generate S3 credentials (preserve existing key on redeploy)
       ansible.builtin.set_fact:
         s3_access_key: "{{ seaweedfs_s3_access_key | default('seaweedfs') }}"
-        s3_secret_key: "{{ seaweedfs_s3_secret_key | default(lookup('password', '/dev/null length=32 chars=ascii_letters,digits')) }}"
+        s3_secret_key: "{{ existing_s3_key.stdout | default('', true) | ternary(existing_s3_key.stdout, lookup('password', '/dev/null length=32 chars=ascii_letters,digits')) }}"
 
     - name: Create S3 auth configuration
       ansible.builtin.set_fact:
