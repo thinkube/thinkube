@@ -45,6 +45,28 @@
     tls_secret_name: "{{ seaweedfs_namespace }}-tls-secret"
 
   tasks:
+    # GUARDRAIL: Prevent accidental redeploy on a running system.
+    # SeaweedFS uses hostPath volumes — redeploying can wipe data that
+    # JuiceFS, MLflow, and Jupyter depend on. Require force_redeploy=true
+    # to proceed if SeaweedFS is already running.
+    - name: Check if SeaweedFS is already deployed
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get statefulset seaweedfs-master -n {{ seaweedfs_namespace }} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: seaweedfs_running
+      changed_when: false
+
+    - name: ABORT — SeaweedFS is already running (use -e force_redeploy=true to override)
+      ansible.builtin.fail:
+        msg: |
+          SeaweedFS is already running with {{ seaweedfs_running.stdout }} ready replica(s).
+          Redeploying can cause DATA LOSS for JuiceFS, MLflow models, and Jupyter data.
+          If you are sure, re-run with: -e force_redeploy=true
+      when:
+        - seaweedfs_running.stdout | int > 0
+        - not (force_redeploy | default(false) | bool)
+
     - name: Ensure application namespace exists and apply resource policies
       ansible.builtin.include_role:
         name: thinkube_namespace
