@@ -62,33 +62,6 @@
         ssh_known_hosts: "{{ github_keyscan.stdout }}"
   when: use_github and github_keyscan.stdout is defined
 
-- name: Restart ArgoCD repo server to pick up new SSH configuration
-  ansible.builtin.shell: |
-    {{ kubectl_bin }} -n {{ argocd_namespace }} rollout restart deployment argocd-repo-server
-    echo "Restarted ArgoCD repo server to pick up new SSH configuration"
-  when: use_github or not use_github  # Always restart to pick up SSH config
-  register: argocd_restart
-  changed_when: true
-
-- name: Wait for ArgoCD repo server to be ready
-  ansible.builtin.shell: |
-    for i in $(seq 1 12); do
-      READY=$({{ kubectl_bin }} -n {{ argocd_namespace }} get deployment argocd-repo-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
-      if [ "$READY" = "1" ]; then
-        echo "ArgoCD repo server is ready"
-        exit 0
-      fi
-      echo "Waiting for ArgoCD repo server to be ready... attempt $i/12"
-      sleep 10
-    done
-    echo "Timed out waiting for ArgoCD repo server to be ready"
-    exit 1
-  register: argocd_ready_wait
-  when: argocd_restart.changed
-  changed_when: false
-  args:
-    executable: /bin/bash
-
 - name: Get Gitea admin token from secret
   kubernetes.core.k8s_info:
     kubeconfig: "{{ kubeconfig }}"
@@ -162,6 +135,39 @@
           {{ github_keyscan.stdout if use_github else '' }}
           {{ gitea_keyscan.stdout if not use_github else '' }}
   when: (use_github and github_keyscan.stdout is defined) or (not use_github and gitea_keyscan.stdout is defined)
+
+# Restart the repo-server AFTER all known-hosts entries are written to the
+# ConfigMap so the new pod boots with the complete SSH config. Restarting
+# earlier creates a race: the new pod starts with stale known-hosts, and
+# kubelet's ConfigMap volume sync (up to ~60s) may not propagate the Gitea
+# entry before the hard-refresh below runs, leaving the Application stuck
+# in ComparisonError ("ssh: handshake failed: knownhosts: key is unknown")
+# until something else triggers a re-refresh.
+- name: Restart ArgoCD repo server to pick up new SSH configuration
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} -n {{ argocd_namespace }} rollout restart deployment argocd-repo-server
+    echo "Restarted ArgoCD repo server to pick up new SSH configuration"
+  register: argocd_restart
+  changed_when: true
+
+- name: Wait for ArgoCD repo server to be ready
+  ansible.builtin.shell: |
+    for i in $(seq 1 12); do
+      READY=$({{ kubectl_bin }} -n {{ argocd_namespace }} get deployment argocd-repo-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+      if [ "$READY" = "1" ]; then
+        echo "ArgoCD repo server is ready"
+        exit 0
+      fi
+      echo "Waiting for ArgoCD repo server to be ready... attempt $i/12"
+      sleep 10
+    done
+    echo "Timed out waiting for ArgoCD repo server to be ready"
+    exit 1
+  register: argocd_ready_wait
+  when: argocd_restart.changed
+  changed_when: false
+  args:
+    executable: /bin/bash
 
 - name: Create ArgoCD Application
   kubernetes.core.k8s:
