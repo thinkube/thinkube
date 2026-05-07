@@ -394,6 +394,13 @@
                 cpu: 50m
                 memory: 64Mi
 
+    # Helm pulls the chart tarball from release-assets.githubusercontent.com,
+    # which periodically EOFs mid-download. The fetch happens before any
+    # kubernetes resources are created/changed, so retrying the whole task
+    # is safe (a re-run of `helm install` on an already-failed first attempt
+    # just tries again from scratch; on a successful first attempt the
+    # `list | grep` switches to the upgrade branch, which is also a no-op
+    # if values haven't changed).
     - name: Deploy or upgrade Argo Workflows using Helm
       ansible.builtin.shell: |
         if {{ helm_bin }} list -n {{ argo_namespace }} | grep -q '^{{ argo_release_name }}'; then
@@ -408,6 +415,9 @@
       args:
         chdir: "/tmp"
       register: argo_deploy
+      retries: 5
+      delay: 10
+      until: argo_deploy.rc == 0
       changed_when: "'STATUS: deployed' in argo_deploy.stdout"
 
     # --- Begin Argo Events installation ---
@@ -425,6 +435,9 @@
       args:
         chdir: "/tmp"
       register: argo_events_deploy
+      retries: 5
+      delay: 10
+      until: argo_events_deploy.rc == 0
       changed_when: "'STATUS: deployed' in argo_events_deploy.stdout"
     # --- End Argo Events installation ---
 
