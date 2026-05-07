@@ -763,9 +763,46 @@
           until: node_ready_post_heal.stdout == 'True'
           changed_when: false
 
+    - name: Wait for Cilium IPAM to allocate pod CIDR on new node
+      ansible.builtin.shell: |
+        k8s kubectl exec -n kube-system \
+          $(k8s kubectl get pod -n kube-system -l k8s-app=cilium \
+            --field-selector spec.nodeName={{ inventory_hostname }} \
+            -o jsonpath='{.items[0].metadata.name}') \
+          -- cilium status --brief
+      delegate_to: "{{ control_plane_host }}"
+      become: true
+      register: cilium_ipam
+      retries: 12
+      delay: 5
+      until: cilium_ipam.rc == 0
+      changed_when: false
+      when: not (already_joined | bool)
+
+    - name: Restart pods with stale IPs from before Cilium was ready
+      ansible.builtin.shell: |
+        stale=$(k8s kubectl get pods -A --field-selector spec.nodeName={{ inventory_hostname }} \
+          -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}:{.status.podIP}{"\n"}{end}' \
+          | grep ':10\.88\.' || true)
+        if [ -n "$stale" ]; then
+          echo "$stale" | while IFS=: read -r nspod ip; do
+            ns="${nspod%%/*}"
+            pod="${nspod#*/}"
+            echo "Restarting $ns/$pod (stale IP $ip)"
+            k8s kubectl delete pod "$pod" -n "$ns" --grace-period=5 2>/dev/null || true
+          done
+        else
+          echo "No stale pods found"
+        fi
+      delegate_to: "{{ control_plane_host }}"
+      become: true
+      register: stale_restart
+      changed_when: "'Restarting' in stale_restart.stdout"
+      when: not (already_joined | bool)
+
     - name: Display worker join status
       ansible.builtin.debug:
-        msg: "Worker {{ inventory_hostname }} successfully joined and is Ready"
+        msg: "Worker {{ inventory_hostname }} successfully joined and is Ready (Cilium IPAM active)"
       when: not (already_joined | bool)
 
   handlers:
