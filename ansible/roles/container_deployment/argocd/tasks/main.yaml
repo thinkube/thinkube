@@ -150,24 +150,19 @@
   register: argocd_restart
   changed_when: true
 
-- name: Wait for ArgoCD repo server to be ready
-  ansible.builtin.shell: |
-    for i in $(seq 1 12); do
-      READY=$({{ kubectl_bin }} -n {{ argocd_namespace }} get deployment argocd-repo-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
-      if [ "$READY" = "1" ]; then
-        echo "ArgoCD repo server is ready"
-        exit 0
-      fi
-      echo "Waiting for ArgoCD repo server to be ready... attempt $i/12"
-      sleep 10
-    done
-    echo "Timed out waiting for ArgoCD repo server to be ready"
-    exit 1
+# `kubectl rollout status` only returns success when the new pod is
+# actually serving — checking `readyReplicas==1` (the previous approach)
+# is satisfied by the OLD pod during a rolling restart and races against
+# the kubelet ConfigMap volume sync, which leaves the next ArgoCD-touching
+# task to absorb ~75s of "knownhosts: key is unknown" retries. Wait
+# properly, then move on.
+- name: Wait for ArgoCD repo server rollout
+  ansible.builtin.command: >
+    {{ kubectl_bin }} -n {{ argocd_namespace }}
+    rollout status deployment/argocd-repo-server --timeout=120s
   register: argocd_ready_wait
   when: argocd_restart.changed
   changed_when: false
-  args:
-    executable: /bin/bash
 
 - name: Create ArgoCD Application
   kubernetes.core.k8s:
