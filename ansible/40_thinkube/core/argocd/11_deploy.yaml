@@ -187,6 +187,11 @@
           ingress:
             enabled: false
 
+    # Helm pulls the chart tarball from release-assets.githubusercontent.com,
+    # which periodically EOFs mid-download. Retry the whole task — a re-run
+    # of `helm install` after a failed first attempt just tries again from
+    # scratch; on a successful first attempt the `list | grep` switches to
+    # the upgrade branch, which is also a no-op if values haven't changed.
     - name: Deploy or upgrade ArgoCD using Helm
       ansible.builtin.shell: |
         if {{ helm_bin }} list -n {{ argocd_namespace }} | grep -q '^{{ argocd_release_name }}'; then
@@ -200,7 +205,11 @@
         fi
       args:
         chdir: "/tmp"
-      failed_when: false
+      register: argocd_deploy
+      retries: 5
+      delay: 10
+      until: argocd_deploy.rc == 0
+      changed_when: "'STATUS: deployed' in argocd_deploy.stdout"
 
     - name: Wait for ArgoCD pods to be ready
       ansible.builtin.shell: |
