@@ -464,7 +464,46 @@
         path: "{{ temp_dir.path }}"
         state: absent
 
-    # Step 12: Display access information
+    # Step 12: Store the JupyterHub service token for thinkube-control
+    # The token was generated in the Helm values (hub.services.thinkube-control.api_token)
+    # and is now stored in JupyterHub's hub secret. Extract and create a dedicated
+    # secret in the thinkube-control namespace so the backend can proxy notebook tool calls.
+    - name: Read JupyterHub hub secret to get service token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ jupyterhub_namespace }}"
+        name: hub
+      register: hub_secret
+
+    - name: Extract service token from hub secret
+      ansible.builtin.set_fact:
+        jupyterhub_service_token: "{{ (hub_secret.resources[0].data['values.yaml'] | b64decode | from_yaml).hub.services['thinkube-control'].api_token | default('') }}"
+      when: hub_secret.resources | length > 0
+      failed_when: false
+
+    - name: Generate fallback service token if extraction failed
+      ansible.builtin.set_fact:
+        jupyterhub_service_token: "{{ lookup('password', '/dev/null chars=hex_digits length=64') }}"
+      when: jupyterhub_service_token is not defined or jupyterhub_service_token == ''
+
+    - name: Create JupyterHub service token secret in thinkube-control namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: jupyterhub-service-token
+            namespace: thinkube-control
+          type: Opaque
+          stringData:
+            token: "{{ jupyterhub_service_token }}"
+            jupyter-url: "https://jupyter.{{ domain_name }}/user/{{ auth_realm_username }}"
+
+    # Step 13: Display access information
     - name: Display JupyterHub access information
       ansible.builtin.debug:
         msg:
