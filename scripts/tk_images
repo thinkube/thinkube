@@ -99,6 +99,105 @@ update_build_token() {
     echo -e "${GREEN}✓ Build token updated: $platforms${NC}"
 }
 
+restart_crashlooping_pods() {
+    # After mirroring images, any DaemonSet pods that pulled wrong-arch
+    # images before the mirror completed need to be force-repulled.
+    # Simply deleting pods isn't enough — containerd caches the wrong-arch
+    # image and IfNotPresent reuses it. We find the owning DaemonSets,
+    # temporarily patch them to imagePullPolicy: Always, wait for the
+    # rollout, then restore IfNotPresent.
+    local nodes_csv="$1"
+    if [ -z "$nodes_csv" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo -e "${CYAN}Checking for crash-looping pods on target nodes...${NC}"
+
+    # Collect unique DaemonSets that own crash-looping pods on target nodes
+    IFS=',' read -ra nodes <<< "$nodes_csv"
+    local daemonsets_to_fix=""
+
+    for node in "${nodes[@]}"; do
+        node=$(echo "$node" | xargs)
+        local ds_list
+        ds_list=$($KUBECTL get pods --all-namespaces --field-selector spec.nodeName="$node" \
+            -o json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+seen = set()
+for pod in data.get('items', []):
+    ns = pod['metadata']['namespace']
+    name = pod['metadata']['name']
+    for cs in pod.get('status', {}).get('containerStatuses', []):
+        waiting = cs.get('state', {}).get('waiting', {})
+        restarts = cs.get('restartCount', 0)
+        if waiting.get('reason') == 'CrashLoopBackOff' or restarts > 10:
+            image = cs.get('image', '')
+            if 'registry.' in image:
+                # Find owning DaemonSet
+                for ref in pod.get('metadata', {}).get('ownerReferences', []):
+                    if ref.get('kind') == 'DaemonSet':
+                        key = f\"{ns}/{ref['name']}\"
+                        if key not in seen:
+                            seen.add(key)
+                            print(key)
+                break
+" 2>/dev/null)
+
+        if [ -n "$ds_list" ]; then
+            daemonsets_to_fix="$daemonsets_to_fix $ds_list"
+        else
+            echo -e "${GREEN}  $node: no crash-looping pods found${NC}"
+        fi
+    done
+
+    # Deduplicate
+    daemonsets_to_fix=$(echo "$daemonsets_to_fix" | tr ' ' '\n' | sort -u | grep -v '^$')
+
+    if [ -z "$daemonsets_to_fix" ]; then
+        return 0
+    fi
+
+    # Patch each DaemonSet to Always, wait for rollout, then restore IfNotPresent
+    while IFS= read -r ds_ref; do
+        local ds_ns="${ds_ref%%/*}"
+        local ds_name="${ds_ref##*/}"
+        echo -e "${YELLOW}  Patching $ds_ref imagePullPolicy → Always (force re-pull)${NC}"
+
+        # Get container count
+        local container_count
+        container_count=$($KUBECTL get daemonset -n "$ds_ns" "$ds_name" \
+            -o jsonpath='{.spec.template.spec.containers}' 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "1")
+
+        # Build patch for all containers
+        local patch="["
+        for i in $(seq 0 $((container_count - 1))); do
+            [ "$i" -gt 0 ] && patch="$patch,"
+            patch="$patch{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/$i/imagePullPolicy\",\"value\":\"Always\"}"
+        done
+        patch="$patch]"
+
+        $KUBECTL patch daemonset -n "$ds_ns" "$ds_name" --type='json' -p="$patch" 2>/dev/null
+
+        echo -e "${CYAN}  Waiting for rollout of $ds_ref...${NC}"
+        $KUBECTL rollout status daemonset -n "$ds_ns" "$ds_name" --timeout=120s 2>/dev/null || true
+
+        # Restore IfNotPresent
+        local restore_patch="["
+        for i in $(seq 0 $((container_count - 1))); do
+            [ "$i" -gt 0 ] && restore_patch="$restore_patch,"
+            restore_patch="$restore_patch{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/$i/imagePullPolicy\",\"value\":\"IfNotPresent\"}"
+        done
+        restore_patch="$restore_patch]"
+
+        $KUBECTL patch daemonset -n "$ds_ns" "$ds_name" --type='json' -p="$restore_patch" 2>/dev/null
+        $KUBECTL rollout status daemonset -n "$ds_ns" "$ds_name" --timeout=120s 2>/dev/null || true
+
+        echo -e "${GREEN}  ✓ $ds_ref re-pulled and restored to IfNotPresent${NC}"
+    done <<< "$daemonsets_to_fix"
+}
+
 uncordon_nodes() {
     local nodes_csv="$1"
     if [ -z "$nodes_csv" ]; then
@@ -184,6 +283,8 @@ case "$COMMAND" in
             echo ""
             update_build_token
             if [ -n "$UNCORDON_NODES" ]; then
+                # Restart any pods that cached wrong-arch images before mirroring
+                restart_crashlooping_pods "$UNCORDON_NODES"
                 echo ""
                 uncordon_nodes "$UNCORDON_NODES"
             fi
