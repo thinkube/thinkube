@@ -371,6 +371,18 @@
     # built-in retry on chart fetch, and hub.jupyter.org/helm-chart returns
     # transient EOFs frequently enough that interactive installs fail. Pull
     # once with backoff, then install from the local file. Tracked in #9.
+    - name: Check for pre-placed chart tarball
+      ansible.builtin.stat:
+        path: "/tmp/jupyterhub-{{ jupyterhub_version }}.tgz"
+      register: preplaced_chart
+
+    - name: Use pre-placed chart if available (skips download)
+      ansible.builtin.copy:
+        src: "/tmp/jupyterhub-{{ jupyterhub_version }}.tgz"
+        dest: "{{ temp_dir.path }}/jupyterhub-{{ jupyterhub_version }}.tgz"
+        remote_src: true
+      when: preplaced_chart.stat.exists
+
     - name: Pre-fetch JupyterHub chart tarball (retries on transient network errors)
       ansible.builtin.command: >-
         {{ helm_bin }} pull {{ helm_repo_name }}/jupyterhub
@@ -381,6 +393,7 @@
       delay: 10
       until: helm_pull.rc == 0
       changed_when: helm_pull.rc == 0
+      when: not preplaced_chart.stat.exists
 
     # Step 8: Deploy JupyterHub using Helm (from the locally pre-fetched
     # tarball — no live chart download during install).
@@ -464,7 +477,35 @@
         path: "{{ temp_dir.path }}"
         state: absent
 
-    # Step 12: Store the JupyterHub service token for thinkube-control
+    # Step 12: Create S3 bucket for notebook outputs (used by tk-ai-extension)
+    - name: Get SeaweedFS S3 credentials
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: seaweedfs
+        name: seaweedfs-s3-credentials
+      register: s3_creds
+      failed_when: false
+
+    - name: Create notebook-outputs S3 bucket
+      ansible.builtin.shell: |
+        cat > /tmp/s3cmd-notebook.cfg << EOF
+        [default]
+        access_key = {{ s3_creds.resources[0].data.access_key | b64decode }}
+        secret_key = {{ s3_creds.resources[0].data.secret_key | b64decode }}
+        host_base = {{ (s3_creds.resources[0].data.endpoint | b64decode).split('://')[1] }}
+        host_bucket = {{ (s3_creds.resources[0].data.endpoint | b64decode).split('://')[1] }}
+        use_https = {{ 'True' if (s3_creds.resources[0].data.endpoint | b64decode).startswith('https') else 'False' }}
+        check_ssl_certificate = False
+        EOF
+        s3cmd -c /tmp/s3cmd-notebook.cfg mb s3://notebook-outputs 2>/dev/null || true
+        rm -f /tmp/s3cmd-notebook.cfg
+      delegate_to: localhost
+      when: s3_creds.resources | default([]) | length > 0
+      no_log: true
+
+    # Step 13: Store the JupyterHub service token for thinkube-control
     # The token was generated in the Helm values (hub.services.thinkube-control.api_token)
     # and is now stored in JupyterHub's hub secret. Extract and create a dedicated
     # secret in the thinkube-control namespace so the backend can proxy notebook tool calls.
