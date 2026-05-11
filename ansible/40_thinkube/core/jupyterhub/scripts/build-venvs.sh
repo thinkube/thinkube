@@ -19,6 +19,14 @@ set -euo pipefail
 # Version for the venvs release
 VERSION="${VENVS_VERSION:-v0.1.0}"
 
+# DevPI index URL for thinkube packages (tk-llm, etc.)
+DEVPI_INDEX_URL="${DEVPI_INDEX_URL:-}"
+EXTRA_INDEX_ARGS=""
+if [ -n "$DEVPI_INDEX_URL" ]; then
+  EXTRA_INDEX_ARGS="--extra-index-url $DEVPI_INDEX_URL"
+  echo "Using DevPI index: $DEVPI_INDEX_URL"
+fi
+
 # Detect architecture
 ARCH=$(uname -m)
 if [ "$ARCH" = "aarch64" ]; then
@@ -139,7 +147,7 @@ create_venv_with_base() {
 
   # Install base packages
   echo "Installing base ML packages..."
-  "$venv_path/bin/pip" install "${BASE_PACKAGES[@]}"
+  "$venv_path/bin/pip" install $EXTRA_INDEX_ARGS "${BASE_PACKAGES[@]}"
 }
 
 # Function to make venv relocatable and package it
