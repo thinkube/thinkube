@@ -1,0 +1,111 @@
+# Build venvs for a single architecture
+# Called from 99_build_venvs.yaml with target_arch set to arm64 or amd64
+
+- name: "Display build start for {{ target_arch }}"
+  ansible.builtin.debug:
+    msg: "Building venvs for {{ target_arch }}..."
+
+- name: "Delete existing build job for {{ target_arch }}"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: "venvs-builder-{{ target_arch }}"
+    namespace: "{{ build_namespace }}"
+    wait: true
+    wait_timeout: 60
+  ignore_errors: true
+
+- name: "Create venvs build job for {{ target_arch }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: "venvs-builder-{{ target_arch }}"
+        namespace: "{{ build_namespace }}"
+      spec:
+        ttlSecondsAfterFinished: 3600
+        backoffLimit: 0
+        template:
+          spec:
+            restartPolicy: Never
+            initContainers:
+              - name: fix-permissions
+                image: "{{ harbor_registry }}/library/busybox:latest"
+                command: ["sh", "-c", "chown -R 1000:100 /output"]
+                securityContext:
+                  runAsUser: 0
+                volumeMounts:
+                  - name: output
+                    mountPath: /output
+            containers:
+              - name: builder
+                image: "{{ harbor_registry }}/library/tk-jupyter-base:latest"
+                imagePullPolicy: Always
+                command:
+                  - bash
+                  - /scripts/build-venvs.sh
+                env:
+                  - name: VENVS_VERSION
+                    value: "{{ venvs_version }}"
+                  - name: OUTPUT_DIR
+                    value: /output
+                  - name: DEVPI_INDEX_URL
+                    value: "https://{{ devpi_api_hostname }}/root/{{ devpi_index_name }}/+simple/"
+                volumeMounts:
+                  - name: build-script
+                    mountPath: /scripts
+                  - name: output
+                    mountPath: /output
+                resources:
+                  requests:
+                    memory: "8Gi"
+                    cpu: "2"
+                  limits:
+                    memory: "16Gi"
+                    cpu: "4"
+            volumes:
+              - name: build-script
+                configMap:
+                  name: venvs-build-script
+                  defaultMode: 0755
+              - name: output
+                persistentVolumeClaim:
+                  claimName: "{{ build_pvc_name }}"
+            nodeSelector:
+              kubernetes.io/arch: "{{ target_arch }}"
+              nvidia.com/gpu.present: "true"
+
+- name: "Wait for {{ target_arch }} build job to complete (20-40 minutes)"
+  kubernetes.core.k8s_info:
+    api_version: batch/v1
+    kind: Job
+    name: "venvs-builder-{{ target_arch }}"
+    namespace: "{{ build_namespace }}"
+  register: job_info
+  until: >
+    (job_info.resources[0].status.succeeded is defined and job_info.resources[0].status.succeeded == 1) or
+    (job_info.resources[0].status.failed is defined and job_info.resources[0].status.failed > 0)
+  retries: 180
+  delay: 20
+
+- name: "Check if {{ target_arch }} build succeeded"
+  ansible.builtin.fail:
+    msg: "Venvs build for {{ target_arch }} failed! Check logs: kubectl logs job/venvs-builder-{{ target_arch }} -n {{ build_namespace }}"
+  when: job_info.resources[0].status.failed is defined and job_info.resources[0].status.failed > 0
+
+- name: "Delete {{ target_arch }} build job"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: "venvs-builder-{{ target_arch }}"
+    namespace: "{{ build_namespace }}"
+    wait: true
+    wait_timeout: 60
+
+- name: "{{ target_arch }} build complete"
+  ansible.builtin.debug:
+    msg: "Successfully built venvs for {{ target_arch }}"

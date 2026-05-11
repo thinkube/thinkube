@@ -41,7 +41,7 @@ echo "Version: $VERSION"
 echo "=============================================="
 
 BUILD_DIR="/tmp/venvs-build"
-OUTPUT_DIR="${OUTPUT_DIR:-/output}/$ARCH_DIR"
+OUTPUT_DIR="${OUTPUT_DIR:-/output}"
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 
 # Base ML packages (included in BOTH venvs)
@@ -167,13 +167,13 @@ package_venv() {
     --name="$name" \
     --display-name="$name ($ARCH_DIR)"
 
-  # Create tarball
+  # Create tarball with arch prefix
   echo "Creating tarball..."
-  tar -czf "$OUTPUT_DIR/$name.tar.gz" -C "$BUILD_DIR" "$name"
+  tar -czf "$OUTPUT_DIR/$ARCH_DIR-$name.tar.gz" -C "$BUILD_DIR" "$name"
 
   # Show size
-  local size=$(du -h "$OUTPUT_DIR/$name.tar.gz" | cut -f1)
-  echo "Created: $OUTPUT_DIR/$name.tar.gz ($size)"
+  local size=$(du -h "$OUTPUT_DIR/$ARCH_DIR-$name.tar.gz" | cut -f1)
+  echo "Created: $OUTPUT_DIR/$ARCH_DIR-$name.tar.gz ($size)"
 }
 
 # ============================================
