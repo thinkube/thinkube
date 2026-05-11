@@ -51,22 +51,12 @@
           metadata:
             name: "{{ build_namespace }}"
 
-    - name: Create temporary PVC for build output
-      kubernetes.core.k8s:
-        state: present
-        definition:
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: "{{ build_pvc_name }}"
-            namespace: "{{ build_namespace }}"
-          spec:
-            accessModes:
-              - ReadWriteOnce
-            storageClassName: csi-rawfile-default
-            resources:
-              requests:
-                storage: 50Gi
+    - name: Create local output directory
+      ansible.builtin.file:
+        path: "{{ local_output_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
 
     - name: Display build info
       ansible.builtin.debug:
@@ -158,77 +148,8 @@
         loop_var: target_arch
 
     # ================================================================
-    # Copy tarballs from PVC and upload to GitHub
+    # Upload tarballs to GitHub
     # ================================================================
-    - name: Create helper pod to copy tarballs
-      kubernetes.core.k8s:
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Pod
-          metadata:
-            name: venvs-copy-helper
-            namespace: "{{ build_namespace }}"
-          spec:
-            restartPolicy: Never
-            containers:
-              - name: helper
-                image: "{{ harbor_registry }}/library/busybox:latest"
-                command: ["sleep", "3600"]
-                volumeMounts:
-                  - name: venvs
-                    mountPath: /venvs
-            volumes:
-              - name: venvs
-                persistentVolumeClaim:
-                  claimName: "{{ build_pvc_name }}"
-
-    - name: Wait for helper pod to be ready
-      kubernetes.core.k8s_info:
-        api_version: v1
-        kind: Pod
-        name: venvs-copy-helper
-        namespace: "{{ build_namespace }}"
-      register: helper_pod
-      until: helper_pod.resources[0].status.phase == "Running"
-      retries: 30
-      delay: 5
-
-    - name: Create local output directory
-      ansible.builtin.file:
-        path: "{{ local_output_dir }}"
-        state: directory
-        mode: '0755'
-      delegate_to: localhost
-
-    - name: List tarballs in PVC
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ build_namespace }} venvs-copy-helper -- ls /venvs/
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: pvc_files
-      changed_when: false
-
-    - name: Display PVC contents
-      ansible.builtin.debug:
-        msg: "Tarballs in PVC: {{ pvc_files.stdout_lines }}"
-
-    - name: Copy tarballs from helper pod
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} cp {{ build_namespace }}/venvs-copy-helper:/venvs/{{ item }} {{ local_output_dir }}/{{ item }}
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      loop: "{{ pvc_files.stdout_lines | select('match', '.*\\.tar\\.gz$') | list }}"
-      delegate_to: localhost
-
-    - name: Delete helper pod
-      kubernetes.core.k8s:
-        state: absent
-        api_version: v1
-        kind: Pod
-        name: venvs-copy-helper
-        namespace: "{{ build_namespace }}"
-
     - name: List downloaded tarballs
       ansible.builtin.find:
         paths: "{{ local_output_dir }}"
@@ -283,14 +204,6 @@
         path: "{{ local_output_dir }}"
         state: absent
       delegate_to: localhost
-
-    - name: Delete temporary build PVC
-      kubernetes.core.k8s:
-        state: absent
-        api_version: v1
-        kind: PersistentVolumeClaim
-        name: "{{ build_pvc_name }}"
-        namespace: "{{ build_namespace }}"
 
     - name: Display completion message
       ansible.builtin.debug:
