@@ -68,6 +68,7 @@ BASE_PACKAGES=(
   cvat-sdk
   langfuse
   openai
+  "tk-llm[openai]"
   arxiv
   python-dotenv
   requests

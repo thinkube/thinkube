@@ -1,0 +1,122 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/16_publish_packages.yaml
+# Description:
+#   Build and publish thinkube Python packages to DevPI.
+#   Clones package repos from GitHub, builds wheels, and uploads to the
+#   private DevPI index so they are available via pip for all user workloads.
+#
+# Requirements:
+#   - DevPI must be deployed and configured (devpi/10_deploy.yaml, devpi/15_configure_cli.yaml)
+#   - python3 with build module available
+#   - Environment variable: ADMIN_PASSWORD (for devpi login)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/16_publish_packages.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain for services
+#   - devpi_api_hostname: DevPI API endpoint
+#   - devpi_index_name: DevPI index name (e.g., stable)
+#   - auth_realm_username: DevPI admin username
+#
+# 🤖 [AI-assisted]
+
+- name: Build and publish thinkube Python packages to DevPI
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    devpi_url: "https://{{ devpi_api_hostname }}"
+    build_dir: "/tmp/thinkube-package-builds"
+    packages:
+      - name: tk-llm
+        repo: "thinkube/tk-llm"
+        branch: main
+
+  tasks:
+    - name: Ensure build tools are available
+      ansible.builtin.pip:
+        name:
+          - build
+          - devpi-client
+        state: present
+        virtualenv: "{{ ansible_env.HOME }}/.venv"
+
+    - name: Create temporary build directory
+      ansible.builtin.file:
+        path: "{{ build_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Clone or update package repositories
+      ansible.builtin.shell: |
+        if [ -d "{{ build_dir }}/{{ item.name }}" ]; then
+          cd "{{ build_dir }}/{{ item.name }}"
+          git fetch origin
+          git reset --hard origin/{{ item.branch }}
+        else
+          GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch {{ item.branch }} \
+            "https://github.com/{{ item.repo }}.git" "{{ build_dir }}/{{ item.name }}"
+        fi
+      loop: "{{ packages }}"
+      register: clone_results
+      changed_when: true
+
+    - name: Build wheels
+      ansible.builtin.command:
+        cmd: "{{ ansible_env.HOME }}/.venv/bin/python -m build --wheel"
+        chdir: "{{ build_dir }}/{{ item.name }}"
+      loop: "{{ packages }}"
+      register: build_results
+      changed_when: true
+
+    - name: Configure devpi client
+      ansible.builtin.command:
+        cmd: "{{ ansible_env.HOME }}/.venv/bin/devpi use {{ devpi_url }}"
+      changed_when: false
+
+    - name: Login to devpi
+      ansible.builtin.command:
+        cmd: "{{ ansible_env.HOME }}/.venv/bin/devpi login root --password={{ admin_password }}"
+      changed_when: false
+      no_log: true
+
+    - name: Select devpi index
+      ansible.builtin.command:
+        cmd: "{{ ansible_env.HOME }}/.venv/bin/devpi use root/{{ devpi_index_name }}"
+      changed_when: false
+
+    - name: Find built wheels
+      ansible.builtin.find:
+        paths: "{{ build_dir }}/{{ item.name }}/dist"
+        patterns: "*.whl"
+      loop: "{{ packages }}"
+      register: wheel_files
+
+    - name: Upload wheels to devpi
+      ansible.builtin.command:
+        cmd: "{{ ansible_env.HOME }}/.venv/bin/devpi upload {{ item.files[0].path }}"
+      loop: "{{ wheel_files.results }}"
+      when: item.files | length > 0
+      register: upload_results
+      changed_when: true
+
+    - name: Clean up build directory
+      ansible.builtin.file:
+        path: "{{ build_dir }}"
+        state: absent
+
+    - name: Display publish summary
+      ansible.builtin.debug:
+        msg: |
+          Published packages to DevPI ({{ devpi_url }}/root/{{ devpi_index_name }}):
+          {% for pkg in packages %}
+            - {{ pkg.name }}
+          {% endfor %}
+
+          Install with: pip install {{ packages | map(attribute='name') | join(' ') }}
