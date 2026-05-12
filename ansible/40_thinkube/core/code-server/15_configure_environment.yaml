@@ -639,10 +639,16 @@
         name: code-server
       register: cs_deployment
 
-    - name: Extract current hostAliases as comparable set
+    - name: Build comparable host strings from current and desired aliases
       ansible.builtin.set_fact:
-        current_host_set: "{{ cs_deployment.resources[0].spec.template.spec.hostAliases | default([]) | map('dict2items') | map('sort') | map('items2dict') | sort(attribute='ip') }}"
-        desired_host_set: "{{ cluster_host_aliases | map('dict2items') | map('sort') | map('items2dict') | sort(attribute='ip') }}"
+        current_hosts: "{{ cs_deployment.resources[0].spec.template.spec.hostAliases | default([]) | map(attribute='ip') | sort | list }}"
+        desired_hosts: "{{ cluster_host_aliases | map(attribute='ip') | sort | list }}"
+        current_hostnames: "{{ cs_deployment.resources[0].spec.template.spec.hostAliases | default([]) | map(attribute='hostnames') | flatten | sort | list }}"
+        desired_hostnames: "{{ cluster_host_aliases | map(attribute='hostnames') | flatten | sort | list }}"
+
+    - name: Determine if hostAliases need updating
+      ansible.builtin.set_fact:
+        hostalias_changed: "{{ current_hosts != desired_hosts or current_hostnames != desired_hostnames }}"
 
     - name: Patch code-server deployment with hostAliases (only if changed)
       kubernetes.core.k8s:
@@ -656,7 +662,7 @@
             template:
               spec:
                 hostAliases: "{{ cluster_host_aliases }}"
-      when: current_host_set != desired_host_set
+      when: hostalias_changed | bool
 
     # The hostAliases patch mutates the deployment spec. With
     # strategy.type: Recreate the old pod is deleted and a new pod is
@@ -670,7 +676,7 @@
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       changed_when: false
-      when: current_host_set != desired_host_set
+      when: hostalias_changed | bool
 
     - name: Re-fetch code-server pod name after hostAliases patch
       ansible.builtin.shell: |
@@ -682,7 +688,7 @@
       register: pod_name
       failed_when: pod_name.stdout == ""
       changed_when: false
-      when: current_host_set != desired_host_set
+      when: hostalias_changed | bool
 
     # Create symlinks for GitHub SSH keys on control plane
     # This allows git config to work both in pod and when SSHing to control plane
