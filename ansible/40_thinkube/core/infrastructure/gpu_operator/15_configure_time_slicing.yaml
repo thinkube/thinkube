@@ -4,23 +4,20 @@
 ---
 # ansible/40_thinkube/core/infrastructure/gpu_operator/15_configure_time_slicing.yaml
 # Description:
-#   Configures GPU time-slicing to allow multiple pods to share GPUs
+#   Configures GPU time-slicing to allow multiple pods to share GPUs.
+#   Applied to ALL GPU nodes with per-family profiles:
+#     - dgx-spark (Blackwell/UMA): 4 virtual GPUs per physical GPU
+#     - consumer (discrete GPUs): 2 virtual GPUs per physical GPU
 #
 # Requirements:
 #   - GPU Operator already installed (run 10_deploy.yaml first)
+#   - GPU nodes must have nvidia.com/gpu.present=true label (set by GFD)
 #
 # Usage:
 #   cd ~/thinkube
-#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/gpu_operator/15_configure_time_slicing.yaml
-#
-# Variables:
-#   - gpu_time_slicing_replicas: (Optional) Virtual GPUs per physical GPU (default: 4)
-#
-# Supported GPUs:
-#   - DGX Spark (GB10) — the only GPU that requires time-slicing
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/gpu_operator/15_configure_time_slicing.yaml
 #
 # Time-slicing shares GPU memory — monitor total usage to avoid OOM.
-# Only runs when a DGX Spark node is present in baremetal_gpus inventory.
 #
 # 🤖 [AI-assisted]
 
@@ -37,25 +34,48 @@
         - kubeconfig
         - kubectl_bin
 
-    - name: Identify DGX Spark nodes
+    - name: Get GPU nodes from Kubernetes labels
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get nodes -l nvidia.com/gpu.present=true \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.nvidia\.com/gpu\.family}{"\t"}{.metadata.labels.nvidia\.com/gpu\.product}{"\n"}{end}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gpu_nodes_raw
+      changed_when: false
+
+    - name: Parse GPU node information
       ansible.builtin.set_fact:
-        dgx_spark_nodes: >-
+        gpu_nodes: >-
           {%- set nodes = [] -%}
-          {%- for host in groups.get('baremetal_gpus', []) -%}
-            {%- if hostvars[host].get('gpu_model', '') is search('DGX Spark|GB10') -%}
-              {%- set _ = nodes.append(host) -%}
+          {%- for line in gpu_nodes_raw.stdout_lines -%}
+            {%- set parts = line.split('\t') -%}
+            {%- if parts | length >= 3 -%}
+              {%- set node_name = parts[0] -%}
+              {%- set family = parts[1] | default('') -%}
+              {%- set product = parts[2] | default('') -%}
+              {%- set is_uma = (family == 'blackwell') or ('GB10' in product) or ('DGX' in product) -%}
+              {%- set profile = 'dgx-spark' if is_uma else 'consumer' -%}
+              {%- set _ = nodes.append({'name': node_name, 'family': family, 'product': product, 'profile': profile}) -%}
             {%- endif -%}
           {%- endfor -%}
           {{ nodes }}
 
-    - name: Skip if no DGX Spark in cluster
+    - name: Skip if no GPU nodes in cluster
       ansible.builtin.meta: end_play
-      when: dgx_spark_nodes | length == 0
+      when: gpu_nodes | length == 0
+
+    - name: Display detected GPU nodes
+      ansible.builtin.debug:
+        msg: "{{ item.name }}: {{ item.product }} ({{ item.family }}) → profile: {{ item.profile }}"
+      loop: "{{ gpu_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
 
   vars:
     gpu_operator_namespace: gpu-operator
     time_slicing_config_name: time-slicing-config
-    gpu_time_slicing_replicas_default: 4
+    dgx_spark_replicas: 4
+    consumer_replicas: 2
 
   tasks:
     - name: Check if GPU Operator is installed
@@ -64,7 +84,7 @@
       failed_when: gpu_ns_check.rc != 0
       changed_when: false
 
-    - name: Create time-slicing ConfigMap with per-node profiles
+    - name: Create time-slicing ConfigMap with per-family profiles
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
         apiVersion: v1
@@ -85,18 +105,31 @@
                 failRequestsGreaterThanOne: false
                 resources:
                 - name: nvidia.com/gpu
-                  replicas: {{ gpu_time_slicing_replicas | default(gpu_time_slicing_replicas_default) }}
+                  replicas: {{ dgx_spark_replicas }}
+          consumer: |-
+            version: v1
+            flags:
+              migStrategy: none
+            sharing:
+              timeSlicing:
+                renameByDefault: false
+                failRequestsGreaterThanOne: false
+                resources:
+                - name: nvidia.com/gpu
+                  replicas: {{ consumer_replicas }}
         EOF
       register: configmap_result
       changed_when: "'created' in configmap_result.stdout or 'configured' in configmap_result.stdout"
 
-    - name: Label DGX Spark nodes for time-slicing profile
+    - name: Label GPU nodes with time-slicing profile
       ansible.builtin.command: >
-        {{ kubectl_bin }} label node {{ item }}
-        nvidia.com/device-plugin.config=dgx-spark --overwrite
+        {{ kubectl_bin }} label node {{ item.name }}
+        nvidia.com/device-plugin.config={{ item.profile }} --overwrite
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      loop: "{{ dgx_spark_nodes }}"
+      loop: "{{ gpu_nodes }}"
+      loop_control:
+        label: "{{ item.name }} → {{ item.profile }}"
       changed_when: true
 
     - name: Patch ClusterPolicy to use per-node time-slicing config
@@ -144,7 +177,7 @@
         {{ kubectl_bin }} get nodes -o json | jq -r '
           .items[] |
           select(.status.capacity."nvidia.com/gpu" != null) |
-          "Node: \(.metadata.name) - Physical: \(.status.capacity."nvidia.com/gpu") -> Virtual: \(.status.allocatable."nvidia.com/gpu")"
+          "Node: \(.metadata.name) - Physical: \(.status.capacity."nvidia.com/gpu") -> Virtual: \(.status.allocatable."nvidia.com/gpu") (profile: \(.metadata.labels."nvidia.com/device-plugin.config" // "default"))"
         '
       register: verification_result
       changed_when: false
