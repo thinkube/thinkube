@@ -15,13 +15,12 @@
     "- **NO fallback values** - if a required variable is missing, test fails immediately\n",
     "\n",
     "**Expected Results:**\n",
-    "- ✅ All core services should pass\n",
-    "- ⊘ Optional services may be skipped (normal if not deployed)\n",
-    "- ❌ Any failures indicate misconfiguration\n",
+    "- \u2705 All core services should pass\n",
+    "- \u2298 Optional services may be skipped (normal if not deployed)\n",
+    "- \u274c Any failures indicate misconfiguration\n",
     "\n",
     "Run all cells to validate your environment setup."
-   ],
-   "id": "introduction"
+   ]
   },
   {
    "cell_type": "code",
@@ -32,29 +31,35 @@
     "# Import required libraries\n",
     "import os\n",
     "import sys\n",
+    "import warnings\n",
     "from pathlib import Path\n",
     "from IPython.display import display, HTML\n",
     "\n",
+    "# Suppress InsecureRequestWarning for internal services using self-signed certs\n",
+    "import urllib3\n",
+    "urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n",
+    "# Suppress Pydantic deprecation warnings from third-party libraries (argilla, etc.)\n",
+    "warnings.filterwarnings(\"ignore\", category=DeprecationWarning)\n",
+    "\n",
     "# Color-coded output helpers\n",
     "def print_success(msg):\n",
-    "    display(HTML(f'<span style=\"color: #00c896; font-weight: bold;\">✅ {msg}</span>'))\n",
+    "    display(HTML(f'<span style=\"color: #00c896; font-weight: bold;\">\u2705 {msg}</span>'))\n",
     "\n",
     "def print_error(msg):\n",
-    "    display(HTML(f'<span style=\"color: #e74c3c; font-weight: bold;\">❌ {msg}</span>'))\n",
+    "    display(HTML(f'<span style=\"color: #e74c3c; font-weight: bold;\">\u274c {msg}</span>'))\n",
     "\n",
     "def print_warning(msg):\n",
-    "    display(HTML(f'<span style=\"color: #ff8c42; font-weight: bold;\">⚠️  {msg}</span>'))\n",
+    "    display(HTML(f'<span style=\"color: #ff8c42; font-weight: bold;\">\u26a0\ufe0f  {msg}</span>'))\n",
     "\n",
     "def print_info(msg):\n",
-    "    display(HTML(f'<span style=\"color: #3498db; font-weight: bold;\">ℹ️  {msg}</span>'))\n",
+    "    display(HTML(f'<span style=\"color: #3498db; font-weight: bold;\">\u2139\ufe0f  {msg}</span>'))\n",
     "\n",
     "def print_section(msg):\n",
     "    display(HTML(f'<h3 style=\"color: #006680; margin-top: 20px;\">{msg}</h3>'))\n",
     "\n",
     "def print_skip(msg):\n",
-    "    display(HTML(f'<span style=\"color: #95a5a6; font-weight: bold;\">⊘ {msg}</span>'))"
-   ],
-   "id": "helper-functions"
+    "    display(HTML(f'<span style=\"color: #95a5a6; font-weight: bold;\">\u2298 {msg}</span>'))"
+   ]
   },
   {
    "cell_type": "markdown",
@@ -63,8 +68,7 @@
     "## 1. Core Infrastructure Services\n",
     "\n",
     "These services provide foundational infrastructure and **MUST** work."
-   ],
-   "id": "section-core-infrastructure"
+   ]
   },
   {
    "cell_type": "code",
@@ -88,8 +92,7 @@
     "    print_error(\"kubernetes python client not installed\")\n",
     "except Exception as e:\n",
     "    print_error(f\"Kubernetes connection failed: {str(e)}\")"
-   ],
-   "id": "test-kubernetes"
+   ]
   },
   {
    "cell_type": "code",
@@ -178,8 +181,7 @@
     "    print_error(\"psycopg2-binary not installed\")\n",
     "except Exception as e:\n",
     "    print_error(f\"PostgreSQL connection failed: {str(e)}\")"
-   ],
-   "id": "test-postgresql"
+   ]
   },
   {
    "cell_type": "code",
@@ -222,8 +224,7 @@
     "    print_error(\"boto3 not installed\")\n",
     "except Exception as e:\n",
     "    print_error(f\"S3 connection failed: {str(e)}\")"
-   ],
-   "id": "test-seaweedfs"
+   ]
   },
   {
    "cell_type": "markdown",
@@ -232,8 +233,7 @@
     "## 2. Core Development Tools\n",
     "\n",
     "These tools are used for development workflows."
-   ],
-   "id": "section-core-dev-tools"
+   ]
   },
   {
    "cell_type": "code",
@@ -249,9 +249,9 @@
     "    print_skip(\"GitHub not configured (optional - GITHUB_TOKEN not set)\")\n",
     "else:\n",
     "    try:\n",
-    "        from github import Github\n",
+    "        from github import Github, Auth\n",
     "        \n",
-    "        g = Github(github_token)\n",
+    "        g = Github(auth=Auth.Token(github_token))\n",
     "        user = g.get_user()\n",
     "        \n",
     "        print_success(\"Connected to GitHub\")\n",
@@ -262,8 +262,7 @@
     "        print_error(\"PyGithub not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"GitHub connection failed: {str(e)}\")"
-   ],
-   "id": "test-github"
+   ]
   },
   {
    "cell_type": "code",
@@ -273,39 +272,44 @@
    "source": [
     "print_section(\"ArgoCD\")\n",
     "\n",
-    "argocd_server = os.environ.get('ARGOCD_WEB_URL')\n",
+    "argocd_server = os.environ.get('ARGOCD_GRPC_URL')\n",
     "argocd_token = os.environ.get('ARGOCD_AUTH_TOKEN')\n",
     "\n",
     "if not argocd_server:\n",
-    "    print_skip(\"ArgoCD not configured (optional - ARGOCD_WEB_URL not set)\")\n",
+    "    print_skip(\"ArgoCD not configured (optional - ARGOCD_GRPC_URL not set)\")\n",
     "else:\n",
     "    try:\n",
-    "        import requests\n",
-    "        import urllib3\n",
-    "        urllib3.disable_warnings()\n",
-    "        \n",
-    "        if not argocd_token:\n",
-    "            print_error(\"ArgoCD token not set (ARGOCD_AUTH_TOKEN required)\")\n",
-    "        else:\n",
-    "            # Test connection with API call\n",
-    "            headers = {'Authorization': f'Bearer {argocd_token}'}\n",
-    "            response = requests.get(\n",
-    "                f'{argocd_server}/api/v1/applications',\n",
-    "                headers=headers,\n",
-    "                verify=False\n",
-    "            )\n",
-    "            response.raise_for_status()\n",
-    "            apps = response.json()\n",
-    "            \n",
-    "            print_success(f\"Connected to ArgoCD at {argocd_server}\")\n",
-    "            print_info(f\"Applications: {len(apps['items']) if 'items' in apps else 0}\")\n",
-    "            \n",
+    "        import grpc\n",
+    "        from argocd_client import ApplicationServiceStub, ApplicationQuery\n",
     "    except ImportError:\n",
-    "        print_error(\"requests library not installed\")\n",
-    "    except Exception as e:\n",
-    "        print_error(f\"ArgoCD connection failed: {str(e)}\")"
-   ],
-   "id": "test-argocd"
+    "        # Fall back to grpc channel health check\n",
+    "        try:\n",
+    "            import grpc\n",
+    "            \n",
+    "            if not argocd_token:\n",
+    "                print_error(\"ArgoCD token not set (ARGOCD_AUTH_TOKEN required)\")\n",
+    "            else:\n",
+    "                # Create gRPC channel with TLS\n",
+    "                credentials = grpc.ssl_channel_credentials()\n",
+    "                call_credentials = grpc.access_token_call_credentials(argocd_token)\n",
+    "                composite = grpc.composite_channel_credentials(credentials, call_credentials)\n",
+    "                \n",
+    "                channel = grpc.secure_channel(argocd_server, composite)\n",
+    "                \n",
+    "                # Use channel connectivity check\n",
+    "                try:\n",
+    "                    grpc.channel_ready_future(channel).result(timeout=5)\n",
+    "                    print_success(f\"Connected to ArgoCD gRPC at {argocd_server}\")\n",
+    "                    print_info(\"gRPC channel ready\")\n",
+    "                except grpc.FutureTimeoutError:\n",
+    "                    print_error(\"ArgoCD gRPC channel not ready (timeout)\")\n",
+    "                finally:\n",
+    "                    channel.close()\n",
+    "        except ImportError:\n",
+    "            print_error(\"grpc library not installed\")\n",
+    "        except Exception as e:\n",
+    "            print_error(f\"ArgoCD connection failed: {str(e)}\")"
+   ]
   },
   {
    "cell_type": "code",
@@ -344,8 +348,7 @@
     "        print_error(\"hera-workflows not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"Argo Workflows connection failed: {str(e)}\")"
-   ],
-   "id": "test-argo-workflows"
+   ]
   },
   {
    "cell_type": "code",
@@ -386,8 +389,7 @@
     "        print_error(\"requests library not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"Gitea connection failed: {str(e)}\")"
-   ],
-   "id": "test-gitea"
+   ]
   },
   {
    "cell_type": "code",
@@ -427,8 +429,7 @@
     "        print_error(\"requests library not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"Perses connection failed: {str(e)}\")"
-   ],
-   "id": "test-perses"
+   ]
   },
   {
    "cell_type": "markdown",
@@ -437,8 +438,7 @@
     "## 3. Optional Data Services\n",
     "\n",
     "These services may not be deployed in all installations."
-   ],
-   "id": "section-optional-data"
+   ]
   },
   {
    "cell_type": "code",
@@ -457,14 +457,16 @@
     "        import redis\n",
     "        \n",
     "        valkey_port = os.environ.get('VALKEY_PORT')\n",
+    "        valkey_password = os.environ.get('VALKEY_PASSWORD', '')\n",
     "        \n",
     "        if not valkey_port:\n",
     "            print_error(\"Valkey port not set (VALKEY_PORT required)\")\n",
     "        else:\n",
-    "            # Connect without SSL (Valkey uses plain TCP)\n",
+    "            # Connect with authentication\n",
     "            client = redis.Redis(\n",
     "                host=valkey_host,\n",
     "                port=int(valkey_port),\n",
+    "                password=valkey_password,\n",
     "                decode_responses=True\n",
     "            )\n",
     "            \n",
@@ -484,8 +486,7 @@
     "        print_error(\"redis library not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"Valkey connection failed: {str(e)}\")"
-   ],
-   "id": "test-valkey"
+   ]
   },
   {
    "cell_type": "code",
@@ -524,8 +525,7 @@
     "        print_error(\"qdrant-client not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"Qdrant connection failed: {str(e)}\")"
-   ],
-   "id": "test-qdrant"
+   ]
   },
   {
    "cell_type": "code",
@@ -568,8 +568,7 @@
     "        print_error(\"clickhouse-connect not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"ClickHouse connection failed: {str(e)}\")"
-   ],
-   "id": "test-clickhouse"
+   ]
   },
   {
    "cell_type": "code",
@@ -603,8 +602,7 @@
     "        print_error(\"nats-py not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"NATS connection failed: {str(e)}\")"
-   ],
-   "id": "test-nats"
+   ]
   },
   {
    "cell_type": "code",
@@ -647,8 +645,7 @@
     "        print_error(\"chromadb not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"Chroma connection failed: {str(e)}\")"
-   ],
-   "id": "test-chroma"
+   ]
   },
   {
    "cell_type": "code",
@@ -672,14 +669,16 @@
     "        if not opensearch_user or not opensearch_password:\n",
     "            print_error(\"OpenSearch not fully configured: missing USER or PASSWORD\")\n",
     "        else:\n",
-    "            client = OpenSearch(\n",
-    "                [opensearch_url],\n",
-    "                http_auth=(opensearch_user, opensearch_password),\n",
-    "                use_ssl=True,\n",
-    "                verify_certs=False\n",
-    "            )\n",
-    "            \n",
-    "            info = client.info()\n",
+    "            with warnings.catch_warnings():\n",
+    "                warnings.filterwarnings(\"ignore\", message=\".*verify_certs=False.*\")\n",
+    "                client = OpenSearch(\n",
+    "                    [opensearch_url],\n",
+    "                    http_auth=(opensearch_user, opensearch_password),\n",
+    "                    use_ssl=True,\n",
+    "                    verify_certs=False\n",
+    "                )\n",
+    "                \n",
+    "                info = client.info()\n",
     "            \n",
     "            print_success(f\"Connected to OpenSearch at {opensearch_url}\")\n",
     "            print_info(f\"Version: {info['version']['number']}\")\n",
@@ -689,8 +688,7 @@
     "        print_error(\"opensearch-py not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"OpenSearch connection failed: {str(e)}\")"
-   ],
-   "id": "test-opensearch"
+   ]
   },
   {
    "cell_type": "code",
@@ -731,8 +729,7 @@
     "        print_error(\"weaviate-client not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"Weaviate connection failed: {str(e)}\")"
-   ],
-   "id": "test-weaviate"
+   ]
   },
   {
    "cell_type": "markdown",
@@ -741,8 +738,7 @@
     "## 4. Optional ML/AI Services\n",
     "\n",
     "These services support machine learning and AI workflows."
-   ],
-   "id": "section-optional-mlai"
+   ]
   },
   {
    "cell_type": "code",
@@ -781,8 +777,7 @@
     "        print_error(\"argilla not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"Argilla connection failed: {str(e)}\")"
-   ],
-   "id": "test-argilla"
+   ]
   },
   {
    "cell_type": "code",
@@ -821,8 +816,7 @@
     "        print_error(\"cvat-sdk not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"CVAT connection failed: {str(e)}\")"
-   ],
-   "id": "test-cvat"
+   ]
   },
   {
    "cell_type": "code",
@@ -896,8 +890,7 @@
     "        print_error(\"mlflow or requests not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"MLflow connection failed: {str(e)}\")"
-   ],
-   "id": "test-mlflow"
+   ]
   },
   {
    "cell_type": "code",
@@ -939,8 +932,7 @@
     "        print_error(\"requests not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"LiteLLM connection failed: {str(e)}\")"
-   ],
-   "id": "test-litellm"
+   ]
   },
   {
    "cell_type": "code",
@@ -979,8 +971,7 @@
     "        print_error(\"langfuse not installed\")\n",
     "    except Exception as e:\n",
     "        print_error(f\"Langfuse connection failed: {str(e)}\")"
-   ],
-   "id": "test-langfuse"
+   ]
   },
   {
    "cell_type": "markdown",
@@ -990,20 +981,19 @@
     "\n",
     "**Configuration Guide:**\n",
     "\n",
-    "1. **Service Endpoints** - Automatically configured from:\n",
-    "   - `.thinkube_env` (core services in Docker image)\n",
-    "   - `.config/thinkube/service-env.sh` (optional services from service discovery)\n",
+    "1. **Service Endpoints** \u2014 Automatically configured from service discovery ConfigMaps:\n",
+    "   - `.config/thinkube/service-env-jh.sh` (generated at pod startup by init container)\n",
+    "   - Environment variables are available in all notebooks and terminals\n",
     "\n",
-    "2. **User Secrets** - Configure via thinkube-control:\n",
-    "   - Navigate to https://control.{{ domain_name }}/settings/api-secrets\n",
+    "2. **User Secrets** \u2014 Configure via thinkube-control:\n",
+    "   - Navigate to the Control Panel settings\n",
     "   - Add your API keys and tokens\n",
-    "   - Add service passwords\n",
     "   - Restart your Jupyter server to load new secrets\n",
     "\n",
     "**Troubleshooting:**\n",
     "\n",
-    "- If environment variables are missing, check that `.thinkube_env` exists in your home directory\n",
-    "- For optional services, verify they are deployed in your Kubernetes cluster\n",
+    "- If environment variables are missing, restart your Jupyter server (service discovery runs at pod startup)\n",
+    "- For optional services, verify they are deployed via the Control Panel Add-Ons page\n",
     "- For password/API key issues, verify they are configured in thinkube-control\n",
     "- Some services (MLflow) require browser authentication before API access works\n",
     "\n",
@@ -1014,16 +1004,15 @@
     "- Authentication succeeds\n",
     "- Service responds correctly to authenticated requests\n",
     "\n",
-    "This validates the complete stack: DNS → Ingress → TLS → Service → Authentication → Backend."
-   ],
-   "id": "summary"
+    "This validates the complete stack: DNS \u2192 Gateway \u2192 TLS \u2192 Service \u2192 Authentication \u2192 Backend."
+   ]
   }
  ],
  "metadata": {
   "kernelspec": {
-   "display_name": "Python 3",
+   "display_name": "agent-dev (amd64)",
    "language": "python",
-   "name": "python3"
+   "name": "agent-dev"
   },
   "language_info": {
    "codemirror_mode": {
@@ -1035,7 +1024,7 @@
    "name": "python",
    "nbconvert_exporter": "python",
    "pygments_lexer": "ipython3",
-   "version": "3.12.0"
+   "version": "3.12.3"
   }
  },
  "nbformat": 4,
