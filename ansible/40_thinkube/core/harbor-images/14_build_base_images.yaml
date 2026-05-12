@@ -569,6 +569,65 @@
       changed_when: true
       tags: [tensorrt-llm-base]
 
+    ###################################################################
+    # text-embeddings-base (TEI + Python/Gradio dependencies)
+    ###################################################################
+    - name: Template text-embeddings-base Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/text-embeddings-base.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/text-embeddings-base.Containerfile"
+      tags: [text-embeddings-base]
+
+    - name: Determine TEI base image per architecture
+      ansible.builtin.set_fact:
+        tei_base_for_arch: "{{ tei_base_for_arch | default({}) | combine({item: (harbor_registry + '/library/text-embeddings-inference:121-latest') if item == 'arm64' else (harbor_registry + '/library/text-embeddings-inference:86-latest')}) }}"
+      loop: "{{ build_architectures }}"
+      tags: [text-embeddings-base]
+
+    - name: "text-embeddings-base — build per-arch"
+      ansible.builtin.shell: |
+        podman build --platform linux/{{ item.key }} \
+                     --tls-verify=true \
+                     --build-arg BASE_IMAGE={{ tei_base_for_arch[item.key] }} \
+                     -t {{ harbor_registry }}/library/text-embeddings-base:latest-{{ item.key }} \
+                     -f {{ remote_containerfiles_dir }}/text-embeddings-base.Containerfile \
+                     {{ base_images_dir }}
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} on {{ item.value }}"
+      register: tei_build
+      changed_when: true
+      tags: [text-embeddings-base]
+
+    - name: "text-embeddings-base — push per-arch"
+      ansible.builtin.shell: |
+        podman push --tls-verify=true --creds=admin:{{ admin_password }} {{ harbor_registry }}/library/text-embeddings-base:latest-{{ item.key }}
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} on {{ item.value }}"
+      changed_when: true
+      no_log: true
+      retries: 2
+      delay: 10
+      tags: [text-embeddings-base]
+
+    - name: "text-embeddings-base — render manifest script"
+      ansible.builtin.template:
+        src: templates/create_manifest_list.sh.j2
+        dest: /tmp/text-embeddings-base-manifest.sh
+        mode: '0755'
+      vars:
+        image_name: "{{ harbor_registry }}/library/text-embeddings-base"
+        image_tags: ['latest']
+      tags: [text-embeddings-base]
+
+    - name: "text-embeddings-base — create manifest list"
+      ansible.builtin.command: /tmp/text-embeddings-base-manifest.sh
+      changed_when: true
+      tags: [text-embeddings-base]
+
     - name: Build mlflow-custom
       ansible.builtin.include_tasks:
         file: _build_native_image.yaml
