@@ -19,9 +19,10 @@
 # Usage:
 #   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s/29_rollback_workers.yaml
 #
-#   For unattended runs (skip prompts):
-#     ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s/29_rollback_workers.yaml \
-#       -e rollback_workers_confirmed=true -e reboot_workers_after_rollback=false
+# Confirmation is the orchestrator's responsibility (installer wizard,
+# thinkube-control UI, or the operator explicitly invoking the script).
+# This playbook contains no internal safety gates — invocation IS the
+# commitment.
 #
 # 🤖 [AI-assisted]
 
@@ -37,28 +38,6 @@
     drain_timeout: "300s"
 
   tasks:
-    # Safety gate: all Thinkube playbooks are designed to be orchestrated
-    # by the installer or thinkube-control, neither of which can respond
-    # to ansible pause prompts. The required-extra-var pattern asks the
-    # orchestrator (or CLI operator) to commit explicitly before the
-    # destructive flow starts; absence of the var fails fast with a
-    # message explaining how to set it.
-    - name: Assert rollback_workers_confirmed is set
-      ansible.builtin.assert:
-        that:
-          - rollback_workers_confirmed is defined
-          - rollback_workers_confirmed | bool
-        fail_msg: |
-          Worker rollback requires explicit confirmation.
-          This playbook drains and deletes the following workers and
-          wipes their local state (raw-file CSI images included):
-
-            {{ groups['k8s_workers'] | join(', ') }}
-
-          To proceed, re-run with:
-            -e rollback_workers_confirmed=true
-        success_msg: "rollback_workers_confirmed=true — proceeding."
-
     - name: Check which workers exist in the cluster
       ansible.builtin.command: "{{ kubectl_path }} get node {{ item }}"
       environment:
@@ -231,16 +210,10 @@
       failed_when: false
       changed_when: true
 
-    # =====================================================================
-    # Optional reboot
-    # =====================================================================
-    # Reboot is opt-in via extra-var. Default: no reboot. Orchestrator
-    # or operator passes -e reboot_workers_after_rollback=true to enable.
-    - name: Reboot worker
-      ansible.builtin.reboot:
-        reboot_timeout: 300
-        msg: "Rebooting to clean post-rollback state"
-      when: reboot_workers_after_rollback | default(false) | bool
+    # No automatic reboot — if the operator wants a clean kernel state
+    # after rollback, they can reboot the worker manually. Keeping the
+    # playbook side-effect-bounded to "cleanup only" makes it safe to
+    # re-run and avoids surprises in unattended orchestration.
 
   post_tasks:
     - name: Display worker cleanup summary
