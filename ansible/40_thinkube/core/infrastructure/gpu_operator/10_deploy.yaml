@@ -9,10 +9,10 @@
 #   cluster-wide helm install runs once on the control plane.
 #
 # Requirements:
-#   - Canonical Kubernetes (k8s-snap) >= 1.34
+#   - Thinkube Kubernetes Cluster (kubeadm) >= 1.34
 #   - NVIDIA-compatible GPU (Volta or newer)
 #   - No active display on nouveau (will block installation)
-#   - kubectl CLI (provided by k8s-snap)
+#   - kubectl CLI at {{ kubectl_bin }} (installed by 10_install_k8s.yaml)
 #   - Helm >= 3.7.0
 #   - jq (for JSON parsing)
 #
@@ -150,7 +150,7 @@
           [Unit]
           Description=Create NVIDIA host driver validation marker
           After=local-fs.target
-          Before=snap.k8s.kubelet.service
+          Before=kubelet.service
 
           [Service]
           Type=oneshot
@@ -361,23 +361,28 @@
           metadata:
             name: "{{ gpu_operator_namespace }}"
 
+    # Under kubeadm we use the standard containerd paths (no k8s-snap
+    # containerd-base-dir indirection). The toolkit env vars and the
+    # daemonset volumes reference /etc/containerd and /run/containerd
+    # directly. The 99-nvidia.toml drop-in lands under /etc/containerd/conf.d/
+    # which our base config.toml imports — see ansible/roles/containerd_install/.
     - name: Install GPU Operator
       ansible.builtin.shell: |
         {{ helm_bin }} upgrade --install gpu-operator nvidia/gpu-operator \
-          --version v26.3.0 \
+          --version v26.3.1 \
           --namespace {{ gpu_operator_namespace }} \
           --wait \
           --timeout 15m \
           --set driver.enabled=false \
           --set toolkit.env[0].name=CONTAINERD_CONFIG \
-          --set toolkit.env[0].value=/var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml \
+          --set toolkit.env[0].value=/etc/containerd/config.toml \
           --set toolkit.env[1].name=CONTAINERD_SOCKET \
-          --set toolkit.env[1].value=/var/lib/k8s-containerd/k8s-containerd/run/containerd/containerd.sock \
+          --set toolkit.env[1].value=/run/containerd/containerd.sock \
           --set toolkit.env[2].name=CONTAINERD_SET_AS_DEFAULT \
           --set-string toolkit.env[2].value=true \
           --set toolkit.env[3].name=RUNTIME_DROP_IN_CONFIG_HOST_PATH \
-          --set toolkit.env[3].value=/var/lib/k8s-containerd/k8s-containerd/etc/containerd/conf.d/99-nvidia.toml \
-          --set-json 'daemonsets.toolkit.volumes=[{"name":"containerd-config","hostPath":{"path":"/var/lib/k8s-containerd/k8s-containerd/etc/containerd","type":"DirectoryOrCreate"}},{"name":"containerd-drop-in-config","hostPath":{"path":"/var/lib/k8s-containerd/k8s-containerd/etc/containerd/conf.d","type":"DirectoryOrCreate"}},{"name":"containerd-socket","hostPath":{"path":"/var/lib/k8s-containerd/k8s-containerd/run/containerd"}}]'
+          --set toolkit.env[3].value=/etc/containerd/conf.d/99-nvidia.toml \
+          --set-json 'daemonsets.toolkit.volumes=[{"name":"containerd-config","hostPath":{"path":"/etc/containerd","type":"DirectoryOrCreate"}},{"name":"containerd-drop-in-config","hostPath":{"path":"/etc/containerd/conf.d","type":"DirectoryOrCreate"}},{"name":"containerd-socket","hostPath":{"path":"/run/containerd"}}]'
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: gpu_operator_install
@@ -435,15 +440,17 @@
       become: true
       when: gpu_supported | default(false) | bool
 
-    - name: Restart k8s-snap containerd to pick up nvidia runtime configuration
-      ansible.builtin.command: snap restart k8s.containerd
+    - name: Restart containerd to pick up nvidia runtime configuration
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
       become: true
       when: gpu_supported | default(false) | bool
 
-    - name: Wait for k8s-snap containerd to be ready after restart
+    - name: Wait for containerd to be ready after restart
       ansible.builtin.pause:
         seconds: 10
-        prompt: "Waiting for k8s-snap containerd to restart..."
+        prompt: "Waiting for containerd to restart..."
       when: gpu_supported | default(false) | bool
 
 # ===========================
