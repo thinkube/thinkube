@@ -514,6 +514,12 @@
             set -e
             echo '===== Cloning platform repositories ====='
 
+            # Branch to clone — propagated from the installer's
+            # THINKUBE_BRANCH env var so the in-cluster code matches
+            # what the installer used. Falls back to main.
+            CLONE_BRANCH='{{ lookup("env", "THINKUBE_BRANCH") | default("main", true) }}'
+            echo "Target branch: $CLONE_BRANCH"
+
             if [ -f /home/thinkube/.ssh/github_ed25519 ]; then
               echo 'GitHub SSH key found at /home/thinkube/.ssh/github_ed25519'
               chmod 600 /home/thinkube/.ssh/github_ed25519
@@ -525,16 +531,24 @@
               repo_full='{{ repo.full_name }}'
               mkdir -p \"/home/thinkube/thinkube-platform/\$category\"
               if [ ! -d \"/home/thinkube/thinkube-platform/\$category/\$repo_name\" ]; then
-                echo \"Cloning \$repo_full into \$category/\$repo_name...\"
+                echo \"Cloning \$repo_full into \$category/\$repo_name (branch: \$CLONE_BRANCH)...\"
                 GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
-                  git clone \"git@github.com:\$repo_full.git\" \"/home/thinkube/thinkube-platform/\$category/\$repo_name\"
+                  git clone -b \"\$CLONE_BRANCH\" \"git@github.com:\$repo_full.git\" \"/home/thinkube/thinkube-platform/\$category/\$repo_name\" 2>/dev/null \
+                  || GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
+                    git clone \"git@github.com:\$repo_full.git\" \"/home/thinkube/thinkube-platform/\$category/\$repo_name\"
               else
                 echo \"\$category/\$repo_name already exists, pulling latest changes...\"
                 cd \"/home/thinkube/thinkube-platform/\$category/\$repo_name\"
                 git reset --hard HEAD
                 if GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' git fetch origin 2>&1; then
-                  echo \"Resetting to origin/main for \$repo_name...\"
-                  git reset --hard origin/main
+                  if git rev-parse --verify \"origin/\$CLONE_BRANCH\" >/dev/null 2>&1; then
+                    echo \"Resetting to origin/\$CLONE_BRANCH for \$repo_name...\"
+                    git checkout \"\$CLONE_BRANCH\" 2>/dev/null || git checkout -b \"\$CLONE_BRANCH\" \"origin/\$CLONE_BRANCH\"
+                    git reset --hard \"origin/\$CLONE_BRANCH\"
+                  else
+                    echo \"Branch \$CLONE_BRANCH not found on origin for \$repo_name, using main...\"
+                    git reset --hard origin/main
+                  fi
                 else
                   echo \"ERROR: Failed to fetch from origin for \$repo_name\"
                   exit 1
