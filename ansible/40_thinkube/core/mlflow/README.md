@@ -131,7 +131,7 @@ Required inventory variables:
 - `auth_realm_username`: SSO user for role assignments (typically 'thinkube')
 - `kubeconfig`: Path to kubeconfig file
 - `postgres_hostname`: PostgreSQL server hostname
-- `seaweedfs_s3_hostname`: SeaweedFS S3 API hostname
+- `object_storage_s3_hostname`: SeaweedFS S3 API hostname
 - `keycloak_url`: Keycloak server URL
 - `keycloak_realm`: Keycloak realm name
 - `harbor_registry`: Harbor registry domain
@@ -234,7 +234,7 @@ kubectl get secret mlflow-s3-secret -n mlflow -o yaml
 s3cmd --config=/dev/null \
   --access_key="<access-key>" \
   --secret_key="<secret-key>" \
-  --host="https://{{ seaweedfs_s3_hostname }}" \
+  --host="https://{{ object_storage_s3_hostname }}" \
   --no-ssl-certificate-check \
   --signature-v2 \
   ls s3://mlflow/
