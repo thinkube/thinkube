@@ -142,7 +142,7 @@ The following variables are used:
 | `admin_username` | Admin username | `tkadmin` |
 | `auth_realm_username` | Realm username for SSO | `thinkube` |
 | `argo_namespace` | Kubernetes namespace | `argo` |
-| `seaweedfs_s3_hostname` | S3 API hostname | `s3.thinkube.com` |
+| `object_storage_s3_hostname` | S3 API hostname | `s3.thinkube.com` |
 | `kubeconfig` | Kubernetes config path | `/etc/kubernetes/admin.conf` |
 | `kubectl_bin` | Path to kubectl binary | `kubectl` |
 | `helm_bin` | Path to helm binary | `helm` |
