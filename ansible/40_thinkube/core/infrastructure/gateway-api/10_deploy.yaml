@@ -14,8 +14,9 @@
 #   Docker Hub dependency at deploy time (same approach as dns-server).
 #
 # Requirements:
-#   - Canonical k8s-snap installed with Cilium CNI
-#   - Cilium load balancer enabled (k8s enable load-balancer)
+#   - Thinkube Kubernetes Cluster (kubeadm) installed with Cilium CNI
+#   - Cilium L2 LoadBalancer pool configured (ZeroTier mode — done by
+#     10_install_k8s.yaml via CiliumLoadBalancerIPPool + L2AnnouncementPolicy)
 #   - acme-certificates deployed (wildcard cert in default namespace)
 #   - podman installed (handled by this playbook)
 #
@@ -47,21 +48,24 @@
     subnet_prefix: "{{ overlay_subnet_prefix if overlay_provider == 'zerotier' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
     primary_gateway_ip: "{{ subnet_prefix }}{{ primary_gateway_ip_octet }}"
 
-    eg_version: "v1.7.1"
+    eg_version: "v1.8.0"
     eg_namespace: "envoy-gateway-system"
     gateway_namespace: "gateway-system"
     gateway_name: "thinkube-gateway"
 
+    # Envoy proxy image bundled with Envoy Gateway v1.8 — see compat
+    # matrix at https://gateway.envoyproxy.io/news/releases/matrix/
     eg_images:
       - name: "docker.io/envoyproxy/gateway:{{ eg_version }}"
         file: "/tmp/envoyproxy-gateway-{{ eg_version }}.tar"
-      - name: "docker.io/envoyproxy/envoy:distroless-v1.37.1"
-        file: "/tmp/envoyproxy-envoy-distroless-v1.37.1.tar"
+      - name: "docker.io/envoyproxy/envoy:distroless-v1.38.0"
+        file: "/tmp/envoyproxy-envoy-distroless-v1.38.0.tar"
       - name: "docker.io/envoyproxy/ratelimit:c8765e89"
         file: "/tmp/envoyproxy-ratelimit-c8765e89.tar"
 
-    containerd_sock: "/var/lib/k8s-containerd/k8s-containerd/run/containerd/containerd.sock"
-    ctr_bin: "/snap/k8s/current/bin/ctr"
+    # Standard containerd paths under kubeadm (no k8s-snap indirection)
+    containerd_sock: "/run/containerd/containerd.sock"
+    ctr_bin: "/usr/bin/ctr"
 
     tcp_services:
       - name: postgres
@@ -92,27 +96,7 @@
 
   tasks:
     ###########################################################################
-    # Step 1: Disable k8s-snap gateway feature (Cilium Gateway API controller)
-    # This leaves Cilium running as CNI only. Envoy Gateway replaces it for
-    # all Gateway API functionality.
-    ###########################################################################
-    - name: Check if k8s-snap gateway feature is enabled
-      ansible.builtin.shell: |
-        sudo k8s status --output-format yaml 2>/dev/null | grep -A2 "^gateway:" | grep -q "enabled" && echo "enabled" || echo "disabled"
-      register: k8s_gateway_status
-      changed_when: false
-      failed_when: false
-
-    - name: Disable k8s-snap gateway feature (Cilium Gateway controller)
-      ansible.builtin.shell: |
-        sudo k8s set gateway.enabled=false
-      become: true
-      register: k8s_gateway_disable
-      changed_when: k8s_gateway_status.stdout == "enabled"
-      when: k8s_gateway_status.stdout == "enabled"
-
-    ###########################################################################
-    # Step 2: Pull Envoy Gateway images with podman, import into containerd
+    # Step 1: Pull Envoy Gateway images with podman, import into containerd
     # Same pattern as dns-server (BIND9): podman pull → tar → ctr import
     ###########################################################################
     - name: Install podman
@@ -172,9 +156,11 @@
       when: item.stdout == ""
 
     ###########################################################################
-    # Step 3: Install experimental Gateway API CRDs (TCPRoute, UDPRoute)
-    # EG v1.7.1 uses Gateway API v1.4.1 standard channel.
-    # TCPRoute is still in experimental channel — install separately.
+    # Step 2: Install experimental Gateway API CRDs (TCPRoute, UDPRoute)
+    # Envoy Gateway v1.8 requires Gateway API v1.5.1 (per the EG
+    # compatibility matrix). TCPRoute is in the experimental channel —
+    # we install the experimental-install.yaml bundle which contains
+    # standard + experimental CRDs.
     ###########################################################################
     - name: Check if TCPRoute CRD exists
       ansible.builtin.shell: |
@@ -185,9 +171,9 @@
       changed_when: false
       failed_when: false
 
-    - name: Install experimental Gateway API CRDs (TCPRoute)
+    - name: Install experimental Gateway API CRDs (v1.5.1, required by EG 1.8)
       ansible.builtin.shell: |
-        {{ kubectl_bin }} apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/experimental-install.yaml
+        {{ kubectl_bin }} apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       when: tcproute_crd_check.stdout == "absent"
@@ -201,7 +187,7 @@
       changed_when: false
 
     ###########################################################################
-    # Step 4: Download and install Envoy Gateway via Helm
+    # Step 3: Download and install Envoy Gateway via Helm
     ###########################################################################
     - name: Check if Envoy Gateway is already installed
       ansible.builtin.shell: |
@@ -251,7 +237,7 @@
       changed_when: false
 
     ###########################################################################
-    # Step 5: Create EnvoyProxy resource
+    # Step 4: Create EnvoyProxy resource
     ###########################################################################
     # In Tailscale mode the operator exposes the Envoy Gateway Service on
     # the tailnet. We use `spec.loadBalancerClass: tailscale` (NOT the
@@ -323,7 +309,7 @@
           changed_when: true
 
     ###########################################################################
-    # Step 6: Create GatewayClass pointing to Envoy Gateway
+    # Step 5: Create GatewayClass pointing to Envoy Gateway
     ###########################################################################
     - name: Create GatewayClass for Envoy Gateway
       kubernetes.core.k8s:
@@ -355,7 +341,7 @@
       changed_when: false
 
     ###########################################################################
-    # Step 7: Create gateway-system namespace and copy TLS certificates
+    # Step 6: Create gateway-system namespace and copy TLS certificates
     ###########################################################################
     - name: Create gateway-system namespace and apply resource policies
       ansible.builtin.include_role:
@@ -393,7 +379,7 @@
             tls.key: "{{ wildcard_cert_data.data['tls.key'] }}"
 
     ###########################################################################
-    # Step 8: Create main Gateway (HTTP + HTTPS + TLS passthrough + TCP ports)
+    # Step 7: Create main Gateway (HTTP + HTTPS + TLS passthrough + TCP ports)
     ###########################################################################
     - name: Build base Gateway spec (listeners only)
       ansible.builtin.set_fact:
@@ -476,7 +462,7 @@
           spec: "{{ gateway_spec }}"
 
     ###########################################################################
-    # Step 9: HTTP → HTTPS redirect route
+    # Step 8: HTTP → HTTPS redirect route
     ###########################################################################
     - name: Create HTTP to HTTPS redirect route
       kubernetes.core.k8s:
@@ -501,7 +487,7 @@
                       statusCode: 301
 
     ###########################################################################
-    # Step 11: Ensure backend namespaces exist and create ReferenceGrants
+    # Step 9: Ensure backend namespaces exist and create ReferenceGrants
     ###########################################################################
     - name: Ensure backend namespaces exist for TCP services
       kubernetes.core.k8s:
@@ -539,7 +525,7 @@
         label: "{{ item.backend_namespace }}"
 
     ###########################################################################
-    # Step 12: Create TCPRoutes (referencing thinkube-gateway)
+    # Step 10: Create TCPRoutes (referencing thinkube-gateway)
     ###########################################################################
     # The TCPRoute CRD requires backendRefs[].port to be an integer.
     # Going through kubernetes.core.k8s with `port: "{{ x | int }}"` was
@@ -576,7 +562,7 @@
         label: "{{ item.name }}"
 
     ###########################################################################
-    # Step 13: Wait for Gateways to receive IP addresses
+    # Step 11: Wait for Gateways to receive IP addresses
     ###########################################################################
     # ZeroTier mode pre-pins primary_gateway_ip via Cilium L2 LB, so we
     # wait for the Gateway to come up with that exact address. Tailscale
@@ -598,7 +584,7 @@
       changed_when: false
 
     ###########################################################################
-    # Step 14: Display summary
+    # Step 12: Display summary
     ###########################################################################
     - name: Display Gateway deployment summary
       ansible.builtin.debug:
