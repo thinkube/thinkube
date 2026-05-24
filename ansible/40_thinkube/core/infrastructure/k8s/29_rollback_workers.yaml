@@ -37,30 +37,27 @@
     drain_timeout: "300s"
 
   tasks:
-    - name: Confirm worker removal (interactive runs only)
-      ansible.builtin.pause:
-        prompt: |
-          !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-          WARNING: This will remove the following worker nodes from
-          the Thinkube Kubernetes Cluster and wipe their local state:
+    # Safety gate: all Thinkube playbooks are designed to be orchestrated
+    # by the installer or thinkube-control, neither of which can respond
+    # to ansible pause prompts. The required-extra-var pattern asks the
+    # orchestrator (or CLI operator) to commit explicitly before the
+    # destructive flow starts; absence of the var fails fast with a
+    # message explaining how to set it.
+    - name: Assert rollback_workers_confirmed is set
+      ansible.builtin.assert:
+        that:
+          - rollback_workers_confirmed is defined
+          - rollback_workers_confirmed | bool
+        fail_msg: |
+          Worker rollback requires explicit confirmation.
+          This playbook drains and deletes the following workers and
+          wipes their local state (raw-file CSI images included):
 
-          {{ groups['k8s_workers'] | join('\n  ') }}
+            {{ groups['k8s_workers'] | join(', ') }}
 
-          Pods on these workers will be evicted; local data on the
-          workers (raw-file CSI images, kubelet pod volumes) will be
-          deleted.
-
-          Type 'yes' to continue.
-          !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-      register: _rollback_confirm
-      when: rollback_workers_confirmed is not defined
-
-    - name: Verify confirmation
-      ansible.builtin.fail:
-        msg: "Worker rollback cancelled by user"
-      when:
-        - rollback_workers_confirmed is not defined
-        - _rollback_confirm.user_input | lower != 'yes'
+          To proceed, re-run with:
+            -e rollback_workers_confirmed=true
+        success_msg: "rollback_workers_confirmed=true — proceeding."
 
     - name: Check which workers exist in the cluster
       ansible.builtin.command: "{{ kubectl_path }} get node {{ item }}"
@@ -237,19 +234,13 @@
     # =====================================================================
     # Optional reboot
     # =====================================================================
-    - name: Decide whether to reboot
-      ansible.builtin.pause:
-        prompt: "Reboot worker {{ inventory_hostname }} to ensure clean state? (yes/no, default: no)"
-      register: _reboot_confirm
-      when: reboot_workers_after_rollback is not defined
-
+    # Reboot is opt-in via extra-var. Default: no reboot. Orchestrator
+    # or operator passes -e reboot_workers_after_rollback=true to enable.
     - name: Reboot worker
       ansible.builtin.reboot:
         reboot_timeout: 300
         msg: "Rebooting to clean post-rollback state"
-      when:
-        - reboot_workers_after_rollback is defined
-        - reboot_workers_after_rollback | bool
+      when: reboot_workers_after_rollback | default(false) | bool
 
   post_tasks:
     - name: Display worker cleanup summary
