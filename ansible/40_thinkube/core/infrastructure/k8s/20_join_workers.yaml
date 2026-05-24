@@ -2,71 +2,89 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-# ansible/40_thinkube/core/infrastructure/k8s-snap/20_join_workers.yaml
-# Description:
-#   Joins worker nodes to the k8s-snap cluster
+# ansible/40_thinkube/core/infrastructure/k8s/20_join_workers.yaml
+#
+# Joins worker nodes to the kubeadm-managed Thinkube Kubernetes Cluster.
+#
+# Workflow per worker:
+#   1. UFW rules
+#   2. containerd.io + kubeadm/kubelet/kubectl via the same roles the
+#      control plane used (kubeadm_install + containerd_install)
+#   3. Token + CA hash issued by the control plane (delegate_to)
+#   4. JoinConfiguration rendered locally; `kubeadm join --config` runs
+#   5. Wait for node to be Ready, with a Cilium-on-new-node self-heal
+#      fallback (kept verbatim from the k8s-snap era — the bug is in
+#      Cilium's init container, not in k8s-snap, so the fix carries over)
+#   6. Cilium IPAM wait + restart pods with stale CIDR-conflict IPs
+#
+# After all workers join, two follow-up plays:
+#   - Control plane: pin CoreDNS to control plane node; wait for all
+#     nodes Ready
+#   - Localhost: append worker hosts to the user's ~/.ssh/config so
+#     code-server can reach them
 #
 # Requirements:
-#   - Ubuntu 24.04 LTS on worker nodes
-#   - 16 cores minimum per worker
-#   - 64GB RAM minimum per worker
-#   - 1TB disk minimum per worker
-#   - Control plane node must be running and accessible
-#   - UFW firewall enabled on workers
-#
-# Usage:
-#   cd ~/thinkube
-#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s-snap/20_join_workers.yaml
+#   - Ubuntu 24.04 LTS, 16 cores, 64 GB RAM, 1 TB disk per worker
+#   - Control plane already initialised by 10_install_k8s.yaml
+#   - UFW enabled on the worker
 #
 # Variables from inventory:
-#   - system_username:        User to configure kubectl/helm wrappers for
-#   - overlay_provider:       'zerotier' or 'tailscale' (selects firewall branch)
-#   - overlay_subnet_prefix:  ZeroTier network subnet prefix (ZeroTier mode only)
+#   - system_username:        User to install kubectl/helm for
+#   - overlay_provider:       'zerotier' or 'tailscale'
+#   - overlay_subnet_prefix:  ZeroTier subnet prefix (ZeroTier mode only)
+#   - control_plane_host:     Hostname of the control plane in inventory
+#
+# Pinned versions are role-default values reflecting the
+# v1.35.5+thinkube.0.1.0 release manifest. Phase 4 of the kubeadm
+# migration will resolve them from thinkube-metadata at install time.
 #
 # 🤖 [AI-assisted]
 
-- name: Prepare Worker Nodes
+- name: Join Worker Nodes to Thinkube Kubernetes Cluster
   hosts: k8s_workers
   gather_facts: true
 
   vars:
-    k8s_channel: "1.35-classic/stable"
-    k8s_snap_revisions:
-      amd64: "5046"
-      arm64: "5049"
     user: "{{ system_username }}"
     user_home: "/home/{{ user }}"
     kubectl_wrapper_path: "{{ user_home }}/.local/bin/kubectl"
     helm_wrapper_path: "{{ user_home }}/.local/bin/helm"
 
+    # Stable API endpoint on the control plane (same value as in
+    # 10_install_k8s.yaml; not derived because the worker doesn't
+    # configure its own dummy interface).
+    k8s_stable_ip: "172.16.0.1"
+
+    # Version pins — release-manifest values for v1.35.5+thinkube.0.1.0
+    kubeadm_k8s_minor: "1.35"
+    kubeadm_k8s_patch: "1.35.5"
+    kubeadm_k8s_apt_revision: "1.1"
+    containerd_apt_version: "2.2.4-1"
+    helm_install_version: "v3.16.4"
+
   pre_tasks:
     - name: Verify required variables exist
       ansible.builtin.fail:
         msg: "Required variable {{ item }} is not defined"
-      when: lookup('ansible.builtin.vars', item, default='__undefined__') == '__undefined__'
+      when: vars[item] is not defined
       loop:
         - system_username
         - overlay_provider
+        - control_plane_host
 
     - name: Verify ZeroTier-specific variables exist (ZeroTier mode only)
       ansible.builtin.fail:
         msg: "Required variable {{ item }} is not defined (required when overlay_provider is 'zerotier')"
       when:
         - overlay_provider == 'zerotier'
-        - lookup('ansible.builtin.vars', item, default='__undefined__') == '__undefined__'
+        - vars[item] is not defined
       loop:
         - overlay_subnet_prefix
 
   tasks:
-    # Note: Docker is left running on workers for the same reason as on the
-    # control plane (DGX Spark ships with Docker; users may need it for
-    # other DGX capabilities). k8s-snap uses a custom containerd-base-dir
-    # (/var/lib/k8s-containerd) — see the join config below — so the two
-    # don't conflict.
-
-    # ===========================
-    # UFW Firewall Configuration
-    # ===========================
+    # =====================================================================
+    # UFW firewall configuration (worker scope — no etcd / scheduler ports)
+    # =====================================================================
     - name: Ensure UFW is installed
       ansible.builtin.apt:
         name: ufw
@@ -129,17 +147,15 @@
         direction: out
       become: true
 
-    # Overlay-network firewall rules. Tailscale's installer (see
-    # 06_install_tailscale.yaml) already opens UDP/41641 and trusts the
-    # tailscale0 interface, so we don't repeat them here. ZeroTier needs
-    # explicit allow rules for the interface family and an SSH-from-overlay
-    # rule keyed on the subnet.
-    - name: Allow all traffic on ZeroTier interfaces (overlay networking)
+    # Overlay rules: Tailscale's installer trusts tailscale0 + opens
+    # UDP/41641 itself. ZeroTier needs explicit allow rules for zt+ and
+    # an SSH-from-overlay rule keyed on the subnet.
+    - name: Allow all traffic on ZeroTier interfaces
       community.general.ufw:
         rule: allow
         interface: "zt+"
         direction: in
-        comment: 'ZeroTier overlay network'
+        comment: 'ZeroTier overlay'
       become: true
       when: overlay_provider == 'zerotier'
 
@@ -148,7 +164,7 @@
         rule: allow
         interface: "zt+"
         direction: out
-        comment: 'ZeroTier overlay network'
+        comment: 'ZeroTier overlay'
       become: true
       when: overlay_provider == 'zerotier'
 
@@ -158,7 +174,7 @@
         src: "{{ overlay_subnet_prefix }}0/24"
         port: '22'
         proto: tcp
-        comment: 'SSH from ZeroTier overlay'
+        comment: 'SSH from ZeroTier'
       become: true
       when: overlay_provider == 'zerotier'
 
@@ -167,76 +183,30 @@
         state: enabled
       become: true
 
-    - name: Reload UFW to apply forward policy
-      ansible.builtin.command: ufw reload
-      changed_when: true
-      when: ufw_forward_policy_changed | default(false)
-      become: true
+    # =====================================================================
+    # containerd + kubeadm/kubelet/kubectl install (via roles)
+    # =====================================================================
+    - name: Install containerd.io with Thinkube config
+      ansible.builtin.import_role:
+        name: containerd_install
+      vars:
+        containerd_apt_version: "{{ containerd_apt_version }}"
 
-    # ===========================
-    # k8s-snap Installation
-    # ===========================
-    # Detect whether k8s-snap is actually usable. `snap list k8s` returns 0
-    # even for a broken/disabled snap (e.g. left behind by a failed
-    # `snap remove --purge`), but the `k8s` binary may not exist. Test for
-    # the binary itself.
-    - name: Check if k8s-snap is already installed
-      ansible.builtin.stat:
-        path: /snap/bin/k8s
-      register: k8s_binary
-      become: true
+    - name: Install kubeadm + kubelet + kubectl
+      ansible.builtin.import_role:
+        name: kubeadm_install
+      vars:
+        kubeadm_k8s_minor: "{{ kubeadm_k8s_minor }}"
+        kubeadm_k8s_patch: "{{ kubeadm_k8s_patch }}"
+        kubeadm_k8s_apt_revision: "{{ kubeadm_k8s_apt_revision }}"
 
-    # Before purging a broken snap, stop kubelet and unmount any lingering
-    # CSI/kubelet mounts. Otherwise `snap remove --purge` fails with
-    # "device or resource busy" on rawfile-csi globalmount mounts.
-    - name: Stop kubelet to release CSI mounts (broken snap cleanup)
-      ansible.builtin.systemd:
-        name: snap.k8s.kubelet.service
-        state: stopped
-      when: not k8s_binary.stat.exists
-      failed_when: false
-      become: true
-
-    - name: Find lingering kubelet/CSI mounts (broken snap cleanup)
-      ansible.builtin.shell: |
-        grep -E '/var/snap/k8s/common/var/lib/kubelet[^ ]*' /proc/mounts | awk '{print $2}' | sort -r
-      register: stale_kubelet_mounts_purge
-      when: not k8s_binary.stat.exists
-      changed_when: false
-      failed_when: false
-      become: true
-
-    - name: Unmount lingering kubelet/CSI mounts (broken snap cleanup)
-      ansible.builtin.command: "umount {{ item }}"
-      loop: "{{ stale_kubelet_mounts_purge.stdout_lines | default([]) }}"
-      when: not k8s_binary.stat.exists
-      failed_when: false
-      changed_when: true
-      become: true
-
-    - name: Purge broken k8s-snap before reinstall
-      ansible.builtin.command: snap remove k8s --purge
-      when: not k8s_binary.stat.exists
-      failed_when: false
-      changed_when: true
-      become: true
-
-    - name: Install k8s-snap on workers (pinned revision)
-      ansible.builtin.command: snap install k8s --classic --revision={{ k8s_snap_revisions[ansible_facts['architecture'] | regex_replace('x86_64', 'amd64') | regex_replace('aarch64', 'arm64')] }}
-      when: not k8s_binary.stat.exists
-      register: snap_install_result
-      changed_when: "'installed' in snap_install_result.stdout"
-      become: true
-
-    - name: Hold k8s snap to prevent auto-updates
-      ansible.builtin.command: snap refresh --hold k8s
-      changed_when: true
-      when: not k8s_binary.stat.exists
-      become: true
-
-    # ===========================
-    # kubectl and helm Wrapper Scripts
-    # ===========================
+    # =====================================================================
+    # Install vanilla upstream kubectl + helm to ~/.local/bin
+    # =====================================================================
+    # No kubeconfig is created on workers — operators wanting to drive
+    # the cluster should SSH to the control plane. kubectl is still
+    # installed so playbooks that templatize kubectl_bin on worker hosts
+    # don't break (they typically delegate_to the control plane anyway).
     - name: Create .local/bin directory for user
       ansible.builtin.file:
         path: "{{ user_home }}/.local/bin"
@@ -244,544 +214,258 @@
         owner: "{{ user }}"
         group: "{{ user }}"
         mode: '0755'
-      become: true
       become_user: "{{ user }}"
 
-    - name: Create kubectl wrapper script
-      ansible.builtin.copy:
-        content: |
-          #!/bin/bash
-          # kubectl wrapper for k8s-snap
-          exec sudo k8s kubectl "$@"
+    - name: Detect system architecture
+      ansible.builtin.set_fact:
+        system_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+
+    - name: Download kubectl binary
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/release/v{{ kubeadm_k8s_patch }}/bin/linux/{{ system_arch }}/kubectl"
         dest: "{{ kubectl_wrapper_path }}"
+        mode: '0755'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+      become_user: "{{ user }}"
+      register: _kubectl_download
+      retries: 5
+      delay: 10
+      until: _kubectl_download is succeeded
+
+    - name: Download helm installer
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3"
+        dest: "/tmp/get-helm-3.sh"
+        mode: '0755'
+        force: true
+      become: true
+
+    - name: Install helm binary
+      ansible.builtin.shell: |
+        export HELM_INSTALL_DIR="{{ user_home }}/.local/bin"
+        export USE_SUDO=false
+        export DESIRED_VERSION="{{ helm_install_version }}"
+        /tmp/get-helm-3.sh
+      args:
+        creates: "{{ helm_wrapper_path }}"
+      environment:
+        PATH: "{{ user_home }}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      become_user: "{{ user }}"
+      register: _helm_install
+      retries: 5
+      delay: 10
+      until: _helm_install.rc == 0
+
+    - name: Set helm binary ownership
+      ansible.builtin.file:
+        path: "{{ helm_wrapper_path }}"
         owner: "{{ user }}"
         group: "{{ user }}"
         mode: '0755'
       become: true
-      become_user: "{{ user }}"
 
-    - name: Create helm wrapper script
-      ansible.builtin.copy:
-        content: |
-          #!/bin/bash
-          # helm wrapper for k8s-snap
-          exec sudo k8s helm "$@"
-        dest: "{{ helm_wrapper_path }}"
-        owner: "{{ user }}"
-        group: "{{ user }}"
-        mode: '0755'
-      become: true
-      become_user: "{{ user }}"
-
-    # ===========================
-    # Thinkube Shared Shell Alias System Integration
-    # ===========================
-    - name: Check if thinkube_shared_shell directory exists
-      ansible.builtin.stat:
-        path: "{{ user_home }}/.thinkube_shared_shell"
-      register: shared_shell_dir
-
-    - name: Integrate kubectl aliases into thinkube_shared_shell
-      when: shared_shell_dir.stat.exists
-      block:
-        - name: Ensure aliases directory exists
-          ansible.builtin.file:
-            path: "{{ user_home }}/.thinkube_shared_shell/aliases"
-            state: directory
-            owner: "{{ user }}"
-            group: "{{ user }}"
-            mode: '0755'
-
-        - name: Create kubectl aliases JSON file
-          ansible.builtin.copy:
-            content: |
-              {
-                "k": "kubectl",
-                "kg": "kubectl get",
-                "kd": "kubectl describe",
-                "kdel": "kubectl delete",
-                "kl": "kubectl logs",
-                "ke": "kubectl edit",
-                "kex": "kubectl exec -it",
-                "kgp": "kubectl get pods",
-                "kgn": "kubectl get nodes",
-                "kgs": "kubectl get svc",
-                "kgd": "kubectl get deployments",
-                "kga": "kubectl get all",
-                "kgpa": "kubectl get pods -A",
-                "kgna": "kubectl get nodes -o wide",
-                "kaf": "kubectl apply -f",
-                "kdf": "kubectl delete -f"
-              }
-            dest: "{{ user_home }}/.thinkube_shared_shell/aliases/kubectl_aliases.json"
-            owner: "{{ user }}"
-            group: "{{ user }}"
-            mode: '0644'
-
-        - name: Create helm aliases JSON file
-          ansible.builtin.copy:
-            content: |
-              {
-                "h": "helm",
-                "hl": "helm list",
-                "hla": "helm list -A",
-                "hi": "helm install",
-                "hu": "helm upgrade",
-                "hd": "helm delete",
-                "hs": "helm status",
-                "hh": "helm history"
-              }
-            dest: "{{ user_home }}/.thinkube_shared_shell/aliases/helm_aliases.json"
-            owner: "{{ user }}"
-            group: "{{ user }}"
-            mode: '0644'
-
-        - name: Create k8s aliases shell script for bash/zsh
-          ansible.builtin.copy:
-            content: |
-              #!/bin/bash
-              # k8s-snap kubectl and helm aliases for bash/zsh
-              # Source this file in your shell rc file
-
-              # kubectl aliases
-              alias k='kubectl'
-              alias kg='kubectl get'
-              alias kd='kubectl describe'
-              alias kdel='kubectl delete'
-              alias kl='kubectl logs'
-              alias ke='kubectl edit'
-              alias kex='kubectl exec -it'
-              alias kgp='kubectl get pods'
-              alias kgn='kubectl get nodes'
-              alias kgs='kubectl get svc'
-              alias kgd='kubectl get deployments'
-              alias kga='kubectl get all'
-              alias kgpa='kubectl get pods -A'
-              alias kgna='kubectl get nodes -o wide'
-              alias kaf='kubectl apply -f'
-              alias kdf='kubectl delete -f'
-
-              # helm aliases
-              alias h='helm'
-              alias hl='helm list'
-              alias hla='helm list -A'
-              alias hi='helm install'
-              alias hu='helm upgrade'
-              alias hd='helm delete'
-              alias hs='helm status'
-              alias hh='helm history'
-            dest: "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh"
-            owner: "{{ user }}"
-            group: "{{ user }}"
-            mode: '0644'
-
-        - name: Create k8s aliases for fish shell
-          ansible.builtin.copy:
-            content: |
-              # k8s-snap kubectl and helm aliases for fish
-              # Source this file in your fish config
-
-              # kubectl aliases
-              abbr -a k kubectl
-              abbr -a kg kubectl get
-              abbr -a kd kubectl describe
-              abbr -a kdel kubectl delete
-              abbr -a kl kubectl logs
-              abbr -a ke kubectl edit
-              abbr -a kex kubectl exec -it
-              abbr -a kgp kubectl get pods
-              abbr -a kgn kubectl get nodes
-              abbr -a kgs kubectl get svc
-              abbr -a kgd kubectl get deployments
-              abbr -a kga kubectl get all
-              abbr -a kgpa kubectl get pods -A
-              abbr -a kgna kubectl get nodes -o wide
-              abbr -a kaf kubectl apply -f
-              abbr -a kdf kubectl delete -f
-
-              # helm aliases
-              abbr -a h helm
-              abbr -a hl helm list
-              abbr -a hla helm list -A
-              abbr -a hi helm install
-              abbr -a hu helm upgrade
-              abbr -a hd helm delete
-              abbr -a hs helm status
-              abbr -a hh helm history
-            dest: "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.fish"
-            owner: "{{ user }}"
-            group: "{{ user }}"
-            mode: '0644'
-
-  handlers:
-    - name: reload_ufw
-      ansible.builtin.command: ufw reload
-      listen: reload_ufw
-      changed_when: true
-      become: true
-
-- name: Join Workers to Cluster
-  hosts: k8s_workers
-  gather_facts: true
-  serial: 1  # Join workers one at a time to avoid race conditions
-
-  vars:
-    control_plane_host: "{{ groups['k8s_control_plane'][0] }}"
-    k8s_stable_ip: "172.16.0.1"
-    k8s_snap_revisions:
-      amd64: "5046"
-      arm64: "5049"
-
-  tasks:
-    # ===========================
-    # Route to Control Plane Stable IP
-    # ===========================
-    - name: Get control plane ZeroTier IP
-      ansible.builtin.set_fact:
-        control_plane_zt_ip: "{{ hostvars[control_plane_host]['ansible_host'] }}"
-
-    - name: Check if route to k8s stable IP exists
-      ansible.builtin.command: ip route show {{ k8s_stable_ip }}/32
-      register: route_check
+    # =====================================================================
+    # Check whether this worker is already in the cluster
+    # =====================================================================
+    - name: Check if this worker is already joined to the cluster
+      ansible.builtin.command: >
+        {{ control_plane_kubectl }} get node {{ inventory_hostname }}
+      delegate_to: "{{ control_plane_host }}"
+      vars:
+        control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+      environment:
+        KUBECONFIG: "/home/{{ system_username }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _node_exists
       failed_when: false
       changed_when: false
-      become: true
 
-    - name: Add route to k8s stable IP via control plane ZeroTier
-      ansible.builtin.command: ip route add {{ k8s_stable_ip }}/32 via {{ control_plane_zt_ip }}
-      when: k8s_stable_ip not in (route_check.stdout | default(''))
-      become: true
-
-    - name: Create persistent route via systemd service
-      ansible.builtin.copy:
-        content: |
-          [Unit]
-          Description=Route to k8s control plane via ZeroTier
-          After=zerotier-one.service network-online.target
-          Wants=zerotier-one.service
-
-          [Service]
-          Type=oneshot
-          RemainAfterExit=yes
-          ExecStartPre=/bin/sleep 5
-          ExecStart=/sbin/ip route replace {{ k8s_stable_ip }}/32 via {{ control_plane_zt_ip }}
-
-          [Install]
-          WantedBy=multi-user.target
-        dest: /etc/systemd/system/k8s-control-plane-route.service
-        mode: '0644'
-      when: k8s_stable_ip not in (route_check.stdout | default(''))
-      become: true
-
-    - name: Enable k8s control plane route service
-      ansible.builtin.systemd:
-        name: k8s-control-plane-route
-        enabled: true
-        daemon_reload: true
-      when: k8s_stable_ip not in (route_check.stdout | default(''))
-      become: true
-
-    # ===========================
-    # Check if Already Joined
-    # ===========================
-    - name: Check if worker is already part of cluster
-      ansible.builtin.command: k8s status
-      register: worker_k8s_status
-      failed_when: false
-      changed_when: false
-      become: true
-
-    - name: Check local k8s state
+    - name: Set already_joined fact
       ansible.builtin.set_fact:
-        has_local_k8s_state: >-
-          {{
-            ('cluster status:' in worker_k8s_status.stdout and 'ready' in worker_k8s_status.stdout)
-            or
-            ('restricted on workers' in (worker_k8s_status.stderr | default('')))
-            or
-            ('already part of a cluster' in (worker_k8s_status.stderr | default('')))
-          }}
+        already_joined: "{{ _node_exists.rc == 0 }}"
 
-    - name: Check if node exists in control plane
-      ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }} --no-headers
+    # =====================================================================
+    # Generate join token + discovery CA hash on the control plane
+    # =====================================================================
+    - name: Generate kubeadm join command on control plane
+      ansible.builtin.command: kubeadm token create --print-join-command --ttl 1h
       delegate_to: "{{ control_plane_host }}"
       become: true
-      register: node_in_cluster
-      failed_when: false
+      register: _join_cmd
       changed_when: false
-      when: has_local_k8s_state | bool
+      when: not already_joined
 
-    - name: Determine join status
+    - name: Extract join token from kubeadm output
       ansible.builtin.set_fact:
-        already_joined: "{{ has_local_k8s_state | bool and node_in_cluster.rc | default(1) == 0 }}"
-        needs_reset: "{{ has_local_k8s_state | bool and node_in_cluster.rc | default(1) != 0 }}"
-
-    - name: Display skip message if already joined
-      ansible.builtin.debug:
-        msg: "Worker {{ inventory_hostname }} is already part of the cluster, skipping join"
-      when: already_joined | bool
-
-    - name: Reset stale k8s state (node removed from cluster but local state remains)
-      when: needs_reset | bool
-      become: true
-      block:
-        - name: Display reset message
-          ansible.builtin.debug:
-            msg: "Worker {{ inventory_hostname }} has stale k8s state (not in cluster but local state exists). Resetting..."
-
-        # Stop kubelet and unmount any lingering CSI pod volumes before
-        # removing the snap. Otherwise `snap remove k8s --purge` fails with
-        # "device or resource busy" on rawfile-csi globalmount mounts.
-        - name: Stop kubelet to release CSI mounts
-          ansible.builtin.systemd:
-            name: snap.k8s.kubelet.service
-            state: stopped
-          failed_when: false
-
-        - name: Find lingering kubelet/CSI mounts
-          ansible.builtin.shell: |
-            grep -E '/var/snap/k8s/common/var/lib/kubelet[^ ]*' /proc/mounts | awk '{print $2}' | sort -r
-          register: stale_kubelet_mounts
-          changed_when: false
-          failed_when: false
-
-        - name: Unmount lingering kubelet/CSI mounts
-          ansible.builtin.command: "umount {{ item }}"
-          loop: "{{ stale_kubelet_mounts.stdout_lines | default([]) }}"
-          failed_when: false
-          changed_when: true
-
-        - name: Remove k8s snap to reset state
-          ansible.builtin.command: snap remove k8s --purge
-          changed_when: true
-
-        - name: Reinstall k8s snap with pinned revision
-          ansible.builtin.command: >
-            snap install k8s --classic
-            --revision={{ k8s_snap_revisions[ansible_facts['architecture'] | regex_replace('x86_64', 'amd64') | regex_replace('aarch64', 'arm64')] }}
-          changed_when: true
-
-        - name: Hold k8s snap version
-          ansible.builtin.command: snap refresh --hold k8s
-          changed_when: true
-
-    # ===========================
-    # Generate and Use Join Token
-    # ===========================
-    - name: Generate join token from control plane
-      ansible.builtin.command: k8s get-join-token {{ inventory_hostname }} --worker
-      delegate_to: "{{ control_plane_host }}"
-      become: true
-      register: join_token_output
-      changed_when: false
-      when: not (already_joined | bool)
-
-    - name: Extract join token
-      ansible.builtin.set_fact:
-        join_token: "{{ join_token_output.stdout | trim }}"
+        join_token: "{{ _join_cmd.stdout | regex_search('--token\\s+(\\S+)', '\\1') | first }}"
+        join_ca_cert_hash: "{{ _join_cmd.stdout | regex_search('--discovery-token-ca-cert-hash\\s+(\\S+)', '\\1') | first }}"
       when:
-        - not (already_joined | bool)
-        - join_token_output is defined
-        - join_token_output.stdout is defined
+        - not already_joined
+        - _join_cmd is defined
+        - _join_cmd.stdout is defined
 
     - name: Display join token (masked)
       ansible.builtin.debug:
-        msg: "Join token generated for {{ inventory_hostname }}: {{ join_token[:20] }}...{{ join_token[-20:] }}"
+        msg: "Join token issued for {{ inventory_hostname }}: {{ join_token[:8] }}...{{ join_token[-4:] }}"
       when:
-        - not (already_joined | bool)
+        - not already_joined
         - join_token is defined
 
-    - name: Create k8s join configuration
-      ansible.builtin.copy:
-        content: |
-          containerd-base-dir: /var/lib/k8s-containerd
-          extra-node-kubelet-args:
-            --system-reserved: "memory=4Gi,cpu=500m"
-            --kube-reserved: "memory=2Gi,cpu=500m"
-            --eviction-hard: "memory.available<2Gi,nodefs.available<10%"
-            --eviction-soft: "memory.available<4Gi,nodefs.available<15%"
-            --eviction-soft-grace-period: "memory.available=30s,nodefs.available=1m"
-            --enforce-node-allocatable: "pods"
-        dest: /tmp/k8s-join-config.yaml
-        mode: '0644'
+    # =====================================================================
+    # kubeadm join
+    # =====================================================================
+    - name: Render kubeadm join configuration
+      ansible.builtin.template:
+        src: kubeadm-join-config.yaml.j2
+        dest: /tmp/kubeadm-join.yaml
+        mode: '0600'
       become: true
       when:
-        - not (already_joined | bool)
+        - not already_joined
         - join_token is defined
 
-    - name: Join worker to cluster
-      ansible.builtin.command: k8s join-cluster {{ join_token }} --file /tmp/k8s-join-config.yaml
-      register: join_result
-      changed_when: "'joined' in join_result.stdout.lower() or join_result.rc == 0"
-      failed_when:
-        - join_result.rc != 0
-        - "'already part of a cluster' not in join_result.stderr"
-        - "'already a member' not in join_result.stderr"
-      when:
-        - not (already_joined | bool)
-        - join_token is defined
+    - name: Run kubeadm join
+      ansible.builtin.command: kubeadm join --config /tmp/kubeadm-join.yaml
       become: true
+      when:
+        - not already_joined
+        - join_token is defined
+      register: _join_result
+      changed_when: _join_result.rc == 0
 
-    - name: Clean up join configuration
+    - name: Remove ephemeral join configuration (contains token)
       ansible.builtin.file:
-        path: /tmp/k8s-join-config.yaml
+        path: /tmp/kubeadm-join.yaml
         state: absent
       become: true
 
-    - name: Create containerd config directory
-      ansible.builtin.file:
-        path: /etc/containerd/conf.d
-        state: directory
-        mode: '0755'
-      become: true
-
-    - name: Create k8s-snap runc runtime config for GPU compatibility
-      ansible.builtin.copy:
-        content: |
-          version = 2
-
-          [plugins]
-            [plugins."io.containerd.grpc.v1.cri"]
-              [plugins."io.containerd.grpc.v1.cri".containerd]
-                default_runtime_name = "runc"
-
-                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
-                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-                    runtime_type = "io.containerd.runc.v2"
-                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-                      SystemdCgroup = true
-        dest: /etc/containerd/conf.d/00-k8s-runc.toml
-        mode: '0644'
-      become: true
-
-    # k8s-snap defaults workers to --root-dir="/var/lib/kubelet" but uses
-    # /var/snap/k8s/common/var/lib/kubelet on the control plane. CSI drivers
-    # (JuiceFS, rawfile) are deployed with kubeletDir set to the snap path,
-    # so the worker kubelet must match or CSI registration fails silently.
-    - name: Read current kubelet args
-      ansible.builtin.slurp:
-        src: /var/snap/k8s/common/args/kubelet
-      register: kubelet_args_raw
-      become: true
-
-    - name: Fix kubelet root-dir to match control plane (snap path)
-      ansible.builtin.replace:
-        path: /var/snap/k8s/common/args/kubelet
-        regexp: '--root-dir="/var/lib/kubelet"'
-        replace: '--root-dir="/var/snap/k8s/common/var/lib/kubelet"'
-      register: kubelet_rootdir_fix
-      become: true
-      when: '"/var/lib/kubelet" in (kubelet_args_raw.content | b64decode)'
-
-    - name: Ensure kubelet CSI directories exist
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: directory
-        mode: '0755'
-      loop:
-        - /var/snap/k8s/common/var/lib/kubelet/plugins_registry
-        - /var/snap/k8s/common/var/lib/kubelet/csi-plugins
-      become: true
-
-    - name: Restart k8s snap to apply kubelet root-dir change
-      ansible.builtin.command: snap restart k8s
-      become: true
-      when: kubelet_rootdir_fix is changed
-
-    - name: Wait for worker to appear in cluster
-      ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }}
+    # =====================================================================
+    # Wait for worker to appear in the cluster
+    # =====================================================================
+    - name: Wait for worker node to appear in cluster
+      ansible.builtin.command: >
+        {{ control_plane_kubectl }} get node {{ inventory_hostname }}
       delegate_to: "{{ control_plane_host }}"
-      become: true
-      register: node_check
+      vars:
+        control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+      environment:
+        KUBECONFIG: "/home/{{ system_username }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _node_check
       retries: 30
       delay: 10
-      until: node_check.rc == 0
+      until: _node_check.rc == 0
       changed_when: false
-      when: not (already_joined | bool)
+      when: not already_joined
 
-    # Wait up to ~2 min for Ready. If the cilium-agent pod's emptyDir is
-    # wedged on first schedule (CrashLoopBackOff with the "Non-existent
-    # configuration directory /tmp/cilium/config-map" fatal), the node
-    # never recovers on its own — but force-deleting that pod once makes
-    # kubelet recreate it cleanly. Self-heal that single case via
-    # block/rescue so users never have to kubectl into a wedged join.
-    - name: Wait for worker node to become Ready (with cilium self-heal fallback)
-      when: not (already_joined | bool)
+    # =====================================================================
+    # Wait for Ready, with Cilium-on-new-node self-heal fallback
+    # =====================================================================
+    # Wait up to ~2 min for Ready. If the cilium-agent pod's emptyDir
+    # is wedged on first schedule (CrashLoopBackOff with the
+    # "Non-existent configuration directory /tmp/cilium/config-map"
+    # fatal), the node never recovers on its own — force-deleting that
+    # pod once makes kubelet recreate it cleanly. Self-heal that single
+    # case via block/rescue so users never have to kubectl into a
+    # wedged join. The bug is in Cilium's init container, not in
+    # k8s-snap, so the workaround carries over unchanged.
+    - name: Wait for worker node to become Ready (with Cilium self-heal fallback)
+      when: not already_joined
+      vars:
+        control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+      environment:
+        KUBECONFIG: "/home/{{ system_username }}/.kube/config"
       block:
         - name: Wait for worker node to become Ready
-          ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+          ansible.builtin.command: >
+            {{ control_plane_kubectl }} get node {{ inventory_hostname }}
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
           delegate_to: "{{ control_plane_host }}"
-          become: true
-          register: node_ready
+          become_user: "{{ system_username }}"
+          register: _node_ready
           retries: 12
           delay: 10
-          until: node_ready.stdout == 'True'
+          until: _node_ready.stdout == 'True'
           changed_when: false
 
       rescue:
-        - name: Inspect cilium pods on stuck node
+        - name: Inspect Cilium pods on stuck node
           ansible.builtin.command: >
-            k8s kubectl -n kube-system get pod -l k8s-app=cilium
+            {{ control_plane_kubectl }} -n kube-system get pod -l k8s-app=cilium
             --field-selector spec.nodeName={{ inventory_hostname }}
             -o json
           delegate_to: "{{ control_plane_host }}"
-          become: true
-          register: cilium_pods_json
+          become_user: "{{ system_username }}"
+          register: _cilium_pods_json
           changed_when: false
 
-        - name: Identify wedged cilium pod (not ready, restartCount >= 2)
+        - name: Identify wedged Cilium pod (not ready, restartCount >= 2)
           ansible.builtin.set_fact:
             wedged_cilium_pod: >-
               {{
-                (cilium_pods_json.stdout | from_json | json_query(
+                (_cilium_pods_json.stdout | from_json | json_query(
                   'items[?status.containerStatuses[?name==`cilium-agent` && ready==`false` && restartCount>=`2`]].metadata.name'
                 )) | first | default('')
               }}
 
-        - name: Force-delete wedged cilium pod so kubelet recreates it cleanly
+        - name: Force-delete wedged Cilium pod so kubelet recreates it cleanly
           ansible.builtin.command: >
-            k8s kubectl -n kube-system delete pod {{ wedged_cilium_pod }} --force --grace-period=0
+            {{ control_plane_kubectl }} -n kube-system delete pod {{ wedged_cilium_pod }}
+            --force --grace-period=0
           delegate_to: "{{ control_plane_host }}"
-          become: true
+          become_user: "{{ system_username }}"
           when: wedged_cilium_pod | length > 0
 
-        - name: Fail if no wedged cilium pod was found (different root cause)
+        - name: Fail if no wedged Cilium pod was found (different root cause)
           ansible.builtin.fail:
             msg: >-
               Worker {{ inventory_hostname }} did not become Ready within 2 minutes
-              and no wedged cilium pod was found to self-heal. Investigate the
+              and no wedged Cilium pod was found to self-heal. Investigate the
               node's CNI / kubelet state on the control plane.
           when: wedged_cilium_pod | length == 0
 
-        - name: Wait for worker node to become Ready (after cilium self-heal)
-          ansible.builtin.command: k8s kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+        - name: Wait for worker node to become Ready (after Cilium self-heal)
+          ansible.builtin.command: >
+            {{ control_plane_kubectl }} get node {{ inventory_hostname }}
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
           delegate_to: "{{ control_plane_host }}"
-          become: true
-          register: node_ready_post_heal
+          become_user: "{{ system_username }}"
+          register: _node_ready_post_heal
           retries: 30
           delay: 10
-          until: node_ready_post_heal.stdout == 'True'
+          until: _node_ready_post_heal.stdout == 'True'
           changed_when: false
 
-    - name: Wait for Cilium IPAM to allocate pod CIDR on new node
+    # =====================================================================
+    # Wait for Cilium IPAM on the new node + restart pods with stale IPs
+    # =====================================================================
+    - name: Wait for Cilium IPAM to allocate pod CIDR on the new node
       ansible.builtin.shell: |
-        k8s kubectl exec -n kube-system \
-          $(k8s kubectl get pod -n kube-system -l k8s-app=cilium \
-            --field-selector spec.nodeName={{ inventory_hostname }} \
-            -o jsonpath='{.items[0].metadata.name}') \
-          -- cilium status --brief
+        set -o pipefail
+        POD=$({{ control_plane_kubectl }} get pod -n kube-system -l k8s-app=cilium \
+          --field-selector spec.nodeName={{ inventory_hostname }} \
+          -o jsonpath='{.items[0].metadata.name}')
+        {{ control_plane_kubectl }} exec -n kube-system "$POD" -- cilium status --brief
+      args:
+        executable: /bin/bash
       delegate_to: "{{ control_plane_host }}"
-      become: true
-      register: cilium_ipam
+      vars:
+        control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+      environment:
+        KUBECONFIG: "/home/{{ system_username }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _cilium_ipam
       retries: 12
       delay: 5
-      until: cilium_ipam.rc == 0
+      until: _cilium_ipam.rc == 0
       changed_when: false
-      when: not (already_joined | bool)
+      when: not already_joined
 
-    - name: Restart pods with stale IPs from before Cilium was ready
+    - name: Restart pods with stale 10.88.x IPs (CNI bootstrap fallback range)
       ansible.builtin.shell: |
-        stale=$(k8s kubectl get pods -A --field-selector spec.nodeName={{ inventory_hostname }} \
+        stale=$({{ control_plane_kubectl }} get pods -A \
+          --field-selector spec.nodeName={{ inventory_hostname }} \
           -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}:{.status.podIP}{"\n"}{end}' \
           | grep ':10\.88\.' || true)
         if [ -n "$stale" ]; then
@@ -789,63 +473,90 @@
             ns="${nspod%%/*}"
             pod="${nspod#*/}"
             echo "Restarting $ns/$pod (stale IP $ip)"
-            k8s kubectl delete pod "$pod" -n "$ns" --grace-period=5 2>/dev/null || true
+            {{ control_plane_kubectl }} delete pod "$pod" -n "$ns" --grace-period=5 2>/dev/null || true
           done
         else
           echo "No stale pods found"
         fi
       delegate_to: "{{ control_plane_host }}"
-      become: true
-      register: stale_restart
-      changed_when: "'Restarting' in stale_restart.stdout"
-      when: not (already_joined | bool)
+      vars:
+        control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+      environment:
+        KUBECONFIG: "/home/{{ system_username }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _stale_restart
+      changed_when: "'Restarting' in _stale_restart.stdout"
+      when: not already_joined
 
     - name: Display worker join status
       ansible.builtin.debug:
-        msg: "Worker {{ inventory_hostname }} successfully joined and is Ready (Cilium IPAM active)"
-      when: not (already_joined | bool)
+        msg: "Worker {{ inventory_hostname }} joined and Ready (Cilium IPAM active)"
+      when: not already_joined
 
   handlers:
     - name: reload_ufw
-      ansible.builtin.command: ufw reload
+      ansible.builtin.shell: |
+        ufw disable
+        ufw --force enable
+      become: true
       listen: reload_ufw
       changed_when: true
-      become: true
 
+
+# =========================================================================
+# After all workers join — pin CoreDNS to the control plane + verify ready
+# =========================================================================
 - name: Pin Critical Services and Verify Cluster Status
   hosts: k8s_control_plane
-  become: true
+  become: false
   gather_facts: false
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
 
   tasks:
     - name: Pin CoreDNS to control plane node
       ansible.builtin.command: >
-        k8s kubectl -n kube-system patch deployment coredns
+        /home/{{ system_username }}/.local/bin/kubectl -n kube-system patch deployment coredns
         --type=merge
         -p '{"spec":{"template":{"spec":{"nodeSelector":{"node-role.kubernetes.io/control-plane":""}}}}}'
-      register: coredns_pin
-      changed_when: "'patched' in coredns_pin.stdout and 'no change' not in coredns_pin.stdout"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _coredns_pin
+      changed_when: "'patched' in _coredns_pin.stdout and 'no change' not in _coredns_pin.stdout"
 
     - name: Wait for CoreDNS rollout after pinning
       ansible.builtin.command: >
-        k8s kubectl -n kube-system rollout status deployment/coredns --timeout=120s
-      when: coredns_pin.changed
+        /home/{{ system_username }}/.local/bin/kubectl -n kube-system rollout status deployment/coredns --timeout=120s
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ system_username }}"
+      when: _coredns_pin is changed
       changed_when: false
 
     - name: Get all cluster nodes
-      ansible.builtin.command: k8s kubectl get nodes -o wide
-      register: all_nodes
+      ansible.builtin.command: /home/{{ system_username }}/.local/bin/kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _all_nodes
       changed_when: false
 
     - name: Display cluster nodes
       ansible.builtin.debug:
-        var: all_nodes.stdout_lines
+        var: _all_nodes.stdout_lines
 
     - name: Wait for all nodes to be Ready
-      ansible.builtin.shell: k8s kubectl get nodes --no-headers | grep -c " Ready " || echo 0
-      register: ready_count
+      ansible.builtin.shell: |
+        /home/{{ system_username }}/.local/bin/kubectl get nodes --no-headers | grep -c " Ready " || echo 0
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _ready_count
       changed_when: false
-      until: ready_count.stdout | int == (groups['k8s_control_plane'] | length + groups['k8s_workers'] | length)
+      until: _ready_count.stdout | int == (groups['k8s_control_plane'] | length + groups['k8s_workers'] | length)
       retries: 18
       delay: 10
 
@@ -853,17 +564,21 @@
       ansible.builtin.debug:
         msg:
           - "==============================================="
-          - "k8s-snap Worker Join Complete"
+          - "Thinkube Kubernetes Worker Join Complete"
           - "==============================================="
-          - "Total nodes in cluster: {{ ready_count.stdout }}"
+          - "Total nodes in cluster: {{ _ready_count.stdout }}"
           - "  Control plane nodes: {{ groups['k8s_control_plane'] | length }}"
-          - "  Worker nodes: {{ groups['k8s_workers'] | length }}"
+          - "  Worker nodes:        {{ groups['k8s_workers'] | length }}"
           - "==============================================="
           - "Next Steps:"
-          - "1. Test worker nodes: ansible/40_thinkube/core/infrastructure/k8s-snap/28_test_worker.yaml"
+          - "1. Test worker nodes: ansible/40_thinkube/core/infrastructure/k8s/28_test_worker.yaml"
           - "2. Install GPU Operator: ansible/40_thinkube/core/infrastructure/gpu_operator/10_deploy.yaml"
           - "==============================================="
 
+
+# =========================================================================
+# After everything — append worker hosts to local SSH config for code-server
+# =========================================================================
 - name: Update Code-Server SSH Config with Worker Nodes
   hosts: localhost
   gather_facts: false
