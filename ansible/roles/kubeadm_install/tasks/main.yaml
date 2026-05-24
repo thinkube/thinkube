@@ -1,0 +1,159 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# kubeadm_install role
+#
+# Installs kubeadm + kubelet + kubectl from the upstream pkgs.k8s.io
+# apt repository at a pinned version, applies kubeadm's preflight
+# requirements (swap off, kernel modules, sysctls), and holds the
+# packages.
+#
+# Does NOT run `kubeadm init` or `kubeadm join` — that's the
+# responsibility of the orchestrating playbook
+# (40_thinkube/core/infrastructure/k8s/10_install_k8s.yaml for control
+# plane, 20_join_workers.yaml for workers).
+#
+# After this role completes, kubelet is enabled but will crashloop
+# until kubeadm configures it (standard upstream pattern — see
+# https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/).
+
+# -----------------------------------------------------------------------------
+# Preflight: swap off
+# -----------------------------------------------------------------------------
+- name: Disable swap (runtime)
+  ansible.builtin.command: swapoff -a
+  become: true
+  changed_when: false  # idempotent; check below catches persistence
+
+- name: Detect swap entries in /etc/fstab
+  ansible.builtin.shell: |
+    grep -E '^[^#].*\s+swap\s+' /etc/fstab || true
+  register: _swap_fstab
+  changed_when: false
+
+- name: Comment out swap entries in /etc/fstab (persist across reboot)
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\s+swap\s+.*)$'
+    replace: '# \1  # disabled by Thinkube (kubeadm requirement)'
+  become: true
+  when: _swap_fstab.stdout | length > 0
+
+# -----------------------------------------------------------------------------
+# Preflight: kernel modules
+# -----------------------------------------------------------------------------
+- name: Declare required kernel modules for load-on-boot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/thinkube-k8s.conf
+    mode: '0644'
+    content: |
+      # Required by kubeadm. Managed by Thinkube (do not edit).
+      {% for mod in kubeadm_kernel_modules %}
+      {{ mod }}
+      {% endfor %}
+  become: true
+
+- name: Load required kernel modules now
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ kubeadm_kernel_modules }}"
+  become: true
+
+# -----------------------------------------------------------------------------
+# Preflight: networking sysctls
+# -----------------------------------------------------------------------------
+- name: Declare required sysctls for persistence
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-thinkube-k8s.conf
+    mode: '0644'
+    content: |
+      # Required by kubeadm. Managed by Thinkube (do not edit).
+      {% for s in kubeadm_sysctls %}
+      {{ s.key }} = {{ s.value }}
+      {% endfor %}
+  become: true
+  register: _sysctl_file
+
+- name: Apply sysctls now (sysctl --system)
+  ansible.builtin.command: sysctl --system
+  become: true
+  changed_when: _sysctl_file is changed
+
+# -----------------------------------------------------------------------------
+# apt: keyring + repo + install + hold
+# -----------------------------------------------------------------------------
+- name: Ensure apt prerequisites are installed
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gpg
+    state: present
+    update_cache: true
+  become: true
+
+- name: Ensure /etc/apt/keyrings exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Fetch Kubernetes apt signing key
+  ansible.builtin.get_url:
+    url: "{{ kubeadm_apt_key_url }}"
+    dest: "/tmp/kubernetes-apt-key.asc"
+    mode: '0644'
+    force: true
+  become: true
+
+- name: Convert key to keyring binary form
+  ansible.builtin.command: >
+    gpg --dearmor --batch --yes --output {{ kubeadm_apt_key_path }} /tmp/kubernetes-apt-key.asc
+  args:
+    creates: "{{ kubeadm_apt_key_path }}"
+  become: true
+
+- name: Remove temporary armored key
+  ansible.builtin.file:
+    path: /tmp/kubernetes-apt-key.asc
+    state: absent
+  become: true
+
+- name: Add Kubernetes apt repository
+  ansible.builtin.copy:
+    dest: "{{ kubeadm_apt_list_path }}"
+    mode: '0644'
+    content: |
+      deb [signed-by={{ kubeadm_apt_key_path }}] {{ kubeadm_apt_repo_url }} /
+  become: true
+  register: _k8s_apt_repo
+
+- name: Update apt cache after repo change
+  ansible.builtin.apt:
+    update_cache: true
+  become: true
+  when: _k8s_apt_repo is changed
+
+- name: Install kubeadm / kubelet / kubectl at pinned versions
+  ansible.builtin.apt:
+    name: "{{ kubeadm_apt_packages }}"
+    state: present
+    allow_change_held_packages: true
+  become: true
+
+- name: Hold kubeadm / kubelet / kubectl against accidental upgrade
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: "{{ kubeadm_apt_hold }}"
+  become: true
+
+- name: Ensure kubelet is enabled (it will crashloop until kubeadm configures it)
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: true
+  become: true
