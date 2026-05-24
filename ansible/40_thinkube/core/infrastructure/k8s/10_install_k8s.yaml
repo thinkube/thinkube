@@ -3,48 +3,77 @@
 
 ---
 # ansible/40_thinkube/core/infrastructure/k8s/10_install_k8s.yaml
-# Description:
-#   Installs and configures Canonical Kubernetes (via k8s-snap) on control plane node
-#   - Installs k8s snap package
-#   - Installs kubectl and helm binaries (no sudo required)
-#   - Creates k8s-hostpath StorageClass (alias to csi-rawfile-default)
-#   - Enables Cilium load balancer (built into k8s-snap; no MetalLB used)
+#
+# Installs and configures the Thinkube Kubernetes Cluster (kubeadm) on
+# the control plane node.
+#
+# This is the kubeadm-era replacement for the former k8s-snap install.
+# It:
+#   - Installs containerd.io (via containerd_install role) with the
+#     Thinkube /etc/containerd/config.toml that sets SystemdCgroup=true
+#     on both the legacy and the active v2 CRI plugins.
+#   - Installs kubeadm/kubelet/kubectl at a pinned version (via
+#     kubeadm_install role) with apt-mark hold.
+#   - Bootstraps the control plane via `kubeadm init` against the stable
+#     dummy interface (k8s0).
+#   - Installs Cilium via helm with kube-proxy replacement, ZeroTier
+#     device exclusion baked into values (no post-install ConfigMap
+#     patch), and L2 announcements (ZeroTier mode only).
+#   - Installs OpenEBS Rawfile CSI via helm; preserves the
+#     csi-rawfile-default StorageClass and the k8s-hostpath alias.
+#   - Installs vanilla upstream kubectl + helm to ~/.local/bin (unchanged
+#     from the k8s-snap era — already kubeadm-clean).
 #
 # Requirements:
 #   - Ubuntu 24.04 LTS
-#   - 16 cores minimum
-#   - 64GB RAM minimum
-#   - 1TB disk minimum
+#   - 16 cores minimum, 64GB RAM minimum, 1TB disk minimum
 #   - UFW firewall enabled
-#
-# Usage:
-#   cd ~/thinkube
-#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s/10_install_k8s.yaml
 #
 # Variables from inventory:
 #   - system_username:        User to install kubectl/helm for
 #   - domain_name:            Domain name for services
-#   - overlay_provider:       'zerotier' or 'tailscale' (selects networking branch)
-#   - overlay_subnet_prefix:  ZeroTier network subnet prefix (ZeroTier mode only)
+#   - cluster_name:           Kubernetes cluster name
+#   - overlay_provider:       'zerotier' or 'tailscale'
+#   - overlay_subnet_prefix:  ZeroTier subnet prefix (ZeroTier mode only)
+#   - lb_ip_start_octet:      L2 LB range start (ZeroTier mode only)
+#   - lb_ip_end_octet:        L2 LB range end (ZeroTier mode only)
+#
+# Pinned versions are role-default values reflecting the
+# v1.35.5+thinkube.0.1.0 release manifest. Phase 4 of the kubeadm
+# migration will resolve them from thinkube-metadata at install time.
 #
 # 🤖 [AI-assisted]
 
-- name: Install Canonical Kubernetes Control Plane
+- name: Install Thinkube Kubernetes Cluster (kubeadm) — Control Plane
   hosts: k8s_control_plane
   become: false
   gather_facts: true
 
   vars:
-    k8s_channel: "1.35-classic/stable"
-    k8s_version: "1.35.0"
-    k8s_snap_revisions:
-      amd64: "5046"
-      arm64: "5049"
     user: "{{ system_username }}"
     user_home: "/home/{{ user }}"
     kubectl_wrapper_path: "{{ user_home }}/.local/bin/kubectl"
     helm_wrapper_path: "{{ user_home }}/.local/bin/helm"
-    k8s_stable_ip: "172.16.0.1"  # Dummy interface IP for location-independent k8s
+    k8s_stable_ip: "172.16.0.1"  # Dummy interface IP
+
+    # Version pins — release-manifest values for v1.35.5+thinkube.0.1.0
+    kubeadm_k8s_minor: "1.35"
+    kubeadm_k8s_patch: "1.35.5"
+    kubeadm_k8s_apt_revision: "1.1"
+    containerd_apt_version: "2.2.4-1"
+    cilium_chart_repo: "https://helm.cilium.io"
+    cilium_chart_version: "1.19.4"
+    openebs_rawfile_chart_repo: "https://openebs.github.io/rawfile-localpv"
+    openebs_rawfile_chart_version: "0.13.1"
+    helm_install_version: "v3.16.4"
+
+    # Cluster networking
+    pod_cidr: "10.244.0.0/16"
+    service_cidr: "10.96.0.0/12"
+
+    # Cilium device exclusion — preserves the ZeroTier carve-out that
+    # existed as a post-install ConfigMap patch in the k8s-snap era.
+    cilium_devices: "k8s0 en+ eth+ wl+ bond+"
 
   pre_tasks:
     - name: Verify required variables exist
@@ -54,6 +83,7 @@
       loop:
         - system_username
         - domain_name
+        - cluster_name
         - overlay_provider
 
     - name: Verify ZeroTier-specific variables exist (ZeroTier mode only)
@@ -83,25 +113,9 @@
       when: (ansible_memtotal_mb / 1024) | int < 64
 
   tasks:
-    # ===========================
-    # DGX Spark Specific: Docker Coexistence
-    # ===========================
-    # Note: DGX Spark ships with Docker pre-installed and enabled.
-    # We configure k8s-snap to use a custom containerd base directory (/var/lib/k8s-containerd)
-    # to allow Docker and k8s-snap to coexist without conflicts.
-    # This enables users to use Docker for other DGX Spark capabilities while running Kubernetes.
-    #
-    # Docker uses: /run/containerd, /var/lib/containerd
-    # k8s-snap uses: /var/lib/k8s-containerd (custom base directory)
-
-    # ===========================
-    # Create Stable k8s Dummy Interface (Location-Independent)
-    # ===========================
-    # This dummy interface provides a stable IP address that:
-    # - Never changes regardless of physical location
-    # - Works for both local kubectl and pods accessing API server
-    # - Eliminates latency (local loopback-like performance)
-    # - Allows remote access via ZeroTier forwarding when needed
+    # =====================================================================
+    # Stable dummy interface (k8s0) for location-independent API endpoint
+    # =====================================================================
     - name: Create systemd-networkd config directory
       ansible.builtin.file:
         path: /etc/systemd/network
@@ -159,13 +173,9 @@
       changed_when: false
       failed_when: k8s_interface_check.rc != 0
 
-    - name: Display k8s stable interface info
-      ansible.builtin.debug:
-        msg: "k8s stable interface k8s0 configured with IP {{ k8s_stable_ip }}"
-
-    # ===========================
-    # UFW Firewall Configuration (CRITICAL for CoreDNS)
-    # ===========================
+    # =====================================================================
+    # UFW Firewall Configuration
+    # =====================================================================
     - name: Ensure UFW is installed
       ansible.builtin.apt:
         name: ufw
@@ -198,12 +208,28 @@
         comment: 'k8s API server'
       become: true
 
-    - name: Allow k8s cluster daemon port (6400/tcp)
+    - name: Allow etcd client + peer ports (2379-2380/tcp, control plane only)
       community.general.ufw:
         rule: allow
-        port: '6400'
+        port: '2379:2380'
         proto: tcp
-        comment: 'k8s cluster daemon'
+        comment: 'etcd client + peer'
+      become: true
+
+    - name: Allow controller-manager port (10257/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '10257'
+        proto: tcp
+        comment: 'k8s controller-manager'
+      become: true
+
+    - name: Allow scheduler port (10259/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '10259'
+        proto: tcp
+        comment: 'k8s scheduler'
       become: true
 
     - name: Allow kubelet API port (10250/tcp)
@@ -229,7 +255,6 @@
         proto: udp
         comment: 'Cilium VXLAN'
       become: true
-
 
     - name: Allow traffic on cilium_host interface
       community.general.ufw:
@@ -261,16 +286,14 @@
       become: true
 
     # Overlay-network firewall rules. Tailscale's daemon configures its
-    # own UFW rules during install (see 06_install_tailscale.yaml — it
-    # opens UDP/41641 and trusts the tailscale0 interface), so we don't
-    # repeat them here. ZeroTier needs explicit allow rules for the
-    # interface family and an SSH-from-overlay rule keyed on the subnet.
-    - name: Allow all traffic on ZeroTier interfaces (overlay networking)
+    # own UFW rules during install (UDP/41641 and tailscale0 trust). For
+    # ZeroTier we add the interface family and an SSH-from-overlay rule.
+    - name: Allow all traffic on ZeroTier interfaces
       community.general.ufw:
         rule: allow
         interface: "zt+"
         direction: in
-        comment: 'ZeroTier overlay network'
+        comment: 'ZeroTier overlay'
       become: true
       when: overlay_provider == 'zerotier'
 
@@ -279,7 +302,7 @@
         rule: allow
         interface: "zt+"
         direction: out
-        comment: 'ZeroTier overlay network'
+        comment: 'ZeroTier overlay'
       become: true
       when: overlay_provider == 'zerotier'
 
@@ -289,7 +312,7 @@
         src: "{{ overlay_subnet_prefix }}0/24"
         port: '22'
         proto: tcp
-        comment: 'SSH from ZeroTier overlay'
+        comment: 'SSH from ZeroTier'
       become: true
       when: overlay_provider == 'zerotier'
 
@@ -298,279 +321,96 @@
         state: enabled
       become: true
 
-    - name: Reload UFW to apply forward policy
-      ansible.builtin.command: ufw reload
-      become: true
-      changed_when: true
-      when: ufw_forward_policy_changed | default(false)
+    # =====================================================================
+    # containerd + kubeadm/kubelet/kubectl install (via roles)
+    # =====================================================================
+    - name: Install containerd.io with Thinkube config
+      ansible.builtin.import_role:
+        name: containerd_install
+      vars:
+        containerd_apt_version: "{{ containerd_apt_version }}"
 
-    # ===========================
-    # k8s-snap Installation
-    # ===========================
-    - name: Check if k8s-snap is already installed
-      ansible.builtin.command: snap list k8s
-      become: true
-      register: k8s_snap_check
-      failed_when: false
-      changed_when: false
+    - name: Install kubeadm + kubelet + kubectl
+      ansible.builtin.import_role:
+        name: kubeadm_install
+      vars:
+        kubeadm_k8s_minor: "{{ kubeadm_k8s_minor }}"
+        kubeadm_k8s_patch: "{{ kubeadm_k8s_patch }}"
+        kubeadm_k8s_apt_revision: "{{ kubeadm_k8s_apt_revision }}"
 
-    - name: Install k8s-snap (pinned revision)
-      ansible.builtin.command: snap install k8s --classic --revision={{ k8s_snap_revisions[ansible_architecture | regex_replace('x86_64', 'amd64') | regex_replace('aarch64', 'arm64')] }}
-      become: true
-      when: k8s_snap_check.rc != 0
-      register: snap_install_result
-      changed_when: "'installed' in snap_install_result.stdout"
+    # =====================================================================
+    # kubeadm init — bootstrap the control plane
+    # =====================================================================
+    - name: Check if cluster is already initialised
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: _admin_conf
 
-    - name: Hold k8s snap to prevent auto-updates
-      ansible.builtin.command: snap refresh --hold k8s
+    - name: Render kubeadm config
+      ansible.builtin.template:
+        src: kubeadm-init-config.yaml.j2
+        dest: /tmp/kubeadm-config.yaml
+        mode: '0600'
       become: true
-      changed_when: true
-      when: k8s_snap_check.rc != 0
+      when: not _admin_conf.stat.exists
 
-    - name: Create k8s bootstrap configuration with stable IP binding
-      ansible.builtin.copy:
-        content: |
-          containerd-base-dir: /var/lib/k8s-containerd
-          cluster-config:
-            network:
-              enabled: true
-            dns:
-              enabled: true
-            local-storage:
-              enabled: true
-            gateway:
-              enabled: true
-          extra-node-kubelet-args:
-            --max-pods: "500"
-            --root-dir: "/var/snap/k8s/common/var/lib/kubelet"
-            --system-reserved: "memory=4Gi,cpu=500m"
-            --kube-reserved: "memory=2Gi,cpu=500m"
-            --eviction-hard: "memory.available<2Gi,nodefs.available<10%"
-            --eviction-soft: "memory.available<4Gi,nodefs.available<15%"
-            --eviction-soft-grace-period: "memory.available=30s,nodefs.available=1m"
-            --enforce-node-allocatable: "pods"
-        dest: /tmp/k8s-bootstrap-config.yaml
-        mode: '0644'
+    - name: Pre-pull kubeadm images
+      ansible.builtin.command: kubeadm config images pull --config /tmp/kubeadm-config.yaml
       become: true
+      when: not _admin_conf.stat.exists
+      register: _kubeadm_pull
+      changed_when: _kubeadm_pull.rc == 0
 
-    - name: Bootstrap k8s cluster on stable dummy interface
-      ansible.builtin.shell: |
-        k8s bootstrap --file /tmp/k8s-bootstrap-config.yaml --address {{ k8s_stable_ip }}:6400
+    - name: Run kubeadm init
+      ansible.builtin.command: kubeadm init --config /tmp/kubeadm-config.yaml --upload-certs --skip-phases=addon/kube-proxy
       become: true
-      register: bootstrap_result
-      changed_when: "'Bootstrapped' in bootstrap_result.stdout"
-      failed_when:
-        - bootstrap_result.rc != 0
-        - "'already bootstrapped' not in bootstrap_result.stderr"
-        - "'already part of a cluster' not in bootstrap_result.stderr"
+      when: not _admin_conf.stat.exists
+      register: _kubeadm_init
+      changed_when: _kubeadm_init.rc == 0
 
-    - name: Wait for k8s cluster to be ready
-      ansible.builtin.command: k8s status --wait-ready
-      become: true
-      register: k8s_status
-      retries: 30
-      delay: 10
-      until: k8s_status.rc == 0
-      changed_when: false
-
-    - name: Verify cluster status
-      ansible.builtin.command: k8s status
-      become: true
-      register: cluster_status
-      changed_when: false
-
-    - name: Display cluster status
+    - name: Display kubeadm init output (truncated)
       ansible.builtin.debug:
-        var: cluster_status.stdout_lines
+        msg: "{{ _kubeadm_init.stdout_lines[-40:] }}"
+      when: _kubeadm_init is changed
 
-    # ===========================
-    # Configure containerd for GPU operator compatibility
-    # ===========================
-    # Create a base runc runtime config that ensures k8s-snap's runc runtime persists
-    # even when GPU operator adds nvidia runtime via imported configs.
-    # This file is imported BEFORE any GPU operator configs (00- prefix).
-    - name: Create containerd config directory
+    - name: Remove ephemeral kubeadm config (contains certificate key)
       ansible.builtin.file:
-        path: /etc/containerd/conf.d
+        path: /tmp/kubeadm-config.yaml
+        state: absent
+      become: true
+
+    # =====================================================================
+    # kubeconfig for the user
+    # =====================================================================
+    - name: Create .kube directory for the user
+      ansible.builtin.file:
+        path: "{{ user_home }}/.kube"
         state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
         mode: '0755'
       become: true
 
-    - name: Create k8s-snap runc runtime config for GPU compatibility
+    - name: Copy admin.conf as the user's kubeconfig
       ansible.builtin.copy:
-        content: |
-          version = 2
-
-          [plugins]
-            [plugins."io.containerd.grpc.v1.cri"]
-              [plugins."io.containerd.grpc.v1.cri".containerd]
-                default_runtime_name = "runc"
-
-                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
-                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-                    runtime_type = "io.containerd.runc.v2"
-                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-                      SystemdCgroup = true
-        dest: /etc/containerd/conf.d/00-k8s-runc.toml
-        mode: '0644'
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ user_home }}/.kube/config"
+        remote_src: true
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: '0600'
       become: true
 
-    - name: Signal k8s-snap containerd to reload config
-      ansible.builtin.command: pkill -SIGHUP containerd
-      become: true
-      register: containerd_reload
-      failed_when: false
-      changed_when: containerd_reload.rc == 0
-
-    # ===========================
-    # Verify Core Components
-    # ===========================
-    - name: Wait for CoreDNS to be ready
-      ansible.builtin.command: k8s kubectl wait --for=condition=ready pod -l k8s-app=coredns -n kube-system --timeout=300s
-      become: true
-      register: coredns_wait
-      retries: 3
-      delay: 10
-      until: coredns_wait.rc == 0
-      changed_when: false
-
-    - name: Wait for Cilium to be ready
-      ansible.builtin.command: k8s kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=300s
-      become: true
-      register: cilium_wait
-      retries: 3
-      delay: 10
-      until: cilium_wait.rc == 0
-      changed_when: false
-
-    # ===========================
-    # Patch Cilium ConfigMap (Device Exclusion)
-    # ===========================
-    # Cilium auto-detects all interfaces with IPs, including ZeroTier (zt*).
-    # Its cil_from_netdev BPF program intercepts LoadBalancer VIP traffic on
-    # the ZeroTier interface and blackholes it (see cilium/cilium#44982).
-    # We restrict devices to physical/cluster interfaces so kube-proxy can
-    # DNAT overlay traffic normally.
-    #
-    # WireGuard is intentionally NOT enabled: inter-node traffic already
-    # traverses the ZeroTier overlay which provides AES-256-GCM encryption.
-    # Cilium WireGuard on top adds no security benefit and breaks pod-to-pod
-    # networking when the control plane uses a dummy interface (k8s0).
-    - name: Patch Cilium ConfigMap (exclude ZeroTier from BPF devices)
-      ansible.builtin.command: >
-        k8s kubectl patch configmap cilium-config -n kube-system
-        --type merge -p '{"data":{"devices":"k8s0 en+ eth+ wl+ bond+"}}'
-      become: true
-      register: cilium_patch
-      changed_when: "'patched' in cilium_patch.stdout"
-      failed_when: cilium_patch.rc != 0
-
-    - name: Restart Cilium DaemonSet to apply config
-      ansible.builtin.command: k8s kubectl rollout restart daemonset/cilium -n kube-system
-      become: true
-      register: cilium_restart
-      changed_when: cilium_restart.rc == 0
-      failed_when: cilium_restart.rc != 0
-
-    - name: Wait for Cilium to be ready after config restart
-      ansible.builtin.command: k8s kubectl rollout status daemonset/cilium -n kube-system --timeout=300s
-      become: true
-      register: cilium_wg_wait
-      changed_when: false
-
-    - name: Verify node is ready
-      ansible.builtin.command: k8s kubectl get nodes
-      become: true
-      register: nodes_status
-      changed_when: false
-
-    - name: Check that node is in Ready state
-      ansible.builtin.assert:
-        that:
-          - "'Ready' in nodes_status.stdout"
-        fail_msg: "Node is not in Ready state"
-        success_msg: "Node is Ready"
-
-    # ===========================
-    # Verify Storage Class
-    # ===========================
-    - name: Get storage classes
-      ansible.builtin.command: k8s kubectl get storageclass
-      become: true
-      register: storage_classes
-      changed_when: false
-
-    - name: Verify csi-rawfile-default storage class exists
-      ansible.builtin.assert:
-        that:
-          - "'csi-rawfile-default' in storage_classes.stdout"
-        fail_msg: "csi-rawfile-default storage class not found"
-        success_msg: "Storage class csi-rawfile-default is available"
-
-    # ===========================
-    # Patch rawfile CSI driver for custom kubelet root-dir
-    # ===========================
-    # The k8s snap (classic channel) sets kubelet --root-dir to
-    # /var/snap/k8s/common/var/lib/kubelet but the rawfile CSI DaemonSet
-    # ships with hardcoded /var/lib/kubelet paths. We patch all volume
-    # hostPaths and the node-driver-registrar DRIVER_REG_SOCK_PATH to use
-    # the snap path. Requires k8s snap >= 1.35.
-    - name: Check current rawfile CSI mountpoint-dir mountPath
+    - name: Verify kubeconfig points at the stable API endpoint
       ansible.builtin.shell: |
-        k8s kubectl get daemonset ck-storage-rawfile-csi-node -n kube-system \
-          -o jsonpath='{.spec.template.spec.containers[0].volumeMounts[1].mountPath}' 2>/dev/null || echo ""
-      become: true
-      register: csi_mountpath_check
-      changed_when: false
-      failed_when: false
-
-    - name: Patch rawfile CSI node daemonset to use correct kubelet paths
-      ansible.builtin.shell: |
-        k8s kubectl patch daemonset ck-storage-rawfile-csi-node -n kube-system --type='json' -p='[
-          {
-            "op": "replace",
-            "path": "/spec/template/spec/volumes/0/hostPath/path",
-            "value": "/var/snap/k8s/common/var/lib/kubelet/plugins_registry"
-          },
-          {
-            "op": "replace",
-            "path": "/spec/template/spec/volumes/1/hostPath/path",
-            "value": "/var/snap/k8s/common/var/lib/kubelet/plugins/rawfile-csi"
-          },
-          {
-            "op": "replace",
-            "path": "/spec/template/spec/volumes/2/hostPath/path",
-            "value": "/var/snap/k8s/common/var/lib/kubelet"
-          },
-          {
-            "op": "replace",
-            "path": "/spec/template/spec/containers/0/volumeMounts/1/mountPath",
-            "value": "/var/snap/k8s/common/var/lib/kubelet"
-          },
-          {
-            "op": "replace",
-            "path": "/spec/template/spec/containers/1/env/1/value",
-            "value": "/var/snap/k8s/common/var/lib/kubelet/plugins/rawfile-csi/csi.sock"
-          }
-        ]'
-      become: true
-      register: csi_patch_result
-      changed_when: csi_patch_result.rc == 0
-      failed_when: false
-      when: csi_mountpath_check.stdout != "/var/snap/k8s/common/var/lib/kubelet"
-
-    - name: Wait for rawfile CSI node pods to be ready after patch
-      ansible.builtin.command: "k8s kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=rawfile-csi -n kube-system --timeout=300s"
-      become: true
-      register: rawfile_csi_wait
-      retries: 3
-      delay: 10
-      until: rawfile_csi_wait.rc == 0
+        grep -q "server: https://{{ k8s_stable_ip }}:6443" "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
       changed_when: false
 
-    # ===========================
-    # Install kubectl and helm Binaries (No Sudo Required)
-    # ===========================
+    # =====================================================================
+    # Install vanilla upstream kubectl + helm to ~/.local/bin
+    # (Kept verbatim from the k8s-snap era — already kubeadm-clean.)
+    # =====================================================================
     - name: Create .local/bin directory for user
       ansible.builtin.file:
         path: "{{ user_home }}/.local/bin"
@@ -586,12 +426,16 @@
 
     - name: Download kubectl binary
       ansible.builtin.get_url:
-        url: "https://dl.k8s.io/release/v{{ k8s_version }}/bin/linux/{{ system_arch }}/kubectl"
+        url: "https://dl.k8s.io/release/v{{ kubeadm_k8s_patch }}/bin/linux/{{ system_arch }}/kubectl"
         dest: "{{ kubectl_wrapper_path }}"
         mode: '0755'
         owner: "{{ user }}"
         group: "{{ user }}"
       become_user: "{{ user }}"
+      register: _kubectl_download
+      retries: 5
+      delay: 10
+      until: _kubectl_download is succeeded
 
     - name: Download helm installer
       ansible.builtin.get_url:
@@ -605,16 +449,17 @@
       ansible.builtin.shell: |
         export HELM_INSTALL_DIR="{{ user_home }}/.local/bin"
         export USE_SUDO=false
+        export DESIRED_VERSION="{{ helm_install_version }}"
         /tmp/get-helm-3.sh
       args:
         creates: "{{ helm_wrapper_path }}"
       environment:
         PATH: "{{ user_home }}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       become_user: "{{ user }}"
-      register: helm_install
+      register: _helm_install
       retries: 5
       delay: 10
-      until: helm_install.rc == 0
+      until: _helm_install.rc == 0
 
     - name: Set helm binary ownership
       ansible.builtin.file:
@@ -624,73 +469,188 @@
         mode: '0755'
       become: true
 
-    # ===========================
-    # Create kubeconfig for user
-    # ===========================
-    - name: Create .kube directory
-      ansible.builtin.file:
-        path: "{{ user_home }}/.kube"
-        state: directory
-        owner: "{{ user }}"
-        group: "{{ user }}"
-        mode: '0755'
-      become: false
+    # =====================================================================
+    # Install Cilium via helm (kube-proxy replacement + ZeroTier exclusion)
+    # =====================================================================
+    - name: Add Cilium helm repository
+      ansible.builtin.command: "{{ helm_wrapper_path }} repo add cilium {{ cilium_chart_repo }}"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      register: _cilium_repo_add
+      changed_when: "'already exists' not in _cilium_repo_add.stderr"
+      failed_when: _cilium_repo_add.rc != 0 and 'already exists' not in _cilium_repo_add.stderr
 
-    - name: Create .kube directory
-      ansible.builtin.file:
-        path: "{{ user_home }}/.kube"
-        state: directory
-        owner: "{{ user }}"
-        group: "{{ user }}"
-        mode: '0755'
-      become: false
-
-    - name: Generate kubeconfig with stable IP
-      ansible.builtin.shell: |
-        k8s config > "{{ user_home }}/.kube/config"
-        chown {{ user }}:{{ user }} "{{ user_home }}/.kube/config"
-        chmod 0600 "{{ user_home }}/.kube/config"
-      become: true
-      register: kubeconfig_generated
-
-    - name: Verify kubeconfig uses stable IP
-      ansible.builtin.shell: |
-        grep "server:" "{{ user_home }}/.kube/config" | grep "{{ k8s_stable_ip }}"
-      become: false
-      register: kubeconfig_verify
-      failed_when: kubeconfig_verify.rc != 0
+    - name: Update helm repos
+      ansible.builtin.command: "{{ helm_wrapper_path }} repo update"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
       changed_when: false
 
-    # ===========================
-    # Deploy k8s-hostpath StorageClass
-    # ===========================
-    - name: Copy k8s-hostpath StorageClass manifest
+    - name: Render Cilium values file
+      ansible.builtin.template:
+        src: cilium-values.yaml.j2
+        dest: "/tmp/cilium-values.yaml"
+        mode: '0644'
+      become_user: "{{ user }}"
+
+    - name: Install / upgrade Cilium
+      ansible.builtin.command: >
+        {{ helm_wrapper_path }} upgrade --install cilium cilium/cilium
+        --version {{ cilium_chart_version }}
+        --namespace kube-system
+        --values /tmp/cilium-values.yaml
+        --wait
+        --timeout 10m
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      register: _cilium_install
+      changed_when: "'has been upgraded' in _cilium_install.stdout or 'STATUS: deployed' in _cilium_install.stdout"
+
+    - name: Wait for Cilium DaemonSet to be ready
+      ansible.builtin.command: "{{ kubectl_wrapper_path }} rollout status daemonset/cilium -n kube-system --timeout=300s"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      changed_when: false
+
+    - name: Wait for CoreDNS to be ready
+      ansible.builtin.command: "{{ kubectl_wrapper_path }} rollout status deployment/coredns -n kube-system --timeout=300s"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      changed_when: false
+
+    # =====================================================================
+    # Cilium L2 Load Balancer (ZeroTier mode only)
+    # =====================================================================
+    # Replaces `k8s enable load-balancer` + `k8s set load-balancer.cidrs=...`.
+    # Tailscale mode skips entirely — the Tailscale Operator handles
+    # Service exposure via per-Service tailnet IPs.
+    - name: Build Cilium load balancer IP range
+      ansible.builtin.set_fact:
+        lb_ip_range_start: "{{ overlay_subnet_prefix }}{{ lb_ip_start_octet }}"
+        lb_ip_range_end: "{{ overlay_subnet_prefix }}{{ lb_ip_end_octet }}"
+      when: overlay_provider == 'zerotier'
+
+    - name: Render Cilium L2 LB pool + announcement manifests
+      ansible.builtin.template:
+        src: cilium-l2-lb.yaml.j2
+        dest: /tmp/cilium-l2-lb.yaml
+        mode: '0644'
+      become_user: "{{ user }}"
+      when: overlay_provider == 'zerotier'
+
+    - name: Apply Cilium L2 LB resources
+      ansible.builtin.command: "{{ kubectl_wrapper_path }} apply -f /tmp/cilium-l2-lb.yaml"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      when: overlay_provider == 'zerotier'
+      register: _lb_apply
+      changed_when: "'created' in _lb_apply.stdout or 'configured' in _lb_apply.stdout"
+
+    - name: Skip Cilium L2 LB (Tailscale mode)
+      ansible.builtin.debug:
+        msg: >-
+          overlay_provider is 'tailscale' — Cilium L2 announcements
+          disabled. The Tailscale Operator provisions tailnet IPs for
+          annotated Services.
+      when: overlay_provider == 'tailscale'
+
+    # =====================================================================
+    # Install OpenEBS Rawfile CSI via helm
+    # =====================================================================
+    - name: Add OpenEBS Rawfile helm repository
+      ansible.builtin.command: "{{ helm_wrapper_path }} repo add openebs-rawfile {{ openebs_rawfile_chart_repo }}"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      register: _rawfile_repo_add
+      changed_when: "'already exists' not in _rawfile_repo_add.stderr"
+      failed_when: _rawfile_repo_add.rc != 0 and 'already exists' not in _rawfile_repo_add.stderr
+
+    - name: Update helm repos (after adding rawfile)
+      ansible.builtin.command: "{{ helm_wrapper_path }} repo update"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      changed_when: false
+
+    - name: Install / upgrade OpenEBS Rawfile CSI
+      ansible.builtin.command: >
+        {{ helm_wrapper_path }} upgrade --install rawfile-csi openebs-rawfile/rawfile-localpv
+        --version {{ openebs_rawfile_chart_version }}
+        --namespace kube-system
+        --wait
+        --timeout 10m
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      register: _rawfile_install
+      changed_when: "'has been upgraded' in _rawfile_install.stdout or 'STATUS: deployed' in _rawfile_install.stdout"
+
+    - name: Wait for rawfile-csi node DaemonSet to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_wrapper_path }} rollout status daemonset -l app.kubernetes.io/name=rawfile-csi -n kube-system --timeout=300s 2>/dev/null \
+          || {{ kubectl_wrapper_path }} rollout status daemonset -l app=rawfile-csi-node -n kube-system --timeout=300s
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      changed_when: false
+
+    - name: Apply k8s-hostpath StorageClass (alias for csi-rawfile-default)
       ansible.builtin.copy:
         src: files/k8s-hostpath-storageclass.yaml
         dest: /tmp/k8s-hostpath-storageclass.yaml
         mode: '0644'
+      become_user: "{{ user }}"
 
-    - name: Deploy k8s-hostpath StorageClass
+    - name: Apply k8s-hostpath StorageClass
+      ansible.builtin.command: "{{ kubectl_wrapper_path }} apply -f /tmp/k8s-hostpath-storageclass.yaml"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      register: _storageclass_apply
+      changed_when: "'created' in _storageclass_apply.stdout or 'configured' in _storageclass_apply.stdout"
+
+    - name: Verify both storage classes are present
       ansible.builtin.shell: |
-        k8s kubectl apply -f /tmp/k8s-hostpath-storageclass.yaml
-      become: true
-      register: storageclass_result
-      changed_when: "'created' in storageclass_result.stdout or 'configured' in storageclass_result.stdout"
-
-    - name: Verify k8s-hostpath StorageClass exists
-      ansible.builtin.command: k8s kubectl get storageclass k8s-hostpath
-      become: true
-      register: k8s_hostpath_sc
+        {{ kubectl_wrapper_path }} get storageclass | grep -E '^(k8s-hostpath|csi-rawfile-default) '
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
       changed_when: false
 
-    - name: Display StorageClass status
-      ansible.builtin.debug:
-        msg: "k8s-hostpath StorageClass deployed successfully (using rawfile.csi.openebs.io provisioner)"
+    # =====================================================================
+    # Wait for control plane node to be Ready
+    # =====================================================================
+    - name: Wait for control plane node to become Ready
+      ansible.builtin.command: >
+        {{ kubectl_wrapper_path }} wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      changed_when: false
 
-    # ===========================
-    # Thinkube Shared Shell Alias System Integration
-    # ===========================
-    - name: Check if thinkube_shared_shell directory exists
+    - name: Get final node status
+      ansible.builtin.command: "{{ kubectl_wrapper_path }} get nodes -o wide"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      register: nodes_status
+      changed_when: false
+
+    - name: Display node status
+      ansible.builtin.debug:
+        var: nodes_status.stdout_lines
+
+    # =====================================================================
+    # Shell aliases for kubectl + helm (unchanged from k8s-snap era)
+    # =====================================================================
+    - name: Check if .thinkube_shared_shell exists
       ansible.builtin.stat:
         path: "{{ user_home }}/.thinkube_shared_shell"
       register: shared_shell_dir
@@ -706,58 +666,11 @@
             group: "{{ user }}"
             mode: '0755'
 
-        - name: Create kubectl aliases JSON file
-          ansible.builtin.copy:
-            content: |
-              {
-                "k": "kubectl",
-                "kg": "kubectl get",
-                "kd": "kubectl describe",
-                "kdel": "kubectl delete",
-                "kl": "kubectl logs",
-                "ke": "kubectl edit",
-                "kex": "kubectl exec -it",
-                "kgp": "kubectl get pods",
-                "kgn": "kubectl get nodes",
-                "kgs": "kubectl get svc",
-                "kgd": "kubectl get deployments",
-                "kga": "kubectl get all",
-                "kgpa": "kubectl get pods -A",
-                "kgna": "kubectl get nodes -o wide",
-                "kaf": "kubectl apply -f",
-                "kdf": "kubectl delete -f"
-              }
-            dest: "{{ user_home }}/.thinkube_shared_shell/aliases/kubectl_aliases.json"
-            owner: "{{ user }}"
-            group: "{{ user }}"
-            mode: '0644'
-
-        - name: Create helm aliases JSON file
-          ansible.builtin.copy:
-            content: |
-              {
-                "h": "helm",
-                "hl": "helm list",
-                "hla": "helm list -A",
-                "hi": "helm install",
-                "hu": "helm upgrade",
-                "hd": "helm delete",
-                "hs": "helm status",
-                "hh": "helm history"
-              }
-            dest: "{{ user_home }}/.thinkube_shared_shell/aliases/helm_aliases.json"
-            owner: "{{ user }}"
-            group: "{{ user }}"
-            mode: '0644'
-
-        - name: Create k8s aliases shell script for bash/zsh
+        - name: Create kubectl aliases shell script for bash/zsh
           ansible.builtin.copy:
             content: |
               #!/bin/bash
-              # k8s-snap kubectl and helm aliases for bash/zsh
-              # Source this file in your shell rc file
-
-              # kubectl aliases
+              # kubectl + helm aliases
               alias k='kubectl'
               alias kg='kubectl get'
               alias kd='kubectl describe'
@@ -775,7 +688,6 @@
               alias kaf='kubectl apply -f'
               alias kdf='kubectl delete -f'
 
-              # helm aliases
               alias h='helm'
               alias hl='helm list'
               alias hla='helm list -A'
@@ -792,10 +704,7 @@
         - name: Create k8s aliases for fish shell
           ansible.builtin.copy:
             content: |
-              # k8s-snap kubectl and helm aliases for fish
-              # Source this file in your fish config
-
-              # kubectl aliases
+              # kubectl + helm abbreviations for fish
               abbr -a k kubectl
               abbr -a kg kubectl get
               abbr -a kd kubectl describe
@@ -813,7 +722,6 @@
               abbr -a kaf kubectl apply -f
               abbr -a kdf kubectl delete -f
 
-              # helm aliases
               abbr -a h helm
               abbr -a hl helm list
               abbr -a hla helm list -A
@@ -826,54 +734,6 @@
             owner: "{{ user }}"
             group: "{{ user }}"
             mode: '0644'
-
-    # ===========================
-    # Cilium Load Balancer (k8s-snap built-in; no MetalLB used)
-    # ===========================
-    # Only enabled in ZeroTier mode. Cilium's L2 LB uses ARP announcements
-    # to claim VIPs on the node subnet, which requires an L2 broadcast
-    # domain — fine on a ZeroTier overlay (L2), broken on a Tailscale
-    # overlay (L3). In Tailscale mode the Tailscale Operator
-    # (40_thinkube/core/infrastructure/tailscale-operator) provisions
-    # tailnet IPs for Services instead, so this step is skipped entirely.
-    - name: Build Cilium load balancer IP range variables
-      ansible.builtin.set_fact:
-        lb_ip_range_start: "{{ overlay_subnet_prefix }}{{ lb_ip_start_octet }}"
-        lb_ip_range_end: "{{ overlay_subnet_prefix }}{{ lb_ip_end_octet }}"
-      when: overlay_provider == 'zerotier'
-
-    - name: Enable Cilium load balancer
-      ansible.builtin.command: k8s enable load-balancer
-      become: true
-      register: lb_enable
-      changed_when: "'Enabled' in lb_enable.stdout or 'enabled' in lb_enable.stdout"
-      when: overlay_provider == 'zerotier'
-
-    - name: Configure Cilium load balancer IP range and L2 mode
-      ansible.builtin.command: k8s set load-balancer.cidrs="{{ lb_ip_range_start }}-{{ lb_ip_range_end }}" load-balancer.l2-mode=true
-      become: true
-      register: lb_config
-      changed_when: true
-      when: overlay_provider == 'zerotier'
-
-    - name: Wait for load balancer to be ready
-      ansible.builtin.pause:
-        seconds: 10
-        prompt: "Waiting for Cilium load balancer to initialize..."
-      when: overlay_provider == 'zerotier'
-
-    - name: Show load balancer status (ZeroTier mode)
-      ansible.builtin.debug:
-        msg: "Cilium load balancer is configured with IP range {{ lb_ip_range_start }}-{{ lb_ip_range_end }}"
-      when: overlay_provider == 'zerotier'
-
-    - name: Skip Cilium load balancer (Tailscale mode)
-      ansible.builtin.debug:
-        msg: >-
-          overlay_provider is 'tailscale' — Cilium L2 load balancer is not
-          enabled. The Tailscale Operator will provision tailnet IPs for
-          Services exposed via tailscale.com/expose annotations.
-      when: overlay_provider == 'tailscale'
 
   handlers:
     - name: reload_ufw
@@ -896,25 +756,23 @@
       ansible.builtin.debug:
         msg:
           - "==============================================="
-          - "Canonical Kubernetes (k8s-snap) Installation Complete"
+          - "Thinkube Kubernetes Cluster (kubeadm) Installed"
           - "==============================================="
-          - "Version: {{ k8s_version }}"
-          - "Channel: {{ k8s_channel }}"
-          - "API Server: https://{{ k8s_stable_ip }}:6443 (stable dummy interface k8s0)"
-          - "Node Status: {{ 'Ready' if 'Ready' in nodes_status.stdout else 'Not Ready' }}"
-          - "CoreDNS: {{ 'Running' if coredns_wait.rc == 0 else 'Not Ready' }}"
-          - "Cilium CNI: {{ 'Running' if cilium_wait.rc == 0 else 'Not Ready' }}"
-          - "Storage Classes: csi-rawfile-default (default), k8s-hostpath"
-          - "kubectl: Installed at {{ kubectl_wrapper_path }} (no sudo required)"
-          - "helm: Installed at {{ helm_wrapper_path }} (no sudo required)"
+          - "Version: v{{ kubeadm_k8s_patch }} + Thinkube"
+          - "API Server: https://{{ k8s_stable_ip }}:6443 (stable interface k8s0)"
+          - "Cluster Name: {{ cluster_name }}"
+          - "containerd: {{ containerd_apt_version }}"
+          - "Cilium: {{ cilium_chart_version }} (kube-proxy replacement, ZeroTier-excluded devices)"
+          - "OpenEBS Rawfile CSI: {{ openebs_rawfile_chart_version }}"
+          - "Storage Classes: csi-rawfile-default, k8s-hostpath"
+          - "kubectl: {{ kubectl_wrapper_path }} (vanilla upstream, no sudo)"
+          - "helm:    {{ helm_wrapper_path }}  (vanilla upstream, no sudo)"
           - "==============================================="
-          - "Network Configuration:"
-          - "- k8s API bound to {{ k8s_stable_ip }} (dummy interface k8s0)"
-          - "- Location-independent: works regardless of physical network"
-          - "- Zero latency for local access (no overlay overhead)"
-          - "- Remote access via {{ 'ZeroTier' if overlay_provider == 'zerotier' else 'Tailscale' }} overlay"
+          - "Overlay mode: {{ overlay_provider }}"
+          - "{{ 'L2 LB range: ' + lb_ip_range_start + ' - ' + lb_ip_range_end if overlay_provider == 'zerotier' else 'L2 LB disabled — Tailscale Operator handles Service exposure' }}"
           - "==============================================="
           - "Next Steps:"
-          - "1. Join worker nodes: ansible/40_thinkube/core/infrastructure/k8s/20_join_workers.yaml"
-          - "2. Install GPU Operator: ansible/40_thinkube/core/infrastructure/gpu_operator/00_install.yaml"
+          - "1. Join workers:     ansible/40_thinkube/core/infrastructure/k8s/20_join_workers.yaml"
+          - "2. GPU Operator:     ansible/40_thinkube/core/infrastructure/gpu_operator/00_install.yaml"
+          - "3. Gateway API:      ansible/40_thinkube/core/infrastructure/gateway-api/10_deploy.yaml"
           - "==============================================="

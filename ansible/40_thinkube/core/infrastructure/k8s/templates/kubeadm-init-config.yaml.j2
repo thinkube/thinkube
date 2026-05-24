@@ -1,0 +1,72 @@
+# Thinkube kubeadm InitConfiguration + ClusterConfiguration + KubeletConfiguration
+# Rendered by 10_install_k8s.yaml on the control plane node.
+#
+# API version v1beta4 was introduced in K8s 1.31 and is the recommended
+# config schema for K8s 1.34+. See:
+# https://kubernetes.io/docs/reference/config-api/kubeadm-config.v1beta4/
+#
+# The KubeletConfiguration block carries the same memory protection
+# values previously applied by the standalone 11_configure_kubelet_args.yaml
+# playbook (deleted under the kubeadm migration). Single-sourcing them here
+# means init and join produce identical kubelet behaviour without a
+# follow-up patch.
+
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "{{ k8s_stable_ip }}"
+  bindPort: 6443
+nodeRegistration:
+  criSocket: "unix:///run/containerd/containerd.sock"
+  imagePullSerial: true
+  kubeletExtraArgs:
+    - name: "node-ip"
+      value: "{{ k8s_stable_ip }}"
+
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: "v{{ kubeadm_k8s_patch }}"
+clusterName: "{{ cluster_name }}"
+controlPlaneEndpoint: "{{ k8s_stable_ip }}:6443"
+networking:
+  podSubnet: "{{ pod_cidr }}"
+  serviceSubnet: "{{ service_cidr }}"
+apiServer:
+  certSANs:
+    - "{{ k8s_stable_ip }}"
+    - "127.0.0.1"
+    - "localhost"
+    - "{{ ansible_hostname }}"
+    - "{{ ansible_fqdn }}"
+
+---
+# Kubelet resource-protection values — formerly in 11_configure_kubelet_args.yaml.
+# Rationale: enforceNodeAllocatable=pods only. system-reserved and kube-reserved
+# inform the scheduler (reducing advertised allocatable) but are NOT enforced
+# via cgroups, because all system daemons run under system.slice alongside OS
+# services. Setting hard cgroup limits on those slices causes memory pressure
+# even on nodes with abundant RAM. Pod-level cgroup enforcement (kubepods.slice)
+# is sufficient.
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+maxPods: 500
+systemReserved:
+  memory: 4Gi
+  cpu: 500m
+kubeReserved:
+  memory: 2Gi
+  cpu: 500m
+evictionHard:
+  memory.available: "2Gi"
+  nodefs.available: "10%"
+evictionSoft:
+  memory.available: "4Gi"
+  nodefs.available: "15%"
+evictionSoftGracePeriod:
+  memory.available: 30s
+  nodefs.available: 1m
+enforceNodeAllocatable:
+  - pods

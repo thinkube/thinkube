@@ -1,0 +1,57 @@
+# Thinkube Cilium helm values.
+# Rendered by 10_install_k8s.yaml after kubeadm init.
+#
+# Replaces the post-install ConfigMap patch from the k8s-snap era
+# (`kubectl patch configmap cilium-config -n kube-system --type merge
+# -p '{"data":{"devices":"k8s0 en+ eth+ wl+ bond+"}}'`) by passing the
+# same device exclusion at install time. No restart dance required.
+
+# Bind Cilium to the stable k8s API endpoint on the dummy interface
+# instead of letting it autodiscover via the in-cluster Service.
+k8sServiceHost: "{{ k8s_stable_ip }}"
+k8sServicePort: 6443
+
+# kube-proxy replacement (Cilium handles all service routing in BPF)
+kubeProxyReplacement: true
+
+# Restrict BPF attachment to physical/cluster interfaces. Cilium would
+# otherwise auto-detect every interface with an IP, including the
+# ZeroTier overlay (zt*) — its cil_from_netdev BPF program intercepts
+# LoadBalancer VIP traffic and blackholes it (see cilium/cilium#44982).
+# Excluding the overlay restores normal kube-proxy DNAT.
+devices: "{{ cilium_devices }}"
+
+# IPAM: Cilium issues per-node /24s from the cluster pool
+ipam:
+  mode: cluster-pool
+  operator:
+    clusterPoolIPv4PodCIDRList:
+      - "{{ pod_cidr }}"
+    clusterPoolIPv4MaskSize: 24
+
+# No WireGuard. Inter-node traffic already traverses the ZeroTier
+# overlay (AES-256-GCM) or Tailscale (WireGuard); a second WireGuard
+# layer adds no security benefit and breaks pod-to-pod networking when
+# the control plane uses the dummy interface (k8s0).
+encryption:
+  enabled: false
+
+# L2 announcements only make sense on ZeroTier (L2 overlay) — disabled
+# on Tailscale (L3 overlay) where the Tailscale Operator handles
+# Service exposure via per-Service tailnet IPs.
+l2announcements:
+  enabled: {{ 'true' if overlay_provider == 'zerotier' else 'false' }}
+
+# Operator: single replica on the control plane
+operator:
+  replicas: 1
+  rollOutPods: true
+
+# Hubble: off for 0.1.0 (observability lands in a separate playbook)
+hubble:
+  enabled: false
+
+# Allow Cilium to attach to interfaces created after it starts
+# (relevant when nodes join late)
+enableIPv4Masquerade: true
+enableIPv6: false
