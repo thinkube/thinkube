@@ -1,0 +1,128 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# containerd_install role
+#
+# Installs the Docker-provided containerd.io package at a pinned version,
+# writes the Thinkube-opinionated /etc/containerd/config.toml, enables the
+# service, and holds the package against accidental upgrade.
+#
+# Why Docker's containerd.io rather than Ubuntu's containerd: Ubuntu's
+# package lags upstream by months; Docker's containerd.io is the version
+# kubeadm validates against and what the NVIDIA GPU operator's container
+# toolkit is tested against. The package is named containerd.io but it IS
+# upstream containerd.
+#
+# Why we own /etc/containerd/config.toml: avoids the failure mode
+# documented in canonical/k8s-snap#1991 (hardcoded imports path
+# overriding custom paths) and #2529 (active CRI plugin defaulting to
+# SystemdCgroup=false). See defaults/main.yaml + templates/config.toml.j2.
+
+- name: Ensure apt prerequisites are installed
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+    update_cache: true
+  become: true
+
+- name: Ensure /etc/apt/keyrings exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Download Docker apt signing key
+  ansible.builtin.get_url:
+    url: "{{ containerd_apt_key_url }}"
+    dest: "{{ containerd_apt_key_path }}"
+    mode: '0644'
+    force: false
+  become: true
+
+- name: Resolve apt architecture
+  ansible.builtin.set_fact:
+    _containerd_apt_arch: "{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
+
+- name: Add Docker apt repository
+  ansible.builtin.copy:
+    dest: "{{ containerd_apt_list_path }}"
+    mode: '0644'
+    content: |
+      deb [arch={{ _containerd_apt_arch }} signed-by={{ containerd_apt_key_path }}] {{ containerd_apt_repo_url }} {{ ansible_facts['distribution_release'] }} stable
+  become: true
+  register: _docker_apt_repo
+
+- name: Update apt cache after repo change
+  ansible.builtin.apt:
+    update_cache: true
+  become: true
+  when: _docker_apt_repo is changed
+
+- name: Install containerd.io at pinned version
+  ansible.builtin.apt:
+    name: "containerd.io={{ containerd_apt_version }}"
+    state: present
+    allow_change_held_packages: true
+  become: true
+  notify: restart containerd
+
+- name: Hold containerd.io against accidental apt upgrade
+  ansible.builtin.dpkg_selections:
+    name: containerd.io
+    selection: hold
+  become: true
+
+- name: Ensure containerd imports directory exists
+  ansible.builtin.file:
+    path: "{{ containerd_imports_dir }}"
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Render /etc/containerd/config.toml
+  ansible.builtin.template:
+    src: config.toml.j2
+    dest: /etc/containerd/config.toml
+    mode: '0644'
+    owner: root
+    group: root
+  become: true
+  notify: restart containerd
+
+- name: Ensure containerd is enabled and started
+  ansible.builtin.systemd:
+    name: containerd
+    enabled: true
+    state: started
+  become: true
+
+- name: Flush handlers (apply any pending containerd restart before continuing)
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for containerd CRI socket to be ready
+  ansible.builtin.wait_for:
+    path: /run/containerd/containerd.sock
+    state: present
+    timeout: 30
+  become: true
+
+- name: Verify containerd advertises SystemdCgroup=true on the active CRI plugin
+  ansible.builtin.shell: |
+    set -o pipefail
+    containerd config dump | awk '
+      /\[plugins\."io\.containerd\.cri\.v1\.runtime"\.containerd\.runtimes\.runc\.options\]/ {in_block=1; next}
+      in_block && /^\[/ {in_block=0}
+      in_block && /SystemdCgroup *= *true/ {found=1}
+      END {exit (found ? 0 : 1)}
+    '
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+  register: _systemd_cgroup_check
+  failed_when: _systemd_cgroup_check.rc != 0

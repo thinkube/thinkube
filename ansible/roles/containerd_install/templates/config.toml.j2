@@ -1,0 +1,46 @@
+version = 3
+
+imports = ["{{ containerd_imports_dir }}/*.toml"]
+
+# containerd 2.x native config syntax (version = 3).
+#
+# Single source of truth: io.containerd.cri.v1.runtime is the active
+# CRI plugin in containerd 2.x. Under version = 3 the legacy
+# io.containerd.grpc.v1.cri name is no longer how you address the CRI
+# plugin, so configuring it here would be dead code under our pinned
+# containerd version (2.2.4-1, apt-mark hold).
+#
+# SystemdCgroup = true makes the active plugin agree with kubelet
+# (--cgroup-driver=systemd, set in kubeadm-init-config KubeletConfiguration).
+# Disagreement is exactly the failure mode of canonical/k8s-snap#2529:
+# runc refuses to create containers when kubelet expects systemd cgroup
+# paths and containerd's active plugin defaults to cgroupfs. We pin the
+# containerd version and write the matching config; the bug class is
+# eliminated by construction.
+#
+# Open hardware-validation item — NVIDIA GPU operator toolkit drop-in.
+# The toolkit writes /etc/containerd/conf.d/99-nvidia.toml. containerd
+# reads each imported file by its own `version =` header, so a v2-syntax
+# drop-in is still parsed — but a v2 grpc.v1.cri-named runtime block
+# lands in a different plugin namespace than ours and would not merge
+# into cri.v1.runtime.runtimes. The toolkit's drop-in format must be
+# verified on DGX Spark: if the toolkit registers the nvidia runtime
+# under cri.v1.runtime (modern syntax), this config works as-is. If it
+# only writes legacy syntax, options are (a) override the toolkit's
+# config-version env var if supported, or (b) invert this template to
+# version = 2 + grpc.v1.cri only. Both are single-block — never
+# dual-block, which adds inconsistency without safety since the
+# containerd version is pinned.
+
+[plugins."io.containerd.cri.v1.runtime"]
+  sandbox_image = "{{ containerd_sandbox_image }}"
+
+  [plugins."io.containerd.cri.v1.runtime".containerd]
+    default_runtime_name = "runc"
+
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes]
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
+        runtime_type = "io.containerd.runc.v2"
+
+        [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
+          SystemdCgroup = true
