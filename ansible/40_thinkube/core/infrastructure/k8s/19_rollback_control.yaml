@@ -2,15 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-# Rollback playbook for k8s-snap control node
-# Description:
-#   Completely removes k8s-snap installation and associated configuration
-#   WARNING: This will destroy the Kubernetes cluster and all resources
+# ansible/40_thinkube/core/infrastructure/k8s/19_rollback_control.yaml
+#
+# Rollback playbook for the Thinkube Kubernetes Cluster control plane
+# (kubeadm-installed).
+#
+# WARNING: This destroys the Kubernetes cluster and all resources.
+# Volumes provisioned by OpenEBS Rawfile CSI are deleted; their backing
+# raw-file images on disk are removed. JuiceFS data in SeaweedFS is not
+# touched (lives outside the cluster). Harbor / Keycloak / PostgreSQL
+# data backed by csi-rawfile-default IS lost.
+#
+# After this runs, the host is ready for a fresh
+# `10_install_k8s.yaml` run.
 #
 # Usage:
-#   ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/infrastructure/k8s-snap/19_rollback_control.yaml
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s/19_rollback_control.yaml
+#
+# 🤖 [AI-assisted]
 
-- name: Rollback k8s-snap Control Node Installation
+- name: Rollback Thinkube Kubernetes Cluster — Control Plane
   hosts: k8s_control_plane
   become: true
   gather_facts: true
@@ -18,141 +29,154 @@
   vars:
     user: "{{ system_username }}"
     user_home: "/home/{{ user }}"
-    kubectl_wrapper_path: "{{ user_home }}/.local/bin/kubectl"
-    helm_wrapper_path: "{{ user_home }}/.local/bin/helm"
+    kubectl_path: "{{ user_home }}/.local/bin/kubectl"
+    helm_path: "{{ user_home }}/.local/bin/helm"
 
   tasks:
-    # ===========================
-    # Stop k8s Cluster
-    # ===========================
-    - name: Check if k8s-snap is installed
-      ansible.builtin.command: snap list k8s
-      register: k8s_snap_check
+    # =====================================================================
+    # kubeadm reset — clean shutdown of the cluster
+    # =====================================================================
+    - name: Check if cluster is initialised
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: _admin_conf
+
+    - name: Check if kubeadm is installed
+      ansible.builtin.stat:
+        path: /usr/bin/kubeadm
+      register: _kubeadm_binary
+
+    - name: Run kubeadm reset (drains etcd, removes /etc/kubernetes, etc.)
+      ansible.builtin.command: kubeadm reset --force --cleanup-tmp-dir
+      when: _kubeadm_binary.stat.exists
+      register: _kubeadm_reset
       failed_when: false
-      changed_when: false
+      changed_when: _kubeadm_reset.rc == 0
 
-    - name: Stop k8s cluster (if installed)
-      ansible.builtin.command: k8s stop
-      register: k8s_stop
+    # =====================================================================
+    # apt: unhold + purge the cluster packages
+    # =====================================================================
+    - name: Unhold kubeadm / kubelet / kubectl / containerd.io
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop:
+        - kubeadm
+        - kubelet
+        - kubectl
+        - containerd.io
       failed_when: false
-      changed_when: k8s_stop.rc == 0
-      when: k8s_snap_check.rc == 0
 
-    - name: Wait for k8s services to stop
-      ansible.builtin.pause:
-        seconds: 10
-      when: k8s_stop is changed
+    - name: Purge k8s + containerd packages
+      ansible.builtin.apt:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+          - containerd.io
+        state: absent
+        purge: true
+        autoremove: true
+      failed_when: false
 
-    # ===========================
-    # Remove k8s-snap
-    # ===========================
-    - name: Unmount lingering kubelet pod volumes
+    # =====================================================================
+    # Wipe state directories owned by Thinkube
+    # =====================================================================
+    - name: Unmount any lingering kubelet pod volumes
       ansible.builtin.shell: |
-        mount | grep "/var/snap/k8s/common/var/lib/kubelet/pods" | awk '{print $3}' | xargs -I {} umount -l {} 2>/dev/null || true
+        mount | awk '/\/var\/lib\/kubelet\/pods/ {print $3}' | xargs -r -I {} umount -l {} 2>/dev/null || true
       changed_when: false
-      when: k8s_snap_check.rc == 0
 
-    - name: Remove k8s-snap
-      community.general.snap:
-        name: k8s
+    - name: Remove cluster + container runtime state directories
+      ansible.builtin.file:
+        path: "{{ item }}"
         state: absent
-      when: k8s_snap_check.rc == 0
-      register: snap_removal
-
-    - name: Purge k8s-snap data
-      ansible.builtin.command: snap remove --purge k8s
-      when:
-        - k8s_snap_check.rc == 0
-        - snap_removal is changed
+      loop:
+        - /etc/kubernetes
+        - /etc/cni/net.d
+        - /etc/containerd
+        - /var/lib/kubelet
+        - /var/lib/containerd
+        - /var/lib/etcd
+        - /var/openebs           # OpenEBS Rawfile dataroot (default)
+        - /var/lib/rawfile-localpv  # alternate OpenEBS path observed in some chart versions
       failed_when: false
-      changed_when: true
 
-    # ===========================
-    # Clean Up Wrapper Scripts
-    # ===========================
-    - name: Remove kubectl wrapper script
+    - name: Remove user kubeconfig
       ansible.builtin.file:
-        path: "{{ kubectl_wrapper_path }}"
+        path: "{{ user_home }}/.kube"
         state: absent
 
-    - name: Remove helm wrapper script
+    - name: Remove vanilla kubectl / helm binaries from ~/.local/bin
       ansible.builtin.file:
-        path: "{{ helm_wrapper_path }}"
+        path: "{{ item }}"
         state: absent
+      loop:
+        - "{{ kubectl_path }}"
+        - "{{ helm_path }}"
 
-    # ===========================
-    # Clean Up Alias System
-    # ===========================
+    - name: Remove Thinkube-owned kernel module and sysctl drop-ins
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/modules-load.d/thinkube-k8s.conf
+        - /etc/sysctl.d/99-thinkube-k8s.conf
+
+    - name: Remove Thinkube-owned apt repositories and keys
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/docker.list
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/keyrings/docker.asc
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Refresh apt cache after repo removal
+      ansible.builtin.apt:
+        update_cache: true
+      failed_when: false
+
+    # =====================================================================
+    # Shell alias cleanup
+    # =====================================================================
     - name: Check if thinkube_shared_shell directory exists
       ansible.builtin.stat:
         path: "{{ user_home }}/.thinkube_shared_shell"
-      register: shared_shell_dir
+      register: _shared_shell_dir
 
     - name: Remove k8s alias files
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
       loop:
-        - "{{ user_home }}/.thinkube_shared_shell/aliases/kubectl_aliases.json"
-        - "{{ user_home }}/.thinkube_shared_shell/aliases/helm_aliases.json"
         - "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh"
         - "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.fish"
-      when: shared_shell_dir.stat.exists
+      when: _shared_shell_dir.stat.exists
 
-    # ===========================
-    # Clean Up Kubeconfig
-    # ===========================
-    - name: Remove k8s kubeconfig
-      ansible.builtin.file:
-        path: /etc/kubernetes/admin.conf
-        state: absent
-
-    - name: Remove k8s configuration directory
-      ansible.builtin.file:
-        path: /etc/kubernetes
-        state: absent
-
-    - name: Remove user .kube directory
-      ansible.builtin.file:
-        path: "{{ user_home }}/.kube"
-        state: absent
-      become_user: "{{ user }}"
-
-    # ===========================
-    # Clean Up Data Directories
-    # ===========================
-    - name: Remove k8s data directories
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /var/snap/k8s/common
-        - /var/lib/k8s-dqlite
-        - /var/lib/rawfile-localpv
-      failed_when: false
-
-    # ===========================
-    # Clean Up CNI Interfaces (Cilium)
-    # ===========================
-    - name: Get list of Cilium network interfaces
+    # =====================================================================
+    # Cilium / kubelet network interfaces
+    # =====================================================================
+    - name: Enumerate Cilium-created interfaces
       ansible.builtin.shell: |
-        ip link show | grep -E 'cilium|lxc' | awk -F: '{print $2}' | sed 's/^ //' || true
-      register: cilium_interfaces
+        ip -o link show | awk -F': ' '/cilium|lxc/ {print $2}' | sed 's/@.*//' | sort -u
+      register: _cilium_interfaces
       changed_when: false
 
-    - name: Remove Cilium network interfaces
-      ansible.builtin.command: ip link delete {{ item }}
-      loop: "{{ cilium_interfaces.stdout_lines }}"
-      when: cilium_interfaces.stdout_lines | length > 0
+    - name: Delete Cilium-created interfaces
+      ansible.builtin.command: "ip link delete {{ item }}"
+      loop: "{{ _cilium_interfaces.stdout_lines | default([]) }}"
+      when: _cilium_interfaces.stdout_lines | length > 0
       failed_when: false
       changed_when: true
 
-    # ===========================
-    # Optional: Reset UFW Rules
-    # ===========================
-    - name: Remove k8s UFW rules
+    # =====================================================================
+    # UFW rule cleanup (kubeadm-specific port set)
+    # =====================================================================
+    - name: Remove kubeadm UFW rules
       block:
-        - name: Remove k8s API server port rule
+        - name: Remove k8s API server port rule (6443/tcp)
           community.general.ufw:
             rule: allow
             port: '6443'
@@ -160,15 +184,31 @@
             delete: true
           failed_when: false
 
-        - name: Remove k8s cluster daemon port rule
+        - name: Remove etcd client + peer rule (2379:2380/tcp)
           community.general.ufw:
             rule: allow
-            port: '6400'
+            port: '2379:2380'
             proto: tcp
             delete: true
           failed_when: false
 
-        - name: Remove kubelet API port rule
+        - name: Remove controller-manager rule (10257/tcp)
+          community.general.ufw:
+            rule: allow
+            port: '10257'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove scheduler rule (10259/tcp)
+          community.general.ufw:
+            rule: allow
+            port: '10259'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove kubelet API rule (10250/tcp)
           community.general.ufw:
             rule: allow
             port: '10250'
@@ -176,7 +216,7 @@
             delete: true
           failed_when: false
 
-        - name: Remove Cilium health port rule
+        - name: Remove Cilium health rule (4240/tcp)
           community.general.ufw:
             rule: allow
             port: '4240'
@@ -184,7 +224,7 @@
             delete: true
           failed_when: false
 
-        - name: Remove Cilium VXLAN port rule
+        - name: Remove Cilium VXLAN rule (8472/udp)
           community.general.ufw:
             rule: allow
             port: '8472'
@@ -192,28 +232,31 @@
             delete: true
           failed_when: false
 
-        # Disable UFW BEFORE flushing iptables.
-        # If UFW stays enabled (per ufw.conf) but its chains get wiped by the
-        # iptables flush below, the next install run will hit
-        # "ERROR: problem running" because ufw tries to reload chains that
-        # no longer exist.
+        # Disable UFW BEFORE the iptables flush below. Same rationale as
+        # the k8s-snap era playbook: if UFW config says enabled but the
+        # iptables flush wipes its chains, the next install will hit
+        # "ERROR: problem running" on UFW's reload.
         - name: Disable UFW so its config matches the post-flush reality
           community.general.ufw:
             state: disabled
           failed_when: false
 
-    # ===========================
-    # Reset iptables
-    # ===========================
-    - name: Flush k8s iptables rules and reset default policies
+    # =====================================================================
+    # iptables reset (last step — anything that follows must re-add rules)
+    # =====================================================================
+    - name: Flush iptables and reset default policies
       ansible.builtin.shell: |
         iptables -F
         iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
         iptables -P INPUT ACCEPT
         iptables -P FORWARD ACCEPT
         iptables -P OUTPUT ACCEPT
         ip6tables -F
         ip6tables -X
+        ip6tables -t nat -F 2>/dev/null || true
+        ip6tables -t nat -X 2>/dev/null || true
         ip6tables -P INPUT ACCEPT
         ip6tables -P FORWARD ACCEPT
         ip6tables -P OUTPUT ACCEPT
@@ -224,19 +267,21 @@
       ansible.builtin.debug:
         msg:
           - "==============================================="
-          - "k8s-snap Control Node Rollback Complete"
+          - "Thinkube Kubernetes Cluster — Control Plane Rolled Back"
           - "==============================================="
           - "Removed:"
-          - "  - k8s-snap package and data"
-          - "  - kubectl and helm wrappers"
-          - "  - k8s alias files"
-          - "  - Kubeconfig files"
-          - "  - Cilium network interfaces"
-          - "  - k8s data directories"
+          - "  - Cluster state via kubeadm reset"
+          - "  - apt packages: kubeadm, kubelet, kubectl, containerd.io (purged + autoremove)"
+          - "  - apt repos and keys for k8s + docker (in /etc/apt/...)"
+          - "  - State directories: /etc/kubernetes, /etc/cni/net.d, /etc/containerd,"
+          - "    /var/lib/{kubelet,containerd,etcd,openebs}, /var/lib/rawfile-localpv"
+          - "  - Vanilla kubectl/helm from ~/.local/bin"
+          - "  - Kernel module + sysctl drop-ins under /etc/{modules-load,sysctl}.d/"
+          - "  - Cilium-created network interfaces"
+          - "  - kubeadm UFW rules; UFW disabled before iptables flush"
+          - "  - All iptables rules (filter + nat)"
           - "==============================================="
-          - "Manual cleanup (if needed):"
-          - "  1. Check UFW rules: sudo ufw status"
-          - "  2. Check network interfaces: ip link show"
-          - "  3. Check for remaining k8s processes: ps aux | grep k8s"
-          - "  4. Review /etc/default/ufw (DEFAULT_FORWARD_POLICY)"
+          - "Next steps:"
+          - "  - Run 10_install_k8s.yaml for a fresh install"
+          - "  - Or verify clean state: ip link show; ps aux | grep -E 'kube|containerd'"
           - "==============================================="
