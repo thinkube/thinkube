@@ -46,14 +46,43 @@
         path: /usr/bin/kubeadm
       register: _kubeadm_binary
 
-    - name: Stop kubelet before reset to prevent hangs
+    # kubeadm reset hangs on CRI gRPC calls to containerd when pods
+    # are stuck (known bug since 2018, no timeout in removeContainers).
+    # Pre-kill everything ourselves, restart containerd, then reset.
+    - name: Stop kubelet to prevent pod respawns
       ansible.builtin.systemd:
         name: kubelet
         state: stopped
+        enabled: false
       failed_when: false
 
-    - name: Run kubeadm reset (drains etcd, removes /etc/kubernetes, etc.)
-      ansible.builtin.command: kubeadm reset --force --cleanup-tmp-dir
+    - name: Remove static pod manifests
+      ansible.builtin.shell: rm -f /etc/kubernetes/manifests/*.yaml
+      failed_when: false
+
+    - name: Force-stop all containers via crictl
+      ansible.builtin.shell: |
+        export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+        crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" stopp $(crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" pods -q 2>/dev/null) 2>/dev/null || true
+        crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" stop $(crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" ps -aq 2>/dev/null) 2>/dev/null || true
+        crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" rmp --all --force 2>/dev/null || true
+        crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" rm --all --force 2>/dev/null || true
+      failed_when: false
+
+    - name: Restart containerd to clear wedged CRI state
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+      failed_when: false
+
+    - name: Wait for containerd to be ready
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Run kubeadm reset
+      ansible.builtin.command: >
+        kubeadm reset --force --cleanup-tmp-dir
+        --cri-socket unix:///run/containerd/containerd.sock
       when: _kubeadm_binary.stat.exists
       register: _kubeadm_reset
       failed_when: false
