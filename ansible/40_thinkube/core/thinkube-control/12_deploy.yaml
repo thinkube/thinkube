@@ -945,17 +945,40 @@
           - Resources: {{ argocd_app.resources[0].status.resources | default([]) | length }}
       when: argocd_app.resources | length > 0
 
-    # Wait for the deployments to roll out. `kubectl rollout status` returns
-    # as soon as the rollout actually completes, and surfaces real failures
-    # (ImagePullBackOff, CrashLoopBackOff, etc.) via the deployment condition
-    # instead of polling for a full timeout. The 5-min ceiling covers a fresh
-    # install where the kaniko build, Harbor push, ArgoCD sync, and image pull
-    # all happen serially after this point.
+    # Wait for the CI/CD chain to complete: build -> Harbor push ->
+    # webhook adapter updates git -> ArgoCD sync -> deployment created.
+    # On a fresh install this takes ~2-3 minutes. kubectl rollout status
+    # fails immediately if the deployment does not exist yet, so we must
+    # wait for it to appear first.
+    - name: Wait for backend deployment to be created by ArgoCD
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+        name: "thinkube-control-backend"
+      register: backend_deploy
+      until: backend_deploy.resources | length > 0
+      retries: 60
+      delay: 5
+
     - name: Wait for backend deployment rollout
       ansible.builtin.command: >
         {{ kubectl_bin }} rollout status deployment/thinkube-control-backend
         -n {{ k8s_namespace }} --timeout=300s
       changed_when: false
+
+    - name: Wait for frontend deployment to be created by ArgoCD
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+        name: "thinkube-control-frontend"
+      register: frontend_deploy
+      until: frontend_deploy.resources | length > 0
+      retries: 60
+      delay: 5
 
     - name: Wait for frontend deployment rollout
       ansible.builtin.command: >
