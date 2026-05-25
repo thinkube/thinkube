@@ -506,6 +506,33 @@
             admin-password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
 
+    - name: Read JupyterHub service token from hub secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: jupyterhub
+        name: hub
+      register: hub_secret
+      failed_when: false
+
+    - name: Copy JupyterHub service token to thinkube-control namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: jupyterhub-service-token
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          data:
+            token: "{{ hub_secret.resources[0].data['hub.services.thinkube-control.apiToken'] }}"
+      when:
+        - hub_secret.resources | default([]) | length > 0
+        - "'hub.services.thinkube-control.apiToken' in hub_secret.resources[0].data"
+
     # Drop and recreate databases for clean slate (split to avoid transaction block)
     - name: Drop thinkube_control database if exists
       kubernetes.core.k8s_exec:
