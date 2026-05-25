@@ -507,63 +507,29 @@
         repos_to_clone: "{{ (repo_metadata.content | from_json).repositories | selectattr('clone_for_development', 'equalto', true) | list }}"
       failed_when: repos_to_clone | length == 0
 
+    - name: Render clone script from template
+      ansible.builtin.template:
+        src: templates/clone_platform_repos.sh.j2
+        dest: "/tmp/clone_platform_repos.sh"
+        mode: '0755'
+      vars:
+        clone_branch: "{{ lookup('env', 'THINKUBE_BRANCH') | default('main', true) }}"
+
+    - name: Copy clone script into code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp /tmp/clone_platform_repos.sh \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/clone_platform_repos.sh
+
     - name: Clone platform repositories into category directories
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "
-            set -e
-            echo '===== Cloning platform repositories ====='
-
-            # Branch to clone — propagated from the installer's
-            # THINKUBE_BRANCH env var so the in-cluster code matches
-            # what the installer used. Falls back to main.
-            CLONE_BRANCH='{{ lookup("env", "THINKUBE_BRANCH") | default("main", true) }}'
-            echo "Target branch: $CLONE_BRANCH"
-
-            if [ -f /home/thinkube/.ssh/github_ed25519 ]; then
-              echo 'GitHub SSH key found at /home/thinkube/.ssh/github_ed25519'
-              chmod 600 /home/thinkube/.ssh/github_ed25519
-
-              {% for repo in repos_to_clone %}
-              # {{ repo.name }} -> {{ repo.category | default('misc') }}/
-              category='{{ repo.category | default('misc') }}'
-              repo_name='{{ repo.name }}'
-              repo_full='{{ repo.full_name }}'
-              mkdir -p \"/home/thinkube/thinkube-platform/\$category\"
-              if [ ! -d \"/home/thinkube/thinkube-platform/\$category/\$repo_name\" ]; then
-                echo \"Cloning \$repo_full into \$category/\$repo_name (branch: \$CLONE_BRANCH)...\"
-                GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
-                  git clone -b \"\$CLONE_BRANCH\" \"git@github.com:\$repo_full.git\" \"/home/thinkube/thinkube-platform/\$category/\$repo_name\" 2>/dev/null \
-                  || GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
-                    git clone \"git@github.com:\$repo_full.git\" \"/home/thinkube/thinkube-platform/\$category/\$repo_name\"
-              else
-                echo \"\$category/\$repo_name already exists, pulling latest changes...\"
-                cd \"/home/thinkube/thinkube-platform/\$category/\$repo_name\"
-                git reset --hard HEAD
-                if GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' git fetch origin 2>&1; then
-                  if git rev-parse --verify \"origin/\$CLONE_BRANCH\" >/dev/null 2>&1; then
-                    echo \"Resetting to origin/\$CLONE_BRANCH for \$repo_name...\"
-                    git checkout \"\$CLONE_BRANCH\" 2>/dev/null || git checkout -b \"\$CLONE_BRANCH\" \"origin/\$CLONE_BRANCH\"
-                    git reset --hard \"origin/\$CLONE_BRANCH\"
-                  else
-                    echo \"Branch \$CLONE_BRANCH not found on origin for \$repo_name, using main...\"
-                    git reset --hard origin/main
-                  fi
-                else
-                  echo \"ERROR: Failed to fetch from origin for \$repo_name\"
-                  exit 1
-                fi
-              fi
-              {% endfor %}
-
-              echo '✅ All platform repositories cloned'
-            else
-              echo 'ERROR: No SSH key found at /home/thinkube/.ssh/github_ed25519'
-              echo 'Please ensure GitHub SSH key is properly configured'
-              exit 1
-            fi
-          "
+          bash /tmp/clone_platform_repos.sh
       register: clone_result
+
+    - name: Clean up clone script
+      ansible.builtin.file:
+        path: "/tmp/clone_platform_repos.sh"
+        state: absent
 
     - name: Display repository cloning output
       ansible.builtin.debug:
@@ -584,46 +550,30 @@
         user_templates_to_clone: "{{ (user_repo_metadata.content | from_json).repositories | selectattr('clone_for_development', 'equalto', true) | list }}"
       when: user_repo_metadata is defined and user_repo_metadata.status | default(0) == 200
 
+    - name: Render user clone script from template
+      ansible.builtin.template:
+        src: templates/clone_user_repos.sh.j2
+        dest: "/tmp/clone_user_repos.sh"
+        mode: '0755'
+      when: user_templates_to_clone is defined and user_templates_to_clone | length > 0
+
+    - name: Copy user clone script into code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp /tmp/clone_user_repos.sh \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/clone_user_repos.sh
+      when: user_templates_to_clone is defined and user_templates_to_clone | length > 0
+
     - name: Clone user template repositories
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "
-            set -e
-            echo '===== Cloning user template repositories ====='
-            mkdir -p /home/thinkube/user-templates
-
-            if [ -f /home/thinkube/.ssh/github_ed25519 ]; then
-              chmod 600 /home/thinkube/.ssh/github_ed25519
-
-              {% for tmpl in user_templates_to_clone %}
-              repo_name='{{ tmpl.name }}'
-              repo_full='{{ tmpl.full_name }}'
-              if [ ! -d \"/home/thinkube/user-templates/\$repo_name\" ]; then
-                echo \"Cloning \$repo_full...\"
-                GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' \
-                  git clone \"git@github.com:\$repo_full.git\" \"/home/thinkube/user-templates/\$repo_name\"
-              else
-                echo \"\$repo_name already exists, pulling latest changes...\"
-                cd \"/home/thinkube/user-templates/\$repo_name\"
-                git reset --hard HEAD
-                if GIT_SSH_COMMAND='ssh -i /home/thinkube/.ssh/github_ed25519 -o StrictHostKeyChecking=no' git fetch origin 2>&1; then
-                  default_branch=\$(git remote show origin 2>/dev/null | grep 'HEAD branch' | awk '{print \$NF}')
-                  echo \"Resetting to origin/\$default_branch for \$repo_name...\"
-                  git reset --hard \"origin/\$default_branch\"
-                else
-                  echo \"ERROR: Failed to fetch from origin for \$repo_name\"
-                  exit 1
-                fi
-              fi
-              {% endfor %}
-
-              echo '✅ User template repositories cloned'
-            else
-              echo 'ERROR: No SSH key found'
-              exit 1
-            fi
-          "
+          bash /tmp/clone_user_repos.sh
       register: user_clone_result
+      when: user_templates_to_clone is defined and user_templates_to_clone | length > 0
+
+    - name: Clean up user clone script
+      ansible.builtin.file:
+        path: "/tmp/clone_user_repos.sh"
+        state: absent
       when: user_templates_to_clone is defined and user_templates_to_clone | length > 0
 
     - name: Display user template cloning output
