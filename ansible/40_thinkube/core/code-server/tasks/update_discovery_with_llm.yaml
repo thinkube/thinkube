@@ -1,0 +1,60 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# tasks/update_discovery_with_llm.yaml
+# Called from thinkube-control/13_configure_code_server.yaml to add
+# LLM gateway environment variables to the code-server service
+# discovery ConfigMap after thinkube-control is deployed.
+#
+# Expected vars:
+#   llm_gateway_url: URL of the LLM gateway proxy
+#   llm_api_token: API token for authenticating with thinkube-control
+
+- name: Read current service discovery ConfigMap
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: ConfigMap
+    name: thinkube-service-config
+    namespace: code-server
+  register: current_configmap
+
+- name: Parse current service.yaml
+  ansible.builtin.set_fact:
+    current_service_yaml: "{{ current_configmap.resources[0].data['service.yaml'] | from_yaml }}"
+  when: current_configmap.resources | length > 0
+
+- name: Build updated environment_variables list
+  ansible.builtin.set_fact:
+    updated_env_vars: >-
+      {{
+        (current_service_yaml.service.environment_variables | default([]))
+        | rejectattr('name', 'equalto', 'LLM_GATEWAY_URL')
+        | rejectattr('name', 'equalto', 'THINKUBE_API_TOKEN')
+        | list
+        + [
+            {'name': 'LLM_GATEWAY_URL', 'value': llm_gateway_url},
+            {'name': 'THINKUBE_API_TOKEN', 'valueFrom': {'secretKeyRef': {'namespace': 'thinkube-control', 'name': 'mcp-default-token', 'key': 'token'}}}
+          ]
+      }}
+  when: current_configmap.resources | length > 0
+
+- name: Update service discovery ConfigMap with LLM gateway vars
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: thinkube-service-config
+        namespace: code-server
+        labels:
+          thinkube.io/managed: "true"
+          thinkube.io/service-type: "core"
+          thinkube.io/service-name: "code-server"
+      data:
+        service.yaml: "{{ current_service_yaml | combine({'service': current_service_yaml.service | combine({'environment_variables': updated_env_vars})}) | to_nice_yaml }}"
+  when: current_configmap.resources | length > 0
