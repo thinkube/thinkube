@@ -278,6 +278,75 @@
           failed_when: false
 
     # =====================================================================
+    # DNS: remove stale BIND9 config so host falls back to ISP DNS
+    # =====================================================================
+    - name: Remove Thinkube DNS config (BIND9 IP becomes stale after rollback)
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d/10-thinkube.conf
+        state: absent
+      register: _dns_cleanup
+
+    - name: Restart systemd-resolved to pick up DNS change
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+      when: _dns_cleanup.changed
+
+    # =====================================================================
+    # Tailscale: remove operator-managed devices and split DNS
+    # =====================================================================
+    - name: Remove Tailscale split DNS for domain
+      ansible.builtin.uri:
+        url: "https://api.tailscale.com/api/v2/tailnet/-/dns/split-dns"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ tailscale_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          "{{ domain_name }}": []
+        status_code: [200]
+      when:
+        - tailscale_api_token is defined and tailscale_api_token | length > 0
+        - overlay_provider | default('') == 'tailscale'
+      failed_when: false
+      become: false
+
+    - name: List Tailscale devices for cleanup
+      ansible.builtin.uri:
+        url: "https://api.tailscale.com/api/v2/tailnet/-/devices"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ tailscale_api_token }}"
+        return_content: yes
+      register: _ts_devices
+      when:
+        - tailscale_api_token is defined and tailscale_api_token | length > 0
+        - overlay_provider | default('') == 'tailscale'
+      failed_when: false
+      become: false
+
+    - name: Delete operator-managed Tailscale devices
+      ansible.builtin.uri:
+        url: "https://api.tailscale.com/api/v2/device/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ tailscale_api_token }}"
+        status_code: [200]
+      loop: >-
+        {{ (_ts_devices.json.devices | default([]))
+           | selectattr('hostname', 'match', '^(' + cluster_name | default('thinkube') + '-|tailscale-operator)')
+           | list }}
+      loop_control:
+        label: "{{ item.hostname }}"
+      when:
+        - _ts_devices is defined
+        - _ts_devices.json is defined
+        - _ts_devices.json.devices | default([]) | length > 0
+      failed_when: false
+      become: false
+
+    # =====================================================================
     # iptables reset (last step — anything that follows must re-add rules)
     # =====================================================================
     - name: Flush iptables and reset default policies

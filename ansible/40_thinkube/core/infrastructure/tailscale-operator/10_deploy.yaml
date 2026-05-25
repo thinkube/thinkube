@@ -64,6 +64,33 @@
           OAuth (Devices/Core R+W, Keys/Auth Keys R+W, tag k8s-operator)
           and re-run the configuration step in the installer.
 
+    - name: Remove stale Tailscale devices from previous installs
+      ansible.builtin.uri:
+        url: "https://api.tailscale.com/api/v2/tailnet/-/devices"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ tailscale_api_token }}"
+        return_content: yes
+      register: ts_devices
+      when: tailscale_api_token is defined and tailscale_api_token | length > 0
+
+    - name: Delete stale operator-managed Tailscale devices
+      ansible.builtin.uri:
+        url: "https://api.tailscale.com/api/v2/device/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ tailscale_api_token }}"
+        status_code: [200]
+      loop: >-
+        {{ (ts_devices.json.devices | default([]))
+           | selectattr('hostname', 'match', '^(' + cluster_name + '-|tailscale-operator)')
+           | list }}
+      loop_control:
+        label: "{{ item.hostname }} ({{ item.addresses[0] | default('?') }})"
+      when:
+        - tailscale_api_token is defined and tailscale_api_token | length > 0
+        - ts_devices.json.devices | default([]) | length > 0
+
     - name: Add the Tailscale Helm repository
       ansible.builtin.command: >
         {{ helm_bin }} repo add {{ operator_repo_name }} {{ operator_repo_url }}
