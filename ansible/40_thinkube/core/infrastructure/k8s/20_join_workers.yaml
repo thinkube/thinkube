@@ -311,6 +311,43 @@
         - join_token is defined
 
     # =====================================================================
+    # Route to control plane's dummy interface (k8s_stable_ip)
+    # =====================================================================
+    # The control plane binds the API server to a dummy interface
+    # (172.16.0.1) for location-independent single-node portability.
+    # Workers reach it via a static route to the control plane's LAN IP.
+    - name: Add route to control plane API server
+      ansible.builtin.command: ip route replace {{ k8s_stable_ip }}/32 via {{ hostvars[control_plane_host]['lan_ip'] }}
+      become: true
+      changed_when: true
+
+    - name: Make route persistent across reboots
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/k8s-api-route.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Route to k8s API server dummy interface
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/sbin/ip route replace {{ k8s_stable_ip }}/32 via {{ hostvars[control_plane_host]['lan_ip'] }}
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+      become: true
+
+    - name: Enable k8s-api-route service
+      ansible.builtin.systemd:
+        name: k8s-api-route
+        enabled: true
+        daemon_reload: true
+      become: true
+
+    # =====================================================================
     # kubeadm join
     # =====================================================================
     - name: Clean up leftover state from any previous failed join attempt
