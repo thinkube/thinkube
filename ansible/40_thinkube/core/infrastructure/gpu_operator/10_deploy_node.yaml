@@ -1,0 +1,173 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/gpu_operator/10_deploy_node.yaml
+# Description:
+#   Lightweight GPU setup for newly added nodes. Runs only the per-node
+#   tasks needed when a worker joins an existing cluster where the GPU
+#   operator is already installed.
+#
+#   For full GPU operator installation, use 10_deploy.yaml instead.
+#
+# What it does:
+#   1. Host-level GPU prerequisites (driver validation marker, Docker runtime)
+#   2. Detect GPU compute capability and set gpu_supported fact
+#   3. Label pre-Volta nodes to disable GPU operator DaemonSets
+#   4. Wait for toolkit DaemonSet to schedule on new GPU nodes
+#   5. Restart containerd on new GPU nodes to pick up nvidia runtime
+#
+# What it does NOT do (already done during initial install):
+#   - Helm install/upgrade of the GPU operator
+#   - Clean stale labels on existing nodes
+#   - Run CUDA test pod (node is cordoned during add-node)
+
+# ===========================
+# Play 1: Per-node host-level GPU setup
+# ===========================
+- name: Configure GPU host prerequisites
+  hosts: baremetal_gpus
+  become: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Configure Docker daemon for NVIDIA runtime (DGX Spark only)
+      ansible.builtin.copy:
+        content: |
+          {
+              "runtimes": {
+                  "nvidia": {
+                      "path": "nvidia-container-runtime",
+                      "runtimeArgs": []
+                  }
+              }
+          }
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+      become: true
+      when: gpu_model is defined and ('DGX Spark' in gpu_model or 'GB10' in gpu_model)
+
+    - name: Restart Docker to load NVIDIA runtime (DGX Spark only)
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+      become: true
+      when: gpu_model is defined and ('DGX Spark' in gpu_model or 'GB10' in gpu_model)
+
+    - name: Check if NVIDIA driver is installed
+      ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+      register: nvidia_smi_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create systemd service for NVIDIA host driver validation marker
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Create NVIDIA host driver validation marker
+          After=local-fs.target
+          Before=kubelet.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/bash -c 'mkdir -p /run/nvidia/validations && touch /run/nvidia/validations/host-driver-ready'
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/nvidia-host-driver-validation.service
+        mode: '0644'
+      become: true
+      when: nvidia_smi_check.rc == 0
+
+    - name: Enable and restart NVIDIA host driver validation service
+      ansible.builtin.systemd:
+        name: nvidia-host-driver-validation
+        enabled: true
+        state: restarted
+        daemon_reload: true
+      become: true
+      when: nvidia_smi_check.rc == 0
+
+# ===========================
+# Play 2: Detect GPU compute capability
+# ===========================
+- name: Detect GPU compute capability on new nodes
+  hosts: baremetal_gpus
+  become: false
+
+  tasks:
+    - name: Query GPU compute capability
+      ansible.builtin.command: nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+      register: compute_cap_result
+      changed_when: false
+      failed_when: false
+
+    - name: Set GPU support facts
+      ansible.builtin.set_fact:
+        gpu_compute_cap: "{{ compute_cap_result.stdout | float }}"
+        gpu_supported: "{{ compute_cap_result.rc == 0 and (compute_cap_result.stdout | float) >= 7.0 }}"
+
+    - name: Display GPU status
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: compute_cap={{ gpu_compute_cap }}, supported={{ gpu_supported }} (policy: Volta+, compute_cap >= 7.0)"
+
+# ===========================
+# Play 3: Label pre-Volta nodes to disable GPU operator
+# ===========================
+- name: Disable GPU operator on pre-Volta nodes
+  hosts: k8s_control_plane
+  become: false
+
+  tasks:
+    - name: Build lists of supported and unsupported GPU nodes
+      ansible.builtin.set_fact:
+        unsupported_gpu_nodes: "{{ groups['baremetal_gpus'] | select('in', ansible_play_hosts) | map('extract', hostvars) | selectattr('gpu_supported', 'equalto', false) | map(attribute='inventory_hostname') | list }}"
+
+    - name: Label unsupported GPU nodes to disable operator DaemonSets
+      ansible.builtin.command: >
+        {{ kubectl_bin }} label node {{ item }} --overwrite
+        nvidia.com/gpu.deploy.container-toolkit=false
+        nvidia.com/gpu.deploy.dcgm=false
+        nvidia.com/gpu.deploy.dcgm-exporter=false
+        nvidia.com/gpu.deploy.device-plugin=false
+        nvidia.com/gpu.deploy.driver=false
+        nvidia.com/gpu.deploy.gpu-feature-discovery=false
+        nvidia.com/gpu.deploy.node-status-exporter=false
+        nvidia.com/gpu.deploy.operator-validator=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ unsupported_gpu_nodes }}"
+      changed_when: true
+      failed_when: false
+      when: unsupported_gpu_nodes | length > 0
+
+# ===========================
+# Play 4: Wait for toolkit and restart containerd on new GPU nodes
+# ===========================
+- name: Restart containerd on new GPU nodes after toolkit configuration
+  hosts: baremetal_gpus
+  become: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Wait for nvidia-container-toolkit to create drop-in config
+      ansible.builtin.wait_for:
+        path: /etc/containerd/conf.d/99-nvidia.toml
+        state: present
+        timeout: 300
+      become: true
+      when: gpu_supported | default(false) | bool
+
+    - name: Restart containerd to pick up nvidia runtime configuration
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+      become: true
+      when: gpu_supported | default(false) | bool
+
+    - name: Wait for containerd to be ready after restart
+      ansible.builtin.pause:
+        seconds: 10
+        prompt: "Waiting for containerd to restart..."
+      when: gpu_supported | default(false) | bool

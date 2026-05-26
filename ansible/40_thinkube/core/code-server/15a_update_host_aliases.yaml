@@ -1,0 +1,69 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/code-server/15a_update_host_aliases.yaml
+# Description:
+#   Lightweight playbook that only updates code-server hostAliases
+#   when nodes are added/removed. Extracted from 15_configure_environment.yaml
+#   to avoid running the full environment setup during add-node.
+
+- name: Update code-server hostAliases for cluster nodes
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    code_server_namespace: "code-server"
+
+  tasks:
+    - name: Build hostAliases list for cluster nodes
+      ansible.builtin.set_fact:
+        cluster_host_aliases: "{{ cluster_host_aliases | default([]) + [{'ip': hostvars[item]['ansible_host'], 'hostnames': [item]}] }}"
+      loop: "{{ groups['baremetal'] }}"
+      when: hostvars[item]['ansible_host'] is defined
+
+    - name: Get current hostAliases from code-server deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Deployment
+        namespace: "{{ code_server_namespace }}"
+        name: code-server
+      register: cs_deployment
+
+    - name: Build comparable host strings from current and desired aliases
+      ansible.builtin.set_fact:
+        current_hosts: "{{ cs_deployment.resources[0].spec.template.spec.hostAliases | default([]) | map(attribute='ip') | sort | list }}"
+        desired_hosts: "{{ cluster_host_aliases | map(attribute='ip') | sort | list }}"
+        current_hostnames: "{{ cs_deployment.resources[0].spec.template.spec.hostAliases | default([]) | map(attribute='hostnames') | flatten | sort | list }}"
+        desired_hostnames: "{{ cluster_host_aliases | map(attribute='hostnames') | flatten | sort | list }}"
+
+    - name: Determine if hostAliases need updating
+      ansible.builtin.set_fact:
+        hostalias_changed: "{{ current_hosts != desired_hosts or current_hostnames != desired_hostnames }}"
+
+    - name: Patch code-server deployment with hostAliases (only if changed)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: patched
+        kind: Deployment
+        namespace: "{{ code_server_namespace }}"
+        name: code-server
+        definition:
+          spec:
+            template:
+              spec:
+                hostAliases: "{{ cluster_host_aliases }}"
+      when: hostalias_changed | bool
+
+    - name: Wait for code-server rollout after hostAliases patch
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status deployment/code-server
+        -n {{ code_server_namespace }} --timeout=300s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+      when: hostalias_changed | bool
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: "{{ 'hostAliases updated for ' + (cluster_host_aliases | length | string) + ' nodes' if hostalias_changed | bool else 'hostAliases unchanged, no restart needed' }}"
