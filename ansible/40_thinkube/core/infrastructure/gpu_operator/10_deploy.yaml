@@ -588,9 +588,18 @@
         gpu_count=$({{ kubectl_bin }} get nodes -o json | jq '[.items[].status.allocatable."nvidia.com/gpu" // "0" | tonumber] | add')
         existing_pod=$({{ kubectl_bin }} get pod cuda-vectoradd -n {{ cuda_test_namespace }} 2>/dev/null || echo "not found")
 
+        schedulable_gpu=$({{ kubectl_bin }} get nodes -o json | jq '
+          [.items[] |
+            select(.status.allocatable."nvidia.com/gpu" // "0" | tonumber > 0) |
+            select((.spec.taints // []) | map(select(.key == "node.kubernetes.io/unschedulable")) | length == 0)
+          ] | length')
+
         if [ "$gpu_count" -eq 0 ]; then
           echo "skip_test=true"
           echo "reason=No GPUs available"
+        elif [ "$schedulable_gpu" -eq 0 ]; then
+          echo "skip_test=true"
+          echo "reason=GPU nodes cordoned, skipping test (nvidia-cuda-validator already passed)"
         elif echo "$existing_pod" | grep -q "cuda-vectoradd"; then
           echo "skip_test=true"
           echo "reason=Test pod already exists"
