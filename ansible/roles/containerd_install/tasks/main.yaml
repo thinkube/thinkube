@@ -93,6 +93,29 @@
     mode: '0755'
   become: true
 
+# Clean up k8s-snap-era containerd config files that use the old
+# io.containerd.grpc.v1.cri plugin syntax. Under our version=3 base
+# config, these imported files cause containerd to warn about unknown
+# keys and can prevent SystemdCgroup=true from appearing in the active
+# config dump. Only removes files containing the old plugin path;
+# legitimate drop-ins (e.g. 99-nvidia.toml) are unaffected.
+- name: Find old k8s-snap containerd config drop-ins
+  ansible.builtin.find:
+    paths: "{{ containerd_imports_dir }}"
+    patterns: "*.toml"
+    contains: "io\\.containerd\\.grpc\\.v1\\.cri"
+  become: true
+  register: _old_snap_configs
+
+- name: Remove old k8s-snap containerd config drop-ins
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _old_snap_configs.files }}"
+  become: true
+  notify: restart containerd
+  when: _old_snap_configs.files | length > 0
+
 - name: Render /etc/containerd/config.toml
   ansible.builtin.template:
     src: config.toml.j2
