@@ -38,15 +38,18 @@
 
   pre_tasks:
     # Build nodes' systemd-resolved is configured below to forward
-    # *.{{ domain_name }} queries to BIND9. The IP we point them at must be
-    # whatever bind9-external is currently reachable on — Cilium L2 LB
-    # claimed value (ZeroTier) or Tailscale Operator-assigned tailnet IP.
-    # `ingress[*].ip` (not `[0].ip`) because the Tailscale operator
-    # writes a hostname entry before the IP entry; `[0].ip` would
-    # therefore be empty.
-    - name: Read bind9-external IP from Service status
+    # *.{{ domain_name }} queries to BIND9. In Tailscale mode, use the
+    # bind9-lan service (Cilium L2 LB, LAN-reachable) because the
+    # Tailscale proxy doesn't forward port 53 from external peers.
+    # In ZeroTier mode, use bind9-external (Cilium L2 LB on overlay).
+    - name: Determine DNS service name for build nodes
+      ansible.builtin.set_fact:
+        bind9_svc_name: "{{ 'bind9-lan' if overlay_provider | default('') == 'tailscale' else 'bind9-external' }}"
+      tags: [always]
+
+    - name: Read DNS service IP from Service status
       ansible.builtin.command: >
-        {{ kubectl_bin }} get svc bind9-external -n dns-system
+        {{ kubectl_bin }} get svc {{ bind9_svc_name }} -n dns-system
         -o jsonpath={.status.loadBalancer.ingress[*].ip}
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
@@ -54,10 +57,10 @@
       changed_when: false
       tags: [always]
 
-    - name: Fail if bind9-external has no LoadBalancer IP yet
+    - name: Fail if DNS service has no LoadBalancer IP yet
       ansible.builtin.fail:
         msg: |
-          bind9-external Service in namespace dns-system has no IP in
+          {{ bind9_svc_name }} Service in namespace dns-system has no IP in
           status.loadBalancer.ingress[]. The dns-server playbook must
           run successfully before this one.
       when: bind9_lookup.stdout | length == 0

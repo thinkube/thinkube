@@ -543,16 +543,23 @@
       changed_when: false
 
     # =====================================================================
-    # Cilium L2 Load Balancer (ZeroTier mode only)
+    # Cilium L2 Load Balancer
     # =====================================================================
-    # Replaces `k8s enable load-balancer` + `k8s set load-balancer.cidrs=...`.
-    # Tailscale mode skips entirely — the Tailscale Operator handles
-    # Service exposure via per-Service tailnet IPs.
-    - name: Build Cilium load balancer IP range
+    # Provides LAN-reachable VIPs for LoadBalancer services via ARP.
+    # ZeroTier mode: uses the overlay subnet for the IP range.
+    # Tailscale mode: uses the LAN subnet. Workers need LAN access to
+    # services like BIND9 that the Tailscale proxy doesn't forward.
+    - name: Build Cilium load balancer IP range (ZeroTier — overlay subnet)
       ansible.builtin.set_fact:
         lb_ip_range_start: "{{ overlay_subnet_prefix }}{{ lb_ip_start_octet }}"
         lb_ip_range_end: "{{ overlay_subnet_prefix }}{{ lb_ip_end_octet }}"
       when: overlay_provider == 'zerotier'
+
+    - name: Build Cilium load balancer IP range (Tailscale — LAN subnet)
+      ansible.builtin.set_fact:
+        lb_ip_range_start: "{{ network_gateway | regex_replace('\\.[0-9]+$', '.240') }}"
+        lb_ip_range_end: "{{ network_gateway | regex_replace('\\.[0-9]+$', '.249') }}"
+      when: overlay_provider == 'tailscale'
 
     - name: Render Cilium L2 LB pool + announcement manifests
       ansible.builtin.template:
@@ -560,24 +567,14 @@
         dest: /tmp/cilium-l2-lb.yaml
         mode: '0644'
       become_user: "{{ user }}"
-      when: overlay_provider == 'zerotier'
 
     - name: Apply Cilium L2 LB resources
       ansible.builtin.command: "{{ kubectl_wrapper_path }} apply -f /tmp/cilium-l2-lb.yaml"
       environment:
         KUBECONFIG: "{{ user_home }}/.kube/config"
       become_user: "{{ user }}"
-      when: overlay_provider == 'zerotier'
       register: _lb_apply
       changed_when: "'created' in _lb_apply.stdout or 'configured' in _lb_apply.stdout"
-
-    - name: Skip Cilium L2 LB (Tailscale mode)
-      ansible.builtin.debug:
-        msg: >-
-          overlay_provider is 'tailscale' — Cilium L2 announcements
-          disabled. The Tailscale Operator provisions tailnet IPs for
-          annotated Services.
-      when: overlay_provider == 'tailscale'
 
     # =====================================================================
     # Install OpenEBS Rawfile CSI via helm

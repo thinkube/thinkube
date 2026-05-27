@@ -337,6 +337,37 @@
       changed_when: "'created' in create_lb_service_tailscale.stdout or 'configured' in create_lb_service_tailscale.stdout"
       when: overlay_provider == 'tailscale'
 
+    # In Tailscale mode, also create a LAN-reachable service via Cilium
+    # L2 LB. The Tailscale operator's proxy doesn't forward port 53 from
+    # external peers, so workers on the LAN need a direct path to BIND9.
+    - name: Create bind9-lan Service (Tailscale mode — LAN access via Cilium L2)
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: bind9-lan
+          namespace: {{ dns_namespace }}
+          labels:
+            app: bind9
+        spec:
+          type: LoadBalancer
+          selector:
+            app: bind9
+          ports:
+          - name: dns-udp
+            port: 53
+            targetPort: 53
+            protocol: UDP
+          - name: dns-tcp
+            port: 53
+            targetPort: 53
+            protocol: TCP
+        EOF
+      register: create_lan_service
+      changed_when: "'created' in create_lan_service.stdout or 'configured' in create_lan_service.stdout"
+      when: overlay_provider == 'tailscale'
+
     - name: Create bind9-internal ClusterIP Service
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
@@ -384,11 +415,37 @@
 
     - name: Capture the IP that bind9-external is reachable on
       ansible.builtin.set_fact:
-        bind9_advertised_ip: >-
+        bind9_external_ip: >-
           {{ ((lb_service_json.stdout | from_json).status.loadBalancer.ingress
               | selectattr('ip', 'defined')
               | map(attribute='ip')
               | list)[0] }}
+
+    # In Tailscale mode, also wait for the LAN service IP (used by workers).
+    - name: Wait for bind9-lan LoadBalancer IP to be assigned
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get service bind9-lan -n {{ dns_namespace }} -o json
+      register: lan_service_json
+      until: >-
+        (lan_service_json.stdout | from_json).status.loadBalancer.ingress
+        | default([])
+        | selectattr('ip', 'defined')
+        | list
+        | length > 0
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: overlay_provider == 'tailscale'
+
+    - name: Set bind9_advertised_ip for worker DNS config
+      ansible.builtin.set_fact:
+        bind9_advertised_ip: "{{ ((lan_service_json.stdout | from_json).status.loadBalancer.ingress | selectattr('ip', 'defined') | map(attribute='ip') | list)[0] }}"
+      when: overlay_provider == 'tailscale'
+
+    - name: Set bind9_advertised_ip for worker DNS config (ZeroTier)
+      ansible.builtin.set_fact:
+        bind9_advertised_ip: "{{ bind9_external_ip }}"
+      when: overlay_provider != 'tailscale'
 
     - name: Configure Tailscale split DNS to route domain queries to BIND9
       ansible.builtin.uri:
@@ -399,7 +456,7 @@
           Content-Type: "application/json"
         body_format: json
         body:
-          "{{ domain_name }}": ["{{ bind9_advertised_ip }}"]
+          "{{ domain_name }}": ["{{ bind9_external_ip }}"]
         status_code: [200]
       when:
         - overlay_provider == 'tailscale'
