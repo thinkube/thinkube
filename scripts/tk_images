@@ -49,12 +49,13 @@ usage() {
 }
 
 get_kubectl() {
-    if command -v kubectl &> /dev/null; then
+    if [ -x "$HOME/.local/bin/kubectl" ]; then
+        echo "$HOME/.local/bin/kubectl"
+    elif command -v kubectl &> /dev/null; then
         echo "kubectl"
-    elif command -v k8s &> /dev/null; then
-        echo "k8s kubectl"
     else
-        echo "kubectl"
+        echo -e "${RED}ERROR: kubectl not found. Install it or check your PATH.${NC}" >&2
+        exit 1
     fi
 }
 
@@ -204,15 +205,23 @@ uncordon_nodes() {
         echo -e "${YELLOW}No nodes specified to uncordon${NC}"
         return 0
     fi
+    local failed=0
     IFS=',' read -ra nodes <<< "$nodes_csv"
     for node in "${nodes[@]}"; do
         node=$(echo "$node" | xargs)
-        if $KUBECTL uncordon "$node" 2>/dev/null; then
+        local output
+        if output=$($KUBECTL uncordon "$node" 2>&1); then
             echo -e "${GREEN}✓ $node uncordoned — ready for scheduling${NC}"
         else
-            echo -e "${RED}✗ Failed to uncordon $node${NC}"
+            echo -e "${RED}✗ Failed to uncordon $node: $output${NC}"
+            failed=1
         fi
     done
+    if [ $failed -ne 0 ]; then
+        echo -e "${RED}ERROR: Some nodes could not be uncordoned. They remain in SchedulingDisabled state.${NC}"
+        echo -e "${RED}       Run manually: $KUBECTL uncordon <node>${NC}"
+        return 1
+    fi
 }
 
 show_status() {
