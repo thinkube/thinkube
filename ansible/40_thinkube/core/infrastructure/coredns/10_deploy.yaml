@@ -77,26 +77,41 @@
     # `ingress[*].ip` (not `[0].ip`) because the Tailscale operator
     # writes the hostname entry first and the IP entry second, so
     # `[0].ip` would be empty.
-    - name: Read coredns_external_ip from bind9-external Service status
+    # In Tailscale mode, CoreDNS forwards to the bind9-internal ClusterIP
+    # so DNS traffic stays within the cluster network. In ZeroTier mode,
+    # use the bind9-external LB IP (overlay VIP, reachable from all nodes).
+    - name: Read coredns_external_ip from bind9-internal ClusterIP (Tailscale mode)
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc bind9-internal -n dns-system
+        -o jsonpath={.spec.clusterIP}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: bind9_internal_lookup
+      changed_when: false
+      when: overlay_provider | default('') == 'tailscale'
+
+    - name: Read coredns_external_ip from bind9-external Service (ZeroTier mode)
       ansible.builtin.command: >
         {{ kubectl_bin }} get svc bind9-external -n dns-system
         -o jsonpath={.status.loadBalancer.ingress[*].ip}
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: bind9_lookup
+      register: bind9_external_lookup
       changed_when: false
+      when: overlay_provider | default('') != 'tailscale'
 
-    - name: Fail if bind9-external has no LoadBalancer IP yet
+    - name: Fail if DNS service IP not found
       ansible.builtin.fail:
         msg: |
-          bind9-external Service in namespace dns-system has no IP in
-          status.loadBalancer.ingress[]. The dns-server playbook must
+          BIND9 DNS service IP not found. The dns-server playbook must
           run successfully before this one.
-      when: bind9_lookup.stdout | length == 0
+      when: >
+        (overlay_provider | default('') == 'tailscale' and bind9_internal_lookup.stdout | default('') | length == 0)
+        or (overlay_provider | default('') != 'tailscale' and bind9_external_lookup.stdout | default('') | length == 0)
 
-    - name: Set coredns_external_ip from discovered Service IP
+    - name: Set coredns_external_ip
       ansible.builtin.set_fact:
-        coredns_external_ip: "{{ bind9_lookup.stdout }}"
+        coredns_external_ip: "{{ bind9_internal_lookup.stdout if overlay_provider | default('') == 'tailscale' else bind9_external_lookup.stdout }}"
 
   tasks:
     # CoreDNS is enabled by default in k8s-snap, just verify it's running

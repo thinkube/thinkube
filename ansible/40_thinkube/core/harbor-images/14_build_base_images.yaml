@@ -37,14 +37,16 @@
     admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
   pre_tasks:
-    # Build nodes' systemd-resolved is configured below to forward
-    # *.{{ domain_name }} queries to BIND9. The IP we point them at must be
-    # whatever bind9-external is currently reachable on — Cilium L2 LB
-    # claimed value (ZeroTier) or Tailscale Operator-assigned tailnet IP.
-    # `ingress[*].ip` (not `[0].ip`) because the Tailscale operator
-    # writes a hostname entry before the IP entry; `[0].ip` would
-    # therefore be empty.
-    - name: Read bind9-external IP from Service status
+    # Build nodes' systemd-resolved forwards *.domain queries to BIND9.
+    # Tailscale mode: use the control plane's LAN IP (BIND9 hostPort 53).
+    # ZeroTier mode: use the bind9-external Service IP (overlay VIP).
+    - name: Set bind9_advertised_ip (Tailscale mode — control plane LAN IP)
+      ansible.builtin.set_fact:
+        bind9_advertised_ip: "{{ hostvars[groups['k8s_control_plane'][0]]['lan_ip'] }}"
+      when: overlay_provider | default('') == 'tailscale'
+      tags: [always]
+
+    - name: Read bind9-external IP from Service status (ZeroTier mode)
       ansible.builtin.command: >
         {{ kubectl_bin }} get svc bind9-external -n dns-system
         -o jsonpath={.status.loadBalancer.ingress[*].ip}
@@ -52,20 +54,24 @@
         KUBECONFIG: "{{ kubeconfig }}"
       register: bind9_lookup
       changed_when: false
+      when: overlay_provider | default('') != 'tailscale'
       tags: [always]
 
-    - name: Fail if bind9-external has no LoadBalancer IP yet
+    - name: Fail if bind9-external has no LoadBalancer IP yet (ZeroTier mode)
       ansible.builtin.fail:
         msg: |
           bind9-external Service in namespace dns-system has no IP in
           status.loadBalancer.ingress[]. The dns-server playbook must
           run successfully before this one.
-      when: bind9_lookup.stdout | length == 0
+      when:
+        - overlay_provider | default('') != 'tailscale'
+        - bind9_lookup.stdout | length == 0
       tags: [always]
 
-    - name: Set bind9_advertised_ip from the discovered IP
+    - name: Set bind9_advertised_ip from discovered IP (ZeroTier mode)
       ansible.builtin.set_fact:
         bind9_advertised_ip: "{{ bind9_lookup.stdout }}"
+      when: overlay_provider | default('') != 'tailscale'
       tags: [always]
 
   tasks:

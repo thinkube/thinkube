@@ -148,6 +148,20 @@
              if overlay_provider == 'tailscale'
              else primary_gateway_ip }}
 
+    # In Tailscale mode, the internal zone wildcard uses the control
+    # plane's LAN IP (reachable from the host and pods via externalIPs
+    # Service). The external zone uses the Tailscale gateway IP.
+    - name: Set control plane LAN IP for internal zone (Tailscale mode)
+      ansible.builtin.set_fact:
+        control_plane_lan_ip: "{{ hostvars[control_plane_hostname]['lan_ip'] }}"
+        internal_gateway_ip: "{{ hostvars[control_plane_hostname]['lan_ip'] }}"
+      when: overlay_provider == 'tailscale'
+
+    - name: Set internal gateway IP (ZeroTier mode — same as effective)
+      ansible.builtin.set_fact:
+        internal_gateway_ip: "{{ effective_gateway_ip }}"
+      when: overlay_provider != 'tailscale'
+
   tasks:
     - name: Create DNS namespace and apply resource policies
       ansible.builtin.include_role:
@@ -155,6 +169,27 @@
       vars:
         ns: "{{ dns_namespace }}"
         tier: "critical"
+
+    # In Tailscale mode, BIND9 runs with hostNetwork: true (or hostPort).
+    # UFW must allow port 53 from the pod CIDR and LAN so pods and workers
+    # can reach BIND9 on the control plane.
+    - name: Allow DNS port 53 from pod CIDR (Tailscale mode)
+      community.general.ufw:
+        rule: allow
+        port: '53'
+        from_ip: "10.244.0.0/16"
+        comment: 'Allow DNS from Kubernetes pods'
+      become: true
+      when: overlay_provider == 'tailscale'
+
+    - name: Allow DNS port 53 from LAN (Tailscale mode)
+      community.general.ufw:
+        rule: allow
+        port: '53'
+        from_ip: "{{ network_cidr }}"
+        comment: 'Allow DNS from LAN nodes'
+      become: true
+      when: overlay_provider == 'tailscale'
 
     # Build BIND9 container image
     - name: Install podman
@@ -245,6 +280,40 @@
               file "/etc/bind/zones/db.{{ domain_name }}";
           };
 
+    # Tailscale mode: create a separate named.conf and zone for the
+    # external BIND9 container (port 5353). External Tailscale clients
+    # need the Tailscale gateway IP, while LAN/pod clients need the
+    # control plane LAN IP. Two containers in the same pod, each
+    # serving different zone data.
+    - name: Create external BIND9 named.conf (Tailscale mode)
+      ansible.builtin.set_fact:
+        named_conf_external: |
+          options {
+              directory "/var/cache/bind";
+              forwarders {
+                  8.8.8.8;
+                  8.8.4.4;
+              };
+              dnssec-validation no;
+              allow-query { any; };
+              recursion yes;
+              allow-recursion { any; };
+              listen-on port 5353 { any; };
+              listen-on-v6 port 5353 { any; };
+              version "DNS Server (external)";
+          };
+          include "/etc/bind/zones/zones-external.conf";
+      when: overlay_provider == 'tailscale'
+
+    - name: Create external zones configuration (Tailscale mode)
+      ansible.builtin.set_fact:
+        zones_conf_external: |
+          zone "{{ domain_name }}" {
+              type master;
+              file "/etc/bind/zones/db.external.{{ domain_name }}";
+          };
+      when: overlay_provider == 'tailscale'
+
     # Create the named.conf + zones.conf ConfigMap (no IP-dependent content)
     # so it can be mounted by the Deployment later.
     - name: Create temporary named.conf file
@@ -326,11 +395,11 @@
           ports:
           - name: dns-udp
             port: 53
-            targetPort: 53
+            targetPort: 5353
             protocol: UDP
           - name: dns-tcp
             port: 53
-            targetPort: 53
+            targetPort: 5353
             protocol: TCP
         EOF
       register: create_lb_service_tailscale
@@ -430,7 +499,7 @@
           ns1     IN      A       {{ bind9_advertised_ip }}
 
           ; Wildcard for all subdomains
-          *       IN      A       {{ effective_gateway_ip }}
+          *       IN      A       {{ internal_gateway_ip }}
 
           ; Specific entries for infrastructure
           dns     IN      A       {{ bind9_advertised_ip }}
@@ -450,6 +519,48 @@
         dest: "/tmp/{{ zone_file_main }}"
         mode: '0644'
 
+    # Tailscale mode: create external zone file (wildcard → Tailscale gateway IP)
+    - name: Create external zone file (Tailscale mode)
+      ansible.builtin.copy:
+        content: |
+          $TTL    604800
+          @       IN      SOA     ns1.{{ domain_name }}. admin.{{ domain_name }}. (
+                                  {{ ansible_date_time.epoch }}  ; Serial
+                                  604800          ; Refresh
+                                  86400           ; Retry
+                                  2419200         ; Expire
+                                  604800 )        ; Negative Cache TTL
+          ;
+          @       IN      NS      ns1.{{ domain_name }}.
+          ns1     IN      A       {{ bind9_advertised_ip }}
+
+          ; Wildcard — returns Tailscale gateway IP for external clients
+          *       IN      A       {{ effective_gateway_ip }}
+
+          ; Infrastructure
+          dns     IN      A       {{ bind9_advertised_ip }}
+          {% set host_ip_key = 'lan_ip' %}
+          {{ control_plane_hostname }}  IN  A  {{ hostvars[control_plane_hostname][host_ip_key] }}
+          {% for host in groups['k8s_workers'] | default([]) %}
+          {{ host }}  IN  A  {{ hostvars[host][host_ip_key] }}
+          {% endfor %}
+        dest: "/tmp/db.external.{{ domain_name }}"
+        mode: '0644'
+      when: overlay_provider == 'tailscale'
+
+    # Tailscale mode: also write the external zones.conf and named.conf
+    - name: Create external config files (Tailscale mode)
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "/tmp/{{ item.name }}"
+        mode: '0644'
+      loop:
+        - name: bind9-named-external.conf
+          content: "{{ named_conf_external }}"
+        - name: bind9-zones-external.conf
+          content: "{{ zones_conf_external }}"
+      when: overlay_provider == 'tailscale'
+
     - name: Create ConfigMap for zone files
       ansible.builtin.shell: |
         {{ kubectl_bin }} create configmap bind9-zones \
@@ -458,6 +569,27 @@
           --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
       register: create_bind9_zones
       changed_when: "'created' in create_bind9_zones.stdout or 'configured' in create_bind9_zones.stdout"
+
+    - name: Create ConfigMap for external zone files (Tailscale mode)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} create configmap bind9-zones-external \
+          --from-file=db.external.{{ domain_name }}=/tmp/db.external.{{ domain_name }} \
+          --from-file=zones-external.conf=/tmp/bind9-zones-external.conf \
+          -n {{ dns_namespace }} \
+          --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
+      register: create_bind9_zones_ext
+      changed_when: "'created' in create_bind9_zones_ext.stdout or 'configured' in create_bind9_zones_ext.stdout"
+      when: overlay_provider == 'tailscale'
+
+    - name: Create ConfigMap for external BIND9 config (Tailscale mode)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} create configmap bind9-config-external \
+          --from-file=named.conf=/tmp/bind9-named-external.conf \
+          -n {{ dns_namespace }} \
+          --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
+      register: create_bind9_config_ext
+      changed_when: "'created' in create_bind9_config_ext.stdout or 'configured' in create_bind9_config_ext.stdout"
+      when: overlay_provider == 'tailscale'
 
     # Deploy BIND9 as a Deployment
     - name: Deploy BIND9 DNS server
@@ -472,6 +604,8 @@
             app: bind9
         spec:
           replicas: 1
+          strategy:
+            type: Recreate
           selector:
             matchLabels:
               app: bind9
@@ -490,9 +624,11 @@
                 imagePullPolicy: Never
                 ports:
                 - containerPort: 53
+                  hostPort: 53
                   name: dns-tcp
                   protocol: TCP
                 - containerPort: 53
+                  hostPort: 53
                   name: dns-udp
                   protocol: UDP
                 volumeMounts:
@@ -531,6 +667,34 @@
                     - "dns.{{ domain_name }}"
                   initialDelaySeconds: 10
                   periodSeconds: 10
+              {% if overlay_provider == 'tailscale' %}
+              # Second container: external BIND9 for Tailscale clients (port 5353)
+              - name: bind9-external
+                image: {{ bind9_image_name }}
+                imagePullPolicy: Never
+                ports:
+                - containerPort: 5353
+                  name: dns-ext-tcp
+                  protocol: TCP
+                - containerPort: 5353
+                  name: dns-ext-udp
+                  protocol: UDP
+                volumeMounts:
+                - name: bind9-config-external
+                  mountPath: /etc/bind/named.conf
+                  subPath: named.conf
+                - name: bind9-zones-external
+                  mountPath: /etc/bind/zones
+                - name: cache-external
+                  mountPath: /var/cache/bind
+                resources:
+                  requests:
+                    memory: "128Mi"
+                    cpu: "50m"
+                  limits:
+                    memory: "256Mi"
+                    cpu: "200m"
+              {% endif %}
               volumes:
               - name: bind9-config
                 configMap:
@@ -540,6 +704,16 @@
                   name: bind9-zones
               - name: cache
                 emptyDir: {}
+              {% if overlay_provider == 'tailscale' %}
+              - name: bind9-config-external
+                configMap:
+                  name: bind9-config-external
+              - name: bind9-zones-external
+                configMap:
+                  name: bind9-zones-external
+              - name: cache-external
+                emptyDir: {}
+              {% endif %}
         EOF
       register: deploy_bind9
       changed_when: "'created' in deploy_bind9.stdout or 'configured' in deploy_bind9.stdout"

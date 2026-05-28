@@ -39,7 +39,16 @@
     # `ingress[*].ip` (not `[0].ip`) because the Tailscale operator
     # writes a hostname entry before the IP entry; `[0].ip` would
     # therefore be empty.
-    - name: Read bind9-external IP from Service status
+    # In Tailscale mode, workers use the control plane's LAN IP for DNS
+    # (BIND9 runs with hostPort 53 on the control plane). In ZeroTier
+    # mode, use the bind9-external LB IP (overlay VIP).
+    - name: Set DNS server IP for workers (Tailscale mode — control plane LAN IP)
+      ansible.builtin.set_fact:
+        coredns_external_ip: "{{ hostvars[groups['k8s_control_plane'][0]]['lan_ip'] }}"
+      when: overlay_provider | default('') == 'tailscale'
+      run_once: true
+
+    - name: Read bind9-external IP from Service status (ZeroTier mode)
       ansible.builtin.command: >
         {{ kubectl_bin }} get svc bind9-external -n dns-system
         -o jsonpath={.status.loadBalancer.ingress[*].ip}
@@ -49,19 +58,23 @@
       changed_when: false
       delegate_to: "{{ groups['k8s_control_plane'][0] }}"
       run_once: true
+      when: overlay_provider | default('') != 'tailscale'
 
-    - name: Fail if bind9-external has no LoadBalancer IP yet
+    - name: Fail if bind9-external has no LoadBalancer IP yet (ZeroTier mode)
       ansible.builtin.fail:
         msg: |
           bind9-external Service in namespace dns-system has no IP in
           status.loadBalancer.ingress[]. The dns-server playbook must
           run successfully before this one.
-      when: bind9_lookup.stdout | length == 0
+      when:
+        - overlay_provider | default('') != 'tailscale'
+        - bind9_lookup.stdout | length == 0
       run_once: true
 
-    - name: Set coredns_external_ip from the discovered IP
+    - name: Set coredns_external_ip from discovered IP (ZeroTier mode)
       ansible.builtin.set_fact:
         coredns_external_ip: "{{ bind9_lookup.stdout }}"
+      when: overlay_provider | default('') != 'tailscale'
 
   tasks:
     # Get CoreDNS IP from Kubernetes

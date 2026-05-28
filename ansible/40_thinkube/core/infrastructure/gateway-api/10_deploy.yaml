@@ -586,7 +586,68 @@
       changed_when: false
 
     ###########################################################################
-    # Step 12: Display summary
+    # Step 12: LAN-side gateway Service (Tailscale mode only)
+    ###########################################################################
+    # In Tailscale mode, the Envoy Gateway's external IP is a Tailscale
+    # CGNAT address (100.x.x.x) that host-level processes (kubelet) can't
+    # reach. Create a ClusterIP Service with externalIPs set to the control
+    # plane's LAN IP so kube-proxy installs iptables DNAT rules that make
+    # the gateway reachable at <lan_ip>:443 from hosts and pods.
+    - name: Create LAN-side gateway Service (Tailscale mode)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: envoy-gateway-lan
+            namespace: "{{ eg_namespace }}"
+            labels:
+              app.kubernetes.io/name: envoy-gateway-lan
+          spec:
+            type: ClusterIP
+            externalIPs:
+              - "{{ hostvars[inventory_hostname]['lan_ip'] }}"
+            selector:
+              app.kubernetes.io/component: proxy
+              app.kubernetes.io/managed-by: envoy-gateway
+              app.kubernetes.io/name: envoy
+              gateway.envoyproxy.io/owning-gateway-name: "{{ gateway_name }}"
+              gateway.envoyproxy.io/owning-gateway-namespace: "{{ gateway_namespace }}"
+            ports:
+              - name: http
+                port: 80
+                targetPort: 80
+                protocol: TCP
+              - name: https
+                port: 443
+                targetPort: 443
+                protocol: TCP
+              - name: postgres
+                port: 5432
+                targetPort: 5432
+                protocol: TCP
+              - name: gitea-ssh
+                port: 2222
+                targetPort: 2222
+                protocol: TCP
+              - name: nats
+                port: 4222
+                targetPort: 4222
+                protocol: TCP
+              - name: valkey
+                port: 6379
+                targetPort: 6379
+                protocol: TCP
+              - name: clickhouse
+                port: 9000
+                targetPort: 9000
+                protocol: TCP
+      when: overlay_provider == 'tailscale'
+
+    ###########################################################################
+    # Step 13: Display summary
     ###########################################################################
     - name: Display Gateway deployment summary
       ansible.builtin.debug:
