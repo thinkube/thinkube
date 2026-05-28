@@ -239,6 +239,56 @@
       changed_when: false
 
     ###########################################################################
+    # Step 3b: UFW rules for gateway hostNetwork ports (Tailscale mode)
+    ###########################################################################
+    # With hostNetwork: true, the envoy proxy binds to ports 10080 and
+    # 10443 directly on the host. UFW must allow traffic from pods and
+    # the LAN so kube-proxy DNAT and direct connections work.
+    - name: Allow gateway port 10080/tcp from pod CIDR
+      community.general.ufw:
+        rule: allow
+        port: '10080'
+        proto: tcp
+        from_ip: '10.244.0.0/16'
+        comment: 'Envoy Gateway HTTP (hostNetwork)'
+      become: true
+      delegate_to: "{{ inventory_hostname }}"
+      when: overlay_provider == 'tailscale'
+
+    - name: Allow gateway port 10443/tcp from pod CIDR
+      community.general.ufw:
+        rule: allow
+        port: '10443'
+        proto: tcp
+        from_ip: '10.244.0.0/16'
+        comment: 'Envoy Gateway HTTPS (hostNetwork)'
+      become: true
+      delegate_to: "{{ inventory_hostname }}"
+      when: overlay_provider == 'tailscale'
+
+    - name: Allow gateway port 10080/tcp from LAN
+      community.general.ufw:
+        rule: allow
+        port: '10080'
+        proto: tcp
+        from_ip: "{{ network_cidr }}"
+        comment: 'Envoy Gateway HTTP (hostNetwork, LAN)'
+      become: true
+      delegate_to: "{{ inventory_hostname }}"
+      when: overlay_provider == 'tailscale'
+
+    - name: Allow gateway port 10443/tcp from LAN
+      community.general.ufw:
+        rule: allow
+        port: '10443'
+        proto: tcp
+        from_ip: "{{ network_cidr }}"
+        comment: 'Envoy Gateway HTTPS (hostNetwork, LAN)'
+      become: true
+      delegate_to: "{{ inventory_hostname }}"
+      when: overlay_provider == 'tailscale'
+
+    ###########################################################################
     # Step 4: Create EnvoyProxy resource
     ###########################################################################
     # In Tailscale mode the operator exposes the Envoy Gateway Service on
@@ -252,13 +302,51 @@
       ansible.builtin.set_fact:
         envoy_proxy_kubernetes: >-
           {{ {} if overlay_provider != 'tailscale' else {
+               'envoyDeployment': {
+                 'pod': {
+                   'nodeSelector': {
+                     'kubernetes.io/hostname': inventory_hostname,
+                   },
+                 },
+                 'strategy': {
+                   'type': 'Recreate',
+                 },
+                 'patch': {
+                   'type': 'StrategicMerge',
+                   'value': {
+                     'spec': {
+                       'template': {
+                         'spec': {
+                           'hostNetwork': true,
+                           'dnsPolicy': 'ClusterFirstWithHostNet',
+                         },
+                       },
+                     },
+                   },
+                 },
+               },
                'envoyService': {
                  'loadBalancerClass': 'tailscale',
+                 'externalTrafficPolicy': 'Local',
+                 'type': 'LoadBalancer',
                  'annotations': {
                    'tailscale.com/hostname': gateway_hostname,
                  },
                },
              } }}
+
+    - name: Build full EnvoyProxy spec
+      ansible.builtin.set_fact:
+        envoy_proxy_spec: >-
+          {{ {
+               'provider': {
+                 'type': 'Kubernetes',
+                 'kubernetes': envoy_proxy_kubernetes,
+               },
+             } | combine(
+               { 'extraArgs': ['--base-id', '1'] }
+               if overlay_provider == 'tailscale' else {}
+             ) }}
 
     - name: Create EnvoyProxy resource for Thinkube
       kubernetes.core.k8s:
@@ -274,10 +362,7 @@
           metadata:
             name: thinkube-proxy
             namespace: "{{ eg_namespace }}"
-          spec:
-            provider:
-              type: Kubernetes
-              kubernetes: "{{ envoy_proxy_kubernetes }}"
+          spec: "{{ envoy_proxy_spec }}"
 
     # Service.spec.loadBalancerClass is immutable, so an existing Envoy
     # Gateway Service from a prior deploy that lacked it (or had the
@@ -309,6 +394,22 @@
             - existing_lb_class.stdout != ''
             - existing_lb_class.stdout != 'tailscale'
           changed_when: true
+
+    ###########################################################################
+    # Step 4b: Clean up stale envoy proxy pods (Tailscale mode)
+    ###########################################################################
+    # When the EnvoyProxy CR changes (e.g., adding hostNetwork, strategy),
+    # old pods may be stuck Pending due to port conflicts. Delete them so
+    # the controller creates fresh pods with the updated spec.
+    - name: Delete stale envoy proxy pods to apply updated EnvoyProxy config
+      ansible.builtin.command: >
+        {{ kubectl_bin }} delete pods -n {{ eg_namespace }}
+        -l gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }}
+        --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: overlay_provider == 'tailscale'
+      changed_when: true
 
     ###########################################################################
     # Step 5: Create GatewayClass pointing to Envoy Gateway
@@ -618,11 +719,11 @@
             ports:
               - name: http
                 port: 80
-                targetPort: 80
+                targetPort: 10080
                 protocol: TCP
               - name: https
                 port: 443
-                targetPort: 443
+                targetPort: 10443
                 protocol: TCP
               - name: postgres
                 port: 5432
