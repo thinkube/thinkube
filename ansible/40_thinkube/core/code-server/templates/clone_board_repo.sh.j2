@@ -1,0 +1,46 @@
+#!/bin/bash
+# Rendered by Ansible — provisions the central Tandem board repo (ADR-0008 / SP-10).
+# Creates {{ github_org }}/{{ board_repo_name }} in the org if it's absent (gh is
+# already authenticated in the pod), then clones (or pulls) it to
+# {{ board_repo_path }} over the github_ed25519 SSH key.
+set -e
+
+REPO="{{ github_org }}/{{ board_repo_name }}"
+DEST="{{ board_repo_path }}"
+KEY="/home/thinkube/.ssh/github_ed25519"
+SSH_CMD="ssh -i $KEY -o StrictHostKeyChecking=no"
+
+echo "===== Provisioning the Tandem board repo ($REPO) ====="
+
+# Create the repo if it doesn't exist yet (idempotent — skip if present).
+if gh repo view "$REPO" >/dev/null 2>&1; then
+  echo "$REPO already exists."
+else
+  echo "Creating $REPO (private)..."
+  gh repo create "$REPO" --private
+fi
+
+if [ ! -f "$KEY" ]; then
+  echo "ERROR: No SSH key at $KEY"
+  exit 1
+fi
+chmod 600 "$KEY"
+export GIT_SSH_COMMAND="$SSH_CMD"
+
+if [ ! -d "$DEST/.git" ]; then
+  echo "Cloning $REPO into $DEST..."
+  git clone "git@github.com:$REPO.git" "$DEST"
+else
+  echo "$DEST already cloned, pulling latest..."
+  cd "$DEST"
+  git fetch origin 2>&1 || echo "(fetch skipped — empty/unreachable remote)"
+  default_branch=$(git remote show origin 2>/dev/null | grep 'HEAD branch' | awk '{print $NF}')
+  if [ -n "$default_branch" ] && [ "$default_branch" != "(unknown)" ]; then
+    git reset --hard "origin/$default_branch"
+  fi
+fi
+
+# Persist the SSH command so the user's later git ops in the board repo work.
+git -C "$DEST" config core.sshCommand "$SSH_CMD"
+
+echo "✅ Tandem board repo provisioned at $DEST"
