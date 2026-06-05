@@ -20,11 +20,15 @@
 - name: Configure code-server environment
   hosts: k8s_control_plane
   gather_facts: true
-  
+
   vars:
     code_server_namespace: "code-server"
     shared_code_path: "/home/{{ system_username }}/shared-code"
     code_source_path: "{{ shared_code_path }}"
+    # The central Tandem board repo (ADR-0008 / SP-10): one repo holding every
+    # Thinking Space's board, cloned beside the workspace roots.
+    board_repo_name: "thinkube-tandem"
+    board_repo_path: "/home/{{ system_username }}/{{ board_repo_name }}"
 
   tasks:
     - name: Get code-server pod name
@@ -36,7 +40,8 @@
         KUBECONFIG: "{{ kubeconfig }}"
       register: pod_name
       failed_when: pod_name.stdout == ""
-      
+      tags: board-repo
+
     - name: Wait for pod to be ready
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
@@ -79,7 +84,7 @@
           GITHUB_TOKEN={{ lookup('env', 'GITHUB_TOKEN') }}
           GITHUB_ORG={{ lookup('env', 'GITHUB_ORG') }}
           THINKUBE_BRANCH={{ lookup('env', 'THINKUBE_BRANCH') | default('main', true) }}
-        mode: '0600'
+        mode: "0600"
       no_log: true
 
     ###################################################################
@@ -388,12 +393,12 @@
 
           [ssh_connection]
           ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no
-          
+
     - name: Create temporary Ansible configuration file
       ansible.builtin.copy:
         content: "{{ ansible_cfg_content }}"
         dest: /tmp/ansible-cfg-{{ ansible_date_time.epoch }}
-        mode: '0644'
+        mode: "0644"
       register: temp_ansible_cfg
 
     - name: Copy Ansible configuration to pod
@@ -418,22 +423,22 @@
       ansible.builtin.file:
         path: "{{ shared_code_path }}/.ansible/inventory"
         state: directory
-        mode: '0755'
+        mode: "0755"
       when: inventory_check.stdout == "missing"
 
     - name: Copy entire inventory directory to shared location if missing
       ansible.builtin.copy:
         src: "{{ inventory_dir }}/"
         dest: "{{ shared_code_path }}/.ansible/inventory/"
-        mode: '0644'
-        directory_mode: '0755'
+        mode: "0644"
+        directory_mode: "0755"
       when: inventory_check.stdout == "missing"
 
     # Update Python interpreters in inventory using a Python script
     - name: Create Python script to update inventory
       ansible.builtin.copy:
         dest: /tmp/update_inventory_interpreters.py
-        mode: '0755'
+        mode: "0755"
         content: |
           #!/usr/bin/env python3
           import yaml
@@ -512,7 +517,7 @@
       ansible.builtin.template:
         src: templates/clone_platform_repos.sh.j2
         dest: "/tmp/clone_platform_repos.sh"
-        mode: '0755'
+        mode: "0755"
       vars:
         clone_branch: "{{ lookup('env', 'THINKUBE_BRANCH') | default('main', true) }}"
 
@@ -555,7 +560,7 @@
       ansible.builtin.template:
         src: templates/clone_user_repos.sh.j2
         dest: "/tmp/clone_user_repos.sh"
-        mode: '0755'
+        mode: "0755"
       when: user_templates_to_clone is defined and user_templates_to_clone | length > 0
 
     - name: Copy user clone script into code-server pod
@@ -732,6 +737,39 @@
           "
       no_log: true
       when: github_token is defined and github_token | length > 0
+      tags: board-repo
+
+    # ── Tandem board repo (ADR-0008 / SP-10) ─────────────────────────────────
+    - name: Render Tandem board-repo provisioning script
+      ansible.builtin.template:
+        src: templates/clone_board_repo.sh.j2
+        dest: /tmp/clone_board_repo.sh
+        mode: "0755"
+      tags: board-repo
+
+    - name: Copy board-repo script into code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp /tmp/clone_board_repo.sh \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/clone_board_repo.sh
+      tags: board-repo
+
+    - name: Provision the Tandem board repo (create-if-absent + clone)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash /tmp/clone_board_repo.sh
+      register: board_repo_result
+      tags: board-repo
+
+    - name: Clean up board-repo script
+      ansible.builtin.file:
+        path: /tmp/clone_board_repo.sh
+        state: absent
+      tags: board-repo
+
+    - name: Display board-repo provisioning output
+      ansible.builtin.debug:
+        var: board_repo_result.stdout_lines
+      tags: board-repo
 
     - name: Get ArgoCD token from .env
       ansible.builtin.shell: grep ARGOCD_DEPLOYMENT_SECRET {{ ansible_env.HOME }}/.env | cut -d= -f2 | tr -d '"'
@@ -743,7 +781,7 @@
       ansible.builtin.template:
         src: templates/argocd_config.j2
         dest: /tmp/argocd-config
-        mode: '0600'
+        mode: "0600"
       vars:
         argocd_deployment_token: "{{ argocd_token_result.stdout }}"
       no_log: true
@@ -761,7 +799,7 @@
       ansible.builtin.template:
         src: templates/argo_config.j2
         dest: /tmp/argo-config
-        mode: '0600'
+        mode: "0600"
       vars:
         argo_grpc_domain: "grpc-argo.{{ domain_name }}"
       no_log: true
@@ -814,7 +852,7 @@
       ansible.builtin.template:
         src: templates/docker-config.json.j2
         dest: /tmp/docker-config.json
-        mode: '0600'
+        mode: "0600"
       vars:
         harbor_auth_b64: "{{ harbor_auth_result.stdout }}"
       no_log: true
@@ -845,7 +883,7 @@
       ansible.builtin.template:
         src: templates/test-cli-tools.sh.j2
         dest: /tmp/test-cli-tools-{{ ansible_date_time.epoch }}.sh
-        mode: '0755'
+        mode: "0755"
       register: test_script
 
     - name: Copy test script to code-server pod
@@ -865,7 +903,7 @@
       ansible.builtin.template:
         src: templates/test-cli-tools.fish.j2
         dest: /tmp/test-cli-tools-{{ ansible_date_time.epoch }}.fish
-        mode: '0755'
+        mode: "0755"
       register: test_script_fish
 
     - name: Copy Fish test script to code-server pod
@@ -925,12 +963,12 @@
               "**/.bash_history": true
             }
           }
-          
+
     - name: Create .vscode directory
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "mkdir -p /home/thinkube/.vscode"
-          
+
     - name: Copy VS Code workspace settings
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
@@ -942,13 +980,13 @@
       ansible.builtin.file:
         path: "{{ code_source_path }}/apps"
         state: directory
-        mode: '0755'
+        mode: "0755"
 
     - name: Create Thinkube workspace file
       ansible.builtin.template:
         src: thinkube.code-workspace.j2
         dest: "{{ code_source_path }}/thinkube.code-workspace"
-        mode: '0644'
+        mode: "0644"
 
     - name: Ensure VS Code extensions directory exists
       ansible.builtin.shell: |
@@ -1028,19 +1066,19 @@
     - name: Display thinkube-theme installation output
       ansible.builtin.debug:
         var: theme_install.stdout_lines
-      
+
     - name: Create temporary settings file from template
       ansible.builtin.template:
         src: templates/vscode-settings.json.j2
         dest: /tmp/vscode-settings-{{ ansible_date_time.epoch }}.json
-        mode: '0644'
+        mode: "0644"
       register: temp_settings_file
 
     - name: Ensure VS Code user settings directory exists on host with correct permissions
       ansible.builtin.file:
         path: "{{ code_source_path }}/.local/share/code-server/User"
         state: directory
-        mode: '0755'
+        mode: "0755"
 
     - name: Check if existing settings file exists on host
       ansible.builtin.stat:
@@ -1075,7 +1113,7 @@
       ansible.builtin.copy:
         content: "{{ merged_vscode_settings | to_nice_json(indent=4) }}"
         dest: /tmp/vscode-settings-merged-{{ ansible_date_time.epoch }}.json
-        mode: '0644'
+        mode: "0644"
       register: merged_settings_file
 
     - name: Get current code-server pod name
@@ -1106,7 +1144,7 @@
       ansible.builtin.file:
         path: "{{ merged_settings_file.dest }}"
         state: absent
-      
+
     - name: Display extension configuration output
       ansible.builtin.debug:
         var: extension_config.stdout_lines

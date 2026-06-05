@@ -24,6 +24,12 @@
     code_server_namespace: "code-server"
     code_server_hostname: "code.{{ domain_name }}"
     test_timeout: 300
+    # Tandem board repo provisioning (ADR-0008 / SP-10). In-pod paths: the
+    # shared-code mount surfaces the host staging dir at /home/{{ system_username }}.
+    board_repo_name: "thinkube-tandem"
+    board_repo_path: "/home/{{ system_username }}/{{ board_repo_name }}"
+    board_workspace_file: "/home/{{ system_username }}/thinkube.code-workspace"
+    board_user_settings: "/home/{{ system_username }}/.local/share/code-server/User/settings.json"
 
   tasks:
     ###################################################################
@@ -46,7 +52,7 @@
         namespace: "{{ code_server_namespace }}"
         name: code-server
       register: deployment_check
-      failed_when: 
+      failed_when:
         - deployment_check.resources | length == 0
         - deployment_check.resources[0].status.readyReplicas != 1
 
@@ -59,7 +65,7 @@
         label_selectors:
           - "app.kubernetes.io/name=oauth2-proxy"
       register: oauth_deployment
-      failed_when: 
+      failed_when:
         - oauth_deployment.resources | length == 0
         - oauth_deployment.resources[0].status.readyReplicas is not defined
 
@@ -71,7 +77,7 @@
         namespace: "{{ code_server_namespace }}"
         name: ephemeral-valkey
       register: valkey_deployment
-      failed_when: 
+      failed_when:
         - valkey_deployment.resources | length == 0
         - valkey_deployment.resources[0].status.readyReplicas != 1
 
@@ -232,19 +238,63 @@
       failed_when: false
 
     ###################################################################
+    # 8.5) Check Tandem board repo provisioning (ADR-0008 / SP-10)
+    ###################################################################
+    - name: Check the Tandem board repo is cloned
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        pod: "{{ code_server_pod_info.resources[0].metadata.name }}"
+        command: test -d {{ board_repo_path }}/.git
+      register: board_repo_check
+      when: code_server_pod_info.resources | length > 0
+      changed_when: false
+      failed_when: board_repo_check.rc is not defined or board_repo_check.rc != 0
+
+    - name: Check the "Tandem" workspace root is configured
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        pod: "{{ code_server_pod_info.resources[0].metadata.name }}"
+        command: grep -q Tandem {{ board_workspace_file }}
+      register: board_workspace_check
+      when: code_server_pod_info.resources | length > 0
+      changed_when: false
+      failed_when: board_workspace_check.rc is not defined or board_workspace_check.rc != 0
+
+    - name: Check thinkube.boards.root is set in User settings
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ code_server_namespace }}"
+        pod: "{{ code_server_pod_info.resources[0].metadata.name }}"
+        command: grep -q thinkube.boards.root {{ board_user_settings }}
+      register: board_settings_check
+      when: code_server_pod_info.resources | length > 0
+      changed_when: false
+      failed_when: board_settings_check.rc is not defined or board_settings_check.rc != 0
+
+    - name: Report Tandem board provisioning
+      ansible.builtin.debug:
+        msg: |
+          ✓ Board repo cloned: {{ board_repo_path }}
+          ✓ Workspace root "Tandem" present in {{ board_workspace_file }}
+          ✓ thinkube.boards.root set in {{ board_user_settings }}
+      when: code_server_pod_info.resources | length > 0
+
+    ###################################################################
     # 9) Summary report
     ###################################################################
     - name: Test summary
       ansible.builtin.debug:
         msg: |
-          
+
           ════════════════════════════════════════════════════════
           ✅ Code Server Test Results
           ════════════════════════════════════════════════════════
-          
+
           Namespace: {{ code_server_namespace }}
           URL: https://{{ code_server_hostname }}
-          
+
           Component Status:
           ✓ Code Server deployment: Running
           ✓ OAuth2 Proxy: Running
@@ -254,7 +304,7 @@
           ✓ Keycloak client: Configured
           ✓ Authentication redirect: Working
           {{ '✓ Repository monitor: Running' if monitor_status.status is defined and monitor_status.status.ActiveState == 'active' else '○ Repository monitor: Not configured' }}
-          
+
           Installed Extensions:
           {% if installed_extensions is defined and installed_extensions.stdout_lines is defined %}
           {% for ext in installed_extensions.stdout_lines %}
@@ -265,15 +315,15 @@
           {% else %}
           - Unable to check extensions
           {% endif %}
-          
+
           Access Instructions:
           1. Navigate to https://{{ code_server_hostname }}
           2. Login with Keycloak credentials
           3. VS Code interface should load
-          
+
           Troubleshooting Commands:
           - kubectl -n {{ code_server_namespace }} get pods
           - kubectl -n {{ code_server_namespace }} logs deployment/code-server
           - kubectl -n {{ code_server_namespace }} logs deployment/oauth2-proxy
-          
+
           ════════════════════════════════════════════════════════
