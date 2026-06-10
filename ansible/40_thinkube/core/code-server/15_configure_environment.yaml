@@ -535,6 +535,38 @@
       ansible.builtin.debug:
         var: clone_result.stdout_lines
 
+    # The Tandem sidecar board repo (TEP-0008) is cloned separately from the
+    # metadata-driven platform repos: it is not in thinkube-metadata, and it
+    # must live at the top level (/home/thinkube/thinkube-tandem) that
+    # thinkube.boards.root points to, not nested under thinkube-platform/.
+    - name: Render Tandem board clone script from template
+      ansible.builtin.template:
+        src: templates/clone_tandem_board.sh.j2
+        dest: "/tmp/clone_tandem_board.sh"
+        mode: '0755'
+      vars:
+        tandem_board_repo: "{{ lookup('env', 'THINKUBE_TANDEM_REPO') | default('cmxela/thinkube-tandem', true) }}"
+
+    - name: Copy Tandem board clone script into code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp /tmp/clone_tandem_board.sh \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/clone_tandem_board.sh
+
+    - name: Clone Tandem board repository
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash /tmp/clone_tandem_board.sh
+      register: tandem_clone_result
+
+    - name: Clean up Tandem board clone script
+      ansible.builtin.file:
+        path: "/tmp/clone_tandem_board.sh"
+        state: absent
+
+    - name: Display Tandem board cloning output
+      ansible.builtin.debug:
+        var: tandem_clone_result.stdout_lines
+
     - name: Fetch user metadata repository
       ansible.builtin.uri:
         url: "https://raw.githubusercontent.com/{{ github_org }}/{{ github_org }}-metadata/main/repositories.json"
