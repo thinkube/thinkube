@@ -280,6 +280,55 @@
         already_joined: "{{ _node_exists.rc == 0 }}"
 
     # =====================================================================
+    # Reset orphaned local state before a fresh join
+    # =====================================================================
+    # A node that was previously joined and later removed from the cluster
+    # (or whose control plane was rebuilt) still carries local k8s state:
+    # /etc/kubernetes/kubelet.conf, the PKI, and a running kubelet on :10250.
+    # The control plane no longer lists it, so already_joined is false and we
+    # take the fresh-join path — but kubeadm's preflight then refuses because
+    # the node is already configured. Detect that orphaned state and clear it
+    # with `kubeadm reset` so the join can proceed.
+    #
+    # Guard: only reset when the control plane *positively* reported the node
+    # as NotFound (not merely unreachable). A transient API error also yields
+    # already_joined=false, and we must never wipe a healthy node on a blip.
+    - name: Check for orphaned local kubelet config
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      become: true
+      register: _local_kubelet_conf
+      when:
+        - not already_joined
+        - "'NotFound' in (_node_exists.stderr | default(''))"
+
+    - name: Reset orphaned Kubernetes state before joining
+      when:
+        - not already_joined
+        - "'NotFound' in (_node_exists.stderr | default(''))"
+        - _local_kubelet_conf.stat.exists | default(false)
+      become: true
+      block:
+        - name: Run kubeadm reset on orphaned node
+          ansible.builtin.command: kubeadm reset -f
+          register: _orphan_reset
+          changed_when: _orphan_reset.rc == 0
+
+        - name: Remove stale CNI network config
+          ansible.builtin.file:
+            path: /etc/cni/net.d
+            state: absent
+
+        - name: Stop kubelet after reset
+          ansible.builtin.systemd:
+            name: kubelet
+            state: stopped
+
+        - name: Report orphaned-node reset
+          ansible.builtin.debug:
+            msg: "Reset orphaned k8s state on {{ inventory_hostname }} before re-join."
+
+    # =====================================================================
     # Generate join token + discovery CA hash on the control plane
     # =====================================================================
     - name: Generate kubeadm join command on control plane
