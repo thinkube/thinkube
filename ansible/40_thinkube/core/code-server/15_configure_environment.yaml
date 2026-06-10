@@ -539,33 +539,41 @@
     # metadata-driven platform repos: it is not in thinkube-metadata, and it
     # must live at the top level (/home/thinkube/thinkube-tandem) that
     # thinkube.boards.root points to, not nested under thinkube-platform/.
+    # The repo belongs to the installing user's GitHub org (github_org); the
+    # name defaults to <github_org>/thinkube-tandem and is overridable via
+    # THINKUBE_TANDEM_REPO for installs that keep the board elsewhere.
     - name: Render Tandem board clone script from template
       ansible.builtin.template:
         src: templates/clone_tandem_board.sh.j2
         dest: "/tmp/clone_tandem_board.sh"
         mode: '0755'
       vars:
-        tandem_board_repo: "{{ lookup('env', 'THINKUBE_TANDEM_REPO') | default('cmxela/thinkube-tandem', true) }}"
+        tandem_board_repo: "{{ lookup('env', 'THINKUBE_TANDEM_REPO') | default(github_org ~ '/thinkube-tandem', true) }}"
+      when: github_org is defined
 
     - name: Copy Tandem board clone script into code-server pod
       ansible.builtin.shell: |
         {{ kubectl_bin }} cp /tmp/clone_tandem_board.sh \
           {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/clone_tandem_board.sh
+      when: github_org is defined
 
     - name: Clone Tandem board repository
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash /tmp/clone_tandem_board.sh
       register: tandem_clone_result
+      when: github_org is defined
 
     - name: Clean up Tandem board clone script
       ansible.builtin.file:
         path: "/tmp/clone_tandem_board.sh"
         state: absent
+      when: github_org is defined
 
     - name: Display Tandem board cloning output
       ansible.builtin.debug:
         var: tandem_clone_result.stdout_lines
+      when: tandem_clone_result is defined and tandem_clone_result is not skipped
 
     - name: Fetch user metadata repository
       ansible.builtin.uri:
