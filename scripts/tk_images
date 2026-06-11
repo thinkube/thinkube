@@ -152,8 +152,11 @@ for pod in data.get('items', []):
         fi
     done
 
-    # Deduplicate
-    daemonsets_to_fix=$(echo "$daemonsets_to_fix" | tr ' ' '\n' | sort -u | grep -v '^$')
+    # Deduplicate. `|| true` is load-bearing: with no crash-looping pods
+    # (the healthy case) grep matches nothing and exits 1, which under
+    # `set -e` would silently kill the whole script right here — before
+    # the uncordon ever runs.
+    daemonsets_to_fix=$(echo "$daemonsets_to_fix" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
 
     if [ -z "$daemonsets_to_fix" ]; then
         return 0
@@ -178,7 +181,7 @@ for pod in data.get('items', []):
         done
         patch="$patch]"
 
-        $KUBECTL patch daemonset -n "$ds_ns" "$ds_name" --type='json' -p="$patch" 2>/dev/null
+        $KUBECTL patch daemonset -n "$ds_ns" "$ds_name" --type='json' -p="$patch" || true
 
         echo -e "${CYAN}  Waiting for rollout of $ds_ref...${NC}"
         $KUBECTL rollout status daemonset -n "$ds_ns" "$ds_name" --timeout=120s 2>/dev/null || true
@@ -191,13 +194,15 @@ for pod in data.get('items', []):
         done
         restore_patch="$restore_patch]"
 
-        $KUBECTL patch daemonset -n "$ds_ns" "$ds_name" --type='json' -p="$restore_patch" 2>/dev/null
+        $KUBECTL patch daemonset -n "$ds_ns" "$ds_name" --type='json' -p="$restore_patch" || true
         $KUBECTL rollout status daemonset -n "$ds_ns" "$ds_name" --timeout=120s 2>/dev/null || true
 
         echo -e "${GREEN}  ✓ $ds_ref re-pulled and restored to IfNotPresent${NC}"
     done <<< "$daemonsets_to_fix"
 }
 
+# Sets UNCORDON_FAILED=1 if any node could not be verified uncordoned.
+UNCORDON_FAILED=0
 uncordon_nodes() {
     local nodes_csv="$1"
     if [ -z "$nodes_csv" ]; then
@@ -207,10 +212,25 @@ uncordon_nodes() {
     IFS=',' read -ra nodes <<< "$nodes_csv"
     for node in "${nodes[@]}"; do
         node=$(echo "$node" | xargs)
-        if $KUBECTL uncordon "$node" 2>/dev/null; then
-            echo -e "${GREEN}✓ $node uncordoned — ready for scheduling${NC}"
+        local ok=0
+        for attempt in 1 2 3; do
+            if $KUBECTL uncordon "$node"; then
+                # Trust but verify: confirm the node is actually schedulable.
+                local unsched
+                unsched=$($KUBECTL get node "$node" -o jsonpath='{.spec.unschedulable}' 2>/dev/null || echo "unknown")
+                if [ "$unsched" != "true" ] && [ "$unsched" != "unknown" ]; then
+                    ok=1
+                    break
+                fi
+            fi
+            echo -e "${YELLOW}  uncordon attempt $attempt/3 for $node failed — retrying in 10s${NC}"
+            sleep 10
+        done
+        if [ "$ok" -eq 1 ]; then
+            echo -e "${GREEN}✓ $node uncordoned — verified schedulable${NC}"
         else
-            echo -e "${RED}✗ Failed to uncordon $node${NC}"
+            echo -e "${RED}✗ Failed to uncordon $node after 3 attempts${NC}"
+            UNCORDON_FAILED=1
         fi
     done
 }
@@ -253,6 +273,12 @@ UNCORDON_NODES=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --uncordon)
+            # Fail loudly if no node list follows — `shift 2` with a
+            # missing value would kill the script silently under set -e.
+            if [ -z "${2:-}" ]; then
+                echo -e "${RED}--uncordon requires a node list (e.g. --uncordon node1,node2)${NC}"
+                usage
+            fi
             UNCORDON_NODES="$2"
             shift 2
             ;;
@@ -291,12 +317,18 @@ case "$COMMAND" in
             echo ""
             echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
             echo -e "${GREEN}  All images built successfully!${NC}"
-            if [ -n "$UNCORDON_NODES" ]; then
-                echo -e "${GREEN}  Nodes uncordoned: $UNCORDON_NODES${NC}"
+            if [ -n "$UNCORDON_NODES" ] && [ "$UNCORDON_FAILED" -eq 0 ]; then
+                echo -e "${GREEN}  Nodes uncordoned (verified): $UNCORDON_NODES${NC}"
+            elif [ -n "$UNCORDON_NODES" ]; then
+                echo -e "${RED}  WARNING: some nodes are STILL CORDONED.${NC}"
+                echo -e "${RED}  Uncordon manually: tk_images uncordon $UNCORDON_NODES${NC}"
             else
                 echo -e "${YELLOW}  Remember to uncordon nodes: tk_images uncordon node1,node2${NC}"
             fi
             echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
+            if [ "$UNCORDON_FAILED" -ne 0 ]; then
+                exit 1
+            fi
         else
             echo ""
             echo -e "${RED}════════════════════════════════════════════════════════${NC}"
