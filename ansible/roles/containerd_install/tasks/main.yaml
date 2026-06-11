@@ -19,6 +19,8 @@
 # overriding custom paths) and #2529 (active CRI plugin defaulting to
 # SystemdCgroup=false). See defaults/main.yaml + templates/config.toml.j2.
 
+# cache_valid_time skips the refresh when the cache is fresh — see the
+# matching comment in the kubeadm_install role.
 - name: Ensure apt prerequisites are installed
   ansible.builtin.apt:
     name:
@@ -27,6 +29,7 @@
       - gnupg
     state: present
     update_cache: true
+    cache_valid_time: 3600
   become: true
 
 - name: Ensure /etc/apt/keyrings exists
@@ -36,13 +39,20 @@
     mode: '0755'
   become: true
 
+# Generous timeout + retries — see the matching comment in the
+# kubeadm_install role; transient handshake stalls have failed joins.
 - name: Download Docker apt signing key
   ansible.builtin.get_url:
     url: "{{ containerd_apt_key_url }}"
     dest: "{{ containerd_apt_key_path }}"
     mode: '0644'
     force: false
+    timeout: 30
   become: true
+  register: _docker_apt_key
+  retries: 5
+  delay: 10
+  until: _docker_apt_key is succeeded
 
 - name: Resolve apt architecture
   ansible.builtin.set_fact:

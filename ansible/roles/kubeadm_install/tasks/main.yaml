@@ -84,6 +84,9 @@
 # -----------------------------------------------------------------------------
 # apt: keyring + repo + install + hold
 # -----------------------------------------------------------------------------
+# cache_valid_time skips the refresh when the cache is fresh — on hosts
+# with many vendor repos the full sweep takes minutes and the connection
+# burst can trip router throttling for the fetches that follow.
 - name: Ensure apt prerequisites are installed
   ansible.builtin.apt:
     name:
@@ -93,6 +96,7 @@
       - gpg
     state: present
     update_cache: true
+    cache_valid_time: 3600
   become: true
 
 - name: Ensure /etc/apt/keyrings exists
@@ -102,13 +106,21 @@
     mode: '0755'
   become: true
 
+# Generous timeout + retries: consumer routers throttle new-connection
+# bursts, and this fetch lands right after the apt refresh opened ~20
+# TLS connections — a 10s handshake timeout here has failed real joins.
 - name: Fetch Kubernetes apt signing key
   ansible.builtin.get_url:
     url: "{{ kubeadm_apt_key_url }}"
     dest: "/tmp/kubernetes-apt-key.asc"
     mode: '0644'
     force: true
+    timeout: 30
   become: true
+  register: _k8s_apt_key
+  retries: 5
+  delay: 10
+  until: _k8s_apt_key is succeeded
 
 - name: Convert key to keyring binary form
   ansible.builtin.command: >
