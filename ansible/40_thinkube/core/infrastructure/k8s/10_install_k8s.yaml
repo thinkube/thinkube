@@ -285,6 +285,43 @@
         direction: out
       become: true
 
+    # Workers re-resolve the control plane's hostname at boot via LLMNR.
+    # Ubuntu ships systemd-resolved with LLMNR disabled, so enable the
+    # responder explicitly and open its query port.
+    - name: Create systemd-resolved drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Enable LLMNR in systemd-resolved
+      ansible.builtin.copy:
+        content: |
+          # Managed by Thinkube — boot-time control-plane re-resolution
+          # (thinkube-node-ip-sync) uses LLMNR on the local link.
+          [Resolve]
+          LLMNR=yes
+        dest: /etc/systemd/resolved.conf.d/10-thinkube-llmnr.conf
+        mode: '0644'
+      become: true
+      register: _llmnr_conf
+
+    - name: Restart systemd-resolved to apply LLMNR setting
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+      become: true
+      when: _llmnr_conf is changed
+
+    - name: Allow LLMNR name resolution (5355/udp)
+      community.general.ufw:
+        rule: allow
+        port: '5355'
+        proto: udp
+        comment: 'LLMNR name resolution'
+      become: true
+
     # Overlay-network firewall rules. Tailscale's daemon configures its
     # own UFW rules during install (UDP/41641 and tailscale0 trust). For
     # ZeroTier we add the interface family and an SSH-from-overlay rule.
@@ -319,6 +356,38 @@
     - name: Enable UFW
       community.general.ufw:
         state: enabled
+      become: true
+
+    # =====================================================================
+    # Boot-time node-ip self-healing
+    # =====================================================================
+    # The stable VIP keeps every cluster-internal reference
+    # network-independent; kubelet's --node-ip is the one value tied to
+    # the current network. This oneshot rewrites it at every boot from
+    # the default route, so moving the machine to another network is just
+    # "plug in and boot" — no playbook needed (none could run anyway with
+    # the cluster down).
+    - name: Install node-ip sync script
+      ansible.builtin.template:
+        src: thinkube-node-ip-sync.sh.j2
+        dest: /usr/local/bin/thinkube-node-ip-sync
+        mode: '0755'
+      vars:
+        node_ip_sync_managed_by: 10_install_k8s.yaml
+      become: true
+
+    - name: Install node-ip sync unit
+      ansible.builtin.copy:
+        src: thinkube-node-ip-sync.service
+        dest: /etc/systemd/system/thinkube-node-ip-sync.service
+        mode: '0644'
+      become: true
+
+    - name: Enable node-ip sync at boot
+      ansible.builtin.systemd:
+        name: thinkube-node-ip-sync.service
+        enabled: true
+        daemon_reload: true
       become: true
 
     # =====================================================================

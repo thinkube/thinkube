@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Managed by Thinkube ({{ node_ip_sync_managed_by }}) — do not edit.
+#
+# Runs at every boot, before kubelet starts. The stable VIP keeps every
+# cluster-internal reference (API endpoint, certs, kubeconfigs, Cilium)
+# network-independent; this script keeps the few values that MUST track
+# the current network in sync, so moving the machine to another network
+# needs no playbook — which couldn't run anyway with the cluster down.
+set -u
+
+FLAGS=/var/lib/kubelet/kubeadm-flags.env
+
+primary_ip() {
+    ip -4 route get 1.1.1.1 2>/dev/null \
+        | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}'
+}
+
+# --- kubelet --node-ip --------------------------------------------------
+# Node InternalIP is the target for Cilium VXLAN node-to-node traffic and
+# apiserver→kubelet (exec/logs/metrics); it must be a real address on the
+# current network. Missing flags file = node not initialised/joined yet.
+if [ -f "$FLAGS" ]; then
+    new_ip=$(primary_ip)
+{% if node_ip_sync_cp_hostname is not defined %}
+    # Control plane with no default route at all: fall back to the stable
+    # VIP. Harmless standalone — nothing references the InternalIP without
+    # other nodes — and corrected on the next boot with connectivity.
+    [ -n "$new_ip" ] || new_ip="{{ k8s_stable_ip }}"
+{% endif %}
+    current_ip=$(grep -oE -- '--node-ip=[0-9.]+' "$FLAGS" | cut -d= -f2)
+    if [ -n "$new_ip" ] && [ -n "$current_ip" ] && [ "$new_ip" != "$current_ip" ]; then
+        sed -i "s/--node-ip=[0-9.]\+/--node-ip=${new_ip}/" "$FLAGS"
+        echo "kubelet node-ip: ${current_ip} -> ${new_ip}"
+    fi
+fi
+{% if node_ip_sync_cp_hostname is defined %}
+
+# --- API VIP proxy backend (worker only) ---------------------------------
+# Re-resolve the control plane on the current network (systemd-resolved's
+# LLMNR answers single-label hostnames on the local link with no extra
+# services) and repoint the proxy if it moved. Resolution failure keeps
+# the last-known backend — no worse than a static IP.
+PROXY_UNIT=/etc/systemd/system/k8s-api-proxy.service
+if [ -f "$PROXY_UNIT" ]; then
+    cp_ip=$(getent ahostsv4 "{{ node_ip_sync_cp_hostname }}" 2>/dev/null | awk '{print $1; exit}')
+    current_backend=$(grep -oE '[0-9.]+:6443' "$PROXY_UNIT" | cut -d: -f1)
+    if [ -n "$cp_ip" ] && [ -n "$current_backend" ] && [ "$cp_ip" != "$current_backend" ]; then
+        sed -i "s/[0-9.]\+:6443/${cp_ip}:6443/" "$PROXY_UNIT"
+        systemctl daemon-reload
+        systemctl try-restart k8s-api-proxy.service 2>/dev/null || true
+        echo "k8s-api-proxy backend: ${current_backend} -> ${cp_ip}"
+    fi
+fi
+{% endif %}
+
+exit 0

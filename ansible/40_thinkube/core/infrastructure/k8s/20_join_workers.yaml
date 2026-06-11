@@ -133,6 +133,43 @@
         comment: 'k8s API node-local proxy'
       become: true
 
+    # The node-ip sync re-resolves the control plane's hostname at boot
+    # via LLMNR. Ubuntu ships systemd-resolved with LLMNR disabled, so
+    # enable it explicitly and open its query port.
+    - name: Create systemd-resolved drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Enable LLMNR in systemd-resolved
+      ansible.builtin.copy:
+        content: |
+          # Managed by Thinkube — boot-time control-plane re-resolution
+          # (thinkube-node-ip-sync) uses LLMNR on the local link.
+          [Resolve]
+          LLMNR=yes
+        dest: /etc/systemd/resolved.conf.d/10-thinkube-llmnr.conf
+        mode: '0644'
+      become: true
+      register: _llmnr_conf
+
+    - name: Restart systemd-resolved to apply LLMNR setting
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+      become: true
+      when: _llmnr_conf is changed
+
+    - name: Allow LLMNR name resolution (5355/udp)
+      community.general.ufw:
+        rule: allow
+        port: '5355'
+        proto: udp
+        comment: 'LLMNR name resolution'
+      become: true
+
     - name: Allow Cilium health port (4240/tcp)
       community.general.ufw:
         rule: allow
@@ -281,6 +318,33 @@
         name: k8s-api-proxy.socket
         enabled: true
         state: started
+      become: true
+
+    # Boot-time self-healing: rewrites kubelet's --node-ip from the
+    # default route and repoints the proxy backend by re-resolving the
+    # control plane's hostname, so a network move is "plug in and boot".
+    - name: Install node-ip sync script
+      ansible.builtin.template:
+        src: thinkube-node-ip-sync.sh.j2
+        dest: /usr/local/bin/thinkube-node-ip-sync
+        mode: '0755'
+      vars:
+        node_ip_sync_managed_by: 20_join_workers.yaml
+        node_ip_sync_cp_hostname: "{{ control_plane_host }}"
+      become: true
+
+    - name: Install node-ip sync unit
+      ansible.builtin.copy:
+        src: thinkube-node-ip-sync.service
+        dest: /etc/systemd/system/thinkube-node-ip-sync.service
+        mode: '0644'
+      become: true
+
+    - name: Enable node-ip sync at boot
+      ansible.builtin.systemd:
+        name: thinkube-node-ip-sync.service
+        enabled: true
+        daemon_reload: true
       become: true
 
     # Gate the join on the full path working end-to-end: dummy → local
