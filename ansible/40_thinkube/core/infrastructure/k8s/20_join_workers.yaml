@@ -8,14 +8,20 @@
 #
 # Workflow per worker:
 #   1. UFW rules
-#   2. containerd.io + kubeadm/kubelet/kubectl via the same roles the
+#   2. Node-local API VIP: the same k8s0 dummy (k8s_stable_ip) the control
+#      plane has, plus a socket proxy forwarding 172.16.0.1:6443 to the
+#      control plane's LAN IP — so the cluster's stable API endpoint
+#      resolves locally on every node and nothing network-dependent is
+#      baked into certs, kubeconfigs, or Cilium
+#   3. containerd.io + kubeadm/kubelet/kubectl via the same roles the
 #      control plane used (kubeadm_install + containerd_install)
-#   3. Token + CA hash issued by the control plane (delegate_to)
-#   4. JoinConfiguration rendered locally; `kubeadm join --config` runs
-#   5. Wait for node to be Ready, with a Cilium-on-new-node self-heal
+#   4. Token + CA hash issued by the control plane (delegate_to)
+#   5. JoinConfiguration rendered locally; `kubeadm join --config` runs
+#      against the VIP
+#   6. Wait for node to be Ready, with a Cilium-on-new-node self-heal
 #      fallback (kept verbatim from the k8s-snap era — the bug is in
 #      Cilium's init container, not in k8s-snap, so the fix carries over)
-#   6. Cilium IPAM wait + restart pods with stale CIDR-conflict IPs
+#   7. Cilium IPAM wait + restart pods with stale CIDR-conflict IPs
 #
 # After all workers join, two follow-up plays:
 #   - Control plane: pin CoreDNS to control plane node; wait for all
@@ -51,9 +57,9 @@
     helm_wrapper_path: "{{ user_home }}/.local/bin/helm"
     control_plane_host: "{{ groups['k8s_control_plane'][0] }}"
 
-    # Stable API endpoint on the control plane (same value as in
-    # 10_install_k8s.yaml; not derived because the worker doesn't
-    # configure its own dummy interface).
+    # Stable API endpoint, same value as in 10_install_k8s.yaml. The worker
+    # gets its own k8s0 dummy carrying this IP plus a local socket proxy to
+    # the control plane's LAN IP, so the VIP resolves on every node.
     k8s_stable_ip: "172.16.0.1"
 
     # Version pins — release-manifest values for v1.35.5+thinkube.0.1.0
@@ -115,6 +121,16 @@
         port: '10250'
         proto: tcp
         comment: 'k8s kubelet'
+      become: true
+
+    # Pod traffic DNAT'd by Cilium to the node-local API VIP arrives via
+    # Cilium interfaces and must pass the INPUT chain to reach the proxy.
+    - name: Allow node-local API VIP port (6443/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '6443'
+        proto: tcp
+        comment: 'k8s API node-local proxy'
       become: true
 
     - name: Allow Cilium health port (4240/tcp)
@@ -182,6 +198,101 @@
       community.general.ufw:
         state: enabled
       become: true
+
+    # =====================================================================
+    # Node-local API VIP (k8s0 dummy + socket proxy)
+    # =====================================================================
+    # The cluster's API endpoint is k8s_stable_ip everywhere (certs,
+    # cluster-info, kubeconfigs, Cilium k8sServiceHost). The worker makes
+    # that IP local: the same k8s0 dummy the control plane carries, plus a
+    # socket-activated proxy forwarding it to the control plane's LAN IP.
+    # Only ordinary worker→CP LAN traffic crosses the wire — the VIP never
+    # does — which keeps the control plane movable across networks.
+    - name: Create systemd-networkd config directory
+      ansible.builtin.file:
+        path: /etc/systemd/network
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Create k8s dummy interface netdev configuration
+      ansible.builtin.copy:
+        content: |
+          [NetDev]
+          Name=k8s0
+          Kind=dummy
+          Description=Kubernetes API Server stable interface
+        dest: /etc/systemd/network/10-k8s-dummy.netdev
+        mode: '0644'
+      become: true
+      notify: restart_networkd
+
+    - name: Create k8s dummy interface network configuration
+      ansible.builtin.copy:
+        content: |
+          [Match]
+          Name=k8s0
+
+          [Network]
+          Address={{ k8s_stable_ip }}/32
+
+          [Link]
+          RequiredForOnline=no
+        dest: /etc/systemd/network/10-k8s-dummy.network
+        mode: '0644'
+      become: true
+      notify: restart_networkd
+
+    - name: Enable and start systemd-networkd
+      ansible.builtin.systemd:
+        name: systemd-networkd
+        enabled: true
+        state: started
+      become: true
+
+    - name: Install API VIP proxy socket unit
+      ansible.builtin.template:
+        src: k8s-api-proxy.socket.j2
+        dest: /etc/systemd/system/k8s-api-proxy.socket
+        mode: '0644'
+      become: true
+      notify: daemon_reload
+
+    - name: Install API VIP proxy service unit
+      ansible.builtin.template:
+        src: k8s-api-proxy.service.j2
+        dest: /etc/systemd/system/k8s-api-proxy.service
+        mode: '0644'
+      become: true
+      notify: daemon_reload
+
+    - name: Flush handlers to apply network config and unit changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify k8s dummy interface exists
+      ansible.builtin.command: ip addr show k8s0
+      become: true
+      register: k8s_interface_check
+      changed_when: false
+      failed_when: k8s_interface_check.rc != 0
+
+    - name: Enable and start API VIP proxy socket
+      ansible.builtin.systemd:
+        name: k8s-api-proxy.socket
+        enabled: true
+        state: started
+      become: true
+
+    # Gate the join on the full path working end-to-end: dummy → local
+    # proxy → control plane apiserver. /version is anonymous-allowed.
+    - name: Verify control plane API is reachable through the node-local VIP
+      ansible.builtin.command: >
+        curl -ks --max-time 10 https://{{ k8s_stable_ip }}:6443/version
+      register: _vip_check
+      retries: 12
+      delay: 5
+      until: _vip_check.rc == 0 and 'gitVersion' in _vip_check.stdout
+      changed_when: false
 
     # =====================================================================
     # containerd + kubeadm/kubelet/kubectl install (via roles)
@@ -544,6 +655,19 @@
       become: true
       listen: reload_ufw
       changed_when: true
+
+    - name: restart_networkd
+      ansible.builtin.systemd:
+        name: systemd-networkd
+        state: restarted
+      become: true
+      listen: restart_networkd
+
+    - name: daemon_reload
+      ansible.builtin.systemd:
+        daemon_reload: true
+      become: true
+      listen: daemon_reload
 
 
 # =========================================================================

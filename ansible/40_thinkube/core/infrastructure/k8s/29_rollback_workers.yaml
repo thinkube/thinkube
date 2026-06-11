@@ -171,6 +171,44 @@
         - "{{ kubectl_path }}"
         - "{{ helm_path }}"
 
+    # =====================================================================
+    # Node-local API VIP (k8s0 dummy + socket proxy) — see 20_join_workers
+    # =====================================================================
+    - name: Stop and disable API VIP proxy units
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - k8s-api-proxy.socket
+        - k8s-api-proxy.service
+      failed_when: false
+
+    - name: Remove API VIP proxy unit files and dummy interface configs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/k8s-api-proxy.socket
+        - /etc/systemd/system/k8s-api-proxy.service
+        - /etc/systemd/network/10-k8s-dummy.netdev
+        - /etc/systemd/network/10-k8s-dummy.network
+
+    - name: Reload systemd after unit removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart systemd-networkd after dummy config removal
+      ansible.builtin.systemd:
+        name: systemd-networkd
+        state: restarted
+      failed_when: false
+
+    - name: Delete k8s0 dummy interface
+      ansible.builtin.command: ip link delete k8s0
+      failed_when: false
+      changed_when: true
+
     - name: Remove Thinkube-owned kernel module and sysctl drop-ins
       ansible.builtin.file:
         path: "{{ item }}"
