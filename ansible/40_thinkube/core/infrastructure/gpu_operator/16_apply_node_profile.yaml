@@ -1,0 +1,93 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/gpu_operator/16_apply_node_profile.yaml
+# Description:
+#   Apply the `dedicated-ai` deployment profile to a GPU node: reserve it for AI
+#   workloads by tainting it, so the platform stack is repelled and the LLM
+#   gateway can offer (near) the full GPU budget (LLM_UMA_AI_BUDGET_DEDICATED_GB).
+#   Implements the SL-7 installer half of SP-tgihtr (TEP-tgih96).
+#
+# SAFETY — order matters:
+#   The GPU operator daemonsets (device-plugin / GFD / dcgm) must tolerate the
+#   taint BEFORE it is applied, or they get evicted and nvidia.com/gpu disappears
+#   (GPU breaks). This playbook patches the ClusterPolicy toleration first, then
+#   taints. node-metrics already tolerates all NoSchedule taints (operator:
+#   Exists), and the gateway's own AI pods tolerate it (llm_pod_manager adds the
+#   toleration). CNI/CSI daemonsets tolerate all taints by default.
+#
+# Validate on first use: tainting a node evicts the platform pods running on it —
+# only run when you intend to dedicate that node to AI (the all-in-one default
+# leaves the node untainted).
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible \
+#     ansible/40_thinkube/core/infrastructure/gpu_operator/16_apply_node_profile.yaml \
+#     -e ai_node=tkspark
+#
+# Revert to all-in-one:
+#   kubectl taint node <ai_node> thinkube.io/workload-
+#   kubectl label node <ai_node> thinkube.io/node-role-
+#
+# 🤖 [AI-assisted]
+
+- name: Apply dedicated-ai node profile
+  hosts: k8s_control_plane
+  become: false
+  vars:
+    ai_taint_key: "thinkube.io/workload"
+    ai_taint: "thinkube.io/workload=ai:NoSchedule"
+
+  pre_tasks:
+    - name: Verify required variables exist
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined
+      loop:
+        - kubeconfig
+        - kubectl_bin
+        - ai_node
+
+  tasks:
+    # 1. Tolerate the taint on the GPU operator daemonsets FIRST, so the
+    #    device-plugin/GFD/dcgm pods are not evicted when the node is tainted.
+    - name: Add AI-taint toleration to GPU operator daemonsets (before tainting)
+      ansible.builtin.command: >-
+        {{ kubectl_bin }} patch clusterpolicy cluster-policy --type=json
+        -p='[{"op":"add","path":"/spec/daemonsets/tolerations/-",
+        "value":{"key":"{{ ai_taint_key }}","operator":"Equal","value":"ai","effect":"NoSchedule"}}]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: cp_patch
+      changed_when: "'patched' in (cp_patch.stdout | default(''))"
+      failed_when:
+        - cp_patch.rc != 0
+        - "'already exists' not in (cp_patch.stderr | default(''))"
+
+    # 2. Label the node so the gateway raises its budget for this role.
+    - name: Label the node thinkube.io/node-role=ai-dedicated
+      ansible.builtin.command: >-
+        {{ kubectl_bin }} label node {{ ai_node }}
+        thinkube.io/node-role=ai-dedicated --overwrite
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+
+    # 3. Taint the node — platform Deployments are now repelled; AI workloads
+    #    (which tolerate it) and tolerate-all daemonsets remain.
+    - name: Taint the node for AI-only scheduling
+      ansible.builtin.command: >-
+        {{ kubectl_bin }} taint node {{ ai_node }} {{ ai_taint }} --overwrite
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ ai_node }} is now dedicated-ai: platform pods are repelled
+          (reschedule them onto the control-plane node), and the LLM gateway
+          offers ~{{ lookup('env', 'LLM_UMA_AI_BUDGET_DEDICATED_GB') | default('112', true) }} GB
+          of AI budget on it.
