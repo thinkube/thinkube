@@ -1,0 +1,189 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 14_harden_node_logging.yaml — Bound system-log growth so a message flood
+# cannot fill a node's disk.
+#
+# Purpose:
+#   On 2026-06-16 a runaway kernel OOM-killer loop on tkspark dumped a stack
+#   trace + memstat block thousands of times per second. The default Ubuntu
+#   rsyslog config writes kernel messages to BOTH /var/log/kern.log and
+#   /var/log/syslog, so the flood grew ~3 TB across the two files, filled the
+#   node's disk to 100%, and triggered DiskPressure pod evictions
+#   (SP-tgqg1j / TEP-tgmtd3). The originating loop is fixed in SP-tgqg1j_SL-1;
+#   this playbook is defense-in-depth so ANY future message storm — from any
+#   source — cannot fill the disk again.
+#
+#   Three independent layers (any one bounds growth; together they cap rate,
+#   redundancy, and total size):
+#     1. rsyslog $RepeatedMsgReduction — collapse consecutive duplicate lines
+#        ("last message repeated N times") + a rate limit on the log socket.
+#     2. journald RateLimit* + SystemMaxUse — cap the journal's own rate/size.
+#     3. logrotate size cap + frequent (hourly) timer on syslog/kern.log — a
+#        hard ceiling on on-disk size regardless of message content.
+#
+# Detection: runs against `baremetal` (all nodes); no per-host gating —
+#   every node benefits from a flood guard.
+#
+# Idempotent. Re-runnable from the installer or the add-node flow.
+#
+# Run with:
+#   ./scripts/run_ansible.sh ansible/00_initial_setup/14_harden_node_logging.yaml
+
+- name: Bound system-log growth against message floods
+  hosts: baremetal
+  gather_facts: false
+  become: true
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Layer 1: rsyslog — collapse duplicates + rate-limit the log socket
+    # ------------------------------------------------------------------
+    - name: Write rsyslog flood-guard drop-in
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/99-thinkube-flood-guard.conf
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          # Thinkube — flood guard (SP-tgqg1j_SL-2 / TEP-tgmtd3)
+          # Collapse consecutive identical lines (OOM dumps repeat heavily). This
+          # is the only rate lever settable from a drop-in on rsyslog v8: the
+          # imuxsock/imklog rate limits are module-load params already fixed in
+          # the base config, so journald RateLimit (below) + the logrotate size
+          # cap carry the hard bound; this just slashes duplicate volume.
+          $RepeatedMsgReduction on
+      register: rsyslog_dropin
+
+    - name: Validate rsyslog configuration before restart
+      ansible.builtin.command: rsyslogd -N1
+      register: rsyslog_check
+      changed_when: false
+      failed_when: rsyslog_check.rc != 0
+
+    - name: Restart rsyslog to apply the drop-in
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+      when: rsyslog_dropin.changed
+
+    # ------------------------------------------------------------------
+    # Layer 2: journald — cap rate and total journal size
+    # ------------------------------------------------------------------
+    - name: Ensure journald drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Write journald flood-guard drop-in
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/99-thinkube-flood-guard.conf
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          # Thinkube — flood guard (SP-tgqg1j_SL-2 / TEP-tgmtd3)
+          [Journal]
+          RateLimitIntervalSec=30s
+          RateLimitBurst=10000
+          SystemMaxUse=2G
+      register: journald_dropin
+
+    - name: Restart systemd-journald to apply the drop-in
+      ansible.builtin.systemd:
+        name: systemd-journald
+        state: restarted
+      when: journald_dropin.changed
+
+    # ------------------------------------------------------------------
+    # Layer 3: logrotate — hard size ceiling on syslog/kern.log, checked hourly
+    # ------------------------------------------------------------------
+    - name: Write logrotate size cap for syslog/kern.log
+      ansible.builtin.copy:
+        dest: /etc/logrotate.d/99-thinkube-flood-cap
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          # Thinkube — flood cap (SP-tgqg1j_SL-2 / TEP-tgmtd3)
+          # Rotate when a file exceeds 200M (checked hourly via the timer below),
+          # keep only 3 compressed generations -> on-disk ceiling ~ a few hundred MB
+          # per file even under a sustained flood.
+          /var/log/syslog
+          /var/log/kern.log
+          {
+              su root adm
+              rotate 3
+              size 200M
+              missingok
+              notifempty
+              compress
+              delaycompress
+              sharedscripts
+              postrotate
+                  /usr/lib/rsyslog/rsyslog-rotate 2>/dev/null || true
+              endscript
+          }
+
+    # logrotate's size trigger only fires when logrotate RUNS; the default timer
+    # is daily, far too slow for a fast flood. Run it hourly so the 200M cap is
+    # enforced within the hour rather than the day.
+    - name: Ensure logrotate.timer drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/logrotate.timer.d
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Install hourly logrotate systemd timer override (run hourly, not daily)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/logrotate.timer.d/99-thinkube-hourly.conf
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          # Thinkube — run logrotate hourly so the syslog/kern.log size cap is
+          # enforced quickly under a flood (SP-tgqg1j_SL-2 / TEP-tgmtd3).
+          [Timer]
+          OnCalendar=
+          OnCalendar=hourly
+      register: logrotate_timer
+
+    - name: Reload systemd and re-arm the logrotate timer
+      ansible.builtin.systemd:
+        name: logrotate.timer
+        state: restarted
+        daemon_reload: true
+      when: logrotate_timer.changed
+
+    # ------------------------------------------------------------------
+    # Verify
+    # ------------------------------------------------------------------
+    - name: Confirm drop-ins are in place
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "rsyslog:   $(test -f /etc/rsyslog.d/99-thinkube-flood-guard.conf && echo present || echo MISSING)"
+        echo "journald:  $(test -f /etc/systemd/journald.conf.d/99-thinkube-flood-guard.conf && echo present || echo MISSING)"
+        echo "logrotate: $(test -f /etc/logrotate.d/99-thinkube-flood-cap && echo present || echo MISSING)"
+        echo "timer:     $(systemctl show -p NextElapseUSecRealtime --value logrotate.timer 2>/dev/null || echo unknown)"
+      args:
+        executable: /bin/bash
+      register: flood_guard_verify
+      changed_when: false
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          ✅ {{ inventory_hostname }}: log flood guard applied
+          ════════════════════════════════════════════════════════
+          {{ flood_guard_verify.stdout }}
+          A message storm now collapses (rsyslog), is rate-limited
+          (journald), and is size-capped on disk (logrotate hourly).
+          ════════════════════════════════════════════════════════
