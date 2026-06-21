@@ -1,0 +1,137 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/headlamp/10_configure_keycloak.yaml
+# Description:
+#   Create/update the Headlamp OIDC client in the "thinkube" Keycloak realm and
+#   capture the issuer + client id/secret so 11_deploy can wire Headlamp's
+#   built-in OIDC. Headlamp signs in through Keycloak SSO (the only front door);
+#   authorization is a single cluster-admin ServiceAccount handled in 11_deploy.
+#
+# Requirements:
+#   - Keycloak must be deployed and accessible
+#   - ADMIN_PASSWORD (or ANSIBLE_BECOME_PASSWORD) environment variable set
+#   - Kubernetes (k8s-snap) cluster with control plane
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/headlamp/10_configure_keycloak.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - keycloak_url: URL to Keycloak instance (https://auth.{{ domain_name }})
+#   - keycloak_realm: Keycloak realm name (thinkube)
+#   - admin_username: Admin username for all applications
+#
+# Handoff to 11_deploy (set as host facts, consumed in the same 00_install run):
+#   - headlamp_oidc_client_id
+#   - headlamp_oidc_client_secret
+#   - headlamp_oidc_issuer
+#
+# Dependencies:
+#   - CORE-006: Keycloak must be deployed
+#
+# 🤖 [AI-assisted]
+
+- name: Configure Keycloak "headlamp" OIDC client
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    # Keycloak connection info - map to the variable names the role expects
+    keycloak_admin_user: "{{ admin_username }}"
+    keycloak_admin_username: "{{ admin_username }}"  # Role expects this variable name
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    keycloak_validate_certs: true
+    keycloak_debug: true
+
+    # "headlamp" client details
+    headlamp_client_id: "headlamp"
+    headlamp_hostname: "headlamp.{{ domain_name }}"
+    headlamp_redirect_uri: "https://{{ headlamp_hostname }}/oidc-callback"
+
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - admin_username is defined
+          - keycloak_url is defined
+          - keycloak_realm is defined
+          - keycloak_admin_password != ""
+        fail_msg: >-
+          Required variables are not defined (domain_name, admin_username,
+          keycloak_url, keycloak_realm, and ADMIN_PASSWORD/ANSIBLE_BECOME_PASSWORD)
+
+    - name: Wait for Keycloak realm to be ready
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: keycloak_check
+      until: keycloak_check.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Create/update the Headlamp Keycloak OIDC client
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_setup
+      vars:
+        keycloak_setup_client_id: "{{ headlamp_client_id }}"
+        keycloak_setup_client_body:
+          clientId: "{{ headlamp_client_id }}"
+          name: "Headlamp"
+          description: "Headlamp Kubernetes web UI (SSO via Keycloak, cluster-admin)"
+          enabled: true
+          protocol: "openid-connect"
+          publicClient: false
+          standardFlowEnabled: true
+          implicitFlowEnabled: false
+          directAccessGrantsEnabled: false
+          serviceAccountsEnabled: false
+          bearerOnly: false
+          fullScopeAllowed: true
+          rootUrl: "https://{{ headlamp_hostname }}"
+          baseUrl: "/"
+          redirectUris:
+            - "{{ headlamp_redirect_uri }}"
+            - "https://{{ headlamp_hostname }}/*"
+          webOrigins:
+            - "https://{{ headlamp_hostname }}"
+          attributes:
+            "post.logout.redirect.uris": "https://{{ headlamp_hostname }}"
+          defaultClientScopes:
+            - "openid"
+            - "email"
+            - "profile"
+          optionalClientScopes:
+            - "address"
+            - "phone"
+            - "offline_access"
+
+    - name: Capture Headlamp OIDC issuer + client id/secret for 11_deploy
+      ansible.builtin.set_fact:
+        headlamp_oidc_client_id: "{{ headlamp_client_id }}"
+        headlamp_oidc_client_secret: "{{ keycloak_client_secret }}"
+        headlamp_oidc_issuer: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+
+    - name: Fail if the Headlamp client secret was not captured
+      ansible.builtin.assert:
+        that:
+          - headlamp_oidc_client_secret is defined
+          - headlamp_oidc_client_secret | length > 0
+        fail_msg: >-
+          Headlamp OIDC client secret was not retrieved from Keycloak - the
+          client may not have been created as a confidential client.
+
+    - name: Display Headlamp OIDC configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "Keycloak OIDC configuration for Headlamp completed!"
+          - "Client ID: {{ headlamp_oidc_client_id }}"
+          - "Issuer: {{ headlamp_oidc_issuer }}"
+          - "Redirect URI: {{ headlamp_redirect_uri }}"
+          - "Scopes: openid email profile"
+          - "Discovery: {{ headlamp_oidc_issuer }}/.well-known/openid-configuration"
+          - "Client secret retrieved and stored for 11_deploy"

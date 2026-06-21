@@ -1,0 +1,381 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/headlamp/11_deploy.yaml
+# Description:
+#   Deploy Headlamp (a web Kubernetes dashboard) on Kubernetes using the
+#   official Headlamp Helm chart, from the Harbor-mirrored image.
+#
+#   This playbook:
+#     1. Mirrors the Headlamp image into Harbor (rate-limit-avoidance pattern)
+#        via the container_deployment/image_mirror role.
+#     2. Creates the headlamp namespace.
+#     3. Copies the wildcard TLS certificate into the namespace.
+#     4. Retrieves the Headlamp OIDC client secret from Keycloak (or consumes
+#        the headlamp_oidc_* facts set by 10_configure_keycloak.yaml).
+#     5. Helm-installs Headlamp wired to Keycloak OIDC, with its ServiceAccount
+#        bound to cluster-admin (single-user model; the chart creates the
+#        ClusterRoleBinding natively).
+#     6. Creates the HTTPRoute for headlamp.{{ domain_name }} on the Envoy
+#        Gateway.
+#
+# Requirements:
+#   - Kubernetes (k8s-snap) must be installed and running
+#   - Harbor registry must be available (HARBOR_ROBOT_TOKEN in ~/.env)
+#   - Keycloak deployed and configured (run 10_configure_keycloak.yaml first)
+#   - Wildcard TLS certificate in the default namespace
+#   - ADMIN_PASSWORD environment variable must be set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/headlamp/11_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#   - harbor_registry: Harbor registry URL
+#   - keycloak_url: Keycloak base URL
+#   - keycloak_realm: Keycloak realm name (thinkube)
+#   - gateway_name / gateway_namespace: Envoy Gateway location
+#   - helm_bin / kubectl_bin: Binary paths
+#
+# 🤖 [AI-generated]
+
+- name: Deploy Headlamp on Kubernetes
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    headlamp_namespace: "headlamp"
+    headlamp_release_name: "headlamp"
+    headlamp_hostname: "headlamp.{{ domain_name }}"
+    headlamp_tls_secret_name: "headlamp-tls-secret"
+
+    # Image (mirrored into Harbor, not pulled from the public registry)
+    headlamp_image_tag: "0.43.0"
+    headlamp_source_image: "ghcr.io/headlamp-k8s/headlamp:{{ headlamp_image_tag }}"
+    library_project: "library"
+    headlamp_image_repository: "{{ library_project }}/headlamp"
+    headlamp_destination_image: "{{ harbor_registry }}/{{ headlamp_image_repository }}:{{ headlamp_image_tag }}"
+
+    # Helm chart
+    headlamp_chart_repo: "https://kubernetes-sigs.github.io/headlamp/"
+    headlamp_chart_version: "0.43.0"  # appVersion 0.43.0
+
+    # OIDC client id (pinned across the component; unit 1 uses the same)
+    headlamp_client_id: "headlamp"
+    headlamp_oidc_scopes: "openid,profile,email"
+
+    # Harbor mirror credentials
+    harbor_admin_user: "admin"
+    harbor_robot_user: "robot$thinkube"
+
+    # Keycloak admin credentials
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    keycloak_validate_certs: false
+
+  tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+          - harbor_registry is defined
+          - admin_username is defined
+          - keycloak_url is defined
+          - keycloak_realm is defined
+          - lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) != ""
+        fail_msg: "Required variables are not defined. Please check your inventory or environment."
+
+    # =========================================================================
+    # MIRROR THE HEADLAMP IMAGE INTO HARBOR
+    # =========================================================================
+    - name: Get Harbor robot token from env file
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep HARBOR_ROBOT_TOKEN {{ ansible_facts.env.HOME }}/.env | cut -d= -f2
+      args:
+        executable: /bin/bash
+      register: robot_token_cmd
+      changed_when: false
+      failed_when: robot_token_cmd.rc != 0
+
+    - name: Set Harbor robot token fact
+      ansible.builtin.set_fact:
+        harbor_robot_token: "{{ robot_token_cmd.stdout | trim }}"
+
+    - name: Verify Harbor robot token is available
+      ansible.builtin.assert:
+        that:
+          - harbor_robot_token | length > 0
+        fail_msg: "HARBOR_ROBOT_TOKEN not found in {{ ansible_facts.env.HOME }}/.env"
+
+    - name: Determine cluster build architectures
+      ansible.builtin.set_fact:
+        build_architectures: >-
+          {{ (container_build_platforms |
+              default('linux/' + ('arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64')))
+             | split(',') | map('trim') | map('replace', 'linux/', '') | list }}
+
+    - name: Check if crane is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/crane
+      register: crane_bin
+
+    - name: Install crane binary
+      ansible.builtin.shell: |
+        set -o pipefail
+        arch="{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'x86_64' }}"
+        base="https://github.com/google/go-containerregistry/releases/latest/download"
+        curl -sL "${base}/go-containerregistry_Linux_${arch}.tar.gz" | tar xz -C /usr/local/bin crane
+        chmod +x /usr/local/bin/crane
+      args:
+        executable: /bin/bash
+      become: true
+      when: not crane_bin.stat.exists
+      changed_when: true
+
+    - name: Ensure library project exists in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects"
+        method: POST
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + keycloak_admin_password) | b64encode }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          project_name: "{{ library_project }}"
+          public: true
+          metadata:
+            public: "true"
+            description: "Public library images mirrored from public registries"
+        validate_certs: true
+        status_code: [201, 409]
+
+    - name: Mirror Headlamp image into Harbor
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../../roles/container_deployment/image_mirror/tasks/main.yaml"
+      vars:
+        source_image: "{{ headlamp_source_image }}"
+        destination_image: "{{ headlamp_destination_image }}"
+        harbor_api_user: "{{ harbor_admin_user }}"
+        harbor_api_password: "{{ keycloak_admin_password }}"
+        harbor_push_user: "{{ harbor_robot_user }}"
+        harbor_push_password: "{{ harbor_robot_token }}"
+        required_architectures: "{{ build_architectures }}"
+
+    # =========================================================================
+    # NAMESPACE + TLS
+    # =========================================================================
+    - name: Create Headlamp namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ headlamp_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Headlamp namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ headlamp_tls_secret_name }}"
+            namespace: "{{ headlamp_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    # =========================================================================
+    # OIDC CLIENT SECRET (consume unit 1's facts, else fetch from Keycloak)
+    # =========================================================================
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ keycloak_admin_username }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: keycloak_token
+      when: headlamp_oidc_secret is not defined
+
+    - name: Get Headlamp client UUID from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ headlamp_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: headlamp_client_response
+      when: headlamp_oidc_secret is not defined
+
+    - name: Get Headlamp client secret from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ headlamp_client_response.json[0].id }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: "{{ keycloak_validate_certs }}"
+        status_code: 200
+      register: client_secret_response
+      when:
+        - headlamp_oidc_secret is not defined
+        - headlamp_client_response.json | length > 0
+
+    - name: Resolve effective OIDC settings
+      ansible.builtin.set_fact:
+        headlamp_effective_client_id: "{{ headlamp_oidc_client_id | default(headlamp_client_id) }}"
+        headlamp_effective_issuer: "{{ headlamp_oidc_issuer | default(keycloak_url ~ '/realms/' ~ keycloak_realm) }}"
+        headlamp_effective_secret: "{{ headlamp_oidc_secret if (headlamp_oidc_secret is defined) else client_secret_response.json.value }}"
+
+    - name: Assert OIDC client secret is available
+      ansible.builtin.assert:
+        that:
+          - headlamp_effective_secret is defined
+          - headlamp_effective_secret | length > 0
+        fail_msg: >-
+          No Headlamp OIDC client secret available. Run
+          10_configure_keycloak.yaml first to create the 'headlamp' client.
+
+    # =========================================================================
+    # HELM DEPLOYMENT
+    # =========================================================================
+    - name: Add Headlamp Helm repo
+      kubernetes.core.helm_repository:
+        binary_path: "{{ helm_bin }}"
+        name: headlamp
+        repo_url: "{{ headlamp_chart_repo }}"
+        state: present
+
+    - name: Update Helm repos for Headlamp
+      ansible.builtin.command: "{{ helm_bin }} repo update headlamp"
+      changed_when: false
+
+    - name: Deploy Headlamp with Helm
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ headlamp_release_name }}"
+        chart_ref: "headlamp/headlamp"
+        release_namespace: "{{ headlamp_namespace }}"
+        create_namespace: false
+        chart_version: "{{ headlamp_chart_version }}"
+        wait: true
+        wait_timeout: "10m"
+        update_repo_cache: true
+        release_values:
+          # Pull the mirrored image from Harbor, not the public registry
+          image:
+            registry: "{{ harbor_registry }}"
+            repository: "{{ headlamp_image_repository }}"
+            tag: "{{ headlamp_image_tag }}"
+            pullPolicy: IfNotPresent
+          # Single-user model: SA bound to cluster-admin (chart-native)
+          serviceAccount:
+            create: true
+          clusterRoleBinding:
+            create: true
+            clusterRoleName: cluster-admin
+          service:
+            type: ClusterIP
+            port: 80
+          # Built-in OIDC wired to the thinkube Keycloak realm
+          config:
+            oidc:
+              clientID: "{{ headlamp_effective_client_id }}"
+              clientSecret: "{{ headlamp_effective_secret }}"
+              issuerURL: "{{ headlamp_effective_issuer }}"
+              scopes: "{{ headlamp_oidc_scopes }}"
+          # Core dashboard only — plugin system stays disabled
+          initContainers: []
+          podSecurityContext: {}
+      register: headlamp_helm_result
+      retries: 5
+      delay: 10
+      until: headlamp_helm_result is not failed
+
+    - name: Set priorityClassName on Headlamp deployment
+      ansible.builtin.command: >
+        {{ kubectl_bin }} patch deployment {{ headlamp_release_name }}
+        -n {{ headlamp_namespace }}
+        --type=strategic
+        -p '{"spec":{"template":{"spec":{"priorityClassName":"thinkube-workload"}}}}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+
+    # =========================================================================
+    # ROUTE
+    # =========================================================================
+    - name: Create Headlamp HTTPRoute
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: headlamp
+            namespace: "{{ headlamp_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name | default('thinkube-gateway') }}"
+                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+                sectionName: https
+            hostnames:
+              - "{{ headlamp_hostname }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: "{{ headlamp_release_name }}"
+                    port: 80
+
+    - name: Wait for Headlamp deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ headlamp_namespace }}"
+        name: "{{ headlamp_release_name }}"
+      register: deployment_status
+      until:
+        - deployment_status.resources is defined
+        - deployment_status.resources | length > 0
+        - deployment_status.resources[0].status.replicas is defined
+        - deployment_status.resources[0].status.readyReplicas is defined
+        - deployment_status.resources[0].status.replicas == deployment_status.resources[0].status.readyReplicas
+      retries: 30
+      delay: 10
+
+    - name: Display deployment status
+      ansible.builtin.debug:
+        msg:
+          - "Headlamp has been deployed successfully!"
+          - "Access URL: https://{{ headlamp_hostname }}"
+          - "Authentication: Keycloak SSO (realm {{ keycloak_realm }}, client {{ headlamp_effective_client_id }})"
+          - "Authorization: ServiceAccount bound to cluster-admin (single-user model)"
+          - "Image: {{ headlamp_destination_image }} (mirrored into Harbor)"

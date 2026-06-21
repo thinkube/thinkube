@@ -1,0 +1,255 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/headlamp/18_test.yaml
+# Description:
+#   Test playbook validating the Headlamp optional component against its
+#   acceptance criteria:
+#     - The Headlamp Deployment in the `headlamp` namespace is Available
+#       (pods Ready).
+#     - headlamp.{{ domain_name }} serves the UI over TLS (HTTP 200) through
+#       the Envoy Gateway with the wildcard ACME cert.
+#     - The Keycloak OIDC client (clientId `headlamp`) exists in the
+#       `thinkube` realm, and an unauthenticated sign-in request redirects to
+#       Keycloak.
+#     - Headlamp's ServiceAccount is bound to `cluster-admin` via a
+#       ClusterRoleBinding (single-user authorization model).
+#     - The service-discovery ConfigMap (`thinkube-service-config`) is present
+#       so thinkube-control lists Headlamp in its optional-component catalog.
+#
+# Requirements:
+#   - Headlamp must be deployed (00_install.yaml)
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/headlamp/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - kubeconfig: Path to kubectl configuration
+#   - keycloak_hostname / keycloak_realm: Keycloak identity provider
+#   - admin_username: Keycloak admin user (password from ADMIN_PASSWORD env)
+#
+# 🤖 [AI-generated]
+
+- name: Test Headlamp deployment
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    headlamp_namespace: headlamp
+    headlamp_hostname: "headlamp.{{ domain_name }}"
+    headlamp_oidc_client_id: headlamp
+
+  tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+          - keycloak_hostname is defined
+          - keycloak_realm is defined
+        fail_msg: "Required variables are not defined"
+
+    ###########################################################################
+    # AC: Headlamp deploys healthy — Deployment Available in ns `headlamp`
+    ###########################################################################
+    - name: Check if Headlamp namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ headlamp_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check Headlamp deployment status
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ headlamp_namespace }}"
+        name: headlamp
+      register: deployment_check
+      retries: 12
+      delay: 10
+      until:
+        - deployment_check.resources | length > 0
+        - deployment_check.resources[0].status.readyReplicas | default(0) == deployment_check.resources[0].spec.replicas
+
+    - name: Verify Headlamp Deployment is Available
+      ansible.builtin.assert:
+        that:
+          - deployment_check.resources | length == 1
+          - >-
+            deployment_check.resources[0].status.conditions
+            | selectattr('type', 'equalto', 'Available')
+            | selectattr('status', 'equalto', 'True')
+            | list | length == 1
+        fail_msg: "Headlamp Deployment is not Available"
+        success_msg: >-
+          Headlamp Deployment is Available
+          ({{ deployment_check.resources[0].status.readyReplicas | default(0) }}/{{ deployment_check.resources[0].spec.replicas }} ready)
+
+    - name: Check Headlamp service exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ headlamp_namespace }}"
+        name: headlamp
+      register: service_check
+      failed_when: service_check.resources | length == 0
+
+    - name: Check Headlamp HTTPRoute exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        namespace: "{{ headlamp_namespace }}"
+        name: headlamp
+      register: httproute_check
+      failed_when: httproute_check.resources | length == 0
+
+    ###########################################################################
+    # AC: Reachable at its thinkube URL over TLS (HTTP 200)
+    ###########################################################################
+    - name: Test Headlamp UI is served over TLS
+      ansible.builtin.uri:
+        url: "https://{{ headlamp_hostname }}/"
+        method: GET
+        validate_certs: true
+        status_code: [200]
+      register: ui_check
+      retries: 6
+      delay: 10
+      until: ui_check.status == 200
+
+    ###########################################################################
+    # AC: Keycloak OIDC sign-in is wired — client exists + redirect fires
+    ###########################################################################
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+
+    - name: Check Headlamp OIDC client exists in Keycloak
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ headlamp_oidc_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: headlamp_client
+
+    - name: Verify Headlamp OIDC client is present
+      ansible.builtin.assert:
+        that:
+          - headlamp_client.json | length >= 1
+          - headlamp_client.json[0].clientId == headlamp_oidc_client_id
+        fail_msg: "Headlamp OIDC client '{{ headlamp_oidc_client_id }}' not found in realm '{{ keycloak_realm }}'"
+        success_msg: "Headlamp OIDC client '{{ headlamp_oidc_client_id }}' exists in realm '{{ keycloak_realm }}'"
+
+    - name: Test unauthenticated sign-in redirects to Keycloak
+      ansible.builtin.uri:
+        url: "https://{{ headlamp_hostname }}/oidc"
+        method: GET
+        follow_redirects: none
+        validate_certs: true
+        status_code: [302, 303, 307]
+      register: oidc_redirect
+      retries: 3
+      delay: 5
+
+    - name: Verify the redirect points at Keycloak
+      ansible.builtin.assert:
+        that:
+          - oidc_redirect.status in [302, 303, 307]
+          - keycloak_hostname in oidc_redirect.location
+        fail_msg: "Unauthenticated Headlamp request did not redirect to Keycloak (location: {{ oidc_redirect.location | default('none') }})"
+        success_msg: "Unauthenticated Headlamp request redirects to Keycloak"
+
+    ###########################################################################
+    # AC: Full-cluster access behind SSO — cluster-admin ClusterRoleBinding
+    ###########################################################################
+    - name: Get all ClusterRoleBindings
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+      register: crb_list
+
+    - name: Find cluster-admin bindings for a ServiceAccount in the headlamp namespace
+      ansible.builtin.set_fact:
+        headlamp_admin_subjects: >-
+          {{ crb_list.resources
+             | selectattr('roleRef.name', 'equalto', 'cluster-admin')
+             | selectattr('subjects', 'defined')
+             | map(attribute='subjects')
+             | list | flatten
+             | selectattr('kind', 'equalto', 'ServiceAccount')
+             | selectattr('namespace', 'defined')
+             | selectattr('namespace', 'equalto', headlamp_namespace)
+             | list }}
+
+    - name: Verify a cluster-admin ClusterRoleBinding exists for the Headlamp ServiceAccount
+      ansible.builtin.assert:
+        that:
+          - headlamp_admin_subjects | length >= 1
+        fail_msg: "No ClusterRoleBinding binds a ServiceAccount in namespace '{{ headlamp_namespace }}' to cluster-admin"
+        success_msg: "Headlamp ServiceAccount is bound to cluster-admin"
+
+    ###########################################################################
+    # AC: Listed in thinkube-control — service-discovery ConfigMap present
+    ###########################################################################
+    - name: Check service-discovery ConfigMap exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ headlamp_namespace }}"
+        name: thinkube-service-config
+      register: discovery_configmap
+      failed_when: discovery_configmap.resources | length == 0
+
+    - name: Verify the discovery ConfigMap registers Headlamp as an optional service
+      ansible.builtin.assert:
+        that:
+          - discovery_configmap.resources[0].metadata.labels['thinkube.io/service-type'] == 'optional'
+        fail_msg: "Discovery ConfigMap is not labelled as an optional service"
+        success_msg: "Discovery ConfigMap registers Headlamp as an optional service"
+
+    ###########################################################################
+    # Summary
+    ###########################################################################
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "===================================="
+          - "Headlamp Test Summary"
+          - "===================================="
+          - "✓ Namespace '{{ headlamp_namespace }}' exists"
+          - "✓ Deployment Available: {{ deployment_check.resources[0].status.readyReplicas | default(0) }}/{{ deployment_check.resources[0].spec.replicas }}"
+          - "✓ Service and HTTPRoute configured"
+          - "✓ UI reachable over TLS: HTTP {{ ui_check.status }}"
+          - "✓ Keycloak OIDC client '{{ headlamp_oidc_client_id }}' exists"
+          - "✓ Unauthenticated request redirects to Keycloak"
+          - "✓ ServiceAccount bound to cluster-admin"
+          - "✓ Service-discovery ConfigMap present"
+          - ""
+          - "Headlamp is fully operational!"
+          - "URL: https://{{ headlamp_hostname }}"
+          - "Authentication: Keycloak OIDC (cluster-admin behind SSO)"
+        verbosity: 0
