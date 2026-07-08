@@ -222,3 +222,6 @@ kubectl get pods -n thinkube-control -l app=thinkube-control-backend
 ```
 
 **"ANSIBLE_BECOME_PASSWORD not set"** - Ensure `~/.env` contains `ANSIBLE_BECOME_PASSWORD=<password>` and is loaded before running playbooks. `tk_ansible` loads it automatically; for manual runs, `source ~/.env` first.
+
+@../thinkube-metadata/plugins/tandem-methodology/methodology.md
+
