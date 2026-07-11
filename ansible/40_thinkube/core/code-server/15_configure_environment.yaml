@@ -118,14 +118,8 @@
             export PATH="/home/thinkube/.cargo/bin:$PATH"
         fi
 
-        # rtk shell integration
-        if [ -x /home/thinkube/.cargo/bin/rtk ]; then
-            if [ -n "$ZSH_VERSION" ]; then
-                eval "$(/home/thinkube/.cargo/bin/rtk init zsh)"
-            else
-                eval "$(/home/thinkube/.cargo/bin/rtk init bash)"
-            fi
-        fi
+        # rtk (Rust Token Killer) is a proxy — invoke it explicitly, e.g. `rtk git status`.
+        # It has no transparent interactive-shell hook; the binary is on PATH via cargo above.
         EOF
         chmod +x /home/thinkube/.thinkube_shared_shell/env_setup.sh
         echo "✅ Bash/Zsh environment setup created"'
@@ -161,10 +155,8 @@
             set -gx PATH /home/thinkube/.cargo/bin $PATH
         end
 
-        # rtk shell integration
-        if test -x /home/thinkube/.cargo/bin/rtk
-            /home/thinkube/.cargo/bin/rtk init fish | source
-        end
+        # rtk (Rust Token Killer) is a proxy — invoke it explicitly, e.g. `rtk git status`.
+        # It has no transparent interactive-shell hook; the binary is on PATH via cargo above.
         EOF
         chmod +x /home/thinkube/.thinkube_shared_shell/env_setup.fish
         echo "✅ Fish environment setup created"'
@@ -361,21 +353,45 @@
             echo '✅ Rust toolchain installed'"
       when: rust_installed.rc != 0
 
-    - name: Check if rtk is installed
+    # rtk = Rust Token Killer (github.com/rtk-ai/rtk), a CLI proxy that compresses
+    # command output to cut LLM tokens. Installed FROM SOURCE — the crates.io `rtk`
+    # name belongs to an unrelated project ("Rust Type Kit"), so `cargo install rtk`
+    # pulls the wrong binary. The guard runs `rtk gain` (a real Rust-Token-Killer
+    # subcommand) rather than `test -x`, so a wrong/absent binary is (re)installed.
+    - name: Check if the correct rtk (Rust Token Killer) is installed
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "test -x /home/thinkube/.cargo/bin/rtk"
+          bash -c "/home/thinkube/.cargo/bin/rtk gain >/dev/null 2>&1"
       register: rtk_installed
       failed_when: false
       changed_when: false
 
-    - name: Install rtk via cargo (v0.1.0)
+    - name: Install rtk (Rust Token Killer) from source
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -lc "cargo install rtk --version 0.1.0 --locked && \
-            /home/thinkube/.cargo/bin/rtk --version && \
-            echo '✅ rtk installed'"
+          bash -lc "cargo install --git https://github.com/rtk-ai/rtk --locked --force && \
+            /home/thinkube/.cargo/bin/rtk gain && \
+            echo '✅ rtk (Rust Token Killer) installed'"
       when: rtk_installed.rc != 0
+
+    # Automatic token savings: register rtk's PreToolUse hook in Claude Code so an
+    # agent's Bash commands are transparently rewritten to run through rtk (`rtk hook
+    # claude`). Idempotent — the guard greps for the hook already present in
+    # ~/.claude/settings.json, so a re-run is a no-op. `rtk init -g --auto-patch` also
+    # writes ~/.claude/RTK.md and adds an @RTK.md reference to ~/.claude/CLAUDE.md.
+    - name: Check if the rtk Claude Code hook is registered
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "grep -q 'rtk hook claude' /home/thinkube/.claude/settings.json"
+      register: rtk_hook_registered
+      failed_when: false
+      changed_when: false
+
+    - name: Register the rtk auto-rewrite hook for Claude Code (global)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -lc "rtk init -g --auto-patch && echo '✅ rtk Claude Code hook registered'"
+      when: rtk_hook_registered.rc != 0
 
     - name: Configure pip to use DevPi
       ansible.builtin.shell: |
