@@ -1,0 +1,190 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/code-server/13_clone_repositories.yaml
+# Description:
+#   Clone the thinkube platform repos, the Tandem board sidecar, and the user
+#   template repos into the code-server workspace.
+#
+#   Split out of 15_configure_environment.yaml on purpose: the clone step runs
+#   `git reset --hard origin/<branch>` on repos that already exist, which
+#   DESTROYS uncommitted work and even switches a checked-out feature branch
+#   back to the default branch. 15 is run frequently just to re-apply config,
+#   and each run used to wipe in-progress work in the cloned repos. Keeping the
+#   destructive clone in its own playbook means a config re-run (14/15) never
+#   touches the repos — only a deliberate (re)install that includes this
+#   playbook does.
+#
+# Requirements:
+#   - code-server must be deployed (10_deploy.yaml) — that playbook also
+#     provisions the GitHub SSH key (~/.ssh/github_ed25519) the clone scripts need
+#   - Pod must be running and ready
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/13_clone_repositories.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Clone code-server workspace repositories
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    code_server_namespace: "code-server"
+
+  tasks:
+    - name: Get code-server pod name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
+          -l app=code-server \
+          -o jsonpath='{.items[0].metadata.name}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: pod_name
+      failed_when: pod_name.stdout == ""
+
+    - name: Wait for pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        name: "{{ pod_name.stdout }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+
+    - name: Create thinkube-platform directory structure
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/thinkube-platform"
+
+    - name: Fetch repository metadata from thinkube-metadata
+      ansible.builtin.uri:
+        url: "https://raw.githubusercontent.com/thinkube/thinkube-metadata/main/repositories.json"
+        return_content: yes
+      register: repo_metadata
+      failed_when: repo_metadata.status != 200
+
+    - name: Parse repository list for development cloning
+      ansible.builtin.set_fact:
+        repos_to_clone: "{{ (repo_metadata.content | from_json).repositories | selectattr('clone_for_development', 'equalto', true) | list }}"
+      failed_when: repos_to_clone | length == 0
+
+    - name: Render clone script from template
+      ansible.builtin.template:
+        src: templates/clone_platform_repos.sh.j2
+        dest: "/tmp/clone_platform_repos.sh"
+        mode: '0755'
+      vars:
+        clone_branch: "{{ lookup('env', 'THINKUBE_BRANCH') | default('main', true) }}"
+
+    - name: Copy clone script into code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp /tmp/clone_platform_repos.sh \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/clone_platform_repos.sh
+
+    - name: Clone platform repositories into category directories
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash /tmp/clone_platform_repos.sh
+      register: clone_result
+
+    - name: Clean up clone script
+      ansible.builtin.file:
+        path: "/tmp/clone_platform_repos.sh"
+        state: absent
+
+    - name: Display repository cloning output
+      ansible.builtin.debug:
+        var: clone_result.stdout_lines
+
+    # The Tandem sidecar board repo (TEP-0008) is cloned separately from the
+    # metadata-driven platform repos: it is not in thinkube-metadata, and it
+    # must live at the top level (/home/thinkube/thinkube-tandem-store) that
+    # thinkube.boards.root points to, not nested under thinkube-platform/.
+    # The repo belongs to the installing user's GitHub org (github_org); the
+    # name defaults to <github_org>/thinkube-tandem-store and is overridable via
+    # THINKUBE_TANDEM_REPO for installs that keep the board elsewhere.
+    - name: Render Tandem board clone script from template
+      ansible.builtin.template:
+        src: templates/clone_tandem_board.sh.j2
+        dest: "/tmp/clone_tandem_board.sh"
+        mode: '0755'
+      vars:
+        tandem_board_repo: "{{ lookup('env', 'THINKUBE_TANDEM_REPO') | default(github_org ~ '/thinkube-tandem-store', true) }}"
+      when: github_org is defined
+
+    - name: Copy Tandem board clone script into code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp /tmp/clone_tandem_board.sh \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/clone_tandem_board.sh
+      when: github_org is defined
+
+    - name: Clone Tandem board repository
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash /tmp/clone_tandem_board.sh
+      register: tandem_clone_result
+      when: github_org is defined
+
+    - name: Clean up Tandem board clone script
+      ansible.builtin.file:
+        path: "/tmp/clone_tandem_board.sh"
+        state: absent
+      when: github_org is defined
+
+    - name: Display Tandem board cloning output
+      ansible.builtin.debug:
+        var: tandem_clone_result.stdout_lines
+      when: tandem_clone_result is defined and tandem_clone_result is not skipped
+
+    - name: Fetch user metadata repository
+      ansible.builtin.uri:
+        url: "https://raw.githubusercontent.com/{{ github_org }}/{{ github_org }}-metadata/main/repositories.json"
+        headers:
+          Authorization: "token {{ github_token }}"
+        return_content: yes
+      register: user_repo_metadata
+      failed_when: false
+      when: github_org is defined and github_token is defined
+
+    - name: Parse user template list for cloning
+      ansible.builtin.set_fact:
+        user_templates_to_clone: "{{ (user_repo_metadata.content | from_json).repositories | selectattr('clone_for_development', 'equalto', true) | list }}"
+      when: user_repo_metadata is defined and user_repo_metadata.status | default(0) == 200
+
+    - name: Render user clone script from template
+      ansible.builtin.template:
+        src: templates/clone_user_repos.sh.j2
+        dest: "/tmp/clone_user_repos.sh"
+        mode: '0755'
+      when: user_templates_to_clone is defined and user_templates_to_clone | length > 0
+
+    - name: Copy user clone script into code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp /tmp/clone_user_repos.sh \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/clone_user_repos.sh
+      when: user_templates_to_clone is defined and user_templates_to_clone | length > 0
+
+    - name: Clone user template repositories
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash /tmp/clone_user_repos.sh
+      register: user_clone_result
+      when: user_templates_to_clone is defined and user_templates_to_clone | length > 0
+
+    - name: Clean up user clone script
+      ansible.builtin.file:
+        path: "/tmp/clone_user_repos.sh"
+        state: absent
+      when: user_templates_to_clone is defined and user_templates_to_clone | length > 0
+
+    - name: Display user template cloning output
+      ansible.builtin.debug:
+        var: user_clone_result.stdout_lines
+      when: user_clone_result is defined and user_clone_result is not skipped
