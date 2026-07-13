@@ -374,6 +374,22 @@
             echo '✅ rtk (Rust Token Killer) installed'"
       when: rtk_installed.rc != 0
 
+    # rtk lands in ~/.cargo/bin, which is on PATH only for INTERACTIVE shells (the
+    # rc scripts above). The code-server process — and the orchestrator / extension
+    # host it spawns — inherits the IMAGE's PATH (Containerfile ENV), which includes
+    # ~/.local/bin but NOT ~/.cargo/bin, so those non-interactive children never see
+    # rtk and the orchestrator aborts ("rtk binary not found on PATH"). Link rtk into
+    # ~/.local/bin — already on the image PATH — so it is visible to every process,
+    # not just login shells. Idempotent (ln -sf); the guard proves the link resolves.
+    - name: Expose rtk on the process PATH (symlink into ~/.local/bin for the orchestrator)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/.local/bin && \
+            ln -sf /home/thinkube/.cargo/bin/rtk /home/thinkube/.local/bin/rtk && \
+            /home/thinkube/.local/bin/rtk gain >/dev/null 2>&1 && \
+            echo '✅ rtk linked into ~/.local/bin (on the process PATH)'"
+      changed_when: false
+
     # Automatic token savings: register rtk's PreToolUse hook in Claude Code so an
     # agent's Bash commands are transparently rewritten to run through rtk (`rtk hook
     # claude`). Idempotent — the guard greps for the hook already present in
