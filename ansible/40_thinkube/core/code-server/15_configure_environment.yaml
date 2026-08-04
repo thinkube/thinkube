@@ -420,16 +420,57 @@
         EOF
         echo '✅ pip configured to use DevPi'"
 
+    # uv has NO `trusted-host` key (that is pip's spelling) — writing it makes uv
+    # REJECT the whole config file, so every `uv tool install` / `uv pip` on a
+    # deployed instance failed with "unknown field `trusted-host`". uv's schema:
+    # a top-level [[index]] (applies to uv tool/add AND the uv-pip interface)
+    # and `allow-insecure-host` (the trusted-host equivalent) at top level.
+    # DevPi is listed WITHOUT `default = true`: uv searches it first and falls
+    # back to PyPI — the same mirror-first-with-fallback intent as pip's
+    # index-url + extra-index-url pair (devpi/15_configure_cli.yaml), and it
+    # keeps installs working when the mirror is degraded (observed 2026-08-04:
+    # root/pypi 404/504 on packages it should proxy).
     - name: Configure uv to use DevPi
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "mkdir -p /home/thinkube/.config/uv && \
             cat > /home/thinkube/.config/uv/uv.toml << 'EOF'
-        [pip]
-        index-url = \"https://{{ devpi_api_hostname }}/root/{{ devpi_index_name }}/+simple/\"
-        trusted-host = [\"{{ devpi_api_hostname | regex_replace('^https?://', '') }}\"]
+        allow-insecure-host = [\"{{ devpi_api_hostname | regex_replace('^https?://', '') }}\"]
+
+        [[index]]
+        url = \"https://{{ devpi_api_hostname }}/root/{{ devpi_index_name }}/+simple/\"
         EOF
         echo '✅ uv configured to use DevPi'"
+
+    # graphify (github.com/Graphify-Labs/graphify): tree-sitter AST → queryable
+    # knowledge graph of a repo, fully local for code (no LLM calls, no vector
+    # store). The tandem extension's contextualize round uses it HOST-SIDE as a
+    # deterministic starting map (`graphify query`), fail-soft when absent. The
+    # PyPI package is `graphifyy` (double y — the single-y name is unrelated);
+    # the CLI is `graphify`. PINNED: bump deliberately, it is a fast-moving
+    # project. Runs AFTER the uv DevPi config so it resolves through the mirror
+    # (root/{{ devpi_index_name }} inherits root/pypi). uv installs the bin
+    # straight into ~/.local/bin, which is the image's process PATH.
+    - name: Check if graphify is installed at the pinned version
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "/home/thinkube/.local/bin/graphify --version 2>/dev/null | grep -q '0.9.32'"
+      register: graphify_installed
+      failed_when: false
+      changed_when: false
+
+    # UV_NO_CONFIG: install straight from PyPI, ignoring the DevPi uv.toml —
+    # same mirror-independence as the claude/rtk/npm install tasks above. uv
+    # HARD-FAILS on an erroring index instead of falling through (observed
+    # 2026-08-04: devpi proxy 504s made every config-routed install fail), and
+    # a pinned bootstrap tool must not depend on mirror health.
+    - name: Install graphify (pinned, direct from PyPI)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "UV_NO_CONFIG=1 /home/thinkube/.local/bin/uv tool install --force graphifyy==0.9.32 && \
+            /home/thinkube/.local/bin/graphify --version && \
+            echo '✅ graphify installed'"
+      when: graphify_installed.rc != 0
 
     - name: Remove legacy pip.conf if it exists
       ansible.builtin.shell: |
