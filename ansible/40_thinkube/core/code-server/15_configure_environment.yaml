@@ -409,6 +409,48 @@
           bash -lc "rtk init -g --auto-patch && echo '✅ rtk Claude Code hook registered'"
       when: rtk_hook_registered.rc != 0
 
+    # Work-preservation policy for Claude Code (PLATFORM DEFAULT). Thinkube's
+    # target user is a solo developer/researcher whose workspace lives in this
+    # pod — one rescheduling or image rebuild away from loss — and the cluster
+    # has no backup policy yet, so PUSHED-TO-REMOTE is the only durable state.
+    # Claude Code's shipped default ("commit/push only when asked") assumes a
+    # durable workstation and has cost users real work here; this inverts it:
+    # verified work is committed (scoped) and pushed immediately. Written as
+    # ~/.claude/GIT-POLICY.md + an @-reference appended to ~/.claude/CLAUDE.md,
+    # the same layering rtk uses. Idempotent via the reference grep.
+    - name: Check if the Claude Code git policy is installed
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "grep -q '@GIT-POLICY.md' /home/thinkube/.claude/CLAUDE.md"
+      register: git_policy_installed
+      failed_when: false
+      changed_when: false
+
+    - name: Install the Claude Code git policy (commit verified work, push immediately)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/.claude && \
+            cat > /home/thinkube/.claude/GIT-POLICY.md << 'EOF'
+        # Git policy — work preservation (Thinkube platform default)
+
+        This workspace runs in a pod: uncommitted work is one rescheduling or
+        image rebuild away from loss, and the pushed remote is the only backup.
+
+        - When a change set is VERIFIED — tests pass, and where applicable it is
+          deployed — commit it immediately without asking. Verified work must
+          never sit uncommitted.
+        - Scope every commit: \`git add\` explicit paths only. NEVER
+          \`git add -A\` / \`git add .\`.
+        - Push right after committing, without asking.
+        - Unverified or work-in-progress changes: do not commit; say what is
+          pending instead.
+        - Destructive git operations (reset --hard, force-push, history
+          rewrites) still require an explicit ask.
+        EOF
+        printf '\n@GIT-POLICY.md\n' >> /home/thinkube/.claude/CLAUDE.md && \
+        echo '✅ Claude Code git policy installed'"
+      when: git_policy_installed.rc != 0
+
     - name: Configure pip to use DevPi
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
