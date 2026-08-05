@@ -451,6 +451,52 @@
         echo '✅ Claude Code git policy installed'"
       when: git_policy_installed.rc != 0
 
+    # Companion Claude Code policies, same layering as GIT-POLICY.md: each is a
+    # standalone file referenced from ~/.claude/CLAUDE.md. Idempotent per file.
+    - name: Check if the companion Claude Code policies are installed
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "grep -q '@NO-DEFERRAL-POLICY.md' /home/thinkube/.claude/CLAUDE.md"
+      register: companion_policies_installed
+      failed_when: false
+      changed_when: false
+
+    - name: Install the companion Claude Code policies (infra, comments, no-deferral)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/.claude && \
+            cat > /home/thinkube/.claude/INFRA-POLICY.md << 'EOF'
+        # Infrastructure policy — no pod-only mutations (Thinkube platform default)
+
+        - Any system-level change made to the pod (packages, config, tools,
+          links) is applied to its persistent home IN THE SAME ACT: the
+          container image for OS packages, the deploy playbook for user-level
+          tools and configuration.
+        - Commit and push that persistent change immediately.
+        - The pod is a cache, never a source of truth.
+        EOF
+        cat > /home/thinkube/.claude/CODE-COMMENTS-POLICY.md << 'EOF'
+        # Code comments policy (Thinkube platform default)
+
+        - A comment explains what the code does and the constraints it serves —
+          nothing else.
+        - Never reference how the code came to be: no dates, no defect stories,
+          no \"was previously\", no session history. That narration belongs in
+          commit messages and the defect ledger, not in source files.
+        EOF
+        cat > /home/thinkube/.claude/NO-DEFERRAL-POLICY.md << 'EOF'
+        # No-deferral policy (Thinkube platform default)
+
+        - Never promise work for later, tomorrow, or a future batch.
+        - Identified work is either done NOW, or bound to a concrete visible
+          trigger (a recorded ask, a slice, a named condition) in the same
+          breath it is identified.
+        - If neither is possible, say plainly that it is dropped.
+        EOF
+        printf '\n@INFRA-POLICY.md\n@CODE-COMMENTS-POLICY.md\n@NO-DEFERRAL-POLICY.md\n' >> /home/thinkube/.claude/CLAUDE.md && \
+        echo '✅ companion policies installed'"
+      when: companion_policies_installed.rc != 0
+
     - name: Configure pip to use DevPi
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
