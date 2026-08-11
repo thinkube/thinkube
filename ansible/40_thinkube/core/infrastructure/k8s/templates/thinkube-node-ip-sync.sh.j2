@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 # Managed by Thinkube ({{ node_ip_sync_managed_by }}) — do not edit.
 #
-# Runs at every boot, before kubelet starts. The stable VIP keeps every
-# cluster-internal reference (API endpoint, certs, kubeconfigs, Cilium)
-# network-independent; this script keeps the few values that MUST track
-# the current network in sync, so moving the machine to another network
-# needs no playbook — which couldn't run anyway with the cluster down.
+# Runs at every boot before kubelet starts, and on a timer thereafter so
+# an address that moves under a running node is picked up too. The stable
+# VIP keeps every cluster-internal reference (API endpoint, certs,
+# kubeconfigs, Cilium) network-independent; this script keeps the few
+# values that MUST track the current network in sync, so moving the
+# machine to another network needs no playbook — which couldn't run
+# anyway with the cluster down.
 set -u
 
 FLAGS=/var/lib/kubelet/kubeadm-flags.env
+
+# Cilium's CNI queues endpoint deletions here whenever the agent is
+# unreachable, and refuses to tear down any sandbox once the directory
+# exceeds its cap — which also leaves the agent a queue it cannot drain
+# on restart. Past this threshold, with no agent running to drain it, the
+# entries are stale by definition.
+CILIUM_DELETE_QUEUE=/var/run/cilium/deleteQueue
+CILIUM_DELETE_QUEUE_LIMIT=200
 
 primary_ip() {
     ip -4 route get 1.1.1.1 2>/dev/null \
@@ -31,6 +41,26 @@ if [ -f "$FLAGS" ]; then
     if [ -n "$new_ip" ] && [ -n "$current_ip" ] && [ "$new_ip" != "$current_ip" ]; then
         sed -i "s/--node-ip=[0-9.]\+/--node-ip=${new_ip}/" "$FLAGS"
         echo "kubelet node-ip: ${current_ip} -> ${new_ip}"
+        # kubelet reads this file only at start: without a restart it keeps
+        # the stale address, refuses to publish node status, and the cluster
+        # keeps routing node-to-node traffic at an address nobody answers.
+        # try-restart is a no-op at boot, where kubelet has yet to start.
+        # --no-block is required, not cosmetic: a blocking call from a unit
+        # ordered before kubelet deadlocks, the script waiting on kubelet's
+        # job while that job waits for the script's unit to finish, leaving
+        # kubelet stopped and the node NotReady.
+        systemctl --no-block try-restart kubelet.service 2>/dev/null || true
+    fi
+fi
+
+# --- Cilium deletion queue ----------------------------------------------
+# Only ever cleared with no agent running: a live agent drains this itself,
+# and entries it still owns are not ours to discard.
+if [ -d "$CILIUM_DELETE_QUEUE" ] && ! pgrep -x cilium-agent >/dev/null 2>&1; then
+    queued=$(find "$CILIUM_DELETE_QUEUE" -mindepth 1 -maxdepth 1 | wc -l)
+    if [ "$queued" -ge "$CILIUM_DELETE_QUEUE_LIMIT" ]; then
+        find "$CILIUM_DELETE_QUEUE" -mindepth 1 -maxdepth 1 -delete
+        echo "cilium deleteQueue: cleared ${queued} stale entries"
     fi
 fi
 {% if node_ip_sync_cp_hostname is defined %}
@@ -43,7 +73,12 @@ fi
 PROXY_UNIT=/etc/systemd/system/k8s-api-proxy.service
 if [ -f "$PROXY_UNIT" ]; then
     cp_ip=$(getent ahostsv4 "{{ node_ip_sync_cp_hostname }}" 2>/dev/null | awk '{print $1; exit}')
-    current_backend=$(grep -oE '[0-9.]+:6443' "$PROXY_UNIT" | cut -d: -f1)
+    # head -1 is load-bearing: the address appears both in the unit's header
+    # comment and in ExecStart, and collecting both yields a two-line value
+    # that can never equal a single address — so every run would rewrite the
+    # unit and restart the proxy carrying kubelet's traffic to the control
+    # plane.
+    current_backend=$(grep -oE '[0-9.]+:6443' "$PROXY_UNIT" | cut -d: -f1 | head -1)
     if [ -n "$cp_ip" ] && [ -n "$current_backend" ] && [ "$cp_ip" != "$current_backend" ]; then
         sed -i "s/[0-9.]\+:6443/${cp_ip}:6443/" "$PROXY_UNIT"
         systemctl daemon-reload
