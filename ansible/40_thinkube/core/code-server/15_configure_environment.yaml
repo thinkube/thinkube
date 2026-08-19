@@ -655,67 +655,134 @@
         directory_mode: '0755'
       when: inventory_check.stdout == "missing"
 
-    # Update Python interpreters in inventory using a Python script
-    - name: Create Python script to update inventory
+    # The helper that resolves a node's current address from the cluster.
+    # Lives in the shared home so code-server, thinkube-control and any
+    # other runner of the shared inventory see the same file.
+    - name: Create shared .local/bin
+      ansible.builtin.file:
+        path: "{{ shared_code_path }}/.local/bin"
+        state: directory
+        mode: '0755'
+      tags: [node_ip_inventory]
+
+    - name: Install thinkube-node-ip helper
       ansible.builtin.copy:
-        dest: /tmp/update_inventory_interpreters.py
+        src: thinkube-node-ip
+        dest: "{{ shared_code_path }}/.local/bin/thinkube-node-ip"
+        mode: '0755'
+      tags: [node_ip_inventory]
+
+    # Two rewrites of the shared inventory, both idempotent:
+    #   - Python interpreters per group/host.
+    #   - Node addresses: every cluster node's ansible_host/lan_ip becomes
+    #     a run-time lookup against the cluster (thinkube-node-ip), with the
+    #     stored address kept as the fallback for when the cluster cannot
+    #     answer. Addresses on this platform are DHCP-assigned and move;
+    #     the cluster's InternalIP (kept current by node-ip sync) is the
+    #     only copy that is always right. ZeroTier ansible_host values are
+    #     overlay addresses, which are static, and stay as they are.
+    - name: Create inventory rewrite script
+      ansible.builtin.copy:
+        dest: /tmp/update_shared_inventory.py
         mode: '0755'
         content: |
+          {% raw %}
           #!/usr/bin/env python3
-          import yaml
           import sys
+          import yaml
+
+          HELPER = "/home/{user}/.local/bin/thinkube-node-ip"
+          NODE_GROUPS = ("k8s_control_plane", "k8s_workers")
+
+          def walk_hosts(node, out, in_node_group=False):
+              """Collect host name -> host dict for hosts under the node groups."""
+              if not isinstance(node, dict):
+                  return
+              for name, body in (node.get("hosts") or {}).items():
+                  if in_node_group and isinstance(body, dict):
+                      out.setdefault(name, body)
+                  elif in_node_group and body is None:
+                      out.setdefault(name, None)
+              for gname, gbody in (node.get("children") or {}).items():
+                  walk_hosts(gbody, out, in_node_group or gname in NODE_GROUPS)
+
+          def find_host_defs(node, name, found):
+              """Every dict that defines host `name` (with vars), anywhere in the tree."""
+              if not isinstance(node, dict):
+                  return
+              body = (node.get("hosts") or {}).get(name)
+              if isinstance(body, dict):
+                  found.append(body)
+              for gbody in (node.get("children") or {}).values():
+                  find_host_defs(gbody, name, found)
+
+          def lookup_expr(user, host, fallback):
+              return '{{ lookup("pipe", "%s %s %s") }}' % (HELPER.format(user=user), host, fallback)
+
+          def is_dynamic(value):
+              return isinstance(value, str) and "thinkube-node-ip" in value
 
           def update_inventory(inventory_path, system_username):
-              # Load inventory
-              with open(inventory_path, 'r') as f:
+              with open(inventory_path) as f:
                   inventory = yaml.safe_load(f)
+              root = inventory.get("all", {})
 
-              # Remove global Python interpreter
-              if 'all' in inventory and 'vars' in inventory['all']:
-                  inventory['all']['vars'].pop('ansible_python_interpreter', None)
+              # --- Python interpreters ---------------------------------
+              (root.get("vars") or {}).pop("ansible_python_interpreter", None)
+              children = root.setdefault("children", {}) or {}
+              root["children"] = children
+              if "baremetal" in children:
+                  bm = children["baremetal"] or {}
+                  children["baremetal"] = bm
+                  bm.setdefault("vars", {})["ansible_python_interpreter"] = "/home/%s/.venv/bin/python3" % system_username
+              mgmt = children.get("management") or {}
+              if "controller" in (mgmt.get("hosts") or {}):
+                  ctl = mgmt["hosts"]["controller"] or {}
+                  mgmt["hosts"]["controller"] = ctl
+                  ctl["ansible_python_interpreter"] = "/home/thinkube/.venv/bin/python3"
 
-              # Add Python interpreter for baremetal group
-              if 'all' in inventory and 'children' in inventory['all']:
-                  if 'baremetal' in inventory['all']['children']:
-                      if inventory['all']['children']['baremetal'] is None:
-                          inventory['all']['children']['baremetal'] = {}
-                      if 'vars' not in inventory['all']['children']['baremetal']:
-                          inventory['all']['children']['baremetal']['vars'] = {}
-                      inventory['all']['children']['baremetal']['vars']['ansible_python_interpreter'] = f'/home/{system_username}/.venv/bin/python3'
+              # --- Cluster-resolved node addresses ----------------------
+              node_hosts = {}
+              walk_hosts(root, node_hosts, False)
+              changed = []
+              for name in node_hosts:
+                  defs = []
+                  find_host_defs(root, name, defs)
+                  for body in defs:
+                      if body.get("ansible_connection") == "local":
+                          continue
+                      lan_ip = body.get("lan_ip")
+                      if not lan_ip or is_dynamic(lan_ip):
+                          continue
+                      if body.get("ansible_host") == lan_ip:
+                          body["ansible_host"] = lookup_expr(system_username, name, lan_ip)
+                      body["lan_ip"] = lookup_expr(system_username, name, lan_ip)
+                      changed.append(name)
 
-              # Add Python interpreter for controller host
-              if 'all' in inventory and 'children' in inventory['all']:
-                  if 'management' in inventory['all']['children']:
-                      if 'hosts' in inventory['all']['children']['management']:
-                          if 'controller' in inventory['all']['children']['management']['hosts']:
-                              if inventory['all']['children']['management']['hosts']['controller'] is None:
-                                  inventory['all']['children']['management']['hosts']['controller'] = {}
-                              inventory['all']['children']['management']['hosts']['controller']['ansible_python_interpreter'] = '/home/thinkube/.venv/bin/python3'
+              with open(inventory_path, "w") as f:
+                  yaml.dump(inventory, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=4096)
+              print("Inventory updated; cluster-resolved addresses for: %s" % (", ".join(changed) or "none (already dynamic)"))
 
-              # Write updated inventory
-              with open(inventory_path, 'w') as f:
-                  yaml.dump(inventory, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-
-          if __name__ == '__main__':
+          if __name__ == "__main__":
               if len(sys.argv) != 3:
-                  print("Usage: update_inventory_interpreters.py <inventory_path> <system_username>")
+                  print("Usage: update_shared_inventory.py <inventory_path> <system_username>")
                   sys.exit(1)
-
               update_inventory(sys.argv[1], sys.argv[2])
-              print("Inventory updated successfully")
-      when: inventory_check.stdout == "missing"
+          {% endraw %}
+      tags: [node_ip_inventory]
 
-    - name: Run Python script to update inventory
+    - name: Rewrite shared inventory (interpreters + cluster-resolved addresses)
       ansible.builtin.command:
-        cmd: python3 /tmp/update_inventory_interpreters.py "{{ shared_code_path }}/.ansible/inventory/inventory.yaml" "{{ system_username }}"
-      changed_when: true
-      when: inventory_check.stdout == "missing"
+        cmd: python3 /tmp/update_shared_inventory.py "{{ shared_code_path }}/.ansible/inventory/inventory.yaml" "{{ system_username }}"
+      register: _inventory_rewrite
+      changed_when: "'already dynamic' not in _inventory_rewrite.stdout"
+      tags: [node_ip_inventory]
 
-    - name: Remove temporary Python script
+    - name: Remove temporary inventory rewrite script
       ansible.builtin.file:
-        path: /tmp/update_inventory_interpreters.py
+        path: /tmp/update_shared_inventory.py
         state: absent
-      when: inventory_check.stdout == "missing"
+      tags: [node_ip_inventory]
 
     # NOTE: Repository cloning (platform repos, Tandem board, user templates)
     # moved to 13_clone_repositories.yaml. It runs `git reset --hard` on existing

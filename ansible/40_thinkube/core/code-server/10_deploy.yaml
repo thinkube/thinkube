@@ -476,10 +476,13 @@
         group: "{{ system_username }}"
 
     - name: Add Thinkube nodes to SSH config
+      tags: [ssh_config]
       vars:
-        # ZeroTier emits overlay_ip per host; Tailscale doesn't, so fall
-        # back to lan_ip (the daemon already establishes the tailnet
-        # path; SSH happens over whichever route the kernel picks).
+        # ZeroTier emits a static overlay_ip per host, used directly as
+        # HostName. Otherwise nodes are reached on the LAN, where addresses
+        # are DHCP-assigned and move: the connection goes through
+        # thinkube-node-ip, which asks the cluster for the node's current
+        # address at connect time and falls back to lan_ip.
         host_ip_key: "{{ 'overlay_ip' if overlay_provider == 'zerotier' else 'lan_ip' }}"
       ansible.builtin.blockinfile:
         path: "{{ code_source_path }}/.ssh/config"
@@ -502,7 +505,11 @@
           # Kubernetes Control Plane
           {% for host in groups['k8s_control_plane'] %}
           Host {{ host }} {{ host }}.{{ domain_name }}
+          {% if overlay_provider == 'zerotier' %}
               HostName {{ hostvars[host][host_ip_key] }}
+          {% else %}
+              ProxyCommand /home/{{ system_username }}/.local/bin/thinkube-node-ip --connect {{ host }} 22 {{ hostvars[host][host_ip_key] }}
+          {% endif %}
               User {{ system_username }}
               StrictHostKeyChecking no
               UserKnownHostsFile /dev/null
@@ -513,7 +520,11 @@
           # Kubernetes Workers
           {% for host in groups.get('k8s_workers', []) %}
           Host {{ host }} {{ host }}.{{ domain_name }}
+          {% if overlay_provider == 'zerotier' %}
               HostName {{ hostvars[host][host_ip_key] }}
+          {% else %}
+              ProxyCommand /home/{{ system_username }}/.local/bin/thinkube-node-ip --connect {{ host }} 22 {{ hostvars[host][host_ip_key] }}
+          {% endif %}
               User {{ system_username }}
               StrictHostKeyChecking no
               UserKnownHostsFile /dev/null
