@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Managed by Thinkube ({{ link_watchdog_managed_by }}) — do not edit.
+#
+# Link watchdog for worker nodes. A worker whose physical link dies does
+# not go down: it stays powered, kubelet stops posting status, the node
+# turns NotReady and every pod on it is stranded until a person reboots
+# the machine. This script runs once a minute, judges the link that
+# carries the default route, and escalates after the link has been dead
+# long enough that it is not a transient blip:
+#
+#   1. bounce the interface (down/up + reconfigure),
+#   2. re-enumerate its PCI device so the driver reloads its firmware,
+#   3. reboot.
+#
+# Only the LOCAL link is judged: a default route exists and the gateway
+# answers. Control-plane reachability is deliberately not a trigger — an
+# outage of the control plane must not reboot every worker.
+set -u
+
+STATE_DIR=/run/thinkube-link-watchdog
+FAIL_FILE=$STATE_DIR/consecutive_failures
+STEP_FILE=$STATE_DIR/last_step
+IFACE_FILE=$STATE_DIR/iface
+
+# Consecutive failed checks (one per minute) before each step.
+RESET_AFTER={{ link_watchdog_reset_after }}
+REBIND_AFTER={{ link_watchdog_rebind_after }}
+REBOOT_AFTER={{ link_watchdog_reboot_after }}
+# No reboot this soon after boot: a slow network start is not a dead link.
+BOOT_GRACE_SECONDS={{ link_watchdog_boot_grace_seconds }}
+
+mkdir -p "$STATE_DIR"
+
+default_route_field() {
+    ip -4 route show default 2>/dev/null \
+        | awk -v key="$1" '{for (i = 1; i < NF; i++) if ($i == key) {print $(i + 1); exit}}'
+}
+
+# The interface is remembered while the route exists: once the link is
+# dead the route is gone, and the name is all that is left to reset.
+iface=$(default_route_field dev)
+if [ -n "$iface" ]; then
+    echo "$iface" > "$IFACE_FILE"
+else
+    iface=$(cat "$IFACE_FILE" 2>/dev/null || true)
+fi
+
+# Wireless power saving is a known cause of firmware stalls on consumer
+# adapters and has no upside on a cluster link. Re-applied every run so it
+# survives reconnects, driver reloads and network-manager resets.
+if [ -n "$iface" ] && [ -d "/sys/class/net/$iface/wireless" ] && command -v iw >/dev/null 2>&1; then
+    if iw dev "$iface" get power_save 2>/dev/null | grep -q ': on'; then
+        iw dev "$iface" set power_save off 2>/dev/null && echo "wireless power_save off on $iface"
+    fi
+fi
+
+# A gateway that answers ICMP is the primary proof. For gateways that drop
+# ICMP, the ping still forces neighbour resolution, so a neighbour entry
+# the kernel has not given up on (anything but FAILED/INCOMPLETE) is the
+# secondary proof.
+link_ok() {
+    local gw state
+    gw=$(default_route_field via)
+    [ -n "$gw" ] || return 1
+    ping -c 1 -W 2 "$gw" >/dev/null 2>&1 && return 0
+    state=$(ip -4 neigh show "$gw" 2>/dev/null | awk '{print $NF}')
+    case "$state" in
+        ""|FAILED|INCOMPLETE) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+reconfigure_iface() {
+    # Whichever manager owns the interface gets to redo its configuration
+    # (DHCP, wireless association). Each call is a no-op where it does not
+    # apply.
+    command -v networkctl >/dev/null 2>&1 && networkctl reconfigure "$1" 2>/dev/null
+    command -v nmcli >/dev/null 2>&1 && nmcli device connect "$1" >/dev/null 2>&1
+    return 0
+}
+
+bounce_iface() {
+    echo "link down for $1 checks: bouncing $iface"
+    ip link set "$iface" down 2>/dev/null
+    sleep 2
+    ip link set "$iface" up 2>/dev/null
+    reconfigure_iface "$iface"
+}
+
+# Removing the PCI device and rescanning the bus re-probes it from
+# scratch: the driver re-binds and reloads its firmware, which clears
+# the hangs a plain interface bounce cannot. Non-PCI devices (USB) are
+# skipped; the next step is the reboot.
+rebind_pci() {
+    local devpath addr
+    devpath=$(readlink -f "/sys/class/net/$iface/device" 2>/dev/null || true)
+    addr=$(basename "$devpath")
+    if [ -z "$devpath" ] || [ ! -e "/sys/bus/pci/devices/$addr/remove" ]; then
+        echo "link down for $1 checks: $iface is not a PCI device, skipping re-probe"
+        return 0
+    fi
+    echo "link down for $1 checks: re-probing PCI device $addr for $iface"
+    echo 1 > "/sys/bus/pci/devices/$addr/remove"
+    sleep 3
+    echo 1 > /sys/bus/pci/rescan
+    sleep 5
+    reconfigure_iface "$iface"
+}
+
+if link_ok; then
+    rm -f "$FAIL_FILE" "$STEP_FILE"
+    exit 0
+fi
+
+failures=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
+echo "$failures" > "$FAIL_FILE"
+last_step=$(cat "$STEP_FILE" 2>/dev/null || echo 0)
+uptime_s=$(cut -d. -f1 /proc/uptime)
+
+if [ -z "$iface" ]; then
+    echo "link down for $failures checks and no interface known; nothing to reset"
+    [ "$failures" -ge "$REBOOT_AFTER" ] && [ "$uptime_s" -ge "$BOOT_GRACE_SECONDS" ] && { echo "rebooting"; systemctl reboot; }
+    exit 0
+fi
+
+if [ "$failures" -ge "$REBOOT_AFTER" ] && [ "$last_step" -ge 2 ]; then
+    if [ "$uptime_s" -lt "$BOOT_GRACE_SECONDS" ]; then
+        echo "link down for $failures checks; within boot grace, not rebooting yet"
+        exit 0
+    fi
+    echo "link down for $failures checks after bounce and re-probe: rebooting"
+    systemctl reboot
+elif [ "$failures" -ge "$REBIND_AFTER" ] && [ "$last_step" -lt 2 ]; then
+    echo 2 > "$STEP_FILE"
+    rebind_pci "$failures"
+elif [ "$failures" -ge "$RESET_AFTER" ] && [ "$last_step" -lt 1 ]; then
+    echo 1 > "$STEP_FILE"
+    bounce_iface "$failures"
+else
+    echo "link down for $failures checks"
+fi
