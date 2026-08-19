@@ -5,7 +5,8 @@
 Thinkube Environment Loader for Jupyter Notebooks
 Automatically loads environment variables from multiple sources:
 1. Core service endpoints from Docker image (.thinkube_env)
-2. Optional service endpoints from service discovery (.config/thinkube/service-env.sh)
+2. Service endpoints from service discovery (.config/thinkube/service-env-jh.sh);
+   these override the image defaults, so a service's real endpoint always wins
 3. User secrets from thinkube-control (notebooks/.secrets.env)
 
 These variables become available via os.environ in all notebook cells.
@@ -78,13 +79,15 @@ def load_thinkube_environment():
         loaded_count += len(env_vars)
         print(f"✓ Loaded {len(env_vars)} core service endpoints from .thinkube_env")
 
-    # 2. Load optional service endpoints from service discovery
-    service_env = home / '.config' / 'thinkube' / 'service-env.sh'
+    # 2. Load service endpoints from service discovery (the init container
+    #    writes service-env-jh.sh). Loaded after the image defaults on
+    #    purpose: the discovered endpoint is the deployed one.
+    service_env = home / '.config' / 'thinkube' / 'service-env-jh.sh'
     if service_env.exists():
         env_vars = parse_env_file(service_env)
         os.environ.update(env_vars)
         loaded_count += len(env_vars)
-        print(f"✓ Loaded {len(env_vars)} optional service endpoints from service-env.sh")
+        print(f"✓ Loaded {len(env_vars)} service endpoints from service-env-jh.sh")
 
     # 3. Load user secrets from thinkube-control
     secrets_env = home / 'thinkube' / 'notebooks' / '.secrets.env'
