@@ -137,10 +137,16 @@ JupyterHub uses a public GitHub repository for example notebooks:
 3. Clean notebooks: `nbstripout notebook.ipynb`
 4. Validate: `./scripts/validate_notebooks.sh`
 5. Commit and push to GitHub
-6. Examples auto-sync daily, or trigger manually:
-   ```bash
-   kubectl create job --from=cronjob/thinkube-ai-examples-sync manual-sync -n jupyterhub
-   ```
+6. Push to GitHub. Every notebook server picks the change up the next time it
+   starts: the `clone-templates` init container re-clones the repository into
+   `~/thinkube/templates/`, which is an emptyDir and therefore always current.
+
+   Note what this does **not** do. `~/thinkube/notebooks/examples/` is copied
+   from the templates once, on first setup, and guarded by a `.copied` marker
+   after that. A user's working notebooks are never overwritten — which keeps
+   their edits safe, and also means an existing installation does not receive
+   updated examples. To take a new version, copy the file across from
+   `~/thinkube/templates/examples/`.
 
 **Cleaning tools (required before commit)**:
 ```bash
@@ -184,15 +190,11 @@ This will:
 
 **Note**: Keycloak must already be configured with the JupyterHub client. The deployment retrieves the existing OIDC secret.
 
-### 3. Configure Examples Auto-Sync
+### 3. Examples
 
-```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/12_configure_examples_sync.yaml
-```
-
-This creates:
-- CronJob for daily sync of examples repository
-- Manual trigger capability for immediate updates
+No step is needed. The `clone-templates` init container clones
+`thinkube-ai-examples` into `~/thinkube/templates/` on every pod start, so the
+templates track the repository without a scheduled job.
 
 ### 4. Verify Deployment
 
@@ -346,16 +348,15 @@ kubectl logs -n jupyterhub jupyter-<username>
    - Check Keycloak client configuration in Keycloak admin console
 
 6. **Examples Not Available**:
-   - Verify examples repository cloned: `kubectl logs -n jupyterhub job/clone-thinkube-ai-examples`
-   - Check examples PVC exists: `kubectl get pvc -n jupyterhub jupyterhub-examples-pvc`
-   - Verify sync job: `kubectl get cronjobs -n jupyterhub thinkube-ai-examples-sync`
-   - Check pod startup logs for examples copying
-   - Manual sync: `kubectl create job --from=cronjob/thinkube-ai-examples-sync manual-sync -n jupyterhub`
+   - Check the clone step: `kubectl logs -n jupyterhub jupyter-<user> -c clone-templates`
+   - Confirm the templates arrived: `ls ~/thinkube/templates/examples/`
+   - Confirm the first-run copy happened: `ls -a ~/thinkube/notebooks/examples/.copied`
 
 7. **Examples Out of Date**:
-   - Trigger manual sync: `kubectl create job --from=cronjob/thinkube-ai-examples-sync manual-sync -n jupyterhub`
-   - Check sync job logs: `kubectl logs -n jupyterhub job/manual-sync`
-   - Verify CronJob schedule: `kubectl get cronjob -n jupyterhub thinkube-ai-examples-sync -o yaml`
+   The working copies in `~/thinkube/notebooks/examples/` are deliberately never
+   refreshed, so that a user's own edits survive. `~/thinkube/templates/examples/`
+   is re-cloned on every pod start and always holds the current repository —
+   copy the file you want from there.
 
 ## Performance Considerations
 
