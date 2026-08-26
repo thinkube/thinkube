@@ -111,6 +111,7 @@ FINETUNING_PACKAGES=(
   protobuf
   openpyxl
   python-constraint  # Puzzle generator for the zebra-grpo example notebook
+  "torchao>=0.16"  # Unsloth rejects the base image's older torchao
 )
 
 # Agent development packages (ON TOP of base)
