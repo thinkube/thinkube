@@ -50,6 +50,7 @@ BASE_PACKAGES=(
   ipykernel
   transformers
   "datasets==4.3.0"  # Pinned for Unsloth compatibility (4.4.x causes recursion errors)
+  torchvision  # Resolved in the venv so it matches the venv's torch; the base image's torchvision only matches the base image's torch
   accelerate
   nvidia-modelopt
   pandas
@@ -109,6 +110,7 @@ FINETUNING_PACKAGES=(
   sentencepiece
   protobuf
   openpyxl
+  python-constraint  # Puzzle generator for the zebra-grpo example notebook
 )
 
 # Agent development packages (ON TOP of base)
