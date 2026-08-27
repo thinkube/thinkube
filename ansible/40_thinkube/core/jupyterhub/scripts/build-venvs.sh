@@ -79,13 +79,9 @@ BASE_PACKAGES=(
   ipykernel
   transformers
   "datasets==4.3.0"  # Pinned for Unsloth compatibility (4.4.x causes recursion errors)
-  # KNOWN DEVIATION - torchvision declares an exact torch== pin, so naming it
-  # here installs a PyPI torch into the venv and shadows the base image build
-  # that the note at the top of this file requires. The NGC base image already
-  # ships a matching torchvision; this entry overrides it with a generic pair.
-  # Resolving this means dropping the entry and letting the base image supply
-  # both, and verifying with the torch-path check documented above.
-  torchvision
+  # torchvision is NOT listed: it declares an exact torch== pin, so naming it
+  # here installs a PyPI torch into the venv and shadows the base image build.
+  # The base image already ships a torchvision matched to its own torch.
   accelerate
   nvidia-modelopt
   pandas
@@ -146,12 +142,18 @@ FINETUNING_PACKAGES=(
   protobuf
   openpyxl
   python-constraint  # Puzzle generator for the zebra-grpo example notebook
-  "torchao>=0.16"  # Unsloth rejects the base image's older torchao
   # Kernels for hybrid-attention models (Qwen3.5 GatedDeltaNet layers).
   # Without them transformers falls back to a slow torch implementation.
+  # flash-linear-attention is pure Python over triton, JIT-compiled at run
+  # time, so it carries no torch ABI of its own and installs normally.
   flash-linear-attention
-  causal-conv1d
 )
+# torchao is NOT listed: the base image ships one, and unsloth_zoo requires
+# only torchao>=0.13, which it satisfies. Naming a newer torchao here installs
+# a PyPI build that wants a newer torch than the image ships.
+#
+# causal-conv1d is NOT listed either - it ships a compiled CUDA extension and
+# is installed separately below, from source. See that step for why.
 
 # Agent development packages (ON TOP of base)
 # Note: Let pip resolve compatible versions for langchain ecosystem
@@ -192,6 +194,53 @@ create_venv_with_base() {
   "$venv_path/bin/pip" install $EXTRA_INDEX_ARGS "${BASE_PACKAGES[@]}"
 }
 
+# Fail the build if a venv shadows the base image's torch, or ships a compiled
+# extension built against a different one. Both are silent at install time and
+# surface much later as import errors or as kernels that compute wrongly, so
+# they are checked here rather than trusted to the install flags above.
+verify_torch_inheritance() {
+  local name=$1
+  local venv_path="$BUILD_DIR/$name"
+
+  echo ""
+  echo ">>> Verifying torch inheritance: $name"
+  "$venv_path/bin/python" - "$venv_path" <<'PYEOF'
+import os, sys, importlib
+venv_path = sys.argv[1]
+failures = []
+
+import torch
+torch_dir = os.path.dirname(torch.__file__)
+print(f"    torch {torch.__version__}")
+print(f"      from {torch_dir}")
+if torch_dir.startswith(os.path.realpath(venv_path)):
+    failures.append(
+        "torch is installed INSIDE the venv and shadows the base image build. "
+        "A package in the lists above declared a torch dependency pip was "
+        "allowed to resolve. Find it and install it with --no-deps."
+    )
+
+# Compiled extensions must load against the torch above. An undefined symbol
+# here means the wheel was built for a different torch.
+for mod, note in (("causal_conv1d_cuda", "causal-conv1d CUDA extension"),
+                  ("flash_attn_2_cuda", "flash-attn CUDA extension")):
+    try:
+        importlib.import_module(mod)
+        print(f"    ok   {mod}")
+    except ImportError as e:
+        failures.append(f"{note} does not load against this torch: {e}")
+    except Exception as e:
+        print(f"    skip {mod} ({type(e).__name__})")
+
+if failures:
+    print("\n  TORCH VERIFICATION FAILED")
+    for f in failures:
+        print(f"    - {f}")
+    sys.exit(1)
+print("    torch inheritance OK")
+PYEOF
+}
+
 # Function to make venv relocatable and package it
 package_venv() {
   local name=$1
@@ -226,6 +275,39 @@ create_venv_with_base "fine-tuning"
 echo "Installing fine-tuning packages..."
 "$BUILD_DIR/fine-tuning/bin/pip" install "${FINETUNING_PACKAGES[@]}"
 
+# causal-conv1d: compiled CUDA extension, must be built against THIS torch
+#
+# It provides the fast causal convolution used by hybrid-attention models
+# (Qwen3.5's GatedDeltaNet layers). Because it is a C++/CUDA extension, a
+# binary built against a different torch does not fail at install time - it
+# fails at import, with an undefined-symbol error, long after the build looks
+# successful. Installing it plainly is not safe: every default leads to a
+# foreign binary.
+#
+#   CAUSAL_CONV1D_FORCE_BUILD=TRUE  its setup.py otherwise downloads a
+#                                   prebuilt CUDA wheel from GitHub releases,
+#                                   built against whatever torch upstream used
+#   --no-binary causal_conv1d       stops pip preferring a PyPI wheel
+#   --no-cache-dir                  stops pip reusing a wheel it built or
+#                                   downloaded under a previous torch
+#   --no-build-isolation            builds against the torch installed here;
+#                                   without it pip creates an isolated env,
+#                                   pulls its OWN torch to build against, and
+#                                   produces a binary for that torch instead
+#   --no-deps                       it declares a bare torch dependency, which
+#                                   would install a PyPI torch over the image's
+#
+# TORCH_CUDA_ARCH_LIST pins the target architectures so the build does not
+# depend on which GPU happens to be visible in the builder. 12.0 covers
+# GB10 / Grace Blackwell (sm_121) by forward compatibility.
+echo "Building causal-conv1d from source against the image's torch..."
+CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0 8.6 8.9 9.0 12.0}" \
+MAX_JOBS="${MAX_JOBS:-8}" \
+"$BUILD_DIR/fine-tuning/bin/pip" install \
+  --no-binary causal_conv1d --no-cache-dir --no-build-isolation --no-deps \
+  causal-conv1d
+
 # Install Unsloth
 #
 # --no-deps is mandatory, for two independent reasons:
@@ -259,6 +341,7 @@ echo "Installing Unsloth..."
 "$BUILD_DIR/fine-tuning/bin/pip" install "git+https://github.com/unslothai/unsloth-zoo.git" --no-deps
 "$BUILD_DIR/fine-tuning/bin/pip" install "unsloth[cu130onlytorch291] @ git+https://github.com/unslothai/unsloth.git" --no-build-isolation --no-deps
 
+verify_torch_inheritance "fine-tuning"
 package_venv "fine-tuning"
 
 # ============================================
@@ -273,6 +356,7 @@ echo "Installing agent development packages..."
 echo "Installing openlit..."
 "$BUILD_DIR/agent-dev/bin/pip" install openlit --no-deps
 
+verify_torch_inheritance "agent-dev"
 package_venv "agent-dev"
 
 # ============================================
