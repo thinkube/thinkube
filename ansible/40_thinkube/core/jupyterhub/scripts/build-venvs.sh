@@ -147,13 +147,24 @@ FINETUNING_PACKAGES=(
   # flash-linear-attention is pure Python over triton, JIT-compiled at run
   # time, so it carries no torch ABI of its own and installs normally.
   flash-linear-attention
+  # torchao is pinned exactly, between two failures on either side.
+  #
+  # peft gates LoRA creation on is_torchao_available(), which rejects the
+  # torchao the base image ships and raises. Unsloth catches that and carries
+  # on, but prints "Ignoring an unusable torchao" during model setup - a
+  # warning in the first cells of every notebook using this venv.
+  #
+  # Going higher is worse, not better: from 0.17 torchao imports
+  # torch.nn.functional.ScalingType, which does not exist before torch 2.11,
+  # so on this image `import peft` fails outright.
+  #
+  # 0.16.0 is the one version that satisfies peft and imports cleanly against
+  # the image's torch. Re-test this pin whenever the base image's torch
+  # changes; on torch >= 2.11 the upper constraint disappears.
+  "torchao==0.16.0"
 )
-# torchao is NOT listed: the base image ships one, and unsloth_zoo requires
-# only torchao>=0.13, which it satisfies. Naming a newer torchao here installs
-# a PyPI build that wants a newer torch than the image ships.
-#
-# causal-conv1d is NOT listed either - it ships a compiled CUDA extension and
-# is installed separately below, from source. See that step for why.
+# causal-conv1d is NOT listed - it ships a compiled CUDA extension and is
+# installed separately below, from source. See that step for why.
 
 # Agent development packages (ON TOP of base)
 # Note: Let pip resolve compatible versions for langchain ecosystem
@@ -231,6 +242,25 @@ for mod, note in (("causal_conv1d_cuda", "causal-conv1d CUDA extension"),
         failures.append(f"{note} does not load against this torch: {e}")
     except Exception as e:
         print(f"    skip {mod} ({type(e).__name__})")
+
+# peft rejects a torchao it considers too old and raises during LoRA creation.
+# Unsloth survives it but prints a warning in the first cells of every notebook
+# using this venv, so the pin is asserted here rather than left to chance.
+try:
+    import peft
+    from peft.import_utils import is_torchao_available
+    import torchao
+    if is_torchao_available():
+        print(f"    ok   peft accepts torchao {torchao.__version__}")
+    else:
+        failures.append(
+            f"peft rejects torchao {torchao.__version__}; LoRA creation will warn. "
+            "Adjust the torchao pin in FINETUNING_PACKAGES."
+        )
+except ImportError as e:
+    if "torchao" in str(e) or "ScalingType" in str(e):
+        failures.append(f"torchao is unusable with this torch: {e}")
+    # peft absent (agent-dev venv) is expected
 
 if failures:
     print("\n  TORCH VERIFICATION FAILED")
