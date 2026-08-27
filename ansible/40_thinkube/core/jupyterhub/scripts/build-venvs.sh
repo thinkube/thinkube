@@ -13,6 +13,35 @@
 #
 # Users who only need basic ML (PyTorch, transformers) use the system Python
 # from tk-jupyter-base directly - no venv needed.
+#
+# ---------------------------------------------------------------------------
+# PyTorch comes from the base image. Never from PyPI.
+#
+# tk-jupyter-base is built on the NGC PyTorch container, whose torch, CUDA
+# libraries, triton and flash-attn are compiled for the GPUs this platform
+# runs on - including GB10 / Grace Blackwell (sm_121), for which stock PyPI
+# wheels carry no kernels. The venvs use --system-site-packages so they
+# inherit that build.
+#
+# A PyPI torch installed into a venv SHADOWS the base image build for every
+# process using that venv. It is a generic wheel: it drops the vendor tuning,
+# and it breaks any extension compiled against the base image's torch ABI.
+#
+# Therefore:
+#   - no package list here may name torch, and
+#   - any package that depends on torch must not be allowed to resolve it.
+#
+# NVIDIA's DGX Spark playbook states this requirement directly: install
+# Unsloth and its dependencies with --no-deps "to avoid overwriting the
+# optimized PyTorch and CUDA libraries already present in the NGC container".
+#   https://github.com/NVIDIA/dgx-spark-playbooks/tree/main/nvidia/unsloth
+#
+# To verify a built venv honours this, the venv's torch must resolve OUTSIDE
+# the venv:
+#   $VENV/bin/python -c "import torch,os; print(torch.__version__, os.path.dirname(torch.__file__))"
+# A path under $VENV/lib/.../site-packages/torch means the venv shadows the
+# base image and the build is wrong.
+# ---------------------------------------------------------------------------
 
 set -euo pipefail
 
@@ -50,7 +79,13 @@ BASE_PACKAGES=(
   ipykernel
   transformers
   "datasets==4.3.0"  # Pinned for Unsloth compatibility (4.4.x causes recursion errors)
-  torchvision  # Resolved in the venv so it matches the venv's torch; the base image's torchvision only matches the base image's torch
+  # KNOWN DEVIATION - torchvision declares an exact torch== pin, so naming it
+  # here installs a PyPI torch into the venv and shadows the base image build
+  # that the note at the top of this file requires. The NGC base image already
+  # ships a matching torchvision; this entry overrides it with a generic pair.
+  # Resolving this means dropping the entry and letting the base image supply
+  # both, and verifying with the torch-path check documented above.
+  torchvision
   accelerate
   nvidia-modelopt
   pandas
@@ -191,7 +226,35 @@ create_venv_with_base "fine-tuning"
 echo "Installing fine-tuning packages..."
 "$BUILD_DIR/fine-tuning/bin/pip" install "${FINETUNING_PACKAGES[@]}"
 
-# Install Unsloth (special handling to avoid conflicts)
+# Install Unsloth
+#
+# --no-deps is mandatory, for two independent reasons:
+#
+# 1. Unsloth's dependency chain resolves torch, which would shadow the base
+#    image build. See the PyTorch note at the top of this file.
+#
+# 2. Unsloth's declared ranges lag its own code. Released versions still
+#    declare torch<2.12.0, transformers<=5.5.0 and trl<=0.24.0, while the
+#    code targets newer ones - the torch 2.12 support below ships in a
+#    version whose metadata still excludes torch 2.12. Resolving those
+#    ranges pins the venv to versions Unsloth itself has moved past.
+#
+# Minimum version: Unsloth 2026.7.x.
+#   torch 2.12 made torch._dynamo.config overrides thread-local, so a
+#   recompile limit raised on the main thread never reaches the autograd
+#   worker threads that run backward under gradient checkpointing. Those
+#   threads recompile fullgraph kernels against the default limit of 8.
+#   Against torch 2.12, earlier Unsloth dies at training step 0 with
+#   "FailOnRecompileLimitHit: Hard failure due to fullgraph=True", and
+#   raising torch._dynamo.config.recompile_limit does NOT help - that
+#   symptom pair is the signature of an Unsloth too old for the torch here.
+#   Restored to process-global by unslothai/unsloth#7019.
+#   https://github.com/unslothai/unsloth/issues/6825
+#
+# Installing from git HEAD satisfies the floor, and keeps whatever GB10 /
+# sm_121 support has landed upstream. Pin a tag here only alongside a
+# recorded reason, and never below 2026.7.x while the base image ships
+# torch 2.12 or newer.
 echo "Installing Unsloth..."
 "$BUILD_DIR/fine-tuning/bin/pip" install "git+https://github.com/unslothai/unsloth-zoo.git" --no-deps
 "$BUILD_DIR/fine-tuning/bin/pip" install "unsloth[cu130onlytorch291] @ git+https://github.com/unslothai/unsloth.git" --no-build-isolation --no-deps
