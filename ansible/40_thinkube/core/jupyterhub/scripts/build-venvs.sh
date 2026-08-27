@@ -112,6 +112,10 @@ FINETUNING_PACKAGES=(
   openpyxl
   python-constraint  # Puzzle generator for the zebra-grpo example notebook
   "torchao>=0.16"  # Unsloth rejects the base image's older torchao
+  # Kernels for hybrid-attention models (Qwen3.5 GatedDeltaNet layers).
+  # Without them transformers falls back to a slow torch implementation.
+  flash-linear-attention
+  causal-conv1d
 )
 
 # Agent development packages (ON TOP of base)
