@@ -215,60 +215,50 @@ verify_torch_inheritance() {
 
   echo ""
   echo ">>> Verifying torch inheritance: $name"
-  "$venv_path/bin/python" - "$venv_path" <<'PYEOF'
-import os, sys, importlib
-venv_path = sys.argv[1]
-failures = []
-
-import torch
-torch_dir = os.path.dirname(torch.__file__)
-print(f"    torch {torch.__version__}")
-print(f"      from {torch_dir}")
-if torch_dir.startswith(os.path.realpath(venv_path)):
-    failures.append(
-        "torch is installed INSIDE the venv and shadows the base image build. "
-        "A package in the lists above declared a torch dependency pip was "
-        "allowed to resolve. Find it and install it with --no-deps."
-    )
-
-# Compiled extensions must load against the torch above. An undefined symbol
-# here means the wheel was built for a different torch.
-for mod, note in (("causal_conv1d_cuda", "causal-conv1d CUDA extension"),
-                  ("flash_attn_2_cuda", "flash-attn CUDA extension")):
-    try:
-        importlib.import_module(mod)
-        print(f"    ok   {mod}")
-    except ImportError as e:
-        failures.append(f"{note} does not load against this torch: {e}")
-    except Exception as e:
-        print(f"    skip {mod} ({type(e).__name__})")
-
-# peft rejects a torchao it considers too old and raises during LoRA creation.
-# Unsloth survives it but prints a warning in the first cells of every notebook
-# using this venv, so the pin is asserted here rather than left to chance.
-try:
-    import peft
-    from peft.import_utils import is_torchao_available
-    import torchao
-    if is_torchao_available():
-        print(f"    ok   peft accepts torchao {torchao.__version__}")
-    else:
-        failures.append(
-            f"peft rejects torchao {torchao.__version__}; LoRA creation will warn. "
-            "Adjust the torchao pin in FINETUNING_PACKAGES."
-        )
-except ImportError as e:
-    if "torchao" in str(e) or "ScalingType" in str(e):
-        failures.append(f"torchao is unusable with this torch: {e}")
-    # peft absent (agent-dev venv) is expected
-
-if failures:
-    print("\n  TORCH VERIFICATION FAILED")
-    for f in failures:
-        print(f"    - {f}")
-    sys.exit(1)
-print("    torch inheritance OK")
-PYEOF
+  # No heredoc: this script is inlined into a ConfigMap with every line
+  # indented, and an indented heredoc terminator does not close the document.
+  # The checker is written to a file, then run.
+  local check_py="$venv_path/.verify_torch.py"
+  {
+    echo "import os, sys, importlib"
+    echo "venv_path = sys.argv[1]"
+    echo "failures = []"
+    echo "import torch"
+    echo "torch_dir = os.path.dirname(torch.__file__)"
+    echo "print(\"    torch \" + torch.__version__)"
+    echo "print(\"      from \" + torch_dir)"
+    echo "if torch_dir.startswith(os.path.realpath(venv_path)):"
+    echo "    failures.append(\"torch is installed INSIDE the venv and shadows the base image build. A package in the lists above declared a torch dependency pip was allowed to resolve. Find it and install it with --no-deps.\")"
+    echo "for mod, note in ((\"causal_conv1d_cuda\", \"causal-conv1d CUDA extension\"), (\"flash_attn_2_cuda\", \"flash-attn CUDA extension\")):"
+    echo "    try:"
+    echo "        importlib.import_module(mod)"
+    echo "        print(\"    ok   \" + mod)"
+    echo "    except ModuleNotFoundError:"
+    echo "        print(\"    n/a  \" + mod + \" (not installed in this venv)\")"
+    echo "    except ImportError as e:"
+    echo "        failures.append(note + \" is installed but does not load against this torch, so it was built against a different one: \" + str(e))"
+    echo "    except Exception as e:"
+    echo "        print(\"    skip \" + mod + \" (\" + type(e).__name__ + \")\")"
+    echo "try:"
+    echo "    import peft, torchao"
+    echo "    from peft.import_utils import is_torchao_available"
+    echo "    if is_torchao_available():"
+    echo "        print(\"    ok   peft accepts torchao \" + torchao.__version__)"
+    echo "    else:"
+    echo "        failures.append(\"peft rejects torchao \" + torchao.__version__ + \"; LoRA creation will warn. Adjust the torchao pin in FINETUNING_PACKAGES.\")"
+    echo "except ImportError as e:"
+    echo "    if \"torchao\" in str(e) or \"ScalingType\" in str(e):"
+    echo "        failures.append(\"torchao is unusable with this torch: \" + str(e))"
+    echo "if failures:"
+    echo "    print(\"\")"
+    echo "    print(\"  TORCH VERIFICATION FAILED\")"
+    echo "    for f in failures:"
+    echo "        print(\"    - \" + f)"
+    echo "    sys.exit(1)"
+    echo "print(\"    torch inheritance OK\")"
+  } > "$check_py"
+  "$venv_path/bin/python" "$check_py" "$venv_path"
+  rm -f "$check_py"
 }
 
 # Function to make venv relocatable and package it
