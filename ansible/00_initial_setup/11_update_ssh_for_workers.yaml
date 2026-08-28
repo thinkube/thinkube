@@ -37,6 +37,63 @@
         key: "{{ cp_pubkey.content | b64decode }}"
         state: present
 
+    # A worker that only has the control plane's public key can be reached but
+    # cannot reach anything. Nodes installed by 10_setup_ssh_keys share one
+    # cluster key; a node added later must get the same key, or every playbook
+    # that runs a command from a worker fails on that node alone.
+    - name: Read cluster key from control plane
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      ansible.builtin.slurp:
+        src: "{{ hostvars[groups['k8s_control_plane'][0]].ansible_user_dir | default('/home/' + (system_username | default('alexmc'))) }}/.ssh/{{ ssh_key_name }}"
+      register: cluster_key
+      run_once: true
+      no_log: true
+
+    - name: Install cluster key on worker
+      ansible.builtin.copy:
+        content: "{{ cluster_key.content | b64decode }}"
+        dest: "{{ ansible_user_dir | default('/home/' + (system_username | default('alexmc'))) }}/.ssh/{{ ssh_key_name }}"
+        mode: '0600'
+      no_log: true
+
+    - name: Install cluster public key on worker
+      ansible.builtin.copy:
+        content: "{{ cp_pubkey.content | b64decode }}"
+        dest: "{{ ansible_user_dir | default('/home/' + (system_username | default('alexmc'))) }}/.ssh/{{ ssh_key_name }}.pub"
+        mode: '0644'
+
+    # The SSH config below reaches peers through this helper, so it is
+    # installed first: a config referencing a missing binary makes every
+    # ssh from this node fail outright, which is worse than a stale address.
+    - name: Ensure ~/.local/bin exists on worker
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir | default('/home/' + (system_username | default('alexmc'))) }}/.local/bin"
+        state: directory
+        mode: '0755'
+
+    - name: Install thinkube-node-ip helper on worker
+      ansible.builtin.copy:
+        src: thinkube-node-ip
+        dest: "{{ ansible_user_dir | default('/home/' + (system_username | default('alexmc'))) }}/.local/bin/thinkube-node-ip"
+        mode: '0755'
+
+    - name: Write baremetal SSH config on worker
+      ansible.builtin.blockinfile:
+        path: "{{ ansible_user_dir | default('/home/' + (system_username | default('alexmc'))) }}/.ssh/config"
+        marker: "# {mark}-THINKUBE-BAREMETAL"
+        create: true
+        mode: '0600'
+        block: |
+          {% for host in groups['baremetal'] if host != inventory_hostname %}
+          Host {{ host }}
+            ProxyCommand {{ ansible_user_dir | default('/home/' + (system_username | default('alexmc'))) }}/.local/bin/thinkube-node-ip --connect {{ host }} 22 {{ hostvars[host]['lan_ip'] | default(hostvars[host]['ansible_host']) }}
+            User {{ ansible_user_id | default(system_username | default('alexmc')) }}
+            IdentityFile {{ ansible_user_dir | default('/home/' + (system_username | default('alexmc'))) }}/.ssh/{{ ssh_key_name }}
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+
+          {% endfor %}
+
 - name: Update SSH config on control plane for all baremetal hosts
   hosts: k8s_control_plane
   gather_facts: true
@@ -45,6 +102,18 @@
     ssh_key_name: "thinkube_cluster_key"
 
   tasks:
+    - name: Ensure ~/.local/bin exists on control plane
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir }}/.local/bin"
+        state: directory
+        mode: '0755'
+
+    - name: Install thinkube-node-ip helper on control plane
+      ansible.builtin.copy:
+        src: thinkube-node-ip
+        dest: "{{ ansible_user_dir }}/.local/bin/thinkube-node-ip"
+        mode: '0755'
+
     - name: Regenerate baremetal SSH config block
       ansible.builtin.blockinfile:
         path: "{{ ansible_user_dir }}/.ssh/config"
@@ -54,7 +123,7 @@
         block: |
           {% for host in groups['baremetal'] if host != inventory_hostname %}
           Host {{ host }}
-            HostName {{ hostvars[host]['ansible_host'] }}
+            ProxyCommand {{ ansible_user_dir }}/.local/bin/thinkube-node-ip --connect {{ host }} 22 {{ hostvars[host]['lan_ip'] | default(hostvars[host]['ansible_host']) }}
             User {{ ansible_user_id }}
             IdentityFile {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}
             StrictHostKeyChecking no
