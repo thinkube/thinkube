@@ -78,6 +78,10 @@ mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 BASE_PACKAGES=(
   ipykernel
   transformers
+  # transformers loads optimised kernels from the Hub through this, and
+  # bitsandbytes looks for it too; without it both log a missing-module warning
+  # on import. Pure Python, so it carries no torch ABI.
+  kernels
   "datasets==4.3.0"  # Pinned for Unsloth compatibility (4.4.x causes recursion errors)
   # torchvision is NOT listed: it declares an exact torch== pin, so naming it
   # here installs a PyPI torch into the venv and shadows the base image build.
@@ -147,21 +151,22 @@ FINETUNING_PACKAGES=(
   # flash-linear-attention is pure Python over triton, JIT-compiled at run
   # time, so it carries no torch ABI of its own and installs normally.
   flash-linear-attention
-  # torchao is pinned exactly, between two failures on either side.
+  # torchao needs a floor and, on older images, a ceiling too.
   #
-  # peft gates LoRA creation on is_torchao_available(), which rejects the
-  # torchao the base image ships and raises. Unsloth catches that and carries
-  # on, but prints "Ignoring an unusable torchao" during model setup - a
-  # warning in the first cells of every notebook using this venv.
+  # The floor: peft gates LoRA creation on is_torchao_available(), which
+  # rejects the torchao the base image ships and raises. Unsloth catches that
+  # and carries on, but prints "Ignoring an unusable torchao" during model
+  # setup - a warning in the first cells of every notebook using this venv.
   #
-  # Going higher is worse, not better: from 0.17 torchao imports
-  # torch.nn.functional.ScalingType, which does not exist before torch 2.11,
-  # so on this image `import peft` fails outright.
+  # The ceiling only bites below torch 2.11: from 0.17 torchao imports
+  # torch.nn.functional.ScalingType, absent before then, which makes
+  # `import peft` fail outright. The base image now ships torch 2.11, so the
+  # ceiling is gone and newer torchao is allowed - it also carries the CUDA
+  # kernels that 0.16 failed to load on amd64.
   #
-  # 0.16.0 is the one version that satisfies peft and imports cleanly against
-  # the image's torch. Re-test this pin whenever the base image's torch
-  # changes; on torch >= 2.11 the upper constraint disappears.
-  "torchao==0.16.0"
+  # If the base image is ever moved back below torch 2.11, this becomes
+  # torchao==0.16.0 again. The build's verification step catches it either way.
+  "torchao>=0.16"
 )
 # causal-conv1d is NOT listed - it ships a compiled CUDA extension and is
 # installed separately below, from source. See that step for why.
