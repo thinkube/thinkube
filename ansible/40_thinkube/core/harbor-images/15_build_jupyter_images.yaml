@@ -178,11 +178,16 @@
         label: "{{ item[0].key }}: {{ item[1] }}"
       when: is_multi_arch and item[0].value != inventory_hostname
 
+    # ssh targets the inventory address, not the bare hostname. Ansible reaches
+    # these nodes through ansible_host; a bare name is resolved by whatever the
+    # build node's resolver says, which on a cluster with mDNS can be a stale
+    # record or a link-local IPv6 address, and the sync then fails on a node
+    # Ansible itself just connected to successfully.
     - name: Sync build context to remote build nodes
       ansible.builtin.shell: |
         tar -czf - -C {{ base_images_dir }} . | \
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-          {{ item.value }} 'tar -xzf - -C {{ base_images_dir }}'
+          {{ hostvars[item.value].ansible_host | default(item.value) }} 'tar -xzf - -C {{ base_images_dir }}'
       loop: "{{ arch_build_nodes | dict2items }}"
       loop_control:
         label: "{{ item.key }} ({{ item.value }})"
@@ -193,7 +198,7 @@
       ansible.builtin.shell: |
         tar -czf - -C {{ remote_containerfiles_dir }} . | \
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-          {{ item.value }} 'tar -xzf - -C {{ remote_containerfiles_dir }}'
+          {{ hostvars[item.value].ansible_host | default(item.value) }} 'tar -xzf - -C {{ remote_containerfiles_dir }}'
       loop: "{{ arch_build_nodes | dict2items }}"
       loop_control:
         label: "{{ item.key }} ({{ item.value }})"
