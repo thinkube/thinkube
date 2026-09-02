@@ -1,0 +1,52 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# roles/common/github_username/tasks/main.yaml
+#
+# Who owns the GitHub token. The token already identifies its owner, so the
+# username is never a second fact to ask for: when nothing supplied it, GitHub
+# is asked, and the answer is kept beside the other secrets so every later run
+# reads the same value. A run that cannot learn it stops here, because a pod
+# deployed with an empty name would silently record everyone's work under it.
+#
+# Needs: github_token, env_file_path.
+
+- name: Take the GitHub username where it is already known
+  ansible.builtin.set_fact:
+    github_username: "{{ github_username | default(lookup('env', 'GITHUB_USERNAME'), true) }}"
+
+- name: Ask GitHub who owns the token
+  ansible.builtin.uri:
+    url: https://api.github.com/user
+    method: GET
+    headers:
+      Authorization: "Bearer {{ github_token }}"
+      Accept: application/vnd.github+json
+    return_content: true
+    status_code: 200
+  register: github_token_owner
+  when: (github_username | default('') | length) == 0
+  no_log: true
+
+- name: Set the GitHub username from the token's owner
+  ansible.builtin.set_fact:
+    github_username: "{{ github_token_owner.json.login }}"
+  when: github_token_owner is not skipped
+
+- name: Stop when no GitHub username could be learned
+  ansible.builtin.assert:
+    that:
+      - github_username is defined
+      - github_username | length > 0
+    fail_msg: >-
+      No GitHub username: GITHUB_USERNAME is not set and the token did not
+      identify its owner. Set GITHUB_USERNAME in {{ env_file_path }}, or use
+      a token that belongs to a user.
+
+- name: Keep the GitHub username beside the other secrets
+  ansible.builtin.lineinfile:
+    path: "{{ env_file_path }}"
+    regexp: "^GITHUB_USERNAME="
+    line: "GITHUB_USERNAME={{ github_username }}"
+    create: true
+    mode: "0600"
