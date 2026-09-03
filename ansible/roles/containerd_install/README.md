@@ -61,7 +61,7 @@ and the live plugin behaviour is deterministic.
 ## Variables
 
 See `defaults/main.yaml`. The defaults pin to the
-`v1.35.5+thinkube.0.1.0` release manifest; in production they should be
+`v1.36.4+thinkube.0.1.0` release manifest; in production they should be
 overridden by values resolved from `thinkube-metadata` (see
 `thinkube-installer/KUBEADM_MIGRATION_PLAN.md` §5.4).
 

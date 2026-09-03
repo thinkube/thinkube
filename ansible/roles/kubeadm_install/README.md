@@ -8,7 +8,7 @@ requirements, and holds the packages.
 
 - `kubeadm`, `kubelet`, `kubectl` from
   `pkgs.k8s.io/core:/stable:/v<MINOR>/deb/` at the pinned patch (default
-  `1.35.5-1.1`)
+  `1.36.4-1.1`)
 - `apt-mark hold` on all three
 - Swap disabled (runtime + `/etc/fstab` comment)
 - Kernel modules `overlay` and `br_netfilter` loaded + persisted via
@@ -41,7 +41,7 @@ auto-refresh: version bumps must be explicit and intentional.
 ## Variables
 
 See `defaults/main.yaml`. The defaults pin to the
-`v1.35.5+thinkube.0.1.0` release manifest; in production they should be
+`v1.36.4+thinkube.0.1.0` release manifest; in production they should be
 overridden by values resolved from `thinkube-metadata` (see
 `thinkube-installer/KUBEADM_MIGRATION_PLAN.md` §5.4).
 
@@ -58,8 +58,8 @@ Or with overrides:
 - import_role:
     name: kubeadm_install
   vars:
-    kubeadm_k8s_minor: "1.35"
-    kubeadm_k8s_patch: "1.35.5"
+    kubeadm_k8s_minor: "1.36"
+    kubeadm_k8s_patch: "1.36.4"
     kubeadm_k8s_apt_revision: "1.1"
 ```
 
@@ -81,7 +81,7 @@ After a successful run:
 
 ```bash
 which kubeadm kubelet kubectl                  # → /usr/bin/...
-kubeadm version | grep GitVersion              # → v1.35.5
+kubeadm version | grep GitVersion              # → v1.36.4
 apt-mark showhold | grep -E 'kubeadm|kubelet|kubectl'   # → all three
 swapon --show                                  # → empty
 sysctl net.ipv4.ip_forward                     # → 1
