@@ -105,7 +105,7 @@ BASE_PACKAGES=(
   nats-py
   weaviate-client
   litellm
-  kubernetes
+  kubernetes==36.0.3
   PyGithub
   hera-workflows
   argilla
