@@ -254,7 +254,7 @@ curl -H "X-Chroma-Token: ${ADMIN_PASSWORD}" \
 
 ## Integration
 
-### With AI/ML Frameworks
+### With AI Frameworks
 
 Chroma integrates well with:
 - LangChain for RAG applications

@@ -16,7 +16,7 @@ NATS is a high-performance messaging system for cloud-native applications and mi
 
 ### Components
 
-- **NATS Server**: Core messaging server (single replica for homelab)
+- **NATS Server**: Core messaging server (single replica)
 - **JetStream**: Persistent storage layer (10Gi)
 - **Monitoring**: Built-in monitoring endpoint on port 8222
 - **nats-box**: CLI tool for testing and management
@@ -32,7 +32,7 @@ NATS is a high-performance messaging system for cloud-native applications and mi
 JetStream uses persistent volumes for message storage:
 - 10Gi persistent volume
 - Survives pod restarts
-- Single replica (suitable for homelab)
+- Single replica (suitable for single-user scale)
 
 ## Deployment
 

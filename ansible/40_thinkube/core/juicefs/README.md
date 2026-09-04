@@ -10,7 +10,7 @@ This component deploys JuiceFS distributed filesystem providing true ReadWriteMa
 - **CSI Driver**: Kubernetes CSI driver for dynamic provisioning
 - **POSIX Compatible**: Full POSIX filesystem semantics
 - **Multi-node Consistency**: Files written on one node are immediately visible on all nodes
-- **Production Ready**: Used in production AI/ML workloads
+- **Production Ready**: Used in production AI workloads
 - **Apache 2.0 License**: Fully compatible with platform licensing
 
 ## Architecture
@@ -77,7 +77,7 @@ spec:
 ### Use Cases
 
 1. **JupyterHub**: Shared notebooks and examples across GPU nodes
-2. **AI/ML Models**: Centralized model storage accessible from any node
+2. **AI Models**: Centralized model storage accessible from any node
 3. **Training Datasets**: Shared datasets for distributed training
 4. **Collaborative Development**: Shared code workspaces
 5. **CI/CD**: Shared build cache and artifacts

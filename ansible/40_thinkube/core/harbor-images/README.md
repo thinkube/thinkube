@@ -29,7 +29,7 @@ Mirrors 50+ essential public images from multiple sources to Harbor's `library` 
 - **Languages**: python:3.12-slim, golang:1.25.3-alpine, node:24-alpine, rust:alpine
 - **Databases**: postgres:18-alpine, valkey:7.2-alpine, pgadmin4
 - **Vector DBs**: qdrant, weaviate, chroma
-- **AI/ML**: litellm, argilla, cvat, tensorrt-llm:1.2.0rc2
+- **AI**: litellm, argilla, cvat, tensorrt-llm:1.2.0rc2
 - **CUDA**: cuda:13.0.0-base, cuda:13.0.0-devel, cuda:13.0.0-cudnn-runtime
 - **Build**: kaniko-executor
 - **Monitoring**: prometheus, alertmanager, node-exporter, kube-state-metrics
@@ -58,7 +58,7 @@ Builds 12+ custom base images with pre-installed dependencies for faster applica
 **Platform Tools**:
 - `tk-service-discovery:latest` - kubectl, jq, yq, bash for Argo Workflows
 
-**AI/ML Bases**:
+**AI Bases**:
 - `ai-inference-base:cuda13.0-torch2.9-py3.12` - CUDA 13.0 + PyTorch 2.9 + transformers for Stable Diffusion
 - `tensorrt-llm-base:1.2.0rc2` - TensorRT-LLM 1.2.0rc2 optimized for NVIDIA Blackwell GB10 (DGX Spark)
 - `mlflow-custom:latest` - MLflow with OIDC auth, PostgreSQL, S3 support

@@ -227,7 +227,7 @@ curl https://weaviate.<domain>/v1/.well-known/openapi
 
 ## Integration
 
-### With AI/ML Frameworks
+### With AI Frameworks
 
 Weaviate integrates well with:
 - LangChain for RAG applications

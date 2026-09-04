@@ -244,7 +244,7 @@ Create visualizations in OpenSearch Dashboards:
 - Enable field-level security
 - Set up document-level security
 
-### 8. **Explore AI/ML Features**
+### 8. **Explore AI Features**
 - Set up anomaly detection
 - Configure ML commons
 - Implement semantic search

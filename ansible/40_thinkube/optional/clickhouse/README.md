@@ -13,7 +13,7 @@ ClickHouse is a high-performance columnar database management system optimized f
 - **Real-time Analytics**: Sub-second query response times
 - **Dual Protocol Access**: HTTP (port 8123) and native TCP (port 9000)
 - **External Access**: HTTPS for HTTP interface, TCP passthrough for native protocol
-- **Horizontal Scalability**: Supports sharding and replication (single node in homelab)
+- **Horizontal Scalability**: Supports sharding and replication (single node in this deployment)
 
 ## Dependencies
 
@@ -82,7 +82,7 @@ Deploys ClickHouse with dual-protocol external access:
     - Default user password: from `ADMIN_PASSWORD`
     - External access: enabled
     - Persistence: 10Gi PVC with `k8s-hostpath` storage class
-  - **Note**: Homelab single-node configuration; production should use multiple replicas
+  - **Note**: Single-node configuration; production should use multiple replicas
 
 - **Pod Readiness Wait**
   - Waits for ClickHouse pod to reach `Running` state

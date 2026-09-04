@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Thinkube is a collection of Ansible playbooks for deploying a complete Kubernetes homelab platform on Ubuntu servers. The playbooks provision bare-metal hosts, install Canonical k8s-snap, and deploy 17 core services plus 17+ optional services (AI/ML tools, databases, monitoring).
+Thinkube is a collection of Ansible playbooks for deploying a complete Kubernetes platform on Ubuntu servers. The playbooks provision bare-metal hosts, install Canonical k8s-snap, and deploy 17 core services plus 17+ optional services (AI tools, databases, monitoring).
 
 **Version**: 0.1.0 (under active development)
 
@@ -113,7 +113,7 @@ Deployed in dependency order:
 
 ### Optional Components (ansible/40_thinkube/optional/)
 
-AI/ML: ollama, litellm, langfuse, argilla, cvat
+AI: ollama, litellm, langfuse, argilla, cvat
 Vector DBs: qdrant, chroma, weaviate
 Data: clickhouse, opensearch, nats
 Monitoring: prometheus, perses
