@@ -37,6 +37,11 @@
     admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
     auth_realm_password: "{{ lookup('env', 'AUTH_REALM_PASSWORD') | default(admin_password, true) }}"
     cluster_admin_group: "cluster-admins"
+    # How long an access token stays valid. Every app on the cluster
+    # renews silently against the realm's SSO session, so this is the
+    # window a client works in before that round trip; a client that
+    # cannot make the round trip works only for this long.
+    keycloak_access_token_lifespan: 3600
 
     keycloak_user:
       username: "{{ auth_realm_username }}"
@@ -103,10 +108,28 @@
           enabled: true
           displayName: "{{ thinkube_applications_displayname }}"
           defaultGroups: ["{{ cluster_admin_group }}"]
+          accessTokenLifespan: "{{ keycloak_access_token_lifespan }}"
         validate_certs: no  # Rate limit issue, certificate is valid but CA trust issue
         status_code: [201, 409]  # 201 => created, 409 => realm already exists
       register: realm_create_result
       no_log: false  # Show error for debugging
+
+    - name: Set the realm's access token lifespan
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ keycloak_admin_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          realm: "{{ keycloak_realm }}"
+          accessTokenLifespan: "{{ keycloak_access_token_lifespan }}"
+        validate_certs: no  # Rate limit issue, certificate is valid but CA trust issue
+        status_code: [204]
+      # Creating the realm answers 409 when it is already there and changes
+      # nothing, so the lifespan is set on its own for a cluster that
+      # already has the realm.
 
     ###################################################################
     # 3) GET the user profile => /admin/realms/{realm}/users/profile
