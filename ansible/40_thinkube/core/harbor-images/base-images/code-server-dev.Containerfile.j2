@@ -177,31 +177,38 @@ RUN apt-get update && apt-get install -y \
 # Uses Playwright's bundled Chromium instead of the Ubuntu snap stub
 ###############################################################################
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
-# The ~195 MB chromium download is the least reliable fetch in this image and
-# it sank a build on 2026-09-08. Three guards, because a failure here costs a
-# full reinstall to retest:
-#   - pinned version: bare `npx playwright` resolves to whatever is newest, so
-#     two identical builds can pull different browser builds from different
-#     download hosts. Not acceptable in an image we regression-test.
-#   - ipv4first: the nodes have no working IPv6 egress (the router advertises a
-#     v6 default route but hands out no usable prefix, so every v6 connection
-#     blackholes). This takes IPv6 out of the picture for the download.
-#   - raised timeout + retries: playwright aborts a stalled transfer after 30s
-#     and does not retry the whole install.
-ENV PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=180000
-RUN for attempt in 1 2 3; do \
-        NODE_OPTIONS=--dns-result-order=ipv4first \
-        npx -y playwright@1.63.0 install --with-deps chromium && break; \
-        echo "⚠️  playwright install failed (attempt ${attempt}/3), retrying in 15s"; \
-        sleep 15; \
-    done; \
+# Chrome for Testing build that playwright 1.63 pins for chromium v1243.
+# Pinned rather than resolved at build time so two builds of this image get the
+# same browser.
+ARG CHROME_FOR_TESTING_VERSION=153.0.8010.12
+# We fetch the browser with curl instead of `playwright install`. On 2026-09-08
+# playwright's downloader failed this build three times, hours apart: it opened
+# the connection and then gave up after its 30s timeout having transferred zero
+# bytes, five attempts each time. curl pulls the same URL on the same node at
+# ~37 MB/s. (It is not IPv6 — forcing ipv4first changed nothing.)
+#
+# Dropping playwright's downloader is safe because nothing here resolves
+# browsers through its registry: Playwright MCP is launched with
+# `--executable-path /usr/bin/chromium-browser` (thinkube-control/
+# 13_configure_code_server.yaml), so the only contract this image owes is a
+# working binary at that path. `install-deps` still pulls the system libraries.
+RUN npx -y playwright@1.63.0 install-deps chromium && \
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+        -o /tmp/chrome-linux64.zip \
+        "https://cdn.playwright.dev/builds/cft/${CHROME_FOR_TESTING_VERSION}/linux64/chrome-linux64.zip" && \
+    mkdir -p /opt/playwright-browsers && \
+    unzip -q /tmp/chrome-linux64.zip -d /opt/playwright-browsers && \
+    rm -f /tmp/chrome-linux64.zip && \
     # Create symlink so Playwright MCP can find chromium-browser
     CHROME_BIN=$(find /opt/playwright-browsers -name chrome -path "*/chrome-linux*/*" | head -1) && \
     if [ -z "$CHROME_BIN" ]; then echo "❌ ERROR: chromium binary not found under /opt/playwright-browsers"; exit 1; fi && \
+    chmod +x "$CHROME_BIN" && \
     ln -sf "$CHROME_BIN" /usr/bin/chromium-browser && \
+    # Fail here, not at MCP start-up, if the browser can't actually run
+    "$CHROME_BIN" --version && \
     # Make browsers dir writable by thinkube user (MCP server creates temp dirs here)
     chown -R 1000:1000 /opt/playwright-browsers && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /root/.npm
+    rm -rf /var/lib/apt/lists/* /root/.npm
 
 ###############################################################################
 # Modern CLI Utilities
