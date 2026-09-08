@@ -39,16 +39,24 @@
         name: common/github_username
 
   tasks:
-    - name: Get code-server pod name
+    # Same retry as 13_clone_repositories: the pod may not exist yet when this
+    # runs (see the comment there). `{.items[0]...}` errors on an empty list,
+    # `{.items[*]...}` returns empty and lets the retry work.
+    - name: Wait for a running code-server pod and take its name
       ansible.builtin.shell: |
         {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
           -l app=code-server \
-          -o jsonpath='{.items[0].metadata.name}'
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[*].metadata.name}' | awk '{print $1}'
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: pod_name
-      failed_when: pod_name.stdout == ""
-      
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: pod_name.stdout != ""
+
+
     - name: Wait for pod to be ready
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"

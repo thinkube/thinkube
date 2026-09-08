@@ -35,15 +35,26 @@
     code_server_namespace: "code-server"
 
   tasks:
-    - name: Get code-server pod name
+    # Waits for the pod to exist before naming it. 10_deploy deletes the
+    # freshly created pod to force a restart, so for a few seconds after it
+    # finishes the ReplicaSet has not yet produced the replacement and there is
+    # no pod to name. `{.items[0]...}` does not return empty in that window —
+    # it exits non-zero with "array index out of bounds", which failed this
+    # playbook on 2026-09-08. `{.items[*]...}` yields an empty string instead,
+    # so the retry can do its job.
+    - name: Wait for a running code-server pod and take its name
       ansible.builtin.shell: |
         {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
           -l app=code-server \
-          -o jsonpath='{.items[0].metadata.name}'
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[*].metadata.name}' | awk '{print $1}'
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
       register: pod_name
-      failed_when: pod_name.stdout == ""
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: pod_name.stdout != ""
 
     - name: Wait for pod to be ready
       kubernetes.core.k8s_info:
