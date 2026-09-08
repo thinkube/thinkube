@@ -177,12 +177,24 @@ RUN apt-get update && apt-get install -y \
 # Uses Playwright's bundled Chromium instead of the Ubuntu snap stub
 ###############################################################################
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
-# ipv4first: the build nodes have no IPv6 egress, and Node's default verbatim
-# DNS order makes the chromium download connect to storage.googleapis.com over
-# IPv6 and stall until the (30s) request timeout, five times, then fail. curl
-# and apt survive this because they fall back to IPv4; Node does not.
-RUN NODE_OPTIONS=--dns-result-order=ipv4first \
-    npx playwright install --with-deps chromium && \
+# The ~195 MB chromium download is the least reliable fetch in this image and
+# it sank a build on 2026-09-08. Three guards, because a failure here costs a
+# full reinstall to retest:
+#   - pinned version: bare `npx playwright` resolves to whatever is newest, so
+#     two identical builds can pull different browser builds from different
+#     download hosts. Not acceptable in an image we regression-test.
+#   - ipv4first: the nodes have no working IPv6 egress (the router advertises a
+#     v6 default route but hands out no usable prefix, so every v6 connection
+#     blackholes). This takes IPv6 out of the picture for the download.
+#   - raised timeout + retries: playwright aborts a stalled transfer after 30s
+#     and does not retry the whole install.
+ENV PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=180000
+RUN for attempt in 1 2 3; do \
+        NODE_OPTIONS=--dns-result-order=ipv4first \
+        npx -y playwright@1.63.0 install --with-deps chromium && break; \
+        echo "⚠️  playwright install failed (attempt ${attempt}/3), retrying in 15s"; \
+        sleep 15; \
+    done; \
     # Create symlink so Playwright MCP can find chromium-browser
     CHROME_BIN=$(find /opt/playwright-browsers -name chrome -path "*/chrome-linux*/*" | head -1) && \
     if [ -z "$CHROME_BIN" ]; then echo "❌ ERROR: chromium binary not found under /opt/playwright-browsers"; exit 1; fi && \
