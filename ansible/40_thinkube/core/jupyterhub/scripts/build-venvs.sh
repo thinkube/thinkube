@@ -172,17 +172,21 @@ FINETUNING_PACKAGES=(
 # installed separately below, from source. See that step for why.
 
 # Agent development packages (ON TOP of base)
-# Note: Let pip resolve compatible versions for langchain ecosystem
+# One set pip resolved together in the base image, held at these versions so
+# that an install and a rebuild from thinkube-control produce the same venv.
+# ag2 stays at 0.10 because the example notebooks import it as `autogen`.
+# Re-resolve the set as a whole when moving any one of them; the same list is
+# AGENT_PACKAGES in thinkube-control's backend/app/api/jupyter_venvs.py.
 AGENT_PACKAGES=(
-  langchain
-  langchain-core
-  langchain-community
-  langchain-openai
-  langgraph
-  "ag2[openai]"
-  openai-agents
-  crewai
-  crewai-tools
+  "langchain==1.4.0"
+  "langchain-core==1.6.3"
+  "langchain-community==0.4.2"
+  "langchain-openai==1.6.2"
+  "langgraph==1.2.11"
+  "ag2[openai]==0.10.2"
+  "openai-agents==0.20.0"
+  "crewai==1.6.1"
+  "crewai-tools==1.6.1"
   faiss-cpu
   opentelemetry-sdk
   opentelemetry-exporter-otlp
