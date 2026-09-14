@@ -37,14 +37,14 @@ else
   exit 1
 fi
 
-# Activate virtual environment if it exists
-if [ -d "$HOME/.venv" ]; then
-  echo "Activating Python virtual environment from $HOME/.venv"
-  source "$HOME/.venv/bin/activate"
-else
-  echo "WARNING: No Python virtual environment found at $HOME/.venv"
-  echo "Using system Python"
+# Ansible and its collections live in the virtual environment
+if [ ! -f "$HOME/.venv/bin/activate" ]; then
+  echo "ERROR: No Python virtual environment at $HOME/.venv"
+  echo "It holds Ansible and its collections; the code-server deploy creates it."
+  exit 1
 fi
+echo "Activating Python virtual environment from $HOME/.venv"
+source "$HOME/.venv/bin/activate"
 
 # Set ANSIBLE_BECOME_PASSWORD from environment
 if [ -z "$ANSIBLE_BECOME_PASSWORD" ]; then
@@ -52,25 +52,24 @@ if [ -z "$ANSIBLE_BECOME_PASSWORD" ]; then
   exit 1
 fi
 
-# Set SSH password for Ansible
-if [ -n "$ANSIBLE_SSH_PASS" ]; then
-  export ANSIBLE_SSH_PASS
-else
-  echo "ANSIBLE_SSH_PASS not set, using ANSIBLE_BECOME_PASSWORD for SSH authentication"
-  export ANSIBLE_SSH_PASS="$ANSIBLE_BECOME_PASSWORD"
-fi
+# The system user signs in over SSH and runs sudo with the same password
+export ANSIBLE_SSH_PASS="$ANSIBLE_BECOME_PASSWORD"
 
-# Make sure we have sshpass installed
+# Password SSH needs sshpass, which the code-server image provides
 if ! command -v sshpass &> /dev/null; then
-  echo "Installing sshpass..."
-  sudo apt-get update -qq && sudo apt-get install -qq -y sshpass
+  echo "ERROR: sshpass is not installed."
+  echo "It belongs in the code-server image: harbor-images/base-images/code-server-dev.Containerfile.j2"
+  exit 1
 fi
 
 # Get the system username from inventory
-SYSTEM_USERNAME=$(python3 -c "import yaml; inv=yaml.safe_load(open('${INVENTORY_DIR}/inventory.yaml')); print(inv['all']['vars']['system_username'])" 2>/dev/null || echo "thinkube")
+if ! SYSTEM_USERNAME=$(python3 -c "import yaml; inv=yaml.safe_load(open('${INVENTORY_DIR}/inventory.yaml')); print(inv['all']['vars']['system_username'])"); then
+  echo "ERROR: Cannot read all.vars.system_username from ${INVENTORY_DIR}/inventory.yaml"
+  exit 1
+fi
 if [ -z "$SYSTEM_USERNAME" ]; then
-  echo "WARNING: Could not determine system_username from inventory, using default 'thinkube'"
-  SYSTEM_USERNAME="thinkube"
+  echo "ERROR: all.vars.system_username is empty in ${INVENTORY_DIR}/inventory.yaml"
+  exit 1
 fi
 
 # Common Ansible settings
