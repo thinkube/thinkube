@@ -354,6 +354,40 @@
       ansible.builtin.command: "{{ helm_bin }} repo update {{ helm_repo_name }}"
       changed_when: false
 
+    # thinkube-control holds the Hub's service token in its environment, read
+    # once when its pod starts, so a deploy keeps the token the Hub already has
+    # and a new one is made only on the first deploy.
+    - name: Keep the service token - read the Hub's current values
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ jupyterhub_namespace }}"
+        name: hub
+      register: hub_secret
+
+    - name: Keep the service token - reuse the one the Hub has
+      ansible.builtin.set_fact:
+        jupyterhub_service_token: "{{ (hub_secret.resources[0].data['values.yaml'] | b64decode | from_yaml).hub.services['thinkube-control'].api_token | default('') }}"
+      when: hub_secret.resources | length > 0
+      failed_when: false
+
+    - name: Keep the service token - make one on the first deploy
+      ansible.builtin.set_fact:
+        jupyterhub_service_token: "{{ lookup('password', '/dev/null chars=hex_digits length=64') }}"
+      when: jupyterhub_service_token is not defined or jupyterhub_service_token == ''
+
+    - name: Count the cluster's nodes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Node
+      register: cluster_nodes
+
+    # One interactive notebook server per node, plus three unattended runs.
+    - name: Set the named server limit
+      ansible.builtin.set_fact:
+        jupyterhub_named_server_limit: "{{ (cluster_nodes.resources | length) + 3 }}"
+
     # Step 8: Create values file from template
     - name: Create temporary directory for JupyterHub configuration
       ansible.builtin.tempfile:
@@ -506,28 +540,9 @@
       no_log: true
 
     # Step 13: Store the JupyterHub service token for thinkube-control
-    # The token was generated in the Helm values (hub.services.thinkube-control.api_token)
-    # and is now stored in JupyterHub's hub secret. Extract and create a dedicated
-    # secret in the thinkube-control namespace so the backend can proxy notebook tool calls.
-    - name: Read JupyterHub hub secret to get service token
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Secret
-        namespace: "{{ jupyterhub_namespace }}"
-        name: hub
-      register: hub_secret
-
-    - name: Extract service token from hub secret
-      ansible.builtin.set_fact:
-        jupyterhub_service_token: "{{ (hub_secret.resources[0].data['values.yaml'] | b64decode | from_yaml).hub.services['thinkube-control'].api_token | default('') }}"
-      when: hub_secret.resources | length > 0
-      failed_when: false
-
-    - name: Generate fallback service token if extraction failed
-      ansible.builtin.set_fact:
-        jupyterhub_service_token: "{{ lookup('password', '/dev/null chars=hex_digits length=64') }}"
-      when: jupyterhub_service_token is not defined or jupyterhub_service_token == ''
+    # The service token is read before the values are rendered (see "Keep the
+    # service token"); the same token goes into a secret in the thinkube-control
+    # namespace so the backend can drive the Hub API.
 
     - name: Ensure thinkube-control namespace exists for service token
       kubernetes.core.k8s:

@@ -11,7 +11,7 @@ hub:
   # Service API token for thinkube-control to proxy Jupyter notebook tool calls
   services:
     thinkube-control:
-      api_token: "{{ jupyterhub_service_token | default(lookup('password', '/dev/null chars=hex_digits length=64')) }}"
+      api_token: "{{ jupyterhub_service_token }}"
       admin: true
   config:
     JupyterHub:
@@ -20,12 +20,13 @@ hub:
       admin_access: true
       admin_users:
         - {{ admin_username }}
-      # Named servers carry unattended notebook runs started by thinkube-control
-      # (run_notebook_job): each run gets its own server with its own resources
-      # and is stopped when the run ends. The default server stays the one the
-      # Server Options form starts.
+      # Named servers carry the interactive notebook servers, one per node and
+      # named after it, and the unattended notebook runs started by
+      # thinkube-control (run_notebook_job), each on its own server stopped when
+      # the run ends. The limit is one per node plus three runs. The default
+      # server stays the one the Server Options form starts.
       allow_named_servers: true
-      named_server_limit_per_user: 3
+      named_server_limit_per_user: {{ jupyterhub_named_server_limit }}
       shutdown_on_logout: true
 
     # Keycloak authentication is mandatory
@@ -145,7 +146,17 @@ hub:
                   sys.exit(1)
 
               jupyterhub_config = config_response.json()
-              logger.info(f"Loaded JupyterHub config: node={jupyterhub_config.get('default_node')}, defaults=({jupyterhub_config['default_cpu_cores']}CPU, {jupyterhub_config['default_memory_gb']}GB, {jupyterhub_config['default_gpu_count']}GPU)")
+              # Each node's defaults for its notebook server; the form opens on the
+              # first node with its defaults and switches to a node's defaults
+              # when that node is chosen.
+              node_defaults = {n['node']: n for n in jupyterhub_config.get('nodes', [])}
+              first_node = sorted(node['name'] for node in resources)[0]
+              opening = node_defaults.get(first_node, {
+                  'cpu_cores': jupyterhub_config['default_cpu_cores'],
+                  'memory_gb': jupyterhub_config['default_memory_gb'],
+                  'gpus': jupyterhub_config['default_gpu_count'],
+              })
+              logger.info(f"Loaded notebook server defaults per node: {({k: (v['cpu_cores'], v['memory_gb'], v['gpus']) for k, v in node_defaults.items()})}")
 
               profiles = []
 
@@ -159,7 +170,7 @@ hub:
               cpu_options = [1, 2, 4, 6, 8, 12, 16, 24, 32]
 
               # Ensure default is an integer and add if not in standard options
-              default_cpu = int(jupyterhub_config['default_cpu_cores'])
+              default_cpu = int(opening['cpu_cores'])
               if default_cpu not in cpu_options:
                   cpu_options.append(default_cpu)
                   cpu_options.sort()
@@ -180,7 +191,7 @@ hub:
               memory_options = [2, 4, 8, 16, 32, 48, 64, 96, 128]
 
               # Ensure default is an integer and add if not in standard options
-              default_memory = int(jupyterhub_config['default_memory_gb'])
+              default_memory = int(opening['memory_gb'])
               if default_memory not in memory_options:
                   memory_options.append(default_memory)
                   memory_options.sort()
@@ -217,7 +228,7 @@ hub:
                   node_label += ")"
                   node_choices[node['name']] = {
                       'display_name': node_label,
-                      'default': (node['name'] == jupyterhub_config.get('default_node'))
+                      'default': (node['name'] == first_node)
                   }
 
               # Build GPU choices based on max available GPUs across nodes
@@ -226,7 +237,7 @@ hub:
               for i in range(0, max_gpus + 1):
                   gpu_choices[str(i)] = {
                       'display_name': f'{i} GPU{"s" if i > 1 else ""}' if i > 0 else 'No GPU',
-                      'default': (i == jupyterhub_config['default_gpu_count'])
+                      'default': (i == int(opening['gpus']))
                   }
 
               # Build per-node resource limits for the dynamic form
@@ -241,14 +252,18 @@ hub:
                   node_limits[node['name']] = {
                       'cpu': int(node['capacity']['cpu']),
                       'memory': parse_memory_to_gb(node['capacity']['memory']),
-                      'gpu': max_node_gpus
+                      'gpu': max_node_gpus,
+                      'defaults': node_defaults.get(node['name'])
                   }
               logger.info(f"Node limits for form: {node_limits}")
 
               # Create a single "Resource Selection" profile
               # Image is fixed to tk-jupyter-base (venvs provide different Python environments)
+              # The slug is what thinkube-control names when it starts a server;
+              # it is fixed so the display name can change on its own.
               profile = {
                   'display_name': 'Thinkube Notebooks',
+                  'slug': 'thinkube-notebooks',
                   'description': 'Select compute resources (Python environments available via kernel selection)',
                   'node_limits': node_limits,
                   'default': True,
@@ -562,7 +577,19 @@ hub:
               }
             }
 
-            $nodeSelect.change(updateOptionsForNode);
+            // A chosen node brings its own defaults for its notebook server.
+            function applyNodeDefaults() {
+              var limits = nodeLimits[$nodeSelect.val()];
+              if (!limits || !limits.defaults) return;
+              $cpuSelect.val(String(limits.defaults.cpu_cores));
+              $memSelect.val(limits.defaults.memory_gb + 'G');
+              $gpuSelect.val(String(limits.defaults.gpus));
+            }
+
+            $nodeSelect.change(function() {
+              updateOptionsForNode();
+              applyNodeDefaults();
+            });
 
             // Trigger on page load
             $('.js-profile-option-select').trigger('change');
@@ -727,11 +754,11 @@ singleuser:
           echo "Cloning templates repository..."
 
           # Clone directly into the templates mount (emptyDir - fresh each pod start)
-          git clone https://github.com/thinkube/thinkube-ai-examples.git /home/thinkube/thinkube/templates/thinkube-ai-examples
+          git clone https://github.com/thinkube/thinkube-notebooks-examples.git /home/thinkube/thinkube/templates/thinkube-notebooks-examples
 
-          # Flatten structure: /templates/thinkube-ai-examples/* → /templates/*
-          mv /home/thinkube/thinkube/templates/thinkube-ai-examples/* /home/thinkube/thinkube/templates/
-          rm -rf /home/thinkube/thinkube/templates/thinkube-ai-examples
+          # Flatten structure: /templates/thinkube-notebooks-examples/* → /templates/*
+          mv /home/thinkube/thinkube/templates/thinkube-notebooks-examples/* /home/thinkube/thinkube/templates/
+          rm -rf /home/thinkube/thinkube/templates/thinkube-notebooks-examples
 
           # Fix ownership
           chown -R 1000:100 /home/thinkube/thinkube/templates
