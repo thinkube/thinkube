@@ -1,0 +1,64 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# The key that encrypts the values in thinkube-control's Secrets store, held in
+# the Secret thinkube-encryption-key and read by the backend as
+# THINKUBE_ENCRYPTION_KEY.
+#
+# It is created once and never replaced. Values encrypted with one key cannot
+# be read with another, so an existing Secret is left exactly as it is, and one
+# that exists without a usable key stops the play instead of being rewritten.
+# Back the Secret up with the thinkube_control database: either one alone
+# cannot recover the stored values.
+
+- name: Look for the Secrets store encryption key
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Secret
+    name: thinkube-encryption-key
+    namespace: thinkube-control
+  register: encryption_key_secret
+  no_log: true
+
+- name: Refuse an encryption key Secret that holds no key
+  ansible.builtin.assert:
+    that:
+      - encryption_key_secret.resources[0].data is defined
+      - encryption_key_secret.resources[0].data.key is defined
+      - (encryption_key_secret.resources[0].data.key | b64decode | length) == 44
+    fail_msg: >-
+      The Secret thinkube-control/thinkube-encryption-key exists but its key is
+      missing or is not a Fernet key. It is not replaced automatically, because
+      a new key would make every value in the Secrets store unreadable.
+    quiet: true
+  when: encryption_key_secret.resources | length > 0
+  no_log: true
+
+- name: Generate the Secrets store encryption key
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+  register: generated_encryption_key
+  changed_when: false
+  when: encryption_key_secret.resources | length == 0
+  no_log: true
+
+- name: Create the Secrets store encryption key
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: thinkube-encryption-key
+        namespace: thinkube-control
+      type: Opaque
+      stringData:
+        key: "{{ generated_encryption_key.stdout }}"
+  when: encryption_key_secret.resources | length == 0
+  no_log: true
