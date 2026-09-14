@@ -107,7 +107,7 @@ All packages are pinned to specific versions for reproducibility:
 ## Examples Repository
 
 JupyterHub uses a public GitHub repository for example notebooks:
-- **Repository**: https://github.com/thinkube/thinkube-ai-examples
+- **Repository**: https://github.com/thinkube/thinkube-notebooks-examples
 - **Structure**: Organized by image type (common, ml-cpu, ml-gpu, fine-tuning, agent-dev)
 - **Auto-sync**: Examples updated daily via CronJob
 - **Fail-fast**: Deployment fails if examples repository unavailable
@@ -117,7 +117,7 @@ JupyterHub uses a public GitHub repository for example notebooks:
 ```
 /home/jovyan/thinkube/
 ├── examples-repo/          # Read-only mount of cloned repository
-│   └── thinkube-ai-examples/
+│   └── thinkube-notebooks-examples/
 │       ├── common/         # Examples for all images
 │       ├── ml-cpu/        # CPU-specific examples
 │       ├── ml-gpu/        # GPU-specific examples
@@ -132,7 +132,7 @@ JupyterHub uses a public GitHub repository for example notebooks:
 ### Managing Examples
 
 **For maintainers updating examples**:
-1. Clone repository: `git clone https://github.com/thinkube/thinkube-ai-examples.git`
+1. Clone repository: `git clone https://github.com/thinkube/thinkube-notebooks-examples.git`
 2. Edit notebooks (outputs must be stripped)
 3. Clean notebooks: `nbstripout notebook.ipynb`
 4. Validate: `./scripts/validate_notebooks.sh`
@@ -154,7 +154,7 @@ JupyterHub uses a public GitHub repository for example notebooks:
 pip install nbstripout pre-commit
 
 # Install pre-commit hooks (auto-cleans on commit)
-cd thinkube-ai-examples
+cd thinkube-notebooks-examples
 pre-commit install
 
 # Manual cleaning
@@ -193,7 +193,7 @@ This will:
 ### 3. Examples
 
 No step is needed. The `clone-templates` init container clones
-`thinkube-ai-examples` into `~/thinkube/templates/` on every pod start, so the
+`thinkube-notebooks-examples` into `~/thinkube/templates/` on every pod start, so the
 templates track the repository without a scheduled job.
 
 ### 4. Verify Deployment
@@ -232,7 +232,7 @@ JupyterHub dynamically discovers available images from thinkube-control. Users c
 ```
 /home/jovyan/thinkube/
 ├── examples-repo/              # Read-only cloned repository
-│   └── thinkube-ai-examples/
+│   └── thinkube-notebooks-examples/
 │       ├── common/             # Examples for all images
 │       ├── ml-cpu/
 │       ├── ml-gpu/
