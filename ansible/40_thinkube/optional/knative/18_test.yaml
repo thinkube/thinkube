@@ -204,15 +204,33 @@
 
     # --- PHASE 7: INGRESS AND TLS VALIDATION ---
     
-    - name: Validate DomainMapping exists
+    # The domain-template in config-network gives a service its own name under
+    # the cluster domain, and net-gateway-api writes the HTTPRoute for it. A
+    # DomainMapping onto that same address would claim a hostname the service
+    # already answers on, and the two would contend for one HTTPRoute name.
+    - name: Validate the external route Knative generated
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
-        api_version: serving.knative.dev/v1beta1
-        kind: DomainMapping
+        api_version: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
         namespace: "{{ kn_namespace }}"
         name: "helloworld-python.{{ domain_name }}"
-      register: domain_mapping
-      failed_when: domain_mapping.resources | length == 0
+      register: external_route
+      failed_when: external_route.resources | length == 0
+
+    - name: Validate the Knative ingress is ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: networking.internal.knative.dev/v1alpha1
+        kind: Ingress
+        namespace: "{{ kn_namespace }}"
+        name: helloworld-python
+      register: kn_ingress
+      failed_when: >-
+        kn_ingress.resources | length == 0 or
+        (kn_ingress.resources[0].status.conditions | default([])
+         | selectattr('type', 'equalto', 'Ready')
+         | selectattr('status', 'equalto', 'True') | list | length) == 0
 
     - name: Validate TLS configuration
       ansible.builtin.shell: |
