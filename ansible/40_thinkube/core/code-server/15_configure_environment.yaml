@@ -1197,113 +1197,53 @@
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           mkdir -p /home/thinkube/.local/share/code-server/extensions
 
-    - name: Build and install thinkube-tandem extension
+    # Every Thinkube extension installs the same way: a fresh clone of its
+    # repository builds a vsix, and code-server's extension manager installs
+    # it, so the manager records the version and the Extensions panel offers
+    # the reload. scripts/deploy.sh is the same file in every repository;
+    # files/extension-deploy.sh is the master, and a repository whose copy
+    # differs is not installed.
+    - name: Read the master extension deploy script
+      ansible.builtin.set_fact:
+        # sha256sum of the file itself: the file lookup would drop its last
+        # newline and never match the copy in a repository.
+        extension_deploy_sha: "{{ lookup('pipe', 'sha256sum ' ~ playbook_dir ~ '/files/extension-deploy.sh').split()[0] }}"
+        extension_repos:
+          - thinkube-theme
+          - thinkube-notebook-view
+          - thinkube-cicd-monitor
+          - thinkube-tandem
+        extension_branch: "{{ lookup('env', 'THINKUBE_BRANCH') | default('main', true) }}"
+
+    - name: Build and install the Thinkube extensions
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c '
-          if [ -d "/home/thinkube/thinkube-platform/extensions/thinkube-ai-integration" ]; then
-            echo "Building thinkube-tandem extension..."
-            cd /home/thinkube/thinkube-platform/extensions/thinkube-ai-integration
-            git pull || echo "Could not pull latest changes"
-            npm install --production=false
-            # The kanban webview (vite, built by compile:webview) is a separate
-            # package — install its deps too, or media/kanban/ is never built
-            # and the kanban panel errors with "webview hasn'"'"'t been built yet".
-            npm --prefix webview/kanban install
-            npm run compile
-            PUBLISHER=$(node -p "require('"'"'./package.json'"'"').publisher")
-            NAME=$(node -p "require('"'"'./package.json'"'"').name")
-            VERSION=$(node -p "require('"'"'./package.json'"'"').version")
-            rm -rf /home/thinkube/.local/share/code-server/extensions/thinkube.thinkube-tandem-* /home/thinkube/.local/share/code-server/extensions/thinkube-tandem
-            ln -sf /home/thinkube/thinkube-platform/extensions/thinkube-ai-integration /home/thinkube/.local/share/code-server/extensions/${PUBLISHER}.${NAME}-${VERSION}
-            echo "✅ thinkube-tandem extension installed"
-          else
-            echo "❌ thinkube-tandem repository not found"
+          set -e
+          BUILD=/tmp/tk-extension-build/{{ item }}
+          rm -rf "$BUILD"
+          mkdir -p /tmp/tk-extension-build
+          git clone --quiet --depth 1 --branch {{ extension_branch }} \
+            https://github.com/thinkube/{{ item }}.git "$BUILD"
+          cd "$BUILD"
+          if [ "$(sha256sum scripts/deploy.sh | cut -d" " -f1)" != "{{ extension_deploy_sha }}" ]; then
+            echo "{{ item }}: scripts/deploy.sh differs from the master copy; not installed"
+            exit 1
           fi
+          scripts/deploy.sh --no-bump
+          rm -rf "$BUILD"
           '
-      register: ai_integration_install
+      loop: "{{ extension_repos }}"
+      register: extension_installs
 
-    - name: Display thinkube-tandem installation output
+    - name: Display the extension installations
       ansible.builtin.debug:
-        var: ai_integration_install.stdout_lines
+        var: item.stdout_lines
+      loop: "{{ extension_installs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
 
-    - name: Build and install thinkube-cicd-monitor extension
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c '
-          if [ -d "/home/thinkube/thinkube-platform/extensions/thinkube-cicd-monitor" ]; then
-            echo "Building thinkube-cicd-monitor extension..."
-            cd /home/thinkube/thinkube-platform/extensions/thinkube-cicd-monitor
-            git pull || echo "Could not pull latest changes"
-            npm install --production=false
-            npm run compile
-            PUBLISHER=$(node -p "require('"'"'./package.json'"'"').publisher")
-            NAME=$(node -p "require('"'"'./package.json'"'"').name")
-            VERSION=$(node -p "require('"'"'./package.json'"'"').version")
-            rm -rf /home/thinkube/.local/share/code-server/extensions/thinkube.thinkube-cicd-monitor-* /home/thinkube/.local/share/code-server/extensions/thinkube-cicd-monitor
-            ln -sf /home/thinkube/thinkube-platform/extensions/thinkube-cicd-monitor /home/thinkube/.local/share/code-server/extensions/${PUBLISHER}.${NAME}-${VERSION}
-            echo "✅ thinkube-cicd-monitor extension installed"
-          else
-            echo "❌ thinkube-cicd-monitor repository not found"
-          fi
-          '
-      register: cicd_monitor_install
 
-    - name: Display thinkube-cicd-monitor installation output
-      ansible.builtin.debug:
-        var: cicd_monitor_install.stdout_lines
-
-    # Thinkube Notebook View: a notebook in an IDE tab, and tk-notebook-open on
-    # the path so Claude Code can show a notebook it has opened.
-    - name: Build and install thinkube-notebook-view extension
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c '
-          if [ -d "/home/thinkube/thinkube-platform/extensions/thinkube-notebook-view" ]; then
-            cd /home/thinkube/thinkube-platform/extensions/thinkube-notebook-view
-            git pull || echo "Could not pull latest changes"
-            npm install --production=false
-            npm run compile
-            PUBLISHER=$(node -p "require('"'"'./package.json'"'"').publisher")
-            NAME=$(node -p "require('"'"'./package.json'"'"').name")
-            VERSION=$(node -p "require('"'"'./package.json'"'"').version")
-            rm -rf /home/thinkube/.local/share/code-server/extensions/thinkube.thinkube-notebook-view-*
-            ln -sfn /home/thinkube/thinkube-platform/extensions/thinkube-notebook-view /home/thinkube/.local/share/code-server/extensions/${PUBLISHER}.${NAME}-${VERSION}
-            mkdir -p /home/thinkube/.local/bin
-            ln -sfn /home/thinkube/thinkube-platform/extensions/thinkube-notebook-view/bin/tk-notebook-open /home/thinkube/.local/bin/tk-notebook-open
-            echo "thinkube-notebook-view extension installed"
-          else
-            echo "thinkube-notebook-view repository not found"
-          fi
-          '
-      register: notebook_view_install
-
-    - name: Display thinkube-notebook-view installation output
-      ansible.builtin.debug:
-        var: notebook_view_install.stdout_lines
-
-    - name: Install thinkube-theme extension
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c '
-          echo "Installing thinkube-theme..."
-          THEME_REPO="/tmp/thinkube-theme"
-          rm -rf "$THEME_REPO"
-          if git clone https://github.com/thinkube/thinkube-theme.git "$THEME_REPO" 2>/dev/null; then
-            rm -rf /home/thinkube/.local/share/code-server/extensions/thinkube-theme
-            cp -r "$THEME_REPO" /home/thinkube/.local/share/code-server/extensions/thinkube-theme
-            rm -rf "$THEME_REPO"
-            echo "✅ thinkube-theme extension installed"
-          else
-            echo "❌ Could not clone thinkube-theme from GitHub"
-          fi
-          '
-      register: theme_install
-
-    - name: Display thinkube-theme installation output
-      ansible.builtin.debug:
-        var: theme_install.stdout_lines
-      
     - name: Create temporary settings file from template
       ansible.builtin.template:
         src: templates/vscode-settings.json.j2
