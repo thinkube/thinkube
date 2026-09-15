@@ -713,15 +713,15 @@
         mode: '0755'
       tags: [node_ip_inventory]
 
-    # Two rewrites of the shared inventory, both idempotent:
-    #   - Python interpreters per group/host.
-    #   - Node addresses: every cluster node's ansible_host/lan_ip becomes
-    #     a run-time lookup against the cluster (thinkube-node-ip), with the
-    #     stored address kept as the fallback for when the cluster cannot
-    #     answer. Addresses on this platform are DHCP-assigned and move;
-    #     the cluster's InternalIP (kept current by node-ip sync) is the
-    #     only copy that is always right. ZeroTier ansible_host values are
-    #     overlay addresses, which are static, and stay as they are.
+    # Idempotent rewrite of the shared inventory's node addresses: every
+    # cluster node's ansible_host/lan_ip becomes a run-time lookup against
+    # the cluster (thinkube-node-ip), with the stored address kept as the
+    # fallback for when the cluster cannot answer. Addresses on this
+    # platform are DHCP-assigned and move; the cluster's InternalIP (kept
+    # current by node-ip sync) is the only copy that is always right.
+    # ZeroTier ansible_host values are overlay addresses, which are static,
+    # and stay as they are. Python interpreters are left as the installer
+    # wrote them.
     - name: Create inventory rewrite script
       ansible.builtin.copy:
         dest: /tmp/update_shared_inventory.py
@@ -768,24 +768,6 @@
                   inventory = yaml.safe_load(f)
               root = inventory.get("all", {})
 
-              # --- Python interpreters ---------------------------------
-              (root.get("vars") or {}).pop("ansible_python_interpreter", None)
-              children = root.setdefault("children", {}) or {}
-              root["children"] = children
-              if "baremetal" in children:
-                  bm = children["baremetal"] or {}
-                  children["baremetal"] = bm
-                  bm.setdefault("vars", {})["ansible_python_interpreter"] = "/home/%s/.venv/bin/python3" % system_username
-              mgmt = children.get("management") or {}
-              if "controller" in (mgmt.get("hosts") or {}):
-                  ctl = mgmt["hosts"]["controller"] or {}
-                  mgmt["hosts"]["controller"] = ctl
-                  # controller runs locally, in whichever pod or machine runs Ansible.
-                  # The shared ~/.venv links to a Python that only the code-server image
-                  # has, so the controller uses the Python that runs Ansible.
-                  ctl["ansible_python_interpreter"] = "{{ ansible_playbook_python }}"
-
-              # --- Cluster-resolved node addresses ----------------------
               node_hosts = {}
               walk_hosts(root, node_hosts, False)
               changed = []
@@ -815,7 +797,7 @@
           {% endraw %}
       tags: [node_ip_inventory]
 
-    - name: Rewrite shared inventory (interpreters + cluster-resolved addresses)
+    - name: Rewrite shared inventory (cluster-resolved addresses)
       ansible.builtin.command:
         cmd: python3 /tmp/update_shared_inventory.py "{{ shared_code_path }}/.ansible/inventory/inventory.yaml" "{{ system_username }}"
       register: _inventory_rewrite

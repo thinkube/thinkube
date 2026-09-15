@@ -641,47 +641,6 @@
           3. Select scopes: repo, write:public_key
           4. Copy the token and add it to your .env file
 
-    - name: Verify GitHub CLI is installed on ansible controller
-      ansible.builtin.command: which gh
-      delegate_to: "{{ groups['management'][0] }}"
-      register: gh_check
-      failed_when: gh_check.rc != 0
-      changed_when: false
-
-    - name: Read GitHub SSH public key
-      ansible.builtin.slurp:
-        src: "{{ code_source_path }}/.ssh/github_ed25519.pub"
-      register: github_pubkey_file
-
-    - name: Check GitHub CLI authentication status
-      ansible.builtin.command: gh auth status
-      delegate_to: "{{ groups['management'][0] }}"
-      register: gh_auth_status
-      failed_when: false
-      changed_when: false
-
-    - name: Authenticate GitHub CLI on ansible controller if needed
-      ansible.builtin.shell: |
-        echo "{{ github_token }}" | gh auth login --with-token
-      delegate_to: "{{ groups['management'][0] }}"
-      when: gh_auth_status.rc != 0
-      no_log: true
-
-    - name: Add GitHub SSH key from ansible controller
-      ansible.builtin.shell: |
-        echo "{{ github_pubkey_file.content | b64decode }}" | \
-        GH_TOKEN="{{ github_token }}" gh ssh-key add - \
-          --title "code-server@{{ domain_name }}-{{ ansible_date_time.date }}"
-      delegate_to: "{{ groups['management'][0] }}"
-      register: gh_key_result
-      failed_when: 
-        - gh_key_result.rc != 0
-        - "'already exists' not in gh_key_result.stderr"
-        - "'key is already in use' not in gh_key_result.stderr"
-      changed_when: 
-        - gh_key_result.rc == 0
-        - "'added to your account' in gh_key_result.stdout"
-
     ###################################################################
     # 5) Create ConfigMap for code‑server (we'll use hostPath instead of PVC)
     ###################################################################
@@ -1158,7 +1117,111 @@
       changed_when: false
 
     ###################################################################
-    # 11) Configure VS Code tasks for Claude Code
+    # 11) GitHub access for code-server
+    ###################################################################
+    # gh runs inside the code-server pod: the image provides it, and the login
+    # it stores lands in the workspace home, wherever this playbook runs from.
+    # The token goes in on stdin so it never appears on a command line.
+    # 13_clone_repositories.yaml clones over SSH with this key, so it runs here.
+    - name: Wait for a running code-server pod and take its name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
+          -l app=code-server \
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[*].metadata.name}' | awk '{print $1}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: code_server_pod
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: code_server_pod.stdout != ""
+      tags: [github_access]
+
+    - name: Wait for the code-server pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        name: "{{ code_server_pod.stdout }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+      tags: [github_access]
+
+    - name: Check GitHub CLI login in code-server
+      ansible.builtin.command:
+        argv:
+          - "{{ kubectl_bin }}"
+          - exec
+          - -n
+          - "{{ code_server_namespace }}"
+          - "{{ code_server_pod.stdout }}"
+          - --
+          - gh
+          - auth
+          - status
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gh_auth_status
+      failed_when: false
+      changed_when: false
+      tags: [github_access]
+
+    - name: Log in the GitHub CLI in code-server
+      ansible.builtin.command:
+        argv:
+          - "{{ kubectl_bin }}"
+          - exec
+          - -i
+          - -n
+          - "{{ code_server_namespace }}"
+          - "{{ code_server_pod.stdout }}"
+          - --
+          - gh
+          - auth
+          - login
+          - --with-token
+        stdin: "{{ github_token }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: gh_auth_status.rc != 0
+      no_log: true
+      tags: [github_access]
+
+    - name: Add the code-server GitHub SSH key to the GitHub account
+      ansible.builtin.command:
+        argv:
+          - "{{ kubectl_bin }}"
+          - exec
+          - -i
+          - -n
+          - "{{ code_server_namespace }}"
+          - "{{ code_server_pod.stdout }}"
+          - --
+          - sh
+          - -c
+          - GH_TOKEN="$(cat)" gh ssh-key add "$HOME/.ssh/github_ed25519.pub" --title "$1"
+          - sh
+          - "code-server@{{ domain_name }}-{{ ansible_date_time.date }}"
+        stdin: "{{ github_token }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gh_key_result
+      failed_when:
+        - gh_key_result.rc != 0
+        - "'already exists' not in gh_key_result.stderr"
+        - "'key is already in use' not in gh_key_result.stderr"
+      changed_when:
+        - gh_key_result.rc == 0
+        - "'added to your account' in gh_key_result.stdout"
+      tags: [github_access]
+
+    ###################################################################
+    # 12) Configure VS Code tasks for Claude Code
     ###################################################################
     # Create VS Code tasks configuration for Claude Code
     - name: Ensure .vscode directory exists in shared code directory
@@ -1203,7 +1266,7 @@
           - "To reload extensions: Press Ctrl+R in code-server"
 
     ###################################################################
-    # 12) Final information
+    # 13) Final information
     ###################################################################
     - name: Final info for code-server setup
       ansible.builtin.debug:
