@@ -4,27 +4,47 @@
 ---
 # ansible/40_thinkube/core/infrastructure/coredns/18_test.yaml
 # Description:
-#   Tests CoreDNS configuration for proper DNS resolution and routing
-#   Verifies internal service resolution, domain forwarding, and worker node config
+#   Tests CoreDNS: its pods and configuration, the DNS probe on every node,
+#   cluster and external resolution from a pod, forwarding of the platform
+#   domain to BIND9, and resolution of the platform domain on every node.
+#
+#   The address every *.domain name must resolve to is read from BIND9's own
+#   zone (ConfigMap bind9-zones), so the test holds for either overlay:
+#   ZeroTier's static gateway address or Tailscale's operator-assigned one.
 #
 # Requirements:
-#   - CoreDNS must be deployed (10_deploy.yaml)
-#   - Core infrastructure components should be running
+#   - dns-server/10_deploy.yaml and coredns/10_deploy.yaml have run
+#   - Thinkube Registry holds library/alpine (the test pod's image)
 #
 # Usage:
 #   cd ~/thinkube
-#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/coredns/18_test.yaml
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/coredns/18_test.yaml
 #
 # Variables from inventory:
 #   - domain_name: Base domain to test
-#   - dns1: DNS server node for ZeroTier DNS
-#   - overlay_subnet_prefix: Prefix for ZeroTier network
+#   - overlay_provider: zerotier or tailscale
+#   - harbor_registry: registry the test pod's image is pulled from
 - name: Test CoreDNS configuration
   hosts: k8s_control_plane
   gather_facts: true
   vars:
-    dns_host_ip_key: "{{ 'overlay_ip' if overlay_provider == 'zerotier' else 'lan_ip' }}"
-    overlay_dns_server: "{{ hostvars['dns1'][dns_host_ip_key] }}"
+    dns_test_pod: dns-test
+    dns_test_namespace: default
+    dns_test_image: "{{ harbor_registry }}/library/alpine:latest"
+    external_names:
+      - google.com
+      - acme-v02.api.letsencrypt.org
+      - github.com
+    platform_names:
+      - auth
+      - registry
+      - git
+      - control
+      - argocd
+      - workflows
+      - notebooks
+      - ide
+      - docs
 
   pre_tasks:
     - name: Verify required variables are defined
@@ -32,7 +52,7 @@
         that:
           - domain_name is defined
           - overlay_provider is defined
-          - hostvars['dns1'][dns_host_ip_key] is defined
+          - harbor_registry is defined
         fail_msg: "Required inventory variables are not defined"
 
     - name: Verify ZeroTier-only variables are defined
@@ -42,8 +62,39 @@
         fail_msg: "ZeroTier-mode variable overlay_subnet_prefix is not defined"
       when: overlay_provider == 'zerotier'
 
+    - name: Read kube-dns ClusterIP
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc kube-dns -n kube-system -o jsonpath={.spec.clusterIP}
+      register: kube_dns_svc
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Read BIND9 zones
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get configmap bind9-zones -n dns-system -o json
+      register: bind9_zones
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Set the wildcard address BIND9 serves for the domain
+      ansible.builtin.set_fact:
+        kube_dns_ip: "{{ kube_dns_svc.stdout }}"
+        expected_wildcard_ip: >-
+          {{ ((bind9_zones.stdout | from_json).data['db.' + domain_name] | default(''))
+             | regex_search('^\*\s+IN\s+A\s+(\S+)', '\1', multiline=True) | default([''], true) | first }}
+
+    - name: Fail if the kube-dns address or the zone's wildcard address is missing
+      ansible.builtin.fail:
+        msg: |
+          kube-dns ClusterIP='{{ kube_dns_ip }}'; wildcard A record in
+          bind9-zones db.{{ domain_name }}='{{ expected_wildcard_ip }}'.
+          Both must exist: run dns-server/10_deploy.yaml and coredns/10_deploy.yaml.
+      when: kube_dns_ip | length == 0 or expected_wildcard_ip | length == 0
+
   tasks:
-    # Test CoreDNS pod status
+    # CoreDNS pods and configuration
     - name: Check CoreDNS pods are running
       ansible.builtin.command: >
         {{ kubectl_bin }} get pods -n kube-system -l k8s-app=kube-dns -o json
@@ -52,12 +103,27 @@
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
 
-    - name: Validate CoreDNS pods are ready  
+    - name: Validate CoreDNS pods are running
       ansible.builtin.assert:
         that:
           - (coredns_pods.stdout | from_json)['items'] | length > 0
-          - (coredns_pods.stdout | from_json)['items'][0]['status']['phase'] == 'Running'
-        fail_msg: "CoreDNS pods are not running properly"
+          - (coredns_pods.stdout | from_json)['items'] | map(attribute='status.phase') | reject('equalto', 'Running') | list | length == 0
+        fail_msg: "CoreDNS pods are not all running"
+
+    - name: Retrieve CoreDNS ConfigMap
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get configmap coredns -n kube-system -o yaml
+      register: coredns_configmap
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Validate CoreDNS configuration contains expected settings
+      ansible.builtin.assert:
+        that:
+          - "'forward . ' in coredns_configmap.stdout"
+          - "'class error' in coredns_configmap.stdout"
+        fail_msg: "CoreDNS ConfigMap does not forward to BIND9 or does not log failed answers only"
 
     # DNS probe: running on every node and started with all its addresses
     - name: Read DNS probe DaemonSet
@@ -86,7 +152,7 @@
           {{ (dns_probe_ds.stdout | from_json)['status']['numberReady'] }} ready of
           {{ cluster_nodes.stdout_lines | length }} nodes
 
-    - name: Read DNS probe start lines
+    - name: Read DNS probe logs
       ansible.builtin.command: >
         {{ kubectl_bin }} logs -n kube-system -l app.kubernetes.io/name=dns-probe --prefix --tail=-1
       register: dns_probe_logs
@@ -104,295 +170,104 @@
       ansible.builtin.debug:
         msg: "{{ dns_probe_logs.stdout_lines | select('search', 'result=fail') | list }}"
 
-    # Create a test pod for comprehensive DNS testing
-    - name: Create DNS test pod
+    # Resolution from a pod
+    - name: Start DNS test pod
       ansible.builtin.shell: |
-        {{ kubectl_bin }} delete pod dnsutils --ignore-not-found
-        {{ kubectl_bin }} run dnsutils --image=tutum/dnsutils --restart=Never -- sleep 3600
-      register: pod_creation
-      changed_when: pod_creation.rc == 0
+        {{ kubectl_bin }} delete pod {{ dns_test_pod }} -n {{ dns_test_namespace }} --ignore-not-found --wait=true
+        {{ kubectl_bin }} run {{ dns_test_pod }} -n {{ dns_test_namespace }} --image={{ dns_test_image }} --restart=Never -- sleep 600
+        {{ kubectl_bin }} wait --for=condition=Ready pod/{{ dns_test_pod }} -n {{ dns_test_namespace }} --timeout=120s
+      changed_when: true
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-        
-    - name: Wait for DNS test pod to be ready
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} wait --for=condition=Ready pod/dnsutils --timeout=60s
-      register: pod_ready
-      changed_when: pod_ready.rc == 0
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-        
-    # Check DNS configuration in the pod
-    - name: Check DNS configuration in test pod
+
+    - name: Read the test pod's resolver configuration
       ansible.builtin.command: >
-        {{ kubectl_bin }} exec dnsutils -- cat /etc/resolv.conf
+        {{ kubectl_bin }} exec {{ dns_test_pod }} -n {{ dns_test_namespace }} -- cat /etc/resolv.conf
       register: dns_config
       changed_when: false
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-        
-    - name: Display DNS configuration
-      ansible.builtin.debug:
-        var: dns_config.stdout_lines
 
-    # Test Kubernetes internal resolution
     - name: Test Kubernetes internal service resolution
       ansible.builtin.command: >
-        {{ kubectl_bin }} exec dnsutils -- nslookup kubernetes.default.svc.cluster.local
+        {{ kubectl_bin }} exec {{ dns_test_pod }} -n {{ dns_test_namespace }} --
+        nslookup kubernetes.default.svc.cluster.local
       register: k8s_service_test
       changed_when: false
+      failed_when: k8s_service_test.rc != 0 or 'Name:' not in k8s_service_test.stdout
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
 
-    - name: Display K8s service resolution test results
-      ansible.builtin.debug:
-        var: k8s_service_test.stdout_lines
-
-    - name: Validate K8s service resolution
-      ansible.builtin.assert:
-        that: k8s_service_test.rc == 0
-        fail_msg: "Kubernetes internal service resolution failed"
-        
-    # Test external domain resolution
+    # External names must reach the internet, not the platform wildcard; the
+    # search list must not turn them into names under the platform domain.
     - name: Test external domain resolution
       ansible.builtin.command: >
-        {{ kubectl_bin }} exec dnsutils -- nslookup {{ item }}
+        {{ kubectl_bin }} exec {{ dns_test_pod }} -n {{ dns_test_namespace }} --
+        nslookup {{ item }}
       register: external_domain_test
       changed_when: false
+      failed_when: >-
+        external_domain_test.rc != 0
+        or 'Name:' not in external_domain_test.stdout
+        or expected_wildcard_ip in external_domain_test.stdout
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      with_items:
-        - google.com
-        - acme-v02.api.letsencrypt.org
-        - github.com
+      loop: "{{ external_names + (external_names | map('regex_replace', '$', '.') | list) }}"
 
-    - name: Display external domain resolution results
-      ansible.builtin.debug:
-        var: external_domain_test.results
-        
-    # Test external domain resolution with FQDN (trailing dot)
-    - name: Test external domain resolution with FQDN
+    - name: Test platform domain forwarding through kube-dns to BIND9
       ansible.builtin.command: >
-        {{ kubectl_bin }} exec dnsutils -- nslookup {{ item }}.
-      register: external_fqdn_test
+        {{ kubectl_bin }} exec {{ dns_test_pod }} -n {{ dns_test_namespace }} --
+        nslookup test.{{ domain_name }} {{ kube_dns_ip }}
+      register: kube_dns_forward_test
       changed_when: false
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      with_items:
-        - google.com
-        - acme-v02.api.letsencrypt.org
-        - github.com
-
-    - name: Display external FQDN resolution results
-      ansible.builtin.debug:
-        var: external_fqdn_test.results
-        
-    # Test ACME challenge domain resolution for cert-manager
-    - name: Test ACME challenge domain forwarding to external DNS (not ZeroTier)
-      ansible.builtin.command: >
-        {{ kubectl_bin }} exec dnsutils -- nslookup _acme-challenge.{{ domain_name }}
-      register: acme_challenge_test
-      changed_when: false
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      
-    - name: Display ACME challenge resolution test results
-      ansible.builtin.debug:
-        var: acme_challenge_test.stdout_lines
-        
-    - name: Verify ACME challenge is NOT forwarded to ZeroTier
-      ansible.builtin.assert:
-        that: 
-          - "'10.200.0.' not in acme_challenge_test.stdout"
-        success_msg: "✅ ACME challenge DNS correctly forwarded to external DNS (not ZeroTier)"
-        fail_msg: "❌ ACME challenge DNS incorrectly forwarded to ZeroTier instead of external DNS"
-    
-    # Test domain forwarding to ZeroTier
-    - name: Test domain forwarding to ZeroTier DNS
-      ansible.builtin.command: >
-        {{ kubectl_bin }} run test-zt-dns-{{ 99999 | random }} --rm -i --restart=Never --image=busybox:latest -- 
-        sh -c "nslookup {{ domain_name }} 10.152.183.10"
-      register: zerotier_dns_test
-      changed_when: false
+      failed_when: kube_dns_forward_test.rc != 0 or expected_wildcard_ip not in kube_dns_forward_test.stdout
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
 
-    - name: Display ZeroTier DNS test results
-      ansible.builtin.debug:
-        var: zerotier_dns_test.stdout_lines
-
-    - name: Validate ZeroTier DNS forwarding
-      ansible.builtin.assert:
-        that: zerotier_dns_test.rc == 0
-        fail_msg: "ZeroTier DNS forwarding failed"
-        
-    # Test resolution of subdomains in thinkube.com and kn.thinkube.com
-    - name: Test resolution of test.thinkube.com
+    - name: Test platform service names resolve to the wildcard address
       ansible.builtin.command: >
-        {{ kubectl_bin }} run test-thinkube-{{ 99999 | random }} --rm -i --restart=Never --image=busybox:latest -- 
-        sh -c "nslookup test.{{ domain_name }}"
-      register: subdomain_test
-      changed_when: false
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-        
-    - name: Display subdomain test results
-      ansible.builtin.debug:
-        var: subdomain_test.stdout_lines
-        
-    # Test resolution of specific service domains that will be used by platform components
-    - name: Test common service domains resolution (wildcards)
-      ansible.builtin.command: >
-        {{ kubectl_bin }} run test-service-{{ item | replace('.', '-') }}-{{ 99999 | random }} --rm -i --restart=Never --image=busybox:latest -- 
-        sh -c "nslookup {{ item }}.{{ domain_name }}"
+        {{ kubectl_bin }} exec {{ dns_test_pod }} -n {{ dns_test_namespace }} --
+        nslookup {{ item }}.{{ domain_name }}
       register: service_subdomain_test
       changed_when: false
-      failed_when: service_subdomain_test.rc != 0 or "10.200.0.200" not in service_subdomain_test.stdout
+      failed_when: service_subdomain_test.rc != 0 or expected_wildcard_ip not in service_subdomain_test.stdout
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      with_items:
-        - "auth"
-        - "keycloak"
-        - "harbor"
-        - "registry"
-        - "postgres"
-        - "argocd"
-        - "workflows"
-        - "devpi"
-        - "awx"
-        - "docs"
-        - "dashboard"
-        
-    - name: Display service domains resolution results
-      ansible.builtin.debug:
-        msg: |
-          Service Domain Resolution:
-          {% for result in service_subdomain_test.results %}
-          - {{ result.item }}.{{ domain_name }}: {{ "SUCCESS - " + result.stdout.split('Address:')[-1].strip() if result.rc == 0 else "FAILED" }}
-          {% endfor %}
+      loop: "{{ platform_names }}"
 
-    # Check configmap
-    - name: Retrieve CoreDNS ConfigMap
+    - name: Remove DNS test pod
       ansible.builtin.command: >
-        {{ kubectl_bin }} get configmap coredns -n kube-system -o yaml
-      register: coredns_configmap
-      changed_when: false
+        {{ kubectl_bin }} delete pod {{ dns_test_pod }} -n {{ dns_test_namespace }} --ignore-not-found --wait=false
+      changed_when: true
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
 
-    - name: Validate CoreDNS configuration contains expected settings
-      ansible.builtin.assert:
-        that:
-          - "'forward . ' in coredns_configmap.stdout"
-          - "'class error' in coredns_configmap.stdout"
-        fail_msg: "CoreDNS ConfigMap does not contain expected configuration"
-
-    # Check if Knative is installed
-    - name: Check if Knative is installed
-      ansible.builtin.command: >
-        {{ kubectl_bin }} get namespace knative-serving --no-headers
-      register: knative_check
-      failed_when: false
+    # Resolution on every node, through the node's own resolver
+    - name: Test platform domain resolution on every node
+      ansible.builtin.command: getent hosts test.{{ domain_name }}
+      register: node_dns_test
       changed_when: false
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-
-    - name: Set Knative installation status
-      ansible.builtin.set_fact:
-        knative_installed: "{{ knative_check.rc == 0 }}"
-
-    # Knative services now use DomainMapping with {name}.{domain} — no separate kn subdomain
-
-    - name: Display Knative DNS test results (if installed)
-      ansible.builtin.debug:
-        var: kn_dns_test.stdout_lines
-      when: knative_installed | bool
-
-    # Test worker node DNS configuration
-    - name: Test DNS resolution on worker nodes
-      ansible.builtin.command: nslookup {{ domain_name }}
+      failed_when: node_dns_test.rc != 0 or expected_wildcard_ip not in node_dns_test.stdout
       delegate_to: "{{ item }}"
-      register: worker_dns_test
-      changed_when: false
-      loop: "{{ groups['k8s_workers'] }}"
+      loop: "{{ groups['k8s'] }}"
 
-    - name: Validate worker node DNS resolution
-      ansible.builtin.assert:
-        that: item.rc == 0
-        fail_msg: "DNS resolution failed on worker node {{ item.item }}"
-      loop: "{{ worker_dns_test.results }}"
-      
-    # Check for conflicting DNS configurations
     - name: Check for conflicting DNS configuration files
       ansible.builtin.stat:
         path: /etc/systemd/resolved.conf.d/dns.conf
       register: conflicting_dns_file
       delegate_to: "{{ item }}"
-      loop: "{{ groups['all'] }}"
-      
+      loop: "{{ groups['k8s'] }}"
+
     - name: Display warning for conflicting DNS configuration files
       ansible.builtin.debug:
         msg: |
-          ⚠️ WARNING: Conflicting DNS configuration file detected on node {{ item.item }}
-          
-          The file /etc/systemd/resolved.conf.d/dns.conf exists, which may override
-          the DNS routing configuration in 10-thinkube.conf.
-          
-          Run the following command to fix this issue:
-          ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/coredns/15_configure_node_dns.yaml
+          ⚠️ WARNING: /etc/systemd/resolved.conf.d/dns.conf exists on {{ item.item }}
+          and may override the DNS routing in 10-thinkube.conf. Run:
+          ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/coredns/15_configure_node_dns.yaml
       when: item.stat.exists | default(false)
       loop: "{{ conflicting_dns_file.results }}"
-      
-    - name: Check DNS configuration precedence
-      ansible.builtin.shell: |
-        # Test specific domain resolution to verify wildcard DNS is working
-        nslookup auth.{{ domain_name }}
-      register: auth_domain_test
-      delegate_to: "{{ item }}"
-      changed_when: false
-      failed_when: false
-      loop: "{{ groups['k8s'] }}"
-      
-    - name: Display auth domain resolution results
-      ansible.builtin.debug:
-        msg: |
-          Node: {{ item.item }}
-          auth.{{ domain_name }} resolution: {{ "SUCCESS" if "10.200.0.200" in item.stdout else "FAILED" }}
-          Result: {{ item.stdout | default('No output') }}
-      loop: "{{ auth_domain_test.results }}"
-      
-    - name: Warn about DNS precedence issues
-      ansible.builtin.debug:
-        msg: |
-          ⚠️ WARNING: DNS Precedence Issue Detected on node {{ item.item }}
-          
-          The wildcard DNS resolution is not working correctly for auth.{{ domain_name }}.
-          This may indicate a conflict in the systemd-resolved configuration.
-          
-          Run the following command to fix this issue:
-          ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/coredns/15_configure_node_dns.yaml
-      when: "item.rc != 0 or '10.200.0.200' not in item.stdout"
-      loop: "{{ auth_domain_test.results }}"
-
-    # Verify final configuration
-    - name: Verify CoreDNS configuration is successful
-      ansible.builtin.assert:
-        that:
-          - k8s_service_test.rc == 0
-          - zerotier_dns_test.rc == 0
-          - not knative_installed | bool or kn_dns_test.rc == 0
-          - "'10.200.0.' not in acme_challenge_test.stdout"  # ACME challenge must use external DNS
-        fail_msg: >
-          CoreDNS configuration validation failed:
-          - Internal DNS: {{ "✓" if k8s_service_test.rc == 0 else "✗" }}
-          - ZeroTier forwarding: {{ "✓" if zerotier_dns_test.rc == 0 else "✗" }}
-          {% if knative_installed | bool %}
-          - Knative DNS: {{ "✓" if kn_dns_test.rc == 0 else "✗" }}
-          {% endif %}
-          - ACME challenge DNS: {{ "✓" if "10.200.0." not in acme_challenge_test.stdout else "✗" }}
-          
-          Please check the logs for more details.
-        success_msg: "All CoreDNS tests passed successfully."
+      loop_control:
+        label: "{{ item.item }}"
 
     - name: Display test summary
       ansible.builtin.debug:
@@ -400,107 +275,17 @@
           ============================================
                      DNS TEST RESULTS
           ============================================
-          
-          CORE DNS CONFIGURATION:
-          ✓ CoreDNS pods are running
-          ✓ ConfigMap contains proper settings
-          
-          KUBERNETES INTERNAL RESOLUTION:
-          ✓ Service resolution: kubernetes.default.svc.cluster.local resolves correctly
-          ✓ Domain forwarding to ZeroTier DNS works
-          {% if knative_installed | bool %}
-          ✓ Knative domain resolution works
-          {% else %}
-          - Knative domain resolution (not tested - Knative not installed)
-          {% endif %}
-          ✓ Worker nodes can resolve domains correctly
-          
-          DNS CONFIGURATION IN TEST POD:
-          {{ dns_config.stdout_lines | to_nice_yaml }}
-          
-          EXTERNAL DOMAIN RESOLUTION:
-          {% for result in external_domain_test.results %}
-          - {{ result.item }}:
-            {% if "Name:" in result.stdout and "kn.thinkube.com" in result.stdout %}
-            ❌ FAILED - Resolves to Knative wildcard (10.200.0.201)
-            {% elif "Name:" in result.stdout and "thinkube.com" in result.stdout and not "kn.thinkube.com" in result.stdout %}
-            ❌ FAILED - Resolves to Thinkube wildcard (10.200.0.200)
-            {% elif "NXDOMAIN" in result.stdout %}
-            ⚠️ WARNING - NXDOMAIN (domain not found)
-            {% elif "Name:" in result.stdout and not ("thinkube.com" in result.stdout) %}
-            ✅ SUCCESS - Resolves to external IP
-            {% else %}
-            ⚠️ INDETERMINATE - Check output manually
-            {% endif %}
-          {% endfor %}
-          
-          EXTERNAL DOMAIN RESOLUTION (WITH TRAILING DOT):
-          {% for result in external_fqdn_test.results %}
-          - {{ result.item }}:
-            {% if "Name:" in result.stdout and "kn.thinkube.com" in result.stdout %}
-            ❌ FAILED - Resolves to Knative wildcard (10.200.0.201)
-            {% elif "Name:" in result.stdout and "thinkube.com" in result.stdout and not "kn.thinkube.com" in result.stdout %}
-            ❌ FAILED - Resolves to Thinkube wildcard (10.200.0.200)
-            {% elif "NXDOMAIN" in result.stdout %}
-            ⚠️ WARNING - NXDOMAIN (domain not found)
-            {% elif "Name:" in result.stdout and not ("thinkube.com" in result.stdout) %}
-            ✅ SUCCESS - Resolves to external IP
-            {% else %}
-            ⚠️ INDETERMINATE - Check output manually
-            {% endif %}
-          {% endfor %}
-          
-          RECOMMENDATIONS:
-          {% if "kn.thinkube.com" in dns_config.stdout or "thinkube.com" in dns_config.stdout %}
-          ❌ DNS SEARCH DOMAINS ISSUE: The pod has search domains that cause external domains 
-             to be incorrectly resolved. To fix this, update inventory/inventory.yaml:
-          
-             dns_search_domains: []  # Empty list to prevent wildcard matching
-          {% else %}
-          ✅ DNS SEARCH DOMAINS: Correctly configured
-          {% endif %}
-          
-          {% set external_resolution_issue = false %}
-          {% for result in external_domain_test.results %}
-          {% if "Name:" in result.stdout and ("thinkube.com" in result.stdout) %}
-          {% set external_resolution_issue = true %}
-          {% endif %}
-          {% endfor %}
-          
-          {% if external_resolution_issue %}
-          ❌ EXTERNAL DOMAIN RESOLUTION ISSUE: External domains are resolving to internal IPs.
-             This will prevent cert-manager from connecting to Let's Encrypt servers.
-          {% endif %}
-          
-          {% set fqdn_resolution_works = false %}
-          {% for result in external_fqdn_test.results %}
-          {% if "Name:" in result.stdout and not ("thinkube.com" in result.stdout) %}
-          {% set fqdn_resolution_works = true %}
-          {% endif %}
-          {% endfor %}
-          
-          {% if fqdn_resolution_works %}
-          ✅ FQDN RESOLUTION: Works correctly with trailing dot (.)
-          {% endif %}
-          
-          CERTIFICATE MANAGER DNS ROUTING:
-          {% if acme_challenge_test is defined and "10.200.0." not in acme_challenge_test.stdout %}
-          ✅ ACME Challenge DNS: _acme-challenge.{{ domain_name }} correctly routed to external DNS (not ZeroTier)
-          {% elif acme_challenge_test is defined %}
-          ❌ ACME Challenge DNS: _acme-challenge.{{ domain_name }} incorrectly routed to ZeroTier
-          {% endif %}
-          
-          ZEROTIER DOMAIN RESOLUTION:
-          {% if subdomain_test is defined and "Address: 10.200.0." in subdomain_test.stdout %}
-          ✅ test.{{ domain_name }}: Resolves to ZeroTier address ({{ subdomain_test.stdout.split('Address: ')[1].split('\n')[0] }})
-          {% elif subdomain_test is defined %}
-          ❌ test.{{ domain_name }}: Not resolving to ZeroTier network
-          {% endif %}
-          
-          ============================================
-          
-          OVERALL STATUS: {% if "thinkube.com" in dns_config.stdout %}❌ NEEDS ATTENTION{% else %}✅ DNS CONFIGURATION IS WORKING PROPERLY{% endif %}
+          Overlay: {{ overlay_provider }}
+          kube-dns: {{ kube_dns_ip }}
+          *.{{ domain_name }} (from BIND9's zone): {{ expected_wildcard_ip }}
 
-          {% if "thinkube.com" in dns_config.stdout %}
-          Please fix the DNS search domains issue before proceeding with cert-manager deployment.
-          {% endif %}
+          ✓ CoreDNS pods running; forwards to BIND9; logs failed answers only
+          ✓ DNS probe running and started on {{ cluster_nodes.stdout_lines | length }} nodes
+          ✓ kubernetes.default.svc.cluster.local resolves in a pod
+          ✓ {{ external_names | join(', ') }} resolve to external addresses, with and without a trailing dot
+          ✓ test.{{ domain_name }} forwards through kube-dns to BIND9
+          ✓ {{ platform_names | length }} platform names resolve to {{ expected_wildcard_ip }}
+          ✓ test.{{ domain_name }} resolves on {{ groups['k8s'] | length }} nodes
+
+          Test pod resolver configuration:
+          {{ dns_config.stdout }}
