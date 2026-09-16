@@ -29,6 +29,20 @@
 #
 # 🤖 AI-assisted
 
+- name: Open node-exporter port on every node
+  hosts: k8s
+  gather_facts: false
+  tasks:
+    # node-exporter listens on the host network behind kube-rbac-proxy;
+    # Prometheus reaches it from the pod network on the node's address.
+    - name: Allow node-exporter port (9100/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '9100'
+        proto: tcp
+        comment: 'node-exporter (kube-prometheus)'
+      become: true
+
 - name: Deploy Prometheus Operator with kube-prometheus
   hosts: k8s_control_plane
   gather_facts: true
@@ -38,6 +52,9 @@
     kube_prometheus_url: "https://github.com/prometheus-operator/kube-prometheus/archive/refs/tags/v{{ kube_prometheus_version }}.tar.gz"
     work_dir: "/tmp/kube-prometheus-deploy"
     manifests_dir: "{{ work_dir }}/kube-prometheus-{{ kube_prometheus_version }}/manifests"
+    prometheus_namespace: "monitoring"
+    # The blackbox exporter release kube-prometheus {{ kube_prometheus_version }} ships.
+    dns_probe_exporter_image: "quay.io/prometheus/blackbox-exporter:v0.25.0"
 
   tasks:
     ###################################################################
@@ -339,6 +356,81 @@
           • nvidia-dcgm-exporter (gpu-operator namespace)
 
     ###################################################################
+    # 12) Per-node DNS probing and Cilium agent metrics
+    ###################################################################
+    - name: Read kube-dns Service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        namespace: kube-system
+        name: kube-dns
+      register: kube_dns_service
+
+    - name: Read bind9-internal Service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        namespace: dns-system
+        name: bind9-internal
+      register: bind9_internal_service
+
+    - name: Read bind9-external Service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        namespace: dns-system
+        name: bind9-external
+      register: bind9_external_service
+
+    - name: Fail if a DNS Service address is missing
+      ansible.builtin.fail:
+        msg: |
+          The DNS probes need kube-dns (kube-system), bind9-internal and
+          bind9-external (dns-system) with their addresses. Found:
+          kube-dns={{ kube_dns_service.resources | length }} service(s),
+          bind9-internal={{ bind9_internal_service.resources | length }} service(s),
+          bind9-external load balancer IPs={{ (bind9_external_service.resources[0].status.loadBalancer.ingress | default([]) | map(attribute='ip', default='') | select | list) if bind9_external_service.resources | length > 0 else [] }}.
+          The dns-server and coredns playbooks must run successfully first.
+      when: >-
+        kube_dns_service.resources | length == 0
+        or bind9_internal_service.resources | length == 0
+        or bind9_external_service.resources | length == 0
+        or (bind9_external_service.resources[0].status.loadBalancer.ingress | default([]) | map(attribute='ip', default='') | select | list | length == 0)
+
+    - name: Set DNS probe targets
+      ansible.builtin.set_fact:
+        dns_probe_targets:
+          - path: kube-dns
+            query: cluster
+            module: dns_cluster
+            server: "{{ kube_dns_service.resources[0].spec.clusterIP }}"
+          - path: kube-dns
+            query: external
+            module: dns_external
+            server: "{{ kube_dns_service.resources[0].spec.clusterIP }}"
+          - path: bind9-internal
+            query: external
+            module: dns_external
+            server: "{{ bind9_internal_service.resources[0].spec.clusterIP }}"
+          - path: bind9-external
+            query: external
+            module: dns_external
+            server: "{{ bind9_external_service.resources[0].status.loadBalancer.ingress | map(attribute='ip', default='') | select | first }}"
+
+    - name: Apply DNS probe exporter and PodMonitors
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        template: templates/dns-and-cilium-monitoring.yaml.j2
+
+    - name: Wait for the DNS probe exporter on every node
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status daemonset/dns-probe-exporter -n {{ prometheus_namespace }} --timeout=180s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    ###################################################################
     # 11) Cleanup
     ###################################################################
     - name: Remove work directory
@@ -365,6 +457,8 @@
           • node-exporter
           • blackbox-exporter
           • prometheus-adapter
+          • dns-probe-exporter (one per node; probe_success by node, path, query)
+          • PodMonitor cilium-agent (cilium_drop_count_total by node and reason)
 
           📊 RECORDING RULES:
           ─────────────────────────

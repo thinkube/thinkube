@@ -1,0 +1,149 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Per-node DNS probing and Cilium agent scraping.
+#
+# dns-probe-exporter runs a blackbox exporter on every node. Prometheus asks
+# each one, every 15 seconds, to resolve a name over each DNS path the
+# cluster uses, so probe_success{node, path, query} is a timeline of name
+# resolution from every node's pod network.
+#
+# cilium-agent scrapes each Cilium agent's metrics on port 9962, among them
+# cilium_drop_count_total{reason, direction}, per node.
+{%- set blackbox_config -%}
+modules:
+  dns_external:
+    prober: dns
+    timeout: 3s
+    dns:
+      query_name: "{{ harbor_registry }}"
+      query_type: A
+      transport_protocol: udp
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      valid_rcodes:
+        - NOERROR
+  dns_cluster:
+    prober: dns
+    timeout: 3s
+    dns:
+      query_name: kubernetes.default.svc.cluster.local
+      query_type: A
+      transport_protocol: udp
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      valid_rcodes:
+        - NOERROR
+{%- endset %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dns-probe-exporter
+  namespace: {{ prometheus_namespace }}
+  labels:
+    app.kubernetes.io/name: dns-probe-exporter
+data:
+  blackbox.yml: |
+    {{ blackbox_config | indent(4) }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dns-probe-exporter
+  namespace: {{ prometheus_namespace }}
+  labels:
+    app.kubernetes.io/name: dns-probe-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dns-probe-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dns-probe-exporter
+      annotations:
+        thinkube.io/config-sha256: "{{ blackbox_config | hash('sha256') }}"
+    spec:
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: blackbox-exporter
+          image: {{ dns_probe_exporter_image }}
+          args:
+            - --config.file=/config/blackbox.yml
+            - --web.listen-address=:9115
+          ports:
+            - name: http
+              containerPort: 9115
+          resources:
+            requests:
+              cpu: 10m
+              memory: 20Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: dns-probe-exporter
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: dns-probe
+  namespace: {{ prometheus_namespace }}
+  labels:
+    app.kubernetes.io/name: dns-probe-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dns-probe-exporter
+  podMetricsEndpoints:
+{% for probe in dns_probe_targets %}
+    - port: http
+      path: /probe
+      interval: 15s
+      scrapeTimeout: 10s
+      params:
+        module:
+          - {{ probe.module }}
+        target:
+          - "{{ probe.server }}:53"
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - targetLabel: path
+          replacement: {{ probe.path }}
+        - targetLabel: query
+          replacement: {{ probe.query }}
+{% endfor %}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: cilium-agent
+  namespace: {{ prometheus_namespace }}
+  labels:
+    app.kubernetes.io/name: cilium-agent
+spec:
+  namespaceSelector:
+    matchNames:
+      - kube-system
+  selector:
+    matchLabels:
+      k8s-app: cilium
+  podMetricsEndpoints:
+    - port: prometheus
+      interval: 30s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node

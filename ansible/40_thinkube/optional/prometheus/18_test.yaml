@@ -140,6 +140,70 @@
         msg: "✅ Recording rules are being evaluated successfully"
 
     ###################################################################
+    # 6) Per-node DNS probing, Cilium agents and node-exporter scraped
+    ###################################################################
+    - name: Count cluster nodes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Node
+      register: cluster_nodes
+
+    - name: Check DNS probe exporter DaemonSet
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: DaemonSet
+        namespace: "{{ prometheus_namespace }}"
+        name: dns-probe-exporter
+      register: dns_probe_exporter
+      failed_when: >-
+        dns_probe_exporter.resources | length == 0
+        or dns_probe_exporter.resources[0].status.numberReady | default(0) != cluster_nodes.resources | length
+
+    - name: Check PodMonitors for DNS probes and Cilium agents
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: monitoring.coreos.com/v1
+        kind: PodMonitor
+        namespace: "{{ prometheus_namespace }}"
+        name: "{{ item }}"
+      register: podmonitors
+      failed_when: podmonitors.resources | length == 0
+      loop:
+        - dns-probe
+        - cilium-agent
+
+    # Every node runs four DNS probes; each Cilium agent and node-exporter is
+    # one target per node. Discovery and the first scrape can take a minute.
+    - name: Wait until every DNS probe, Cilium agent and node-exporter is scraped
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ kubeconfig }}
+        {{ kubectl_bin }} exec -n {{ prometheus_namespace }} {{ prometheus_pod.stdout }} -c prometheus -- \
+          wget -qO- 'http://localhost:9090/api/v1/query?query={{ item.query | urlencode }}'
+      register: scrape_counts
+      changed_when: false
+      until: >-
+        (scrape_counts.stdout | from_json).data.result | length > 0
+        and ((scrape_counts.stdout | from_json).data.result[0].value[1] | int) == (item.expected | int)
+      retries: 18
+      delay: 10
+      loop:
+        - name: DNS probes answering
+          query: 'count(probe_success{job="monitoring/dns-probe"} == 1)'
+          expected: "{{ (cluster_nodes.resources | length) * 4 }}"
+        - name: Cilium agents scraped
+          query: 'count(up{job="monitoring/cilium-agent"} == 1)'
+          expected: "{{ cluster_nodes.resources | length }}"
+        - name: node-exporters scraped
+          query: 'count(up{job="node-exporter"} == 1)'
+          expected: "{{ cluster_nodes.resources | length }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display DNS probe and scrape status
+      ansible.builtin.debug:
+        msg: "✅ {{ cluster_nodes.resources | length }} nodes: DNS probes answering on every path, Cilium agents and node-exporters scraped"
+
+    ###################################################################
     # 6) Summary
     ###################################################################
     - name: Test summary
@@ -155,6 +219,8 @@
           ✅ kubernetes-mixin recording rules: Found
           ✅ Prometheus API: Healthy
           ✅ Recording rules: Being evaluated
+          ✅ DNS probes: every node, every path answering
+          ✅ Cilium agents and node-exporters: scraped on every node
 
           📊 READY FOR:
           ─────────────────────────

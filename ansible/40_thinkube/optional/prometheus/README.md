@@ -384,6 +384,38 @@ cd ~/thinkube
 
 **Warning**: This will delete all Prometheus data and configurations. Backup any important data before uninstalling.
 
+## DNS probes, Cilium drops and node-exporter
+
+The deploy adds three scrape sources that make a network or DNS fault on one
+node readable after the fact.
+
+| What | Where | Series |
+|---|---|---|
+| DNS probe on every node | DaemonSet `dns-probe-exporter`, PodMonitor `dns-probe` | `probe_success{node, path, query}`, `probe_duration_seconds` |
+| Cilium agent on every node | PodMonitor `cilium-agent` (kube-system, port 9962) | `cilium_drop_count_total{node, reason, direction}` |
+| node-exporter on every node | kube-prometheus ServiceMonitor | `node_*` |
+
+`path` is the DNS path probed: `kube-dns` (the cluster DNS Service),
+`bind9-internal` (BIND9's ClusterIP) or `bind9-external` (BIND9's load
+balancer address, the one CoreDNS forwards to). `query` is `cluster` for
+`kubernetes.default.svc.cluster.local` or `external` for the registry's name.
+
+Useful queries:
+
+```promql
+# nodes and paths where name resolution failed in the last hour
+max_over_time((1 - probe_success{job="monitoring/dns-probe"})[1h:15s]) > 0
+
+# drops by reason and node over the last hour
+sum by (node, reason) (increase(cilium_drop_count_total[1h])) > 0
+```
+
+The deploy opens 9100/tcp on every node for node-exporter; the Kubernetes
+install opens 9962/tcp for the Cilium agents. Without those rules the targets
+time out with "context deadline exceeded". The core install also runs its
+own log-only DNS probe (DaemonSet `dns-probe` in kube-system), which works
+without this component; see the CoreDNS README.
+
 ## References
 
 - [Prometheus Official Documentation](https://prometheus.io/docs/)
