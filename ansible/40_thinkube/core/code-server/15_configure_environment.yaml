@@ -701,6 +701,71 @@
         directory_mode: '0755'
       when: inventory_check.stdout == "missing"
 
+    # The shared inventory outlives a reinstall, so the copy above does not
+    # run again and would keep the credentials of the previous install. The
+    # credentials the installer writes are therefore mirrored from the
+    # installer's inventory on every run: set when the installer defines
+    # them, removed when it does not. Every other value in the shared
+    # inventory (nodes added later, rewritten addresses) is kept.
+    - name: Check the installer inventory has an all.vars mapping
+      ansible.builtin.assert:
+        that:
+          - (lookup('ansible.builtin.file', inventory_file) | from_yaml).all.vars is mapping
+        fail_msg: "{{ inventory_file }} has no all.vars mapping; the installer writes its credentials there."
+        quiet: true
+
+    - name: Read credentials from the installer inventory
+      ansible.builtin.set_fact:
+        installer_inventory_vars: "{{ (lookup('ansible.builtin.file', inventory_file) | from_yaml).all.vars }}"
+      no_log: true
+
+    - name: Mirror installer credentials into the shared inventory
+      ansible.builtin.shell: |
+        python3 - "{{ shared_code_path }}/.ansible/inventory/inventory.yaml" <<'EOF'
+        import json
+        import os
+        import sys
+        import yaml
+
+        path = sys.argv[1]
+        keys = json.loads(os.environ["CREDENTIAL_KEYS"])
+        source = json.loads(os.environ["INSTALLER_CREDENTIALS"])
+        with open(path) as f:
+            inventory = yaml.safe_load(f)
+        target = inventory["all"]["vars"]
+        changed = []
+        for key in keys:
+            if key not in source:
+                if key in target:
+                    del target[key]
+                    changed.append(key)
+            elif target.get(key) != source[key]:
+                target[key] = source[key]
+                changed.append(key)
+        if changed:
+            with open(path, "w") as f:
+                yaml.dump(inventory, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=4096)
+        print("changed: " + ", ".join(changed) if changed else "unchanged")
+        EOF
+      environment:
+        CREDENTIAL_KEYS: "{{ installer_credential_keys | to_json }}"
+        INSTALLER_CREDENTIALS: >-
+          {{ installer_inventory_vars | dict2items
+             | selectattr('key', 'in', installer_credential_keys)
+             | items2dict | to_json }}
+      vars:
+        installer_credential_keys:
+          - cloudflare_api_token
+          - github_token
+          - zerotier_network_id
+          - zerotier_api_token
+          - tailscale_auth_key
+          - tailscale_api_token
+          - tailscale_oauth_client_id
+          - tailscale_oauth_client_secret
+      register: _credential_sync
+      changed_when: _credential_sync.stdout != "unchanged"
+
     # The helper that resolves a node's current address from the cluster.
     # Lives in the shared home so code-server, thinkube-control and any
     # other runner of the shared inventory see the same file.
