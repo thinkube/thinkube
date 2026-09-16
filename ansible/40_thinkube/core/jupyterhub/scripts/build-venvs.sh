@@ -73,126 +73,37 @@ BUILD_DIR="/tmp/venvs-build"
 OUTPUT_DIR="${OUTPUT_DIR:-/output}"
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 
-# Base ML packages (included in BOTH venvs)
-# These provide the common ML/data science foundation
-BASE_PACKAGES=(
-  ipykernel
-  transformers
-  # transformers loads optimised kernels from the Hub through this, and
-  # bitsandbytes looks for it too; without it both log a missing-module warning
-  # on import. Pure Python, so it carries no torch ABI.
-  kernels
-  "datasets==4.3.0"  # Pinned for Unsloth compatibility (4.4.x causes recursion errors)
-  # torchvision is NOT listed: it declares an exact torch== pin, so naming it
-  # here installs a PyPI torch into the venv and shadows the base image build.
-  # The base image already ships a torchvision matched to its own torch.
-  accelerate
-  nvidia-modelopt
-  pandas
-  scikit-learn
-  matplotlib
-  seaborn
-  plotly
-  psycopg2-binary
-  redis
-  qdrant-client
-  langchain-qdrant
-  opensearch-py
-  mlflow
-  boto3
-  clickhouse-connect
-  chromadb
-  nats-py
-  weaviate-client
-  litellm
-  kubernetes==36.0.3
-  PyGithub
-  hera-workflows
-  argilla
-  cvat-sdk
-  langfuse
-  openai
-  "tk-llm[openai]"
-  arxiv
-  python-dotenv
-  requests
-  httpx
-  pydantic
-  sqlalchemy
-  alembic
-  ipywidgets
-  jupyterlab-widgets
-  tqdm
-  Pillow
-  opencv-python
-  sentence-transformers
-  spacy
-  grpcio
-  grpcio-tools
-  gql
-  websockets
-  claude-agent-sdk
-  openai-harmony
-)
+# The package lists are in venv-packages.txt, beside this script: the one
+# list a rebuild from thinkube-control reads too. Sections [base],
+# [fine-tuning] and [agent-dev]; one package per line; # starts a comment.
+PACKAGES_FILE="$(dirname "$0")/venv-packages.txt"
+if [ ! -f "$PACKAGES_FILE" ]; then
+  echo "ERROR: $PACKAGES_FILE not found; the ConfigMap must carry venv-packages.txt beside build-venvs.sh" >&2
+  exit 1
+fi
 
-# Fine-tuning specific packages (ON TOP of base)
-FINETUNING_PACKAGES=(
-  bitsandbytes
-  peft
-  trl
-  tyro
-  hf_transfer
-  sentencepiece
-  protobuf
-  openpyxl
-  python-constraint  # Puzzle generator for the zebra-grpo example notebook
-  # Kernels for hybrid-attention models (Qwen3.5 GatedDeltaNet layers).
-  # Without them transformers falls back to a slow torch implementation.
-  # flash-linear-attention is pure Python over triton, JIT-compiled at run
-  # time, so it carries no torch ABI of its own and installs normally.
-  flash-linear-attention
-  # torchao needs a floor and, on older images, a ceiling too.
-  #
-  # The floor: peft gates LoRA creation on is_torchao_available(), which
-  # rejects the torchao the base image ships and raises. Unsloth catches that
-  # and carries on, but prints "Ignoring an unusable torchao" during model
-  # setup - a warning in the first cells of every notebook using this venv.
-  #
-  # The ceiling only bites below torch 2.11: from 0.17 torchao imports
-  # torch.nn.functional.ScalingType, absent before then, which makes
-  # `import peft` fail outright. The base image now ships torch 2.11, so the
-  # ceiling is gone and newer torchao is allowed - it also carries the CUDA
-  # kernels that 0.16 failed to load on amd64.
-  #
-  # If the base image is ever moved back below torch 2.11, this becomes
-  # torchao==0.16.0 again. The build's verification step catches it either way.
-  "torchao>=0.16"
-)
+read_section() {
+  awk -v section="[$1]" '
+    $0 == section { inside = 1; next }
+    /^\[/        { inside = 0 }
+    inside        { sub(/#.*/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") print }
+  ' "$PACKAGES_FILE"
+}
+
+mapfile -t BASE_PACKAGES < <(read_section base)
+mapfile -t FINETUNING_PACKAGES < <(read_section fine-tuning)
+mapfile -t AGENT_PACKAGES < <(read_section agent-dev)
+for list in BASE_PACKAGES FINETUNING_PACKAGES AGENT_PACKAGES; do
+  declare -n packages="$list"
+  if [ "${#packages[@]}" -eq 0 ]; then
+    echo "ERROR: $list is empty; its section is missing from $PACKAGES_FILE" >&2
+    exit 1
+  fi
+  unset -n packages
+done
+
 # causal-conv1d is NOT listed - it ships a compiled CUDA extension and is
 # installed separately below, from source. See that step for why.
-
-# Agent development packages (ON TOP of base)
-# One set pip resolved together in the base image, held at these versions so
-# that an install and a rebuild from thinkube-control produce the same venv.
-# ag2 stays at 0.10 because the example notebooks import it as `autogen`.
-# Re-resolve the set as a whole when moving any one of them; the same list is
-# AGENT_PACKAGES in thinkube-control's backend/app/api/jupyter_venvs.py.
-AGENT_PACKAGES=(
-  "langchain==1.4.0"
-  "langchain-core==1.6.3"
-  "langchain-community==0.4.2"
-  "langchain-openai==1.6.2"
-  "langgraph==1.2.11"
-  "ag2[openai]==0.10.2"
-  "openai-agents==0.20.0"
-  "crewai==1.6.1"
-  "crewai-tools==1.6.1"
-  faiss-cpu
-  opentelemetry-sdk
-  opentelemetry-exporter-otlp
-  opentelemetry-api
-  tiktoken
-)
 
 # Function to create a venv with base packages
 create_venv_with_base() {
