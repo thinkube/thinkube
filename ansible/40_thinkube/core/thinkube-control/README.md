@@ -227,7 +227,7 @@ Variables replaced during processing:
 - `{{ domain_name }}` - Your configured domain
 - `{{ registry_subdomain }}.{{ domain_name }}` - Harbor registry URL
 - `{{ namespace }}` - Kubernetes namespace
-- `{{ github_org }}` - GitHub organization/user
+- `{{ github_username }}` - GitHub account that owns the token
 
 ## Notes
 

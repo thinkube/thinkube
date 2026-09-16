@@ -135,7 +135,7 @@ The following variables must be defined in inventory:
 | `devpi_dashboard_hostname` | Dashboard hostname | `devpi.thinkube.com` |
 | `devpi_api_hostname` | API endpoint hostname | `devpi-api.thinkube.com` |
 | `devpi_index_name` | Default index name | `prod` |
-| `github_org` | GitHub organization | `thinkube` |
+| `github_username` | GitHub account that owns the token | `cmxela` |
 | `harbor_registry` | Harbor registry domain | `registry.thinkube.com` |
 | `harbor_project` | Harbor project name | `thinkube` |
 

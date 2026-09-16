@@ -21,7 +21,6 @@ This is an alternative to cert-manager that provides:
    ```
 3. **Optional variables** for GitHub backup:
    ```yaml
-   github_org: your-github-org                      # Already required by installer
    github_token: ghp_...                           # Already required by installer
    github_certificates_repo: thinkube-certificates  # Repo name (default)
    cert_backup_password: your-password              # Encryption password (defaults to admin_password)
@@ -72,7 +71,7 @@ cd ~/thinkube
    - Certificate expires within 30 days
    - Domain list has changed
 4. **Kubernetes Integration**: Creates the same secret format as cert-manager
-5. **GitHub Backup** (optional): If github_org and github_token are defined:
+5. **GitHub Backup** (optional): If github_token is defined, in the GitHub account that owns the token (github_username):
    - Creates private repository for certificate backups
    - Encrypts certificates before storing
    - Automatically backs up when certificates are issued/renewed

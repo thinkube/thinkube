@@ -33,6 +33,16 @@
 
   vars:
     code_server_namespace: "code-server"
+    env_file_path: "{{ ansible_env.HOME }}/.env"
+
+  pre_tasks:
+    - name: Set github_token from environment
+      ansible.builtin.set_fact:
+        github_token: "{{ github_token | default(lookup('env', 'GITHUB_TOKEN'), true) }}"
+
+    - name: Resolve the GitHub username from the token
+      ansible.builtin.include_role:
+        name: common/github_username
 
   tasks:
     # Waits for the pod to exist before naming it. 10_deploy deletes the
@@ -118,8 +128,8 @@
     # metadata-driven platform repos: it is not in thinkube-metadata, and it
     # must live at the top level (/home/thinkube/thinkube-tandem-store) that
     # thinkube.boards.root points to, not nested under thinkube-platform/.
-    # The repo belongs to the installing user's GitHub org (github_org); the
-    # name defaults to <github_org>/thinkube-tandem-store and is overridable via
+    # The repo belongs to the installing user's GitHub account (github_username); the
+    # name defaults to <github_username>/thinkube-tandem-store and is overridable via
     # THINKUBE_TANDEM_REPO for installs that keep the board elsewhere.
     - name: Render Tandem board clone script from template
       ansible.builtin.template:
@@ -127,27 +137,23 @@
         dest: "/tmp/clone_tandem_board.sh"
         mode: '0755'
       vars:
-        tandem_board_repo: "{{ lookup('env', 'THINKUBE_TANDEM_REPO') | default(github_org ~ '/thinkube-tandem-store', true) }}"
-      when: github_org is defined
+        tandem_board_repo: "{{ lookup('env', 'THINKUBE_TANDEM_REPO') | default(github_username ~ '/thinkube-tandem-store', true) }}"
 
     - name: Copy Tandem board clone script into code-server pod
       ansible.builtin.shell: |
         {{ kubectl_bin }} cp /tmp/clone_tandem_board.sh \
           {{ code_server_namespace }}/{{ pod_name.stdout }}:/tmp/clone_tandem_board.sh
-      when: github_org is defined
 
     - name: Clone Tandem board repository
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash /tmp/clone_tandem_board.sh
       register: tandem_clone_result
-      when: github_org is defined
 
     - name: Clean up Tandem board clone script
       ansible.builtin.file:
         path: "/tmp/clone_tandem_board.sh"
         state: absent
-      when: github_org is defined
 
     - name: Display Tandem board cloning output
       ansible.builtin.debug:
@@ -156,13 +162,12 @@
 
     - name: Fetch user metadata repository
       ansible.builtin.uri:
-        url: "https://raw.githubusercontent.com/{{ github_org }}/{{ github_org }}-metadata/main/repositories.json"
+        url: "https://raw.githubusercontent.com/{{ github_username }}/{{ github_username }}-metadata/main/repositories.json"
         headers:
           Authorization: "token {{ github_token }}"
         return_content: yes
       register: user_repo_metadata
       failed_when: false
-      when: github_org is defined and github_token is defined
 
     - name: Parse user template list for cloning
       ansible.builtin.set_fact:

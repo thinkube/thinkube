@@ -39,7 +39,7 @@ Required in `~/.env`:
 
 Optional:
 - `ADMIN_PASSWORD`, `ADMIN_USERNAME` (default: tkadmin) - Service admin credentials
-- `GITHUB_TOKEN`, `GITHUB_ORG` - GitHub integration
+- `GITHUB_TOKEN`, `GITHUB_USERNAME` - GitHub integration; the username is learned from the token
 - `CLOUDFLARE_TOKEN` - DNS management
 - `ZEROTIER_NETWORK_ID` - Network overlay
 - `CLUSTER_NAME` - Kubernetes cluster name
