@@ -9,6 +9,22 @@
     msg: "Building venvs for {{ target_arch }}..."
 
 # ── PVC ──────────────────────────────────────────────────────────
+- name: "Check for an earlier {{ target_arch }} build PVC"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: "{{ build_pvc_name }}-{{ target_arch }}"
+    namespace: "{{ build_namespace }}"
+  register: earlier_pvc
+
+- name: "Stop if the earlier {{ target_arch }} build PVC is still being deleted"
+  ansible.builtin.fail:
+    msg: >-
+      PVC {{ build_pvc_name }}-{{ target_arch }} is being deleted but a pod still uses it.
+      Find the pod with: kubectl get pods -n {{ build_namespace }} | grep venvs-
+      and delete it, then run this playbook again.
+  when: earlier_pvc.resources | length > 0 and earlier_pvc.resources[0].metadata.deletionTimestamp is defined
+
 - name: "Create PVC for {{ target_arch }} build"
   kubernetes.core.k8s:
     state: present
@@ -34,9 +50,10 @@
     kind: Job
     name: "venvs-builder-{{ target_arch }}"
     namespace: "{{ build_namespace }}"
+    delete_options:
+      propagationPolicy: Foreground
     wait: true
-    wait_timeout: 60
-  ignore_errors: true
+    wait_timeout: 120
 
 - name: "Create venvs build job for {{ target_arch }}"
   kubernetes.core.k8s:
@@ -191,8 +208,10 @@
     kind: Job
     name: "venvs-builder-{{ target_arch }}"
     namespace: "{{ build_namespace }}"
+    delete_options:
+      propagationPolicy: Foreground
     wait: true
-    wait_timeout: 60
+    wait_timeout: 120
 
 - name: "Delete {{ target_arch }} PVC"
   kubernetes.core.k8s:
@@ -201,6 +220,8 @@
     kind: PersistentVolumeClaim
     name: "{{ build_pvc_name }}-{{ target_arch }}"
     namespace: "{{ build_namespace }}"
+    wait: true
+    wait_timeout: 120
 
 - name: "{{ target_arch }} build complete"
   ansible.builtin.debug:
