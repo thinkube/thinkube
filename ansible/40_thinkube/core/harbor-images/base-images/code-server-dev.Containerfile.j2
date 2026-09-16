@@ -289,6 +289,44 @@ RUN printf '%s\n' \
     > /usr/lib/code-server/src/browser/pages/fonts.css
 
 ###############################################################################
+# Thinkube typography - the fonts of Thinkube Notebooks
+###############################################################################
+# Interface: Poppins. Editor and terminal: Noto Sans Mono, in its Nerd Font
+# build so the Starship prompt keeps its icons. code-server only loads fonts it
+# serves itself (font-src 'self'), so the files are part of the image.
+ARG POPPINS_COMMIT=8b0a1d0f5983c89bc2b93f1b5fb55f9e252744b5
+RUN apt-get update && apt-get install -y woff2 && \
+    mkdir -p /tmp/tkfonts && cd /tmp/tkfonts && \
+    for weight in Regular Medium SemiBold Bold; do \
+        wget -q --tries=5 --waitretry=5 --retry-connrefused \
+             "https://raw.githubusercontent.com/google/fonts/${POPPINS_COMMIT}/ofl/poppins/Poppins-${weight}.ttf"; \
+    done && \
+    wget -q --tries=5 --waitretry=5 --retry-connrefused \
+         https://github.com/ryanoasis/nerd-fonts/releases/download/v3.1.1/Noto.zip && \
+    unzip -q Noto.zip NotoSansMNerdFont-Regular.ttf NotoSansMNerdFont-Bold.ttf && \
+    for ttf in Poppins-*.ttf NotoSansMNerdFont-*.ttf; do \
+        woff2_compress "$ttf" && \
+        cp "${ttf%.ttf}.woff2" /usr/lib/code-server/src/browser/media/fonts/; \
+    done && \
+    apt-get remove -y woff2 && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* /tmp/tkfonts
+
+# VS Code sets the interface font on .monaco-workbench, one rule per operating
+# system. The Thinkube rule replaces all of them; the editor and the terminal
+# set their own fonts from the settings. The build stops if the workbench no
+# longer sets its font that way, because the rule would then miss.
+RUN grep -q '\.monaco-workbench\.linux{font-family:' /usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.css && \
+    for face in 'Poppins Poppins-Regular 400' 'Poppins Poppins-Medium 500' 'Poppins Poppins-SemiBold 600' 'Poppins Poppins-Bold 700' \
+                'NotoSansM_Nerd_Font NotoSansMNerdFont-Regular 400' 'NotoSansM_Nerd_Font NotoSansMNerdFont-Bold 700'; do \
+        set -- $face; \
+        printf '\n@font-face {\n    font-family: "%s";\n    src: url("/_static/src/browser/media/fonts/%s.woff2") format("woff2");\n    font-weight: %s;\n    font-style: normal;\n}\n' \
+            "$(echo "$1" | tr _ ' ')" "$2" "$3" >> /usr/lib/code-server/src/browser/pages/fonts.css; \
+    done && \
+    printf '\n.monaco-workbench {\n    font-family: "Poppins", sans-serif !important;\n}\n' >> /usr/lib/code-server/src/browser/pages/fonts.css && \
+    echo "✅ Thinkube typography: Poppins interface, NotoSansM Nerd Font code"
+
+###############################################################################
 # Custom Favicon - Thinkube Code Icon
 ###############################################################################
 # Copy Thinkube code icon from build context
