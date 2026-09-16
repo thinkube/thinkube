@@ -41,6 +41,10 @@
     ca_cert: "{{ cert_dir }}/ca.crt"
     ca_key: "{{ cert_dir }}/ca.key"
     knative_enabled: false  # Explicitly set to false for CoreDNS setup
+    # The probe runs before Thinkube Registry exists, so it pulls the pinned
+    # Alpine release the registry itself mirrors.
+    dns_probe_image: "mirror.gcr.io/library/alpine:3.22.4"
+    dns_probe_interval_seconds: 5
     # Subnet prefix is only meaningful in ZeroTier mode (Cilium L2 LB picks
     # IPs from the overlay subnet). In Tailscale mode the operator assigns
     # IPs and coredns_external_ip is discovered from Service status below,
@@ -262,6 +266,59 @@
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
 
+    # DNS probe on every node: resolves over the pod resolver, kube-dns and
+    # both BIND9 addresses, and logs each failure with its time and path.
+    - name: Read kube-dns ClusterIP
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc kube-dns -n kube-system -o jsonpath={.spec.clusterIP}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: kube_dns_svc
+      changed_when: false
+
+    - name: Read bind9-internal ClusterIP
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc bind9-internal -n dns-system -o jsonpath={.spec.clusterIP}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: bind9_internal_svc
+      changed_when: false
+
+    - name: Fail if a DNS Service address is missing
+      ansible.builtin.fail:
+        msg: |
+          The DNS probe needs the ClusterIP of kube-dns (kube-system) and of
+          bind9-internal (dns-system). Found kube-dns='{{ kube_dns_svc.stdout }}',
+          bind9-internal='{{ bind9_internal_svc.stdout }}'. The dns-server
+          playbook must run successfully before this one.
+      when: kube_dns_svc.stdout | length == 0 or bind9_internal_svc.stdout | length == 0
+
+    - name: Set DNS probe addresses
+      ansible.builtin.set_fact:
+        kube_dns_cluster_ip: "{{ kube_dns_svc.stdout }}"
+        bind9_internal_cluster_ip: "{{ bind9_internal_svc.stdout }}"
+
+    - name: Render DNS probe manifests
+      ansible.builtin.template:
+        src: "templates/dns-probe.yaml.j2"
+        dest: "{{ ansible_user_dir }}/dns-probe.yaml"
+        mode: '0644'
+
+    - name: Apply DNS probe
+      ansible.builtin.command: >
+        {{ kubectl_bin }} apply -f {{ ansible_user_dir }}/dns-probe.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: dns_probe_apply
+      changed_when: "'configured' in dns_probe_apply.stdout or 'created' in dns_probe_apply.stdout"
+
+    - name: Wait for the DNS probe on every node
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status daemonset/dns-probe -n kube-system --timeout=180s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
     - name: Display summary message
       ansible.builtin.debug:
         msg: |
@@ -274,5 +331,8 @@
           Note: External DNS for {{ domain_name }} is handled by a separate
           BIND9 deployment. Run the dns-server playbook to deploy it.
 
-          CoreDNS ClusterIP: 10.152.183.10
+          CoreDNS ClusterIP: {{ kube_dns_cluster_ip }}
           This handles only Kubernetes-internal DNS resolution.
+
+          DNS probe: a pod on every node logs each failed lookup.
+          kubectl logs -n kube-system -l app.kubernetes.io/name=dns-probe --prefix

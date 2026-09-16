@@ -59,6 +59,51 @@
           - (coredns_pods.stdout | from_json)['items'][0]['status']['phase'] == 'Running'
         fail_msg: "CoreDNS pods are not running properly"
 
+    # DNS probe: running on every node and started with all its addresses
+    - name: Read DNS probe DaemonSet
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get daemonset dns-probe -n kube-system -o json
+      register: dns_probe_ds
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Count cluster nodes
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get nodes -o name
+      register: cluster_nodes
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Validate DNS probe runs on every node
+      ansible.builtin.assert:
+        that:
+          - (dns_probe_ds.stdout | from_json)['status']['desiredNumberScheduled'] == (cluster_nodes.stdout_lines | length)
+          - (dns_probe_ds.stdout | from_json)['status']['numberReady'] == (cluster_nodes.stdout_lines | length)
+        fail_msg: >
+          DNS probe is not ready on every node:
+          {{ (dns_probe_ds.stdout | from_json)['status']['numberReady'] }} ready of
+          {{ cluster_nodes.stdout_lines | length }} nodes
+
+    - name: Read DNS probe start lines
+      ansible.builtin.command: >
+        {{ kubectl_bin }} logs -n kube-system -l app.kubernetes.io/name=dns-probe --prefix --tail=-1
+      register: dns_probe_logs
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Validate every DNS probe pod started
+      ansible.builtin.assert:
+        that:
+          - (dns_probe_logs.stdout_lines | select('search', 'dns-probe started') | list | length) == (cluster_nodes.stdout_lines | length)
+        fail_msg: "Not every DNS probe pod logged its start line:\n{{ dns_probe_logs.stdout }}"
+
+    - name: Display DNS probe failures logged so far
+      ansible.builtin.debug:
+        msg: "{{ dns_probe_logs.stdout_lines | select('search', 'result=fail') | list }}"
+
     # Create a test pod for comprehensive DNS testing
     - name: Create DNS test pod
       ansible.builtin.shell: |
@@ -238,8 +283,8 @@
     - name: Validate CoreDNS configuration contains expected settings
       ansible.builtin.assert:
         that:
-          - "('forward ' + domain_name) in coredns_configmap.stdout"
-          - "'hosts {' in coredns_configmap.stdout"
+          - "'forward . ' in coredns_configmap.stdout"
+          - "'class error' in coredns_configmap.stdout"
         fail_msg: "CoreDNS ConfigMap does not contain expected configuration"
 
     # Check if Knative is installed

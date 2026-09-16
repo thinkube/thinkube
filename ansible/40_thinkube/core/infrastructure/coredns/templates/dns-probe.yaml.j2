@@ -1,0 +1,141 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# DNS probe: one pod on every node resolves names from the pod network over
+# each DNS path the cluster uses and logs one line per failure, with the
+# time, node, path and the resolver's own message. A summary line every
+# hour shows the probe ran when nothing failed.
+#
+# Read it with:
+#   kubectl logs -n kube-system -l app.kubernetes.io/name=dns-probe --prefix
+{%- set dns_probe_script -%}
+#!/bin/sh
+set -u
+
+for var in NODE_NAME PROBE_INTERVAL EXTERNAL_NAME CLUSTER_NAME KUBE_DNS_IP BIND9_INTERNAL_IP BIND9_EXTERNAL_IP; do
+  eval "value=\${$var:-}"
+  if [ -z "$value" ]; then
+    echo "dns-probe: environment variable $var is not set" >&2
+    exit 1
+  fi
+done
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+checks=0
+failures=0
+last_summary=$(date +%s)
+
+# check <path> <name> [server]
+# Without a server the lookup goes through the pod's resolv.conf, search
+# list included, as an application's would.
+check() {
+  path=$1
+  name=$2
+  server=${3:-}
+  checks=$((checks + 1))
+  if [ -n "$server" ]; then
+    out=$(nslookup -timeout=2 "$name" "$server" 2>&1)
+  else
+    out=$(nslookup -timeout=2 "$name" 2>&1)
+  fi
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    failures=$((failures + 1))
+    detail=$(printf '%s' "$out" | tail -n 1)
+    echo "$(now) node=$NODE_NAME path=$path server=${server:-resolv.conf} name=$name result=fail detail=\"$detail\""
+  fi
+}
+
+echo "$(now) node=$NODE_NAME dns-probe started interval=${PROBE_INTERVAL}s external=$EXTERNAL_NAME kube-dns=$KUBE_DNS_IP bind9-internal=$BIND9_INTERNAL_IP bind9-external=$BIND9_EXTERNAL_IP"
+
+while true; do
+  check resolver "$EXTERNAL_NAME"
+  check kube-dns "$CLUSTER_NAME" "$KUBE_DNS_IP"
+  check kube-dns "$EXTERNAL_NAME" "$KUBE_DNS_IP"
+  check bind9-internal "$EXTERNAL_NAME" "$BIND9_INTERNAL_IP"
+  check bind9-external "$EXTERNAL_NAME" "$BIND9_EXTERNAL_IP"
+
+  current=$(date +%s)
+  if [ $((current - last_summary)) -ge 3600 ]; then
+    echo "$(now) node=$NODE_NAME summary checks=$checks failures=$failures"
+    checks=0
+    failures=0
+    last_summary=$current
+  fi
+  sleep "$PROBE_INTERVAL"
+done
+{%- endset %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dns-probe
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: dns-probe
+data:
+  dns-probe.sh: |
+    {{ dns_probe_script | indent(4) }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dns-probe
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: dns-probe
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dns-probe
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dns-probe
+      annotations:
+        thinkube.io/script-sha256: "{{ dns_probe_script | hash('sha256') }}"
+    spec:
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: dns-probe
+          image: {{ dns_probe_image }}
+          command: ["/bin/sh", "/probe/dns-probe.sh"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: PROBE_INTERVAL
+              value: "{{ dns_probe_interval_seconds }}"
+            - name: EXTERNAL_NAME
+              value: "{{ harbor_registry }}"
+            - name: CLUSTER_NAME
+              value: "kubernetes.default.svc.cluster.local"
+            - name: KUBE_DNS_IP
+              value: "{{ kube_dns_cluster_ip }}"
+            - name: BIND9_INTERNAL_IP
+              value: "{{ bind9_internal_cluster_ip }}"
+            - name: BIND9_EXTERNAL_IP
+              value: "{{ coredns_external_ip }}"
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+          volumeMounts:
+            - name: script
+              mountPath: /probe
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: dns-probe

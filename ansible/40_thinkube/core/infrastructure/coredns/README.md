@@ -89,6 +89,31 @@ This will:
 - Reset worker node DNS configuration
 - Remove system certificates ConfigMap
 
+## DNS probe
+
+The deploy runs a DaemonSet `dns-probe` in kube-system: one pod per node
+resolves names from the pod network every five seconds over five checks and
+logs one line per failure, with the time, node, path, server and the
+resolver's own message.
+
+| Path | Server | Name |
+|---|---|---|
+| `resolver` | the pod's resolv.conf, search list included | the registry's name |
+| `kube-dns` | kube-dns ClusterIP | `kubernetes.default.svc.cluster.local` and the registry's name |
+| `bind9-internal` | bind9-internal ClusterIP | the registry's name |
+| `bind9-external` | the address CoreDNS forwards to | the registry's name |
+
+Each pod logs a start line with its addresses and a summary line every hour,
+so a quiet log means nothing failed.
+
+```bash
+kubectl logs -n kube-system -l app.kubernetes.io/name=dns-probe --prefix --tail=-1 | grep result=fail
+```
+
+CoreDNS itself logs failed answers only (`log . { class error }`), so its log
+covers days rather than minutes. When the Prometheus component is installed,
+it adds a per-node blackbox DNS probe with the same paths as a time series.
+
 ## Implementation Notes
 
 This is a migration from `thinkube-core/playbooks/core/50_setup_coredns.yaml` with:
