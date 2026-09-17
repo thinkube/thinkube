@@ -131,7 +131,7 @@ gitea/
 
 - **Keycloak**: OAuth2 authentication provider
 - **PostgreSQL**: Database backend
-- **ArgoCD**: Watches Gitea repositories for deployments
+- **ArgoCD**: Deploys from Gitea repositories when argocd-sync-webhook requests a sync
 - **Harbor**: Container registry referenced in manifests
 - **Argo Events**: Webhook endpoint for CI/CD triggers
 

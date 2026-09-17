@@ -10,7 +10,7 @@ The control system consists of:
 - **Authentication**: OAuth2 Proxy with Keycloak OIDC
 - **Session Management**: Redis for OAuth2 session storage
 - **Build System**: Argo Workflows with Kaniko
-- **Deployment**: GitOps via ArgoCD watching Gitea repositories
+- **Deployment**: GitOps via ArgoCD, synced from Gitea on request: harbor-webhook-adapter commits a build's image tags and calls argocd-sync-webhook
 
 ## GitOps Workflow
 
