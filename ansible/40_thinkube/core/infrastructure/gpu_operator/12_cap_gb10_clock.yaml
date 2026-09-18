@@ -1,0 +1,102 @@
+# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/gpu_operator/12_cap_gb10_clock.yaml
+# Description:
+#   Caps the GPU clock of GB10 (DGX Spark) nodes, on every boot.
+#
+#   Under sustained load a GB10 draws power in short spikes near the top of
+#   its clock range, and the machine's embedded controller answers a spike by
+#   cutting the power at once: the node goes off with no shutdown, no kernel
+#   message, and stays off until someone presses the power button. A ceiling
+#   on the clock removes the highest spikes. Owners report the power-offs
+#   stop at a ceiling of 2000–2300 MHz, for about 2–5 % of LLM throughput,
+#   because generating text is bound by memory speed more than by the clock.
+#
+#   `nvidia-smi -lgc` does not survive a reboot, so a systemd unit sets it on
+#   every boot, before the kubelet starts workloads.
+#
+#   A node is a GB10 when its GPU says so: the inventory's gpu_model holds the
+#   PCI name (tkspark's is "Device 2e12 (rev a1)"), which does not name it.
+#
+# Usage:
+#   cd ~/thinkube-platform/core/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/gpu_operator/12_cap_gb10_clock.yaml
+#
+# Variables:
+#   - gb10_clock_min_mhz, gb10_clock_max_mhz: the clock range the GPU may use
+#
+# References:
+#   - https://github.com/tonyd2wild/dgx-spark-hard-poweroff-fix
+#   - https://ai-muninn.com/en/blog/gx10-thermal-hard-poweroff
+
+- name: Cap the GPU clock of GB10 nodes
+  hosts: baremetal_gpus
+  become: false
+  any_errors_fatal: true
+
+  vars:
+    gb10_clock_min_mhz: 300
+    gb10_clock_max_mhz: 2200
+
+  tasks:
+    - name: Ask the GPU its name
+      ansible.builtin.command: nvidia-smi --query-gpu=name --format=csv,noheader
+      register: gpu_name
+      changed_when: false
+
+    - name: Find nvidia-smi for the unit
+      ansible.builtin.command: which nvidia-smi
+      register: nvidia_smi_path
+      changed_when: false
+      when: "'GB10' in gpu_name.stdout"
+
+    - name: Cap the clock on GB10 nodes
+      when: "'GB10' in gpu_name.stdout"
+      become: true
+      block:
+        - name: Install the clock-cap unit
+          ansible.builtin.copy:
+            content: |
+              [Unit]
+              Description=Thinkube: cap the GB10 GPU clock at {{ gb10_clock_max_mhz }} MHz, below the power spikes that cut the power
+              After=local-fs.target nvidia-host-driver-validation.service
+              Before=kubelet.service
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart={{ nvidia_smi_path.stdout | trim }} -lgc {{ gb10_clock_min_mhz }},{{ gb10_clock_max_mhz }}
+              ExecStop={{ nvidia_smi_path.stdout | trim }} -rgc
+
+              [Install]
+              WantedBy=multi-user.target
+            dest: /etc/systemd/system/thinkube-gpu-clock-cap.service
+            mode: '0644'
+
+        - name: Enable the unit and apply the cap now
+          ansible.builtin.systemd:
+            name: thinkube-gpu-clock-cap
+            enabled: true
+            state: restarted
+            daemon_reload: true
+
+        - name: Read the unit's result
+          ansible.builtin.command: systemctl show thinkube-gpu-clock-cap -p ActiveState -p Result
+          register: cap_state
+          changed_when: false
+
+        - name: Fail when the cap was not applied
+          ansible.builtin.fail:
+            msg: "thinkube-gpu-clock-cap did not apply the cap ({{ cap_state.stdout_lines | join(', ') }}); see journalctl -u thinkube-gpu-clock-cap"
+          when: "'ActiveState=active' not in cap_state.stdout_lines or 'Result=success' not in cap_state.stdout_lines"
+
+        - name: Show the node's clock now
+          ansible.builtin.command: nvidia-smi --query-gpu=name,clocks.sm,clocks.max.sm --format=csv,noheader
+          register: clock_now
+          changed_when: false
+
+        - name: Report
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }}: {{ clock_now.stdout | trim }}; capped at {{ gb10_clock_max_mhz }} MHz on every boot"
