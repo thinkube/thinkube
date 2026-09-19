@@ -265,7 +265,7 @@
         
     - name: Ensure .ssh directory exists
       ansible.builtin.file:
-        path: "{{ ansible_user_dir }}/.ssh"
+        path: "{{ ansible_facts.user_dir }}/.ssh"
         state: directory
         mode: '0700'
 
@@ -274,12 +274,12 @@
         path: "{{ item }}"
         state: absent
       with_items:
-        - "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}"
-        - "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}.pub"
+        - "{{ ansible_facts.user_dir }}/.ssh/{{ ssh_key_name }}"
+        - "{{ ansible_facts.user_dir }}/.ssh/{{ ssh_key_name }}.pub"
 
     - name: Generate fresh SSH key for each host
       ansible.builtin.command:
-        cmd: ssh-keygen -t {{ ssh_key_type }} -f {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }} -C "thinkube_cluster_{{ ansible_hostname }}" -N ""
+        cmd: ssh-keygen -t {{ ssh_key_type }} -f {{ ansible_facts.user_dir }}/.ssh/{{ ssh_key_name }} -C "thinkube_cluster_{{ ansible_facts.hostname }}" -N ""
       changed_when: true
 
     - name: Ensure correct permissions on SSH keys
@@ -288,18 +288,18 @@
         state: file
         mode: "{{ '0600' if item.endswith('/thinkube_cluster_key') else '0644' }}"
       with_items:
-        - "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}"
-        - "{{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}.pub"
+        - "{{ ansible_facts.user_dir }}/.ssh/{{ ssh_key_name }}"
+        - "{{ ansible_facts.user_dir }}/.ssh/{{ ssh_key_name }}.pub"
 
     - name: Get public key content
-      ansible.builtin.command: cat {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}.pub
+      ansible.builtin.command: cat {{ ansible_facts.user_dir }}/.ssh/{{ ssh_key_name }}.pub
       register: pubkey_content
       changed_when: false
 
     # Clean up old thinkube cluster keys from authorized_keys
     - name: Remove old thinkube cluster keys from authorized_keys
       ansible.builtin.lineinfile:
-        path: "{{ ansible_user_dir }}/.ssh/authorized_keys"
+        path: "{{ ansible_facts.user_dir }}/.ssh/authorized_keys"
         regexp: ".*thinkube_cluster.*"
         state: absent
         backup: yes
@@ -307,7 +307,7 @@
     # Simple approach - add all public keys to all hosts directly
     - name: Add public keys to authorized_keys from all hosts
       ansible.builtin.authorized_key:
-        user: "{{ ansible_user_id }}"
+        user: "{{ ansible_facts.user_id }}"
         key: "{{ hostvars[item]['pubkey_content']['stdout'] }}"
         state: present
       loop: "{{ groups['baremetal'] }}"
@@ -332,7 +332,7 @@
 
     - name: Add controller's key to all baremetal hosts
       ansible.builtin.authorized_key:
-        user: "{{ ansible_user_id }}"
+        user: "{{ ansible_facts.user_id }}"
         key: "{{ controller_pubkey.stdout }}"
         state: present
       when: 
@@ -356,13 +356,13 @@
 
     - name: Check for existing SSH config file
       ansible.builtin.stat:
-        path: "{{ ansible_user_dir }}/.ssh/config"
+        path: "{{ ansible_facts.user_dir }}/.ssh/config"
       register: ssh_config_stat
 
     - name: Backup existing SSH config if it exists
       ansible.builtin.copy:
-        src: "{{ ansible_user_dir }}/.ssh/config"
-        dest: "{{ ansible_user_dir }}/.ssh/config.backup.{{ ansible_date_time.epoch }}"
+        src: "{{ ansible_facts.user_dir }}/.ssh/config"
+        dest: "{{ ansible_facts.user_dir }}/.ssh/config.backup.{{ ansible_facts.date_time.epoch }}"
         remote_src: yes
         mode: '0600'
       when: ssh_config_stat.stat.exists
@@ -370,8 +370,8 @@
     # Simple approach: Check for section markers and either create a new file or update existing
     - name: Check if SSH config already has Thinkube Baremetal section
       ansible.builtin.shell: |
-        if [ -f "{{ ansible_user_dir }}/.ssh/config" ]; then
-          grep -q "BEGIN-THINKUBE-BAREMETAL" "{{ ansible_user_dir }}/.ssh/config" && echo "found" || echo "not found"
+        if [ -f "{{ ansible_facts.user_dir }}/.ssh/config" ]; then
+          grep -q "BEGIN-THINKUBE-BAREMETAL" "{{ ansible_facts.user_dir }}/.ssh/config" && echo "found" || echo "not found"
         else
           echo "not found"
         fi
@@ -382,7 +382,7 @@
     - name: Create new SSH config file if it doesn't exist
       ansible.builtin.template:
         src: "{{ playbook_dir }}/templates/ssh_config.j2"
-        dest: "{{ ansible_user_dir }}/.ssh/config"
+        dest: "{{ ansible_facts.user_dir }}/.ssh/config"
         mode: '0600'
       when: not ssh_config_stat.stat.exists
 
@@ -390,7 +390,7 @@
     - name: Generate Thinkube baremetal SSH config snippet
       ansible.builtin.template:
         src: "{{ playbook_dir }}/templates/ssh_config.j2"
-        dest: "{{ ansible_user_dir }}/.ssh/baremetal_snippet"
+        dest: "{{ ansible_facts.user_dir }}/.ssh/baremetal_snippet"
         mode: '0600'
       when: ssh_config_stat.stat.exists
 
@@ -398,38 +398,38 @@
     - name: Update existing Thinkube baremetal section
       ansible.builtin.shell: |
         # Create new config file
-        touch "{{ ansible_user_dir }}/.ssh/config.new"
+        touch "{{ ansible_facts.user_dir }}/.ssh/config.new"
         
         # Add everything before the BEGIN marker
-        sed -n '1,/# BEGIN-THINKUBE-BAREMETAL/p' "{{ ansible_user_dir }}/.ssh/config" | \
-        grep -v "# BEGIN-THINKUBE-BAREMETAL" > "{{ ansible_user_dir }}/.ssh/config.new"
+        sed -n '1,/# BEGIN-THINKUBE-BAREMETAL/p' "{{ ansible_facts.user_dir }}/.ssh/config" | \
+        grep -v "# BEGIN-THINKUBE-BAREMETAL" > "{{ ansible_facts.user_dir }}/.ssh/config.new"
         
         # Add the new baremetal snippet
-        cat "{{ ansible_user_dir }}/.ssh/baremetal_snippet" >> "{{ ansible_user_dir }}/.ssh/config.new"
+        cat "{{ ansible_facts.user_dir }}/.ssh/baremetal_snippet" >> "{{ ansible_facts.user_dir }}/.ssh/config.new"
         
         # Add everything after the END marker
-        sed -n '/# END-THINKUBE-BAREMETAL/,$p' "{{ ansible_user_dir }}/.ssh/config" | \
-        grep -v "# END-THINKUBE-BAREMETAL" >> "{{ ansible_user_dir }}/.ssh/config.new"
+        sed -n '/# END-THINKUBE-BAREMETAL/,$p' "{{ ansible_facts.user_dir }}/.ssh/config" | \
+        grep -v "# END-THINKUBE-BAREMETAL" >> "{{ ansible_facts.user_dir }}/.ssh/config.new"
         
         # Replace the original file
-        mv "{{ ansible_user_dir }}/.ssh/config.new" "{{ ansible_user_dir }}/.ssh/config"
-        chmod 600 "{{ ansible_user_dir }}/.ssh/config"
+        mv "{{ ansible_facts.user_dir }}/.ssh/config.new" "{{ ansible_facts.user_dir }}/.ssh/config"
+        chmod 600 "{{ ansible_facts.user_dir }}/.ssh/config"
       when: ssh_config_stat.stat.exists and has_baremetal_section.stdout == "found"
 
     # If no section exists yet, append it
     - name: Append baremetal section to existing SSH config
       ansible.builtin.shell: |
         # Add an empty line for separation
-        echo "" >> "{{ ansible_user_dir }}/.ssh/config"
+        echo "" >> "{{ ansible_facts.user_dir }}/.ssh/config"
         
         # Add the baremetal snippet
-        cat "{{ ansible_user_dir }}/.ssh/baremetal_snippet" >> "{{ ansible_user_dir }}/.ssh/config"
+        cat "{{ ansible_facts.user_dir }}/.ssh/baremetal_snippet" >> "{{ ansible_facts.user_dir }}/.ssh/config"
       when: ssh_config_stat.stat.exists and has_baremetal_section.stdout == "not found"
 
     # Clean up temporary files
     - name: Clean up temporary files
       ansible.builtin.file:
-        path: "{{ ansible_user_dir }}/.ssh/baremetal_snippet"
+        path: "{{ ansible_facts.user_dir }}/.ssh/baremetal_snippet"
         state: absent
       when: ssh_config_stat.stat.exists
 
@@ -440,7 +440,7 @@
           About to test SSH connections
           ═══════════════════════════════════════════════════════════
           From: {{ inventory_hostname }}
-          SSH Key: {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }}
+          SSH Key: {{ ansible_facts.user_dir }}/.ssh/{{ ssh_key_name }}
           Targets: {{ groups['baremetal'] }}
           ═══════════════════════════════════════════════════════════
       run_once: true
@@ -449,7 +449,7 @@
       ansible.builtin.shell: |
         if [ "{{ item }}" != "{{ inventory_hostname }}" ]; then
           echo "Testing SSH connection to {{ item }} at IP {{ hostvars[item]['ansible_host'] }}..."
-          ssh -v -i {{ ansible_user_dir }}/.ssh/{{ ssh_key_name }} -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ hostvars[item]['ansible_host'] }} "echo Successfully connected from {{ inventory_hostname }} to {{ item }}" 2>&1
+          ssh -v -i {{ ansible_facts.user_dir }}/.ssh/{{ ssh_key_name }} -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ hostvars[item]['ansible_host'] }} "echo Successfully connected from {{ inventory_hostname }} to {{ item }}" 2>&1
           exit $?
         else
           echo "Skipping test to self ({{ inventory_hostname }})"
