@@ -23,7 +23,6 @@
 #   - kubeconfig: Path to kubeconfig file
 #   - helm_bin: Path to Helm binary
 #   - harbor_registry: Harbor registry URL
-#   - library_project: Harbor library project name
 #   - ingress_namespace: Namespace for ingress controller
 #   - primary_ingress_service: Ingress controller service name
 #   - primary_ingress_class: Ingress class name
@@ -124,7 +123,7 @@
             priorityClassName: thinkube-workload
           nats:
             image:
-              repository: "{{ harbor_registry }}/{{ library_project | default('library') }}/nats"
+              repository: "{{ harbor_registry }}/library/nats"
               tag: "2.12.0-alpine"
               pullPolicy: IfNotPresent
 
@@ -164,7 +163,7 @@
             natsBox:
               enabled: true
               image:
-                repository: "{{ harbor_registry }}/{{ library_project | default('library') }}/nats-box"
+                repository: "{{ harbor_registry }}/library/nats-box"
                 tag: "0.18.1"
       register: nats_helm_result
       retries: 5
@@ -203,8 +202,8 @@
             namespace: "{{ k8s_namespace }}"
           spec:
             parentRefs:
-              - name: "{{ gateway_name | default('thinkube-gateway') }}"
-                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
                 sectionName: https
             hostnames:
               - "{{ nats_hostname }}"
@@ -217,8 +216,29 @@
                   - name: nats-headless
                     port: "{{ nats_monitoring_port }}"
 
-    # TCP routing for NATS (port 4222) is handled by the Gateway API
-    # TCPRoute created in gateway-api/10_deploy.yaml — no ingress patching needed.
+    # Clients reach port 4222 through the TCPRoute gateway-api/10_deploy.yaml
+    # creates in the gateway's namespace. A route may send traffic to a Service
+    # in another namespace only when that namespace grants it, and the grant
+    # lives in this namespace, which a rollback deletes; the deploy creates it
+    # with the namespace.
+    - name: Allow the gateway's TCP routes to reach the NATS Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1beta1
+          kind: ReferenceGrant
+          metadata:
+            name: allow-gateway-tcp
+            namespace: "{{ k8s_namespace }}"
+          spec:
+            from:
+              - group: gateway.networking.k8s.io
+                kind: TCPRoute
+                namespace: "{{ gateway_namespace }}"
+            to:
+              - group: ""
+                kind: Service
 
     - name: Display deployment results
       ansible.builtin.debug:
