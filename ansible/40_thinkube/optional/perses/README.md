@@ -576,12 +576,10 @@ spec:
       selfHeal: true
 ```
 
-### Export to Grafana
-
-While Perses is independent, you can export metrics queries to Grafana if needed:
+### Extract the queries of a dashboard
 
 ```bash
-# Extract PromQL queries from Perses dashboard
+# The PromQL queries of a Perses dashboard
 percli get dashboard my-dashboard --project kubernetes -o json | \
   jq '.spec.panels[].spec.queries[].spec.query'
 ```

@@ -180,14 +180,9 @@ kubectl port-forward -n monitoring svc/alertmanager-main 9093:9093
 
 Then access at: http://localhost:9093
 
-### Grafana (from kube-prometheus)
+### Grafana
 
-```bash
-kubectl port-forward -n monitoring svc/grafana 3000:3000
-```
-
-Then access at: http://localhost:3000
-- Default credentials: `admin` / `admin`
+Not installed: the deploy leaves kube-prometheus's Grafana manifests out. Grafana is AGPL-3.0 licensed, which conflicts with the platform's license; dashboards are in Perses.
 
 ## Configuration
 
