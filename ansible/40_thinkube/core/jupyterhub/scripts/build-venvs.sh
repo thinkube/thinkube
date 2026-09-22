@@ -46,7 +46,7 @@
 set -euo pipefail
 
 # Version for the venvs release
-VERSION="${VENVS_VERSION:-v0.1.0}"
+VERSION="${VENVS_VERSION:?VENVS_VERSION is not set; set it to the thinkube-venvs release tag (jupyter_venvs_version in vars/venvs.yaml)}"
 
 # DevPI index URL for thinkube packages (tk-llm, etc.)
 DEVPI_INDEX_URL="${DEVPI_INDEX_URL:-}"

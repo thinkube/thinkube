@@ -35,7 +35,7 @@ The deployment implements a secure approach to S3 authentication that addresses 
    - Add the `-s3.config=/etc/seaweedfs/s3-config.json` parameter to the filer command
    - Mount the S3 configuration from a Kubernetes secret as a volume
    - Check for existing volumes/mounts to avoid duplicates during re-runs
-3. **Fallback Mechanism**: The configuration playbook checks if the config file is mounted and only uses `s3.configure` command as a fallback
+3. **Verification**: The configuration playbook (`15_configure.yaml`) checks that the filer command carries `-s3.config`, that the config file is mounted, and that it holds the credentials from the `seaweedfs-s3-config` secret. It stops with an error if any of these is not true
 
 This implementation ensures that S3 credentials are managed by Kubernetes RBAC and not stored in the filer's persistent volume.
 

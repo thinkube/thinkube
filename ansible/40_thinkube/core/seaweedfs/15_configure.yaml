@@ -80,20 +80,44 @@
         s3_access_key: "{{ s3_config_secret.resources[0].data.access_key | b64decode }}"
         s3_secret_key: "{{ s3_config_secret.resources[0].data.secret_key | b64decode }}"
 
-    - name: Check if S3 config is already mounted
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ seaweedfs_namespace }} {{ filer_pods.resources[0].metadata.name }} -- test -f /etc/seaweedfs/s3-config.json && echo "exists" || echo "missing"
+    - name: Read the S3 config mounted in the filer pod
+      ansible.builtin.command: >-
+        {{ kubectl_bin }} exec -n {{ seaweedfs_namespace }} {{ filer_pods.resources[0].metadata.name }}
+        -- cat /etc/seaweedfs/s3-config.json
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: s3_config_check
+      register: s3_config_mounted
+      changed_when: false
+      failed_when: false
 
-    - name: Configure S3 auth using s3.configure (fallback if config mount failed)
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ seaweedfs_namespace }} {{ filer_pods.resources[0].metadata.name }} -- sh -c 'echo "s3.configure -access_key={{ s3_access_key }} -secret_key={{ s3_secret_key }} -user=admin -actions=Admin,Read,Write,List,Tagging -apply" | weed shell -master=seaweedfs-master:9333'
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: s3_config_result
-      when: s3_config_check.stdout == "missing"
+    - name: Verify the S3 config file is mounted in the filer pod
+      ansible.builtin.assert:
+        that:
+          - s3_config_mounted.rc == 0
+        fail_msg: >-
+          /etc/seaweedfs/s3-config.json is not readable in pod
+          {{ seaweedfs_namespace }}/{{ filer_pods.resources[0].metadata.name }}:
+          {{ s3_config_mounted.stderr }}.
+          10_deploy.yaml mounts it from secret seaweedfs-s3-config by patching
+          StatefulSet seaweedfs-filer. Run 10_deploy.yaml again and check the patch tasks.
+
+    - name: Verify the filer runs with the mounted S3 config and the secret's credentials
+      ansible.builtin.assert:
+        that:
+          - "'-s3.config=/etc/seaweedfs/s3-config.json' in (filer_pods.resources[0].spec.containers[0].command | join(' '))"
+          - "(s3_config_mounted.stdout | from_json).identities
+             | selectattr('name', 'equalto', 'admin')
+             | map(attribute='credentials') | flatten
+             | selectattr('accessKey', 'equalto', s3_access_key)
+             | selectattr('secretKey', 'equalto', s3_secret_key)
+             | list | length == 1"
+        fail_msg: >-
+          The S3 config is not in effect in pod
+          {{ seaweedfs_namespace }}/{{ filer_pods.resources[0].metadata.name }}.
+          The filer command must contain -s3.config=/etc/seaweedfs/s3-config.json,
+          and the mounted file must hold the admin access_key and secret_key of
+          secret seaweedfs-s3-config. Run 10_deploy.yaml again, then check
+          the patched command and restart the filer pod if the secret changed.
 
     - name: Create S3 configuration secret for other services
       kubernetes.core.k8s:

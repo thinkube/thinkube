@@ -71,7 +71,7 @@ JupyterHub uses one image, `tk-jupyter-base`, built by
 - JupyterLab 4.5.0 and JupyterHub 5.3.0 (required for the jupyterhub-singleuser command), installed in the system Python
 
 ML packages are not in the image. They live in Python venvs:
-- An init container, `setup-venvs`, downloads the `fine-tuning` and `agent-dev` venvs for the node's architecture from https://github.com/thinkube/thinkube-venvs/releases (version `jupyter_venvs_version`, default `v0.1.0`) and registers them as Jupyter kernels
+- An init container, `setup-venvs`, downloads the `fine-tuning` and `agent-dev` venvs for the node's architecture from https://github.com/thinkube/thinkube-venvs/releases (version `jupyter_venvs_version`, set in `vars/venvs.yaml`) and registers them as Jupyter kernels
 - The venvs are kept on each node at `/var/lib/jupyterhub-venvs` and mounted at `/home/thinkube/venvs`
 - `99_build_venvs.yaml` builds new venv tarballs for every GPU architecture in the cluster and uploads them to a GitHub release (needs `gh` authenticated). The package list is `venv-packages.txt`
 

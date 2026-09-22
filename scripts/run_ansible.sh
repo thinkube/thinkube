@@ -65,10 +65,11 @@ if ! command -v sshpass &> /dev/null; then
 fi
 
 # Get the system username from inventory
-SYSTEM_USERNAME=$(cd "${THINKUBE_DIR}" && python3 -c "import yaml; inv=yaml.safe_load(open('inventory/inventory.yaml')); print(inv['all']['vars']['system_username'])" 2>/dev/null || echo "thinkube")
-if [ -z "$SYSTEM_USERNAME" ]; then
-  echo "WARNING: Could not determine system_username from inventory, using default 'thinkube'"
-  SYSTEM_USERNAME="thinkube"
+INVENTORY_FILE="${THINKUBE_DIR}/inventory/inventory.yaml"
+if ! SYSTEM_USERNAME=$(python3 -c "import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))['all']['vars']['system_username'])" "$INVENTORY_FILE") \
+   || [ -z "$SYSTEM_USERNAME" ]; then
+  echo "ERROR: Could not read all.vars.system_username from $INVENTORY_FILE. Set all.vars.system_username in that file to the user Ansible connects as."
+  exit 1
 fi
 
 # Common Ansible settings
