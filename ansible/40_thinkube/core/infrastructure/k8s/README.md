@@ -1,542 +1,203 @@
-# Canonical Kubernetes (k8s-snap) Installation Guide
+# Kubernetes (kubeadm)
 
-## Overview
+This folder installs the Thinkube Kubernetes cluster with kubeadm: containerd, kubeadm, kubelet and kubectl on every node, Cilium as the network, and OpenEBS Rawfile CSI for storage.
 
-Canonical Kubernetes deployed via snap on Ubuntu systems.
+## How it is run
 
-**Tested on**: DGX Spark (ARM64) with Ubuntu 24.04.3 LTS, NVIDIA Blackwell GB10 GPU, driver 580.95.05
+The Thinkube installer runs these playbooks as a core component:
 
-## Critical Prerequisites
+1. `10_install_k8s.yaml` on the control plane.
+2. `20_join_workers.yaml`, only when the cluster has worker nodes.
+3. `12_configure_resource_policies.yaml`, after the GPU operator step.
 
-### 1. UFW Firewall Configuration
+If step 1 fails, the installer offers `19_rollback_control.yaml`. If step 2 fails, it offers `29_rollback_workers.yaml`.
 
-**CRITICAL**: This is MANDATORY or CoreDNS will fail with 503 errors.
+thinkube-control also runs `20_join_workers.yaml` when a node is added to a running cluster.
 
-#### Enable IP Forwarding
+The GPU operator is a separate component. See [`../gpu_operator/`](../gpu_operator/README.md). This folder does not install it.
 
-`/etc/sysctl.conf`:
-```
-net.ipv4.ip_forward=1
-```
+## Playbooks
 
-Apply:
-```bash
-sudo sysctl -w net.ipv4.ip_forward=1
-```
+| Playbook | What it does |
+|----------|--------------|
+| `10_install_k8s.yaml` | Control plane. Checks the host, sets up the `k8s0` interface and UFW, installs containerd and kubeadm, runs `kubeadm init`, installs kubectl and helm for the user, then Cilium and OpenEBS Rawfile CSI. |
+| `12_configure_resource_policies.yaml` | Creates four PriorityClasses: `thinkube-critical` (1000000), `thinkube-platform` (100000), `thinkube-workload` (10000, the cluster default) and `thinkube-batch` (1000). |
+| `13_test_resource_policies.yaml` | Checks the four PriorityClasses and that `thinkube-workload` is the default. Checks LimitRanges and ResourceQuotas in the gateway, PostgreSQL, Harbor and Argo CD namespaces, so it passes only after those components are installed. Creates a test pod to confirm a LimitRange applies its default memory limit. |
+| `16_test_kubelet_protection.yaml` | Reads kubelet arguments from `/var/snap/k8s/common/args/kubelet`. This install does not create that file, so the playbook fails. |
+| `18_test_control.yaml` | Checks the control plane with `snap list k8s`, `k8s status` and a UFW rule for port 6400. This install uses none of these, so the playbook fails. |
+| `19_rollback_control.yaml` | Removes the cluster from the control plane. See [Rollback](#rollback). |
+| `20_join_workers.yaml` | Workers. Sets up UFW, the `k8s0` interface and a local API proxy, the node-ip sync and the link watchdog, installs containerd and kubeadm, and runs `kubeadm join`. Then pins CoreDNS to the control plane and adds the workers to the SSH config used by code-server. |
+| `28_test_worker.yaml` | Checks each worker: kubelet active, kubeadm installed, `k8s0` carries `172.16.0.1`, the API answers through the local proxy, `kubelet.conf` points at `https://172.16.0.1:6443`, node Ready, node InternalIP equals `lan_ip`, Cilium running, UFW forward policy ACCEPT. Then runs a test pod on each worker and calls the in-cluster API from it. |
+| `29_rollback_workers.yaml` | Drains and deletes the workers, then wipes them. See [Rollback](#rollback). |
 
-#### Set UFW Forward Policy
+## What the install sets up
 
-`/etc/default/ufw`:
-```
-DEFAULT_FORWARD_POLICY="ACCEPT"
-```
+Versions are pinned in the playbooks and in the role defaults:
 
-**Without this setting, pods cannot reach the Kubernetes API server.**
+| Part | Version | Where |
+|------|---------|-------|
+| Kubernetes (kubeadm, kubelet, kubectl) | `1.36.4-1.1`, held with `apt-mark hold` | role `kubeadm_install`, from `pkgs.k8s.io` |
+| containerd.io | `2.2.4-1`, held with `apt-mark hold` | role `containerd_install`, from `download.docker.com` |
+| Cilium chart | `1.20.1` | `10_install_k8s.yaml` |
+| OpenEBS Rawfile CSI chart | `0.13.1` | `10_install_k8s.yaml` |
+| helm | `v3.16.4` | `10_install_k8s.yaml`, `20_join_workers.yaml` |
 
-#### Required Ports
+The role READMEs explain why the versions are pinned and held:
 
-```bash
-# Kubernetes API server
-sudo ufw allow 6443/tcp comment 'k8s API server'
+- `../../../../roles/kubeadm_install/README.md`
+- `../../../../roles/containerd_install/README.md`
 
-# Kubelet
-sudo ufw allow 10250/tcp comment 'k8s kubelet'
+### Stable API address
 
-# k8s-snap cluster daemon
-sudo ufw allow 6400/tcp comment 'k8s cluster daemon'
+- Every node has a dummy interface `k8s0` with the address `172.16.0.1/32`.
+- The API server endpoint, its certificate and Cilium all use `https://172.16.0.1:6443`. So the cluster does not depend on the LAN address of any node.
+- On workers, a systemd socket proxy (`k8s-api-proxy.socket` and `k8s-api-proxy.service`) listens on `172.16.0.1:6443` and forwards to the control plane's `lan_ip`.
+- kubelet's `--node-ip` is the node's real LAN address (`lan_ip`). Cilium traffic between nodes and API server calls to kubelet use this address.
 
-# Cilium CNI
-sudo ufw allow 4240/tcp comment 'Cilium networking'
-sudo ufw allow 8472/udp comment 'Cilium VXLAN'
+### Network changes
 
-# Cilium interfaces
-sudo ufw allow in on cilium_host
-sudo ufw allow out on cilium_host
+- `thinkube-node-ip-sync` runs at boot, before kubelet, and every minute after that through a timer.
+- If the node's LAN address changed, it writes the new address into `/var/lib/kubelet/kubeadm-flags.env` and restarts kubelet.
+- On workers it also looks up the control plane by host name (LLMNR) and points the API proxy at the new address.
+- When no Cilium agent is running and `/var/run/cilium/deleteQueue` holds 200 or more entries, it empties that directory.
+- The playbooks turn on LLMNR in systemd-resolved (`/etc/systemd/resolved.conf.d/10-thinkube-llmnr.conf`) on every node.
 
-# Reload
-sudo ufw reload
-```
+### Link watchdog (workers only)
 
-#### Port Reference
+- `thinkube-link-watchdog` checks every minute that the default route exists and the gateway answers.
+- After 3 failed checks in a row it restarts the interface. After 6 it re-probes the PCI device. After 12 it reboots the worker, but not in the first 600 seconds after boot.
+- It only checks the local link. It does not react when the control plane is down.
+- The four limits can be changed in the inventory with `link_watchdog_reset_after_override`, `link_watchdog_rebind_after_override`, `link_watchdog_reboot_after_override` and `link_watchdog_boot_grace_seconds_override`.
 
-| Port | Protocol | Service | Notes |
-|------|----------|---------|-------|
-| 6443 | TCP | kube-apiserver | All nodes |
-| 6400 | TCP | k8sd | All nodes |
-| 10250 | TCP | kubelet | All nodes |
-| 4240 | TCP | cilium-agent | All nodes |
-| 8472 | UDP | cilium-agent | All nodes (VXLAN) |
-| 2379 | TCP | etcd | Control plane only |
-| 2380 | TCP | etcd peer | Control plane only |
+### Cluster settings
 
-### 2. Conflicting Software
+- `kubeadm init` skips kube-proxy. Cilium runs with `kubeProxyReplacement: true`.
+- Pod network `10.244.0.0/16`, service network `10.96.0.0/12`. Cilium gives each node a `/23`.
+- kubelet: `maxPods: 500`, `systemReserved` 4Gi memory and 500m CPU, `kubeReserved` 2Gi memory and 500m CPU, hard eviction at 2Gi free memory, soft eviction at 4Gi free memory. Control plane and workers use the same values.
+- The control-plane `NoSchedule` taint is removed. Platform workloads run on the control plane.
+- Cilium attaches only to `k8s0 en+ eth+ wl+ bond+`. The ZeroTier interfaces are left out.
+- ZeroTier mode only: Cilium L2 announcements hand out LoadBalancer addresses from `overlay_subnet_prefix` + `lb_ip_start_octet` to `lb_ip_end_octet`. In Tailscale mode this is off.
+- Storage classes: `csi-rawfile-default` and `k8s-hostpath`. `k8s-hostpath` uses the same provisioner (`rawfile.csi.openebs.io`) and is marked as the default class.
+- After workers join, CoreDNS is pinned to the control plane.
 
-Check and stop Docker if running:
-```bash
-sudo systemctl stop docker 2>/dev/null || true
-sudo systemctl disable docker 2>/dev/null || true
-```
+### User tools
 
-k8s-snap manages its own containerd instance and will conflict with system containerd/docker.
+- kubectl (from `dl.k8s.io`) and helm in `~/.local/bin`. No sudo is needed.
+- kubeconfig in `~/.kube/config` on the control plane only. Workers get kubectl and helm but no kubeconfig.
+- If `~/.thinkube_shared_shell` exists, kubectl and helm aliases are written to `aliases/k8s_aliases.sh` and `aliases/k8s_aliases.fish`.
 
-### 3. System Requirements
+## Prerequisites
 
-- **OS**: Ubuntu 24.04 LTS
-- **CPU**: 16 cores minimum
-- **Memory**: 64GB minimum
-- **Disk**: 1TB minimum
+`10_install_k8s.yaml` stops if one of these checks fails on the control plane:
 
-## Installation
+- Ubuntu 24.04.
+- At least 16 CPU cores.
+- At least 60 GB of RAM as reported by the kernel. This is the check for a 64 GB machine.
+- Inventory variables `system_username`, `domain_name`, `cluster_name`, `overlay_provider`. In ZeroTier mode also `overlay_subnet_prefix`, `lb_ip_start_octet`, `lb_ip_end_octet`.
 
-### 1. Install k8s-snap
+`20_join_workers.yaml` checks only the inventory variables `system_username` and `overlay_provider`, plus `overlay_subnet_prefix` in ZeroTier mode.
 
-```bash
-sudo snap install k8s --classic --channel=1.35-classic/stable
-```
+The playbook headers also state a 1 TB disk minimum. No playbook checks the disk size.
 
-**Tested version**: 1.35.0 (from 1.35-classic/stable channel)
+### System settings made by the roles
 
-### 2. Bootstrap Cluster
+The `kubeadm_install` role, on every node:
 
-```bash
-sudo k8s bootstrap
-```
+- Turns swap off and comments out swap lines in `/etc/fstab`.
+- Loads the kernel modules `overlay` and `br_netfilter`, and lists them in `/etc/modules-load.d/thinkube-k8s.conf`.
+- Writes `/etc/sysctl.d/99-thinkube-k8s.conf` with:
+  - `net.ipv4.ip_forward = 1`
+  - `net.bridge.bridge-nf-call-iptables = 1`
+  - `net.bridge.bridge-nf-call-ip6tables = 1`
+  - `fs.inotify.max_user_instances = 1024`
+  - `fs.inotify.max_user_watches = 524288`
 
-Enables by default:
-- Cilium CNI
-- CoreDNS
-- Local storage
+The `containerd_install` role writes `/etc/containerd/config.toml` with `SystemdCgroup = true`. It also imports `/etc/containerd/conf.d/*.toml`, so the GPU operator can add its NVIDIA runtime there.
 
-### 3. Verify
+### UFW
 
-```bash
-sudo k8s status --wait-ready
-```
+Both playbooks install UFW, set `DEFAULT_FORWARD_POLICY="ACCEPT"` in `/etc/default/ufw`, add the rules below and enable UFW. The playbooks mark the ACCEPT forward policy as required for Kubernetes networking, and both test playbooks check it.
 
-Expected output:
-```
-cluster status:           ready
-network:                  enabled
-dns:                      enabled at 10.152.183.X
-```
+| Port or interface | Control plane | Worker | Purpose |
+|-------------------|:-:|:-:|---------|
+| 22/tcp | yes | yes | SSH |
+| 6443/tcp | yes | yes | API server (worker: the local API proxy) |
+| 2379-2380/tcp | yes | | etcd |
+| 10250/tcp | yes | yes | kubelet |
+| 10257/tcp | yes | | controller-manager |
+| 10259/tcp | yes | | scheduler |
+| 4240/tcp | yes | yes | Cilium health |
+| 8472/udp | yes | yes | Cilium VXLAN |
+| 9962/tcp | yes | yes | Cilium agent metrics |
+| 5355/udp | yes | yes | LLMNR |
+| `cilium_host` in and out | yes | yes | Cilium |
+| `k8s0` in and out | yes | | API server on the dummy interface |
+| `zt+` in and out | ZeroTier only | ZeroTier only | ZeroTier overlay |
+| 22/tcp from `overlay_subnet_prefix`.0/24 | ZeroTier only | ZeroTier only | SSH over ZeroTier |
 
-Check pods:
-```bash
-sudo k8s kubectl get pods -n kube-system
-```
+The playbooks add no rules for Tailscale.
 
-All should be Running:
-- `cilium-*`: 1/1
-- `cilium-operator-*`: 1/1
-- `coredns-*`: 1/1
-- `metrics-server-*`: 1/1
-- `ck-storage-*`: 2/2 (controller), 4/4 (node)
+## Rollback
 
-## GPU Operator Installation
+Both rollback playbooks delete data. The installer or the person who runs them is responsible for confirmation. The playbooks do not ask.
 
-### Prerequisites
+### `19_rollback_control.yaml`
 
-- NVIDIA drivers installed on host
-- Verify: `nvidia-smi`
+It removes:
 
-### Installation
+- The cluster. It stops kubelet, removes the static pod manifests, stops all containers, restarts containerd, then runs `kubeadm reset`.
+- The packages `kubeadm`, `kubelet`, `kubectl` and `containerd.io`. They are unheld and purged.
+- `/etc/kubernetes`, `/etc/cni/net.d`, `/etc/containerd`, `/var/lib/kubelet`, `/var/lib/containerd`, `/var/lib/etcd`, `/var/openebs`, `/var/lib/rawfile-localpv`, `/var/csi`. All volume data on `csi-rawfile-default` and `k8s-hostpath` is lost.
+- `~/.kube`, `~/.local/bin/kubectl`, `~/.local/bin/helm` and the k8s alias files.
+- `/etc/modules-load.d/thinkube-k8s.conf` and `/etc/sysctl.d/99-thinkube-k8s.conf`.
+- The Kubernetes and Docker apt sources and keys.
+- Network interfaces whose names contain `cilium` or `lxc`.
+- The UFW rules for 6443, 2379-2380, 10257, 10259, 10250, 4240 and 8472/udp. Then it disables UFW.
+- `/etc/systemd/resolved.conf.d/10-thinkube.conf`.
+- In Tailscale mode, when `tailscale_api_token` is set: the Tailscale split DNS entry for `domain_name`.
+- Last, it flushes all iptables and ip6tables rules and sets the default policies to ACCEPT.
 
-```bash
-sudo k8s helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
-sudo k8s helm repo update
+It leaves in place:
 
-sudo k8s helm install gpu-operator nvidia/gpu-operator \
-  --namespace gpu-operator \
-  --create-namespace \
-  --version v25.3.4 \
-  --set driver.enabled=false \
-  --wait --timeout 10m
-```
+- The `k8s0` interface configuration in `/etc/systemd/network/`.
+- The node-ip sync script, its units and its timer.
+- The LLMNR drop-in `10-thinkube-llmnr.conf`.
+- The UFW rules for 22, 9962, 5355, `cilium_host`, `k8s0` and ZeroTier. UFW itself is disabled.
+- `DEFAULT_FORWARD_POLICY="ACCEPT"` in `/etc/default/ufw`.
+- Swap stays off. The `/etc/fstab` lines stay commented out.
 
-### Verification
+### `29_rollback_workers.yaml`
 
-```bash
-# Check pods
-sudo k8s kubectl get pods -n gpu-operator
+On the control plane, it drains each worker (timeout 300 s, `--force`) and deletes the node.
 
-# Verify GPU advertised
-sudo k8s kubectl describe node | grep nvidia.com/gpu
-```
+On each worker, it removes:
 
-Expected output:
-```
-  nvidia.com/gpu:     1
-  nvidia.com/gpu:     1
-```
+- The cluster state, with `kubeadm reset`.
+- The packages `kubeadm`, `kubelet`, `kubectl` and `containerd.io`. They are unheld and purged.
+- `/etc/kubernetes`, `/etc/cni/net.d`, `/etc/containerd`, `/var/lib/kubelet`, `/var/lib/containerd`, `/var/openebs`, `/var/lib/rawfile-localpv`.
+- `~/.local/bin/kubectl` and `~/.local/bin/helm`.
+- The API proxy, node-ip sync and link watchdog units and scripts.
+- The `k8s0` configuration and the `k8s0` interface.
+- The kernel module and sysctl files, and the Kubernetes and Docker apt sources and keys.
+- Network interfaces whose names contain `cilium` or `lxc`.
 
-### DGX Spark Specific
+It leaves in place:
 
-Expected warning (this is normal):
-```
-Ignoring error getting device memory: Not Supported
-```
+- All UFW rules. UFW stays enabled.
+- The iptables rules. They are not flushed.
+- The LLMNR drop-in, and the `iw` package if it was installed.
+- The worker entries in the code-server SSH config.
+- Swap stays off.
 
-This is documented behavior for DGX Spark's Unified Memory Architecture (UMA).
-See: https://docs.nvidia.com/dgx/dgx-spark/known-issues.html
+It does not reboot the worker.
 
-## Key Paths
+## Running a playbook by hand (maintainers)
 
-**Custom Containerd Configuration** (for Docker coexistence on DGX):
+Run from `core/thinkube`:
 
-```
-Containerd base dir:   /var/lib/k8s-containerd
-Containerd socket:     /var/lib/k8s-containerd/k8s-containerd/run/containerd/containerd.sock
-Containerd config:     /var/lib/k8s-containerd/k8s-containerd/etc/containerd/config.toml
-Kubeconfig:           ~/.kube/config
-kubectl:              ~/.local/bin/kubectl (or sudo k8s kubectl)
-helm:                 ~/.local/bin/helm (or sudo k8s helm)
-Local storage:        /var/snap/k8s/common/rawfile-storage
-```
+- In code-server: `./scripts/tk_ansible <playbook>`. It uses the inventory in `/home/thinkube/.ansible/inventory`.
+- On a machine with the repository inventory: `./scripts/run_ansible.sh <playbook>`. It uses `inventory/inventory.yaml`.
 
-**Note**: The custom `containerd-base-dir: /var/lib/k8s-containerd` is configured to allow Docker and k8s-snap to coexist without conflicts. This is particularly important for DGX systems where Docker is needed for standard DGX functionality.
+`<playbook>` is the path from `core/thinkube`, for example `ansible/40_thinkube/core/infrastructure/k8s/28_test_worker.yaml`.
 
-## GPU Operator Compatibility
-
-The k8s-snap installation playbook automatically configures containerd to support GPU workloads. This configuration is required for the NVIDIA GPU Operator to function correctly.
-
-### Automatic Configuration
-
-During cluster installation, the playbook creates `/etc/containerd/conf.d/00-k8s-runc.toml`:
-
-```toml
-version = 2
-
-[plugins]
-  [plugins."io.containerd.grpc.v1.cri"]
-    [plugins."io.containerd.grpc.v1.cri".containerd]
-      default_runtime_name = "runc"
-
-      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
-        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-          runtime_type = "io.containerd.runc.v2"
-          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-            SystemdCgroup = true
-```
-
-### Why This Is Needed
-
-k8s-snap imports configurations from `/etc/containerd/conf.d/*.toml` using a mechanism that **replaces** entire plugin sections rather than merging them. When the GPU operator's nvidia-container-toolkit creates `99-nvidia.toml` with only the nvidia runtime definition, it would normally cause k8s-snap's containerd to lose the runc runtime definition, resulting in this error:
-
-```
-failed to load plugin io.containerd.grpc.v1.cri: no corresponding runtime configured in containerd.runtimes for default_runtime_name = "runc"
-```
-
-The `00-k8s-runc.toml` file (with the `00-` prefix) ensures it loads **before** the GPU operator's `99-nvidia.toml`, establishing the base runc runtime that must persist alongside the nvidia runtime.
-
-### How It Works
-
-1. **During k8s-snap installation**: `00-k8s-runc.toml` is created with the runc runtime definition
-2. **When GPU operator deploys**: The nvidia-container-toolkit DaemonSet creates `99-nvidia.toml` with the nvidia runtime
-3. **Both configs coexist**: k8s-snap containerd imports both files in alphabetical order, resulting in a complete configuration with both runtimes
-4. **Automatic for new nodes**: New GPU nodes joining the cluster automatically get the correct configuration from both the k8s-snap setup and the GPU operator DaemonSet
-
-### Verification
-
-After cluster installation, verify the configuration:
-
-```bash
-# Check that the runc config exists
-cat /etc/containerd/conf.d/00-k8s-runc.toml
-
-# After GPU operator is deployed, check nvidia config exists
-cat /etc/containerd/conf.d/99-nvidia.toml
-
-# Verify containerd is using both configs
-sudo k8s kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu
-```
-
-## Troubleshooting
-
-### CoreDNS Readiness Probe Failed (503)
-
-**Root cause**: UFW forward policy is DROP or ports blocked
-
-**Fix**:
-1. Verify `/etc/default/ufw` has `DEFAULT_FORWARD_POLICY="ACCEPT"`
-2. Verify all ports listed above are open
-3. `sudo ufw reload`
-4. Delete CoreDNS pod: `sudo k8s kubectl delete pod -n kube-system coredns-*`
-5. Wait 60 seconds, verify: `sudo k8s kubectl get pods -n kube-system`
-
-### GPU Operator Pod Warnings
-
-**Warning about nvidia runtime not configured**: Normal during initialization. Pods should reach Running state within 5 minutes.
-
-## Testing
-
-### DNS Resolution
-```bash
-sudo k8s kubectl run test --image=curlimages/curl --rm -it --restart=Never -- \
-  curl -k https://kubernetes.default.svc.cluster.local:443/version
-```
-Expected: `401 Unauthorized` (means DNS and API connectivity work)
-
-### External Connectivity
-```bash
-sudo k8s kubectl run test --image=busybox --rm -it --restart=Never -- ping -c 2 8.8.8.8
-```
-
-## Migrating Existing Playbooks from MicroK8s
-
-### Thinkube Installer Updates
-
-**Critical**: The thinkube-installer must be updated to call k8s-snap playbooks instead of MicroK8s playbooks.
-
-**Files to update**:
-- `frontend/src-tauri/backend/app/services/ansible_executor.py` - Playbook paths
-- `frontend/src-tauri/backend/app/api/playbooks.py` - Playbook execution logic
-- Inventory generation - Use k8s groups instead of microk8s groups
-
-**Playbook path changes**:
-```python
-# Before:
-"ansible/40_thinkube/core/infrastructure/microk8s/10_install_microk8s.yaml"
-"ansible/40_thinkube/core/infrastructure/microk8s/20_join_workers.yaml"
-
-# After:
-"ansible/40_thinkube/core/infrastructure/k8s-snap/10_install_k8s.yaml"
-"ansible/40_thinkube/core/infrastructure/k8s-snap/20_join_workers.yaml"
-```
-
-**Inventory group changes**:
-```yaml
-# Before:
-microk8s:
-  children:
-    microk8s_control_plane:
-    microk8s_workers:
-
-# After:
-k8s:
-  children:
-    k8s_control_plane:
-    k8s_workers:
-```
-
-**UI/Display text updates**:
-- "MicroK8s" → "Canonical Kubernetes" or "k8s-snap"
-- Update any progress messages, logs, error messages
-
-### Group Variables Update
-
-**File**: `inventory/group_vars/microk8s.yml`
-
-Update these variables:
-
-```yaml
-# Before (MicroK8s):
-kubeconfig: "/var/snap/microk8s/current/credentials/client.config"
-kubectl_bin: "/snap/bin/microk8s.kubectl"
-helm_bin: "/snap/bin/microk8s.helm3"
-harbor_storage_class: "microk8s-hostpath"
-prometheus_storage_class: "microk8s-hostpath"
-
-# After (k8s-snap):
-kubeconfig: "/etc/kubernetes/admin.conf"
-kubectl_bin: "sudo k8s kubectl"
-helm_bin: "sudo k8s helm"
-harbor_storage_class: "csi-rawfile-default"
-prometheus_storage_class: "csi-rawfile-default"
-```
-
-**Note**: Consider renaming `microk8s.yml` to `k8s.yml` or similar.
-
-### Direct Command Replacements
-
-**165 references** across 40+ playbook files need updating:
-
-```bash
-# Find all references:
-grep -rE "microk8s[\. ]kubectl|microk8s[\. ]helm" ansible/ --include="*.yaml"
-```
-
-**Replace patterns**:
-- `microk8s kubectl` → `sudo k8s kubectl`
-- `microk8s.kubectl` → `sudo k8s kubectl`
-- `microk8s helm3` → `sudo k8s helm`
-- `microk8s.helm3` → `sudo k8s helm`
-
-**Files affected**: All core and optional component playbooks that interact with Kubernetes.
-
-### Storage Class Updates
-
-All references to `microk8s-hostpath` storage class must change to `csi-rawfile-default`:
-
-```bash
-# Find storage class references:
-grep -r "microk8s-hostpath" ansible/ inventory/ --include="*.yaml"
-```
-
-**Known locations**:
-- `inventory/group_vars/microk8s.yml` (harbor_storage_class, prometheus_storage_class)
-- Any PVC/StatefulSet definitions in playbooks
-
-### Kubernetes Module Usage
-
-The `kubernetes.core.*` modules (913 references) use the `kubeconfig` variable - these will work automatically after updating `group_vars`.
-
-**No changes needed** for:
-- `kubernetes.core.k8s`
-- `kubernetes.core.k8s_info`
-- `kubernetes.core.helm`
-
-## Worker Node Joining
-
-k8s-snap uses a simpler token-based join process compared to MicroK8s.
-
-### Process
-
-**1. Generate join token (on control plane)**:
-```bash
-sudo k8s get-join-token <worker-hostname> --worker
-```
-
-This outputs a base64 token.
-
-**2. Join worker to cluster (on worker node)**:
-```bash
-sudo k8s join-cluster <token>
-```
-
-**3. Verify**:
-```bash
-sudo k8s kubectl get nodes
-```
-
-### Prerequisites for Workers
-- k8s-snap installed: `sudo snap install k8s --classic --channel=1.35-classic/stable`
-- Same UFW configuration as control plane
-- Docker stopped/disabled if present
-- Network connectivity to control plane (port 6400)
-
-## Playbook Requirements
-
-Following the same structure as MicroK8s playbooks, we need 6 playbooks:
-
-### Control Plane Installation (10_install_k8s.yaml)
-1. **UFW Configuration** (critical)
-   - Set IP forwarding in sysctl
-   - Set forward policy to ACCEPT
-   - Add all required port rules
-   - Reload UFW
-
-2. **DGX Spark Specific**
-   - Stop and disable pre-installed Docker
-
-3. **Installation**
-   - Install k8s snap from 1.35-classic/stable channel
-   - Bootstrap cluster
-   - Wait for ready state
-
-4. **Validation**
-   - Check all system pods are Running
-   - Verify CoreDNS is 1/1 Ready
-   - Test pod connectivity
-
-5. **Create Wrappers**
-   - kubectl wrapper at ~/.local/bin/kubectl
-   - helm wrapper at ~/.local/bin/helm
-   - Thinkube alias integration
-
-### Control Plane Testing (18_test_control.yaml)
-1. **Cluster Status**
-   - Verify cluster ready
-   - Check all system pods Running
-
-2. **DNS Testing**
-   - Test service DNS resolution
-   - Verify CoreDNS responding
-
-3. **Network Testing**
-   - Test pod-to-pod connectivity
-   - Test external connectivity
-
-### Control Plane Rollback (19_rollback_control.yaml)
-1. **Remove k8s-snap**
-   - `sudo snap remove k8s --purge`
-
-2. **Clean UFW Rules**
-   - Remove k8s-snap specific rules
-   - Restore forward policy if needed
-
-3. **Restore Docker** (DGX Spark only)
-   - Re-enable Docker if it was disabled
-
-4. **Verification**
-   - Confirm snap removed
-   - Verify no k8s processes running
-
-### Worker Node Join (20_join_workers.yaml)
-1. **UFW Configuration** (same as control plane)
-
-2. **DGX Spark Specific**
-   - Stop and disable Docker if present
-
-3. **Installation**
-   - Install k8s snap
-   - Do NOT bootstrap (workers don't bootstrap)
-
-4. **Join Cluster**
-   - Get join token from control plane
-   - Execute join-cluster command
-   - Wait for node to be Ready
-
-5. **Validation**
-   - Verify node appears in cluster
-   - Check node is Ready
-   - Verify system pods running on worker
-
-### Worker Node Testing (28_test_worker.yaml)
-1. **Node Status** (from control plane)
-   - Verify worker node Ready
-   - Check node labels
-
-2. **Pod Distribution**
-   - Verify system pods on worker
-   - Test pod scheduling to worker
-
-### Worker Node Rollback (29_rollback_workers.yaml)
-1. **Remove from Cluster** (from control plane)
-   - Drain node
-   - Delete node from cluster
-
-2. **Remove k8s-snap** (on worker)
-   - `sudo snap remove k8s --purge`
-
-3. **Clean UFW Rules**
-   - Remove k8s-snap specific rules
-
-4. **Restore Docker** (DGX Spark only)
-   - Re-enable Docker if it was disabled
-
-5. **Verification**
-   - Confirm node removed from cluster
-   - Verify snap removed from worker
-
-## GPU Operator
-
-GPU Operator has its own separate playbook set under `ansible/40_thinkube/core/infrastructure/gpu_operator/`:
-- `10_deploy.yaml` - Deploy GPU Operator
-- `17_configure_discovery.yaml` - Configure GPU discovery
-- `18_test.yaml` - Test GPU functionality
-- `19_rollback.yaml` - Remove GPU Operator
-
-**These should be run AFTER the k8s-snap cluster is fully installed and tested.**
-
-GPU Operator installation is documented in `gpu_operator/README.md` and requires:
-- NVIDIA drivers pre-installed on nodes
-- Working k8s cluster with kubectl access
-- GPU nodes labeled appropriately
-
-## References
-
-- [Canonical Kubernetes Docs](https://documentation.ubuntu.com/canonical-kubernetes/latest/)
-- [UFW Configuration](https://documentation.ubuntu.com/canonical-kubernetes/latest/snap/howto/networking/ufw/)
-- [Ports Reference](https://documentation.ubuntu.com/canonical-kubernetes/latest/snap/reference/ports-and-services/)
-- [NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/)
-- [DGX Spark Known Issues](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html)
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for known problems.

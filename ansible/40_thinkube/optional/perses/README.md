@@ -864,27 +864,12 @@ percli get dashboard test-dashboard --project kubernetes
 
 ## Rollback
 
-To rollback or remove the Perses deployment:
+Remove Perses from the Optional Components page in thinkube-control. This
+runs `19_rollback.yaml`, which uninstalls the Perses Helm release, deletes
+the `perses` namespace with everything in it, and removes the Perses client
+from Keycloak.
 
-```bash
-# Uninstall Perses Helm release
-helm uninstall perses -n perses
-
-# Delete Keycloak client
-# (requires manual deletion via Keycloak admin UI or API)
-
-# Delete ConfigMaps and Secrets
-kubectl delete configmap -n perses thinkube-service-config
-kubectl delete secret -n perses perses-tls-secret
-
-# Optional: Delete persistent data (WARNING: This deletes all dashboards)
-kubectl delete pvc -n perses perses
-
-# Optional: Delete namespace
-kubectl delete namespace perses
-```
-
-**Note**: Deleting the PVC will permanently remove all custom dashboards. Export important dashboards before proceeding.
+**Note**: Deleting the namespace deletes the data volume, which permanently removes all custom dashboards. Export important dashboards before proceeding.
 
 To export all dashboards before rollback:
 

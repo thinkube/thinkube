@@ -57,19 +57,19 @@ From `inventory/group_vars/k8s.yml`:
 
 ```bash
 export ADMIN_PASSWORD='your-secure-password'
-ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/keycloak/10_deploy.yaml
+./scripts/run_ansible.sh ansible/40_thinkube/core/keycloak/10_deploy.yaml
 ```
 
 ### Configure Kubernetes Realm
 
 ```bash
-ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/keycloak/15_configure_realm.yaml
+./scripts/run_ansible.sh ansible/40_thinkube/core/keycloak/15_configure_realm.yaml
 ```
 
 ### Configure Custom Theme (Optional)
 
 ```bash
-ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/keycloak/16_configure_theme.yaml
+./scripts/run_ansible.sh ansible/40_thinkube/core/keycloak/16_configure_theme.yaml
 ```
 
 This will deploy a custom Thinkube theme for the login pages. To customize:
@@ -79,13 +79,13 @@ This will deploy a custom Thinkube theme for the login pages. To customize:
 ### Test Deployment
 
 ```bash
-ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/keycloak/18_test.yaml
+./scripts/run_ansible.sh ansible/40_thinkube/core/keycloak/18_test.yaml
 ```
 
 ### Rollback
 
 ```bash
-ansible-playbook -i inventory/inventory.yaml ansible/40_thinkube/core/keycloak/19_rollback.yaml -e confirm_rollback=true
+./scripts/run_ansible.sh ansible/40_thinkube/core/keycloak/19_rollback.yaml
 ```
 
 ## Notes

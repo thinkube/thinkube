@@ -1,4 +1,6 @@
-# ⚠️ Under Development - Not Ready for Use
+# thinkube
+
+The Ansible playbooks that install the Thinkube platform. The Thinkube installer clones this repository and runs them.
 
 ## License
 

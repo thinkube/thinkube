@@ -1,58 +1,72 @@
-# 40 Thinkube - Component-Based Deployment
+# 40 Thinkube - platform components
 
-This directory contains the component-based deployment structure for the Thinkube platform, migrated from the thinkube-core repository as part of Milestone 2.
+One folder of playbooks per component of the Thinkube platform.
+
+- **core/**: installed by the Thinkube installer, in the order it sets.
+- **optional/**: installed and removed from the Optional Components page in
+  thinkube-control. The catalogue of optional components is
+  `optional_components.json` in the thinkube-metadata repository.
 
 ## Directory Structure
 
 ```
 40_thinkube/
-├── core/                           # Essential platform components
-│   ├── infrastructure/            # MicroK8s, ingress, cert-manager, coredns
+├── core/
+│   ├── infrastructure/
+│   │   ├── k8s/                  # Kubernetes (kubeadm) on control plane and workers
+│   │   ├── gateway-api/          # Gateway API ingress
+│   │   ├── acme-certificates/    # TLS certificates
+│   │   ├── coredns/              # Cluster DNS
+│   │   ├── dns-server/           # BIND9 DNS for the platform domain
+│   │   ├── gpu_operator/         # NVIDIA GPU operator
+│   │   ├── tailscale-operator/   # Tailscale operator
+│   │   └── paused-backend/       # Page shown while a scaled-to-zero service is paused
+│   ├── postgresql/               # Database
 │   ├── keycloak/                 # SSO and authentication
-│   ├── postgresql/               # Database services
 │   ├── seaweedfs/                # Object storage (S3-compatible)
-│   ├── juicefs/                  # POSIX filesystem layer
+│   ├── juicefs/                  # POSIX filesystem over SeaweedFS
 │   ├── harbor/                   # Container registry
-│   ├── mlflow/                   # ML experiment tracking and model registry
-│   ├── argo-workflows/           # Workflow automation
+│   ├── harbor-images/            # Mirrored public images and Thinkube base images
+│   ├── gitea/                    # Git server
+│   ├── argo-workflows/           # Workflows and image builds
 │   ├── argocd/                   # GitOps deployment
-│   ├── devpi/                    # Python package repository
-│   ├── awx/                      # Ansible automation
-│   ├── mkdocs/                   # Documentation platform
-│   └── thinkube-dashboard/       # Main dashboard
-└── optional/                      # AWX-deployed components
+│   ├── devpi/                    # Python package index
+│   ├── mlflow/                   # Experiment tracking and model registry
+│   ├── jupyterhub/               # Notebooks
+│   ├── code-server/              # VS Code in the browser
+│   ├── thinkube-control/         # The platform's control plane
+│   └── gpu_operator/             # VERSION file only; the playbooks are in infrastructure/gpu_operator
+└── optional/
+    ├── argilla/                  # Data annotation and curation for model training
+    ├── chroma/                   # Embedding database
+    ├── clickhouse/               # Analytics database
+    ├── cvat/                     # Image and video annotation
+    ├── knative/                  # Serverless workloads that scale to zero
+    ├── langflow/                 # Low-code builder for RAG and LLM workflows
+    ├── langfuse/                 # LLM tracing and monitoring
+    ├── litellm/                  # LLM API proxy
+    ├── nats/                     # Messaging with JetStream
+    ├── ollama/                   # Local LLM inference for quantized models
+    ├── opensearch/               # Search and analytics
+    ├── perses/                   # Dashboards
+    ├── pgadmin/                  # PostgreSQL administration
     ├── prometheus/               # Metrics collection
-    ├── opensearch/               # Log aggregation
-    ├── jupyterhub/               # Data science notebooks
-    ├── code-server/              # VS Code in browser
-    ├── knative/                  # Serverless platform
     ├── qdrant/                   # Vector database
-    ├── pgadmin/                  # PostgreSQL admin
-    ├── penpot/                   # Design platform
-    └── valkey/                   # Cache service
+    ├── valkey/                   # In-memory data store, Redis-compatible
+    └── weaviate/                 # Vector database
 ```
 
-## Development Approach
+Three optional components have no folder here, because they are templates:
+`vllm` (tkt-vllm-gradio), `tensorrt` (tkt-tensorrt-llm-harmony) and
+`text-embeddings` (tkt-text-embeddings). thinkube-control deploys them from
+their repositories.
 
-Each component follows the standard playbook numbering convention:
-- `10_*.yaml` - Primary deployment
+## Playbook numbering
+
+Each component folder follows the same numbering:
+- `00_install.yaml` - Runs the component's playbooks in order
+- `10_*.yaml` - Deployment
 - `15_*.yaml` - Configuration
-- `18_*.yaml` - Testing
-- `19_*.yaml` - Rollback
-
-## Migration from thinkube-core
-
-Components are being migrated from the thinkube-core repository to this structure following these principles:
-1. Preserve all original functionality
-2. Update to use proper host groups (microk8s_workers, microk8s_control_plane)
-3. Migrate from hardcoded values to inventory variables
-4. Replace manual cert configuration with cert-manager
-
-## GitHub Issue Tracking
-
-Each component has a corresponding GitHub issue:
-- Infrastructure components: CORE-001 to CORE-003
-- Core services: CORE-004 to CORE-014
-- Optional services: OPT-001 to OPT-011
-
-See [/docs/architecture-k8s/COMPONENT_ARCHITECTURE.md](/docs/architecture-k8s/COMPONENT_ARCHITECTURE.md) for the complete component architecture and deployment sequence.
+- `17_configure_discovery.yaml` - ConfigMap describing the component's service endpoints
+- `18_test.yaml` - Tests
+- `19_rollback.yaml` - Rollback
