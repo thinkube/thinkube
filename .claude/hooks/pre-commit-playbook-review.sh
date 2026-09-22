@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
 # SPDX-License-Identifier: Apache-2.0
 
 # Pre-commit hook that uses Claude to review changed playbooks

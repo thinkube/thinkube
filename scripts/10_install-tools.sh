@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
 # SPDX-License-Identifier: Apache-2.0
 
 # install-tools.sh - Install Ansible and configure shell environments

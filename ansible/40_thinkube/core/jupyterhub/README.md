@@ -389,5 +389,5 @@ The examples repository and volume mount strategy provides:
 
 ## License
 
-Copyright 2025 Alejandro Martínez Corriá and the Thinkube contributors
+Copyright Alejandro Martínez Corriá and the Thinkube contributors
 SPDX-License-Identifier: Apache-2.0
