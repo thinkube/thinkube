@@ -4,6 +4,14 @@ Installs the Docker-provided `containerd.io` package at a pinned
 version, writes Thinkube's opinionated `/etc/containerd/config.toml`,
 enables the service, and holds the package against accidental upgrade.
 
+
+## Installation
+
+This role is part of the Kubernetes install. The Thinkube installer runs
+`40_thinkube/core/infrastructure/k8s/10_install_k8s.yaml` (control plane)
+and `20_join_workers.yaml` (workers), and both import this role. It is not
+installed on its own.
+
 ## What it provides
 
 - `containerd.io` from `download.docker.com/linux/ubuntu` at the pinned

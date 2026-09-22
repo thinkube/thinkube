@@ -2,6 +2,13 @@
 
 This component deploys JuiceFS distributed filesystem providing true ReadWriteMany (RWX) storage capabilities for the Kubernetes cluster. JuiceFS separates metadata and data storage, using PostgreSQL for metadata and SeaweedFS S3 for data storage.
 
+## Installation
+
+JuiceFS is a core component. The Thinkube installer installs it by running
+`00_install.yaml`, which runs `10_deploy.yaml`, `11_create_mlflow_volume.yaml`,
+`12_deploy_mlflow_gateway.yaml` and `17_configure_discovery.yaml` in that
+order. It is not installed on its own.
+
 ## Features
 
 - **True ReadWriteMany (RWX)** storage across multiple nodes
@@ -30,6 +37,15 @@ JuiceFS solves the multi-node RWX storage problem that SeaweedFS CSI driver cann
 - **Result**: True shared filesystem across all GPU nodes for JupyterHub, AI models, datasets, etc.
 
 ## Deployment
+
+| Playbook | What it does |
+|---|---|
+| `10_deploy.yaml` | Creates the `juicefs` database and the `juicefs-data` bucket, installs the JuiceFS CSI driver (Helm, `kube-system`, images from Harbor) and the `juicefs-rwx` StorageClass |
+| `11_create_mlflow_volume.yaml` | Creates a JuiceFS volume and StorageClass over the SeaweedFS `mlflow` bucket, for POSIX access to MLflow artifacts |
+| `12_deploy_mlflow_gateway.yaml` | Deploys the JuiceFS S3 gateway (port 9001) for that volume: MLflow writes through S3, inference workloads read the same files through a POSIX mount |
+| `17_configure_discovery.yaml` | Creates the service-discovery ConfigMap |
+| `18_test.yaml` | Tests the filesystem and multi-node RWX consistency |
+| `19_rollback.yaml` | Removes the CSI driver and StorageClass; PVCs that use it become unusable |
 
 ```bash
 # Deploy JuiceFS

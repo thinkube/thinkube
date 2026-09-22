@@ -2,12 +2,18 @@
 
 This component deploys a PostgreSQL database server in Kubernetes, providing a centralized data store for platform services including Keycloak, Harbor, MLflow, and other components.
 
+## Installation
+
+PostgreSQL is a core component. The Thinkube installer installs it by running
+`00_install.yaml`, which runs `10_deploy.yaml` and `17_configure_discovery.yaml`
+in that order. It is not installed on its own.
+
 ## Features
 
-- Uses official PostgreSQL container image (14.5-alpine)
+- Uses official PostgreSQL container image (`postgres:18-alpine`, pulled from `public.ecr.aws/docker/library`)
 - Persistent storage via StatefulSet
 - TLS secured connections
-- TCP passthrough enabled with Ingress controller
+- External TCP access on port 5432 through a Gateway API TCPRoute (created in `infrastructure/gateway-api/10_deploy.yaml`)
 - Database persistence across pod restarts
 - Configurable resource limits
 - Comprehensive tests for functionality verification
@@ -51,7 +57,7 @@ Database: mydatabase
 
 ### From outside the cluster
 
-External access is available via the ingress TCP passthrough:
+External access is available via the gateway TCPRoute:
 
 ```
 Host: {{ postgres_hostname }}
@@ -69,7 +75,9 @@ PGPASSWORD='{{ admin_password }}' psql -h {{ postgres_hostname }} -p 5432 -U {{ 
 
 ## Data Persistence
 
-Data is stored in a persistent volume claim named `postgres-data` in the `postgres` namespace. This ensures data survives pod restarts and redeployments.
+Data is stored in the StatefulSet's volume claim `data-postgresql-official-0` in the `postgres` namespace, mounted at `/var/lib/postgresql`. The storage class is `k8s-hostpath`. This ensures data survives pod restarts and redeployments.
+
+`10_deploy.yaml` also creates a PVC named `postgres-data`, but the StatefulSet does not mount it.
 
 For complete data protection, consider implementing a backup strategy using:
 
@@ -106,7 +114,7 @@ metadata:
 spec:
   volumeSnapshotClassName: csi-hostpath-snapclass
   source:
-    persistentVolumeClaimName: postgres-data
+    persistentVolumeClaimName: data-postgresql-official-0
 EOF
 ```
 
@@ -116,11 +124,11 @@ The deployment includes the following resource limits:
 
 - CPU: 250m request, 1000m limit
 - Memory: 256Mi request, 1Gi limit
-- Storage: 10Gi (configurable)
+- Storage: 10Gi (`postgres_persistence_size` in `10_deploy.yaml`)
 
 ## Security Notes
 
 - PostgreSQL admin credentials use the standard `admin_username` and `admin_password` variables
-- TLS is configured with certificates from the platform's default certificate store
+- TLS uses the wildcard certificate, copied from the default namespace into the `postgres-tls-secret` secret
 - Access is restricted to the specific PostgreSQL port (5432)
 - Security context sets correct PostgreSQL UID (999)

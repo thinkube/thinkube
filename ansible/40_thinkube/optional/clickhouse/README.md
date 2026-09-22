@@ -2,6 +2,19 @@
 
 Component #34 in the Thinkube Platform stack.
 
+## Installation
+
+ClickHouse is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control. It is not installed on its own.
+
+- Install: [00_install.yaml](00_install.yaml)
+- Test: [18_test.yaml](18_test.yaml)
+- Uninstall: [19_rollback.yaml](19_rollback.yaml)
+- Required components: none listed
+
+The playbooks read the `ADMIN_PASSWORD` environment variable. It becomes the
+password of the ClickHouse `default` user.
+
 ## Overview
 
 ClickHouse is a high-performance columnar database management system optimized for online analytical processing (OLAP). Deployed via the Altinity Kubernetes operator, ClickHouse provides real-time analytics capabilities for CVAT annotation tracking, Langfuse LLM observability, and other data-intensive workloads.
@@ -21,15 +34,14 @@ This component depends on the following Thinkube components:
 
 - **Kubernetes (#6)** - Provides the container orchestration platform
 - **ACME Certificates (#12)** - Secures HTTPS connections
-- **Ingress (#13)** - NGINX Ingress Controller with TCP passthrough
+- **Gateway API** - Envoy Gateway: an HTTPRoute for HTTPS and a TCP listener on port 9000 for the native protocol
 
 ## Prerequisites
 
 ```yaml
 requirements:
   kubernetes:
-    version: "1.34.0"
-    provider: "k8s-snap"
+    provider: "kubeadm"
 
   helm:
     repository: "https://helm.altinity.com"
@@ -56,142 +68,32 @@ requirements:
 
 ## Playbooks
 
-### **Main Deployment**
-**File**: [10_deploy.yaml](10_deploy.yaml)
+| Playbook | What it does |
+|---|---|
+| [00_install.yaml](00_install.yaml) | Runs 10 and 17 in order. |
+| [10_deploy.yaml](10_deploy.yaml) | Checks `ADMIN_PASSWORD`, creates the `clickhouse` namespace, installs the `altinity/clickhouse` Helm chart (release `clickhouse`, 1 replica, 1 shard, 10Gi on `k8s-hostpath`), waits for the pod, copies the TLS secret, creates the `clickhouse-route` HTTPRoute and the `allow-gateway-tcp` ReferenceGrant, and writes `~/.clickhouse-client/config.xml` into the code-server pod. |
+| [17_configure_discovery.yaml](17_configure_discovery.yaml) | Creates the `thinkube-service-config` ConfigMap for thinkube-control and adds the `CLICKHOUSE_*` variables to the code-server environment. |
+| [18_test.yaml](18_test.yaml) | Checks the namespace, StatefulSet, pod and service, then runs `clickhouse-client` in the pod to create a database and a table, insert and query a row, and drop the test database. |
+| [19_rollback.yaml](19_rollback.yaml) | Deletes the ClickHouseInstallation resources (removing their finalizers), then the `clickhouse` namespace, forcing its finalizers off if it is stuck. |
 
-Deploys ClickHouse with dual-protocol external access:
+The code-server CLI config points at
+`clickhouse-clickhouse-cluster.clickhouse.svc.cluster.local:9000`, user
+`default`, with the admin password.
 
-- **Variable Validation**
-  - Verifies `domain_name`, `kubeconfig`, `admin_username` are defined
-  - Checks `admin_password` from `ADMIN_PASSWORD` environment variable
-  - Fails deployment if password not set
+Environment variables that service discovery gives to code-server:
 
-- **Namespace Creation**
-  - Creates `clickhouse` namespace
+- `CLICKHOUSE_HOST`: `clickhouse.example.com`
+- `CLICKHOUSE_HTTP_PORT`: `443`
+- `CLICKHOUSE_NATIVE_PORT`: `9000`
+- `CLICKHOUSE_USER`: `default`
+- `CLICKHOUSE_PASSWORD`: from `ADMIN_PASSWORD`
+- `CLICKHOUSE_URL`: `https://clickhouse.example.com`
 
-- **Helm Repository Configuration**
-  - Adds Altinity Helm repository: `https://helm.altinity.com`
-  - Provides ClickHouse Kubernetes Operator and chart
-
-- **ClickHouse Deployment via Helm**
-  - Chart: `altinity/clickhouse`
-  - Release name: `clickhouse`
-  - Configuration:
-    - Replicas: 1 (single node)
-    - Shards: 1 (no horizontal partitioning)
-    - Default user password: from `ADMIN_PASSWORD`
-    - External access: enabled
-    - Persistence: 10Gi PVC with `k8s-hostpath` storage class
-  - **Note**: Single-node configuration; production should use multiple replicas
-
-- **Pod Readiness Wait**
-  - Waits for ClickHouse pod to reach `Running` state
-  - Label selector: `app.kubernetes.io/name=clickhouse`
-  - Retries: 30 attempts with 10s delay (5 minutes total)
-
-- **TLS Certificate Setup**
-  - Retrieves wildcard certificate from `default` namespace
-  - Copies certificate to `clickhouse` namespace as `clickhouse-tls-secret`
-
-- **HTTP Ingress Creation**
-  - Creates `clickhouse-http-ingress` in `clickhouse` namespace
-  - Host: `clickhouse.example.com`
-  - Backend: `clickhouse-clickhouse` service on port 8123
-  - Annotations:
-    - Backend protocol: HTTP
-    - Proxy body size: unlimited (for large result sets)
-  - TLS termination with wildcard certificate
-
-- **TCP Passthrough Configuration**
-  - Patches NGINX Ingress ConfigMap `primary-ingress-ingress-nginx-tcp`
-  - Maps port 9000 to `clickhouse/clickhouse-clickhouse:9000`
-  - Enables external native protocol access for high-performance clients
-
-- **Code-Server CLI Configuration**
-  - Generates ClickHouse CLI config from [templates/clickhouse-config.xml.j2](templates/clickhouse-config.xml.j2)
-  - Template contains:
-    - Host: `clickhouse-clickhouse-cluster.clickhouse.svc.cluster.local`
-    - Port: 9000 (native protocol)
-    - User: `default`
-    - Password: from `ADMIN_PASSWORD`
-  - Writes config to `/tmp/clickhouse-config.xml` (mode 0600)
-  - Gets code-server pod name
-  - Copies config to code-server: `/home/thinkube/.clickhouse-client/config.xml`
-  - Sets permissions: 600 (user read/write only)
-  - Removes temporary file
-  - **Result**: `clickhouse-client` CLI works without authentication prompts in code-server
-
-- **Connection Information Display**
-  - External HTTPS URL
-  - Native TCP endpoint
-  - Internal cluster service name
-  - Port numbers (8123 HTTP, 9000 native)
-  - Default user and password source
-
-### **Service Discovery**
-**File**: [17_configure_discovery.yaml](17_configure_discovery.yaml)
-
-Registers ClickHouse with Thinkube service discovery system:
-
-- **ConfigMap Creation** (`thinkube-service-config` in `clickhouse` namespace)
-  - Service type: `optional`
-  - Category: `data`
-  - Icon: `/icons/tk_data.svg`
-  - Component version: `0.1.0` (from VERSION file)
-
-- **Endpoints Registered**:
-  - Primary: External HTTP (HTTPS) at `https://clickhouse.example.com` (health: `/ping`)
-  - External native TCP at `clickhouse.example.com:9000`
-  - Internal HTTP at `http://clickhouse-clickhouse.clickhouse.svc.cluster.local:8123` (health: `/ping`)
-  - Internal native TCP at `clickhouse-clickhouse.clickhouse.svc.cluster.local:9000`
-
-- **Features Documented**:
-  - Real-time analytics
-  - SQL interface
-  - High performance OLAP
-  - Columnar storage
-
-- **Scaling Configuration**:
-  - Resource type: StatefulSet `chi-clickhouse-clickhouse-0-0`
-  - Min replicas: 1
-  - Can disable: true
-
-- **Environment Variables**:
-  - `CLICKHOUSE_HOST`: `clickhouse.example.com`
-  - `CLICKHOUSE_HTTP_PORT`: `443`
-  - `CLICKHOUSE_NATIVE_PORT`: `9000`
-  - `CLICKHOUSE_USER`: `default`
-  - `CLICKHOUSE_PASSWORD`: from `ADMIN_PASSWORD`
-  - `CLICKHOUSE_URL`: `https://clickhouse.example.com`
-
-- **Code-Server Integration**
-  - Updates code-server environment variables via `code_server_env_update` role
-  - Makes ClickHouse connection details available to development environment
-
-## Deployment
-
-This component is automatically deployed via the **thinkube-control Optional Components interface**:
-
-1. Navigate to https://thinkube.example.com/optional-components
-2. Locate the **ClickHouse** card in the **Data** section
-3. Click **Install** to deploy the component
-4. Monitor real-time deployment progress via WebSocket streaming
-5. Verify deployment status in the dashboard
-
-The deployment executes the orchestrator playbook at `/ansible/40_thinkube/optional/clickhouse/00_install.yaml`.
-
-**Deployment Sequence**:
-1. Validate environment variables (`ADMIN_PASSWORD` required)
-2. Create namespace
-3. Add Altinity Helm repository
-4. Deploy ClickHouse via Helm (single replica, 10Gi storage)
-5. Wait for pod to be running
-6. Configure HTTP ingress with TLS
-7. Configure TCP passthrough for native protocol
-8. Setup ClickHouse CLI in code-server
-9. Register with service discovery
-
-**Important**: Set `ADMIN_PASSWORD` environment variable before deployment. This password protects the `default` user account.
+The native protocol on port 9000 reaches ClickHouse through the `clickhouse`
+TCPRoute. [gateway-api/10_deploy.yaml](../../core/infrastructure/gateway-api/10_deploy.yaml)
+creates that route and the listener in `gateway-system`. The
+`allow-gateway-tcp` ReferenceGrant lets that route reach the Service in the
+`clickhouse` namespace.
 
 ## Access Points
 
@@ -266,13 +168,8 @@ ClickHouse does not create application-specific databases automatically. Applica
 
 Default storage uses `k8s-hostpath` storage class with 10Gi:
 
-To increase storage, edit the Helm values before deployment or upgrade:
-
-```bash
-helm upgrade clickhouse altinity/clickhouse \
-  -n clickhouse \
-  --set clickhouse.persistence.size=50Gi
-```
+The size and storage class are set in the Helm values in
+[10_deploy.yaml](10_deploy.yaml) (`clickhouse.persistence`).
 
 ### Replication and Sharding
 
@@ -443,10 +340,11 @@ WHERE event_type = 'login';
 
 Langfuse uses ClickHouse for high-performance trace storage:
 
-Connection configured via environment variables:
-- `CLICKHOUSE_URL=https://clickhouse.example.com`
+Connection configured via environment variables (see `optional/langfuse/11_deploy.yaml`):
+- `CLICKHOUSE_URL=http://clickhouse-clickhouse.clickhouse.svc.cluster.local:8123`
+- `CLICKHOUSE_MIGRATION_URL=clickhouse://default:<password>@clickhouse-clickhouse.clickhouse.svc.cluster.local:9000`
 - `CLICKHOUSE_USER=default`
-- `CLICKHOUSE_PASSWORD` from secret
+- `CLICKHOUSE_PASSWORD`: the admin password
 
 Langfuse creates database `langfuse` with tables:
 - `traces` - LLM execution traces
@@ -597,18 +495,16 @@ From external (native):
 clickhouse-client --host clickhouse.example.com --port 9000 --user default --password $ADMIN_PASSWORD --query "SELECT 1"
 ```
 
-### Verify TCP Passthrough
+### Verify the Native Protocol Route
 
-Check Ingress ConfigMap:
+Check the TCPRoute and the ReferenceGrant:
 ```bash
-kubectl get configmap primary-ingress-ingress-nginx-tcp -n ingress -o yaml | grep 9000
+kubectl get tcproute clickhouse -n gateway-system -o yaml
+kubectl get referencegrant allow-gateway-tcp -n clickhouse -o yaml
 ```
 
-Should show:
-```yaml
-data:
-  "9000": "clickhouse/clickhouse-clickhouse:9000"
-```
+The TCPRoute should send to `clickhouse-clickhouse` port 9000 in the
+`clickhouse` namespace.
 
 ### Authentication Issues
 
@@ -667,7 +563,7 @@ SHOW CREATE TABLE events;
 ### Common Issues
 
 **Issue**: Cannot connect externally
-- **Solution**: Verify ingress and TCP passthrough configuration
+- **Solution**: Verify the `clickhouse-route` HTTPRoute and the `clickhouse` TCPRoute
 - **Solution**: Check firewall allows port 9000 traffic
 
 **Issue**: Slow queries
@@ -692,22 +588,17 @@ SHOW CREATE TABLE events;
 ## Testing
 
 The test playbook [18_test.yaml](18_test.yaml) verifies:
-- ClickHouse pod is running
-- HTTP interface responds to ping
-- Native protocol accepts connections
-- Can create database and table
-- Can insert and query data
-- External access works via both protocols
-- Code-server CLI is configured correctly
+- The `clickhouse` namespace, StatefulSet, pod and service exist
+- `clickhouse-client` inside the pod answers `SELECT 1`
+- A test database and table can be created, a row inserted and queried
+- The test database is dropped afterwards
+
+It does not test external access or the code-server CLI config.
 
 ## Rollback
 
-To uninstall ClickHouse:
-
-```bash
-cd ~/thinkube
-./scripts/tk_ansible ansible/40_thinkube/optional/clickhouse/19_rollback.yaml
-```
+[19_rollback.yaml](19_rollback.yaml) runs when ClickHouse is removed from the
+Optional Components page.
 
 **Warning**: This will delete all ClickHouse data including databases created by Langfuse, CVAT, and custom applications. Backup important data before uninstalling.
 

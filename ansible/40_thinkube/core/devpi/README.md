@@ -2,6 +2,12 @@
 
 DevPi is a private Python package index server used for hosting internal Python packages and caching PyPI packages in the Thinkube platform.
 
+## Installation
+
+DevPi is a core component. The Thinkube installer installs it by running
+`00_install.yaml`, which runs `10_deploy.yaml`, `15_configure_cli.yaml` and
+`17_configure_discovery.yaml` in that order. It is not installed on its own.
+
 ## Overview
 
 This deployment provides:
@@ -9,8 +15,7 @@ This deployment provides:
 - PyPI package caching
 - Web UI with Keycloak authentication
 - Unauthenticated API access for pip/CLI tools
-- Automated container builds via Argo Workflows
-- GitOps deployment through ArgoCD
+- Image built with podman from https://github.com/thinkube/thinkube-devpi and pushed to Harbor
 - Fish shell integration for developers
 
 ## Architecture
@@ -18,38 +23,35 @@ This deployment provides:
 ### Components
 - **DevPi Server**: The main package index server
 - **OAuth2 Proxy**: Provides Keycloak authentication for web UI
-- **Redis**: Session storage for OAuth2 Proxy
-- **Ingress**: Dual ingress configuration
-  - Protected dashboard: `devpi.{{ domain_name }}`
-  - Open API endpoint: `devpi-api.{{ domain_name }}`
+- **Valkey** (`ephemeral-redis`): Session storage for OAuth2 Proxy
+- **HTTPRoutes**: Two routes
+  - Protected dashboard: `packages.{{ domain_name }}` (`devpi_dashboard_hostname`)
+  - Open API endpoint: `packages-api.{{ domain_name }}` (`devpi_api_hostname`)
 
-### Container Build Pipeline
-1. GitHub repository stores Dockerfile and Kubernetes manifests
-2. Argo Workflows builds containers using Kaniko
-3. Images pushed to Harbor registry
-4. ArgoCD syncs deployments from GitHub
+### Container Build
+`10_deploy.yaml` does not use Argo Workflows or ArgoCD:
+1. Clones https://github.com/thinkube/thinkube-devpi to `/tmp/thinkube-devpi` on the control plane
+2. Builds the image with podman from `dockerfile/Dockerfile`
+3. Pushes it to `{{ harbor_registry }}/library/devpi:latest`
+4. Applies the Kubernetes manifests with kubectl
 
 ## Prerequisites
 
-- Canonical k8s-snap cluster (CORE-001, CORE-002)
-- Cert-Manager (CORE-003)
-- Keycloak (CORE-004)
-- Harbor Registry (CORE-005)
-- Argo Workflows (CORE-008)
-- ArgoCD (CORE-009)
+- Kubernetes (kubeadm) cluster
+- Wildcard TLS certificate (`infrastructure/acme-certificates`)
+- Keycloak
+- Harbor Registry, and podman on the control plane (`harbor/11_install_podman.yaml`)
 
 ## Environment Variables
 
 Required environment variables:
 - `ADMIN_PASSWORD`: Admin password for Keycloak and Harbor access
-- `DEVPI_ADMIN_PASSWORD`: Password for DevPi admin user
 
 ## Deployment
 
 ### 1. Set Environment Variables
 ```bash
 export ADMIN_PASSWORD='your-admin-password'
-export DEVPI_ADMIN_PASSWORD='your-devpi-password'
 ```
 
 ### 2. Deploy DevPi
@@ -77,19 +79,19 @@ Or using bash:
 ## Usage
 
 ### Web Interface
-Access the web interface at: https://devpi.{{ domain_name }}
+Access the web interface at: https://packages.{{ domain_name }}
 - Protected by Keycloak authentication
 - Browse packages and indices
 - View package documentation
 
 ### API Access
-The API endpoint at https://devpi-api.{{ domain_name }} is unauthenticated for pip access.
+The API endpoint at https://packages-api.{{ domain_name }} is unauthenticated for pip access.
 
 ### CLI Commands
 
 #### Configure pip to use DevPi
 ```bash
-pip config set global.index-url https://devpi-api.{{ domain_name }}/{{ admin_username }}/prod/+simple/
+pip config set global.index-url https://packages-api.{{ domain_name }}/{{ admin_username }}/stable/+simple/
 ```
 
 #### Upload a package
@@ -127,24 +129,25 @@ To completely remove DevPi:
 
 ## Inventory Variables
 
-The following variables must be defined in inventory:
+These are set in `inventory/group_vars/k8s.yml`:
 
-| Variable | Description | Example |
+| Variable | Description | Value |
 |----------|-------------|---------|
 | `devpi_namespace` | Kubernetes namespace | `devpi` |
-| `devpi_dashboard_hostname` | Dashboard hostname | `devpi.thinkube.com` |
-| `devpi_api_hostname` | API endpoint hostname | `devpi-api.thinkube.com` |
-| `devpi_index_name` | Default index name | `prod` |
-| `github_username` | GitHub account that owns the token | `cmxela` |
-| `harbor_registry` | Harbor registry domain | `registry.thinkube.com` |
-| `harbor_project` | Harbor project name | `thinkube` |
+| `devpi_dashboard_hostname` | Dashboard hostname | `packages.{{ domain_name }}` |
+| `devpi_api_hostname` | API endpoint hostname | `packages-api.{{ domain_name }}` |
+| `devpi_index_name` | Default index name | `stable` |
+| `harbor_registry` | Harbor registry domain | `registry.{{ domain_name }}` |
+
+The image goes to the Harbor `library` project; `10_deploy.yaml` sets
+`harbor_project: library` itself.
 
 ## Security Considerations
 
 - Web UI protected by Keycloak OIDC authentication
 - API endpoint is intentionally unauthenticated for pip compatibility
 - All traffic uses HTTPS with valid certificates
-- OAuth2 sessions stored in Redis
+- OAuth2 sessions stored in Valkey
 - Container images stored in private Harbor registry
 
 ## Troubleshooting
@@ -160,19 +163,18 @@ kubectl logs -n devpi deploy/devpi
 kubectl logs -n devpi deploy/oauth2-proxy
 ```
 
-### Verify ingress
+### Verify routes
 ```bash
-kubectl get ingress -n devpi
+kubectl get httproute -n devpi
 ```
 
 ### Test API connectivity
 ```bash
-curl -I https://devpi-api.{{ domain_name }}/+api
+curl -I https://packages-api.{{ domain_name }}/+api
 ```
 
 ## Notes
 
-- The dual ingress configuration is critical for pip functionality
-- DevPi data is persisted in a 5Gi PVC
+- The two routes are critical for pip functionality: pip uses the open API hostname
+- DevPi data is persisted in a 50Gi PVC (`devpi-data-pvc`)
 - Resource limits are set to 4Gi memory and 2 CPU cores
-- Session cookies use SameSite=none for cross-origin requests

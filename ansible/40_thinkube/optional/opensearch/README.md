@@ -1,6 +1,15 @@
 # OpenSearch Deployment
 
-This directory contains Ansible playbooks for deploying OpenSearch and OpenSearch Dashboards with Keycloak OIDC integration on Kubernetes (k8s-snap).
+This directory contains Ansible playbooks for deploying OpenSearch and OpenSearch Dashboards with Keycloak OIDC integration on Kubernetes (kubeadm).
+
+## Installation
+
+OpenSearch is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install (it runs `10_deploy.yaml` and then
+`17_configure_discovery.yaml`), `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. The component catalogue lists no required components; the
+playbook uses Keycloak, which is a core component.
 
 ## Overview
 
@@ -14,9 +23,9 @@ OpenSearch is an open-source search and analytics engine used for log aggregatio
 
 ## Prerequisites
 
-- Kubernetes (k8s-snap) cluster deployed and running
-- Keycloak deployed (CORE-003)
-- TLS certificates available
+- Kubernetes (kubeadm) cluster deployed and running
+- Keycloak deployed
+- Wildcard TLS certificate in the default namespace (`<domain_name with dashes>-tls`)
 - Helm installed on control plane
 - Environment variables set:
   - `ADMIN_PASSWORD`: Admin password for OpenSearch and all other applications (including Keycloak)
@@ -29,15 +38,18 @@ OpenSearch is an open-source search and analytics engine used for log aggregatio
    - Configures Keycloak client and roles
    - Deploys OpenSearch via Helm
    - Deploys OpenSearch Dashboards
-   - Configures ingress for external access
+   - Creates HTTPRoutes (Gateway API) for external access
 
-4. **18_test.yaml** - Test playbook
+2. **17_configure_discovery.yaml** - Service discovery
+   - Creates the ConfigMap that describes the service endpoints and metadata
+
+3. **18_test.yaml** - Test playbook
    - Verifies pods are running
    - Tests authentication
    - Checks Keycloak integration
    - Validates external connectivity
 
-5. **19_rollback.yaml** - Rollback playbook
+4. **19_rollback.yaml** - Rollback playbook
    - Removes all OpenSearch resources
    - Cleans up Keycloak configuration
    - Deletes persistent volumes
@@ -61,30 +73,13 @@ After deployment, services are available at:
 
 ## Usage
 
-### Deploy OpenSearch
-
-```bash
-cd ~/thinkube
-
-# Set required password
-export ADMIN_PASSWORD='your-secure-password'
-
-# Deploy OpenSearch
-./scripts/run_ansible.sh ansible/40_thinkube/optional/opensearch/10_deploy.yaml
-```
+Install and removal run from the Optional Components page.
 
 ### Test Deployment
 
 ```bash
 # Run tests
 ./scripts/run_ansible.sh ansible/40_thinkube/optional/opensearch/18_test.yaml
-```
-
-### Rollback Deployment
-
-```bash
-# Remove OpenSearch
-./scripts/run_ansible.sh ansible/40_thinkube/optional/opensearch/19_rollback.yaml
 ```
 
 ## Security Configuration
@@ -169,10 +164,10 @@ Data persists across pod restarts but is deleted during rollback.
 
 ## Dependencies
 
-- Kubernetes (k8s-snap) cluster
+- Kubernetes (kubeadm) cluster
 - Keycloak (for OIDC)
-- Ingress controller
-- Cert-manager (for TLS)
+- Gateway API gateway (Envoy Gateway)
+- Wildcard TLS certificate from `infrastructure/acme-certificates`
 - Persistent storage provisioner
 
 ## Notes
@@ -247,7 +242,7 @@ Example integrations:
 from elasticsearch import Elasticsearch
 
 es = Elasticsearch(
-    ['https://opensearch.thinkube.com'],
+    ['https://opensearch.<domain_name>'],
     http_auth=('admin', 'your-password'),
     verify_certs=True
 )

@@ -2,20 +2,27 @@
 
 This component deploys [Argo Workflows](https://argoproj.github.io/workflows/) and [Argo Events](https://argoproj.github.io/events/) for workflow automation and event-driven processing in the Thinkube environment.
 
+## Installation
+
+Argo Workflows and Argo Events are a core component. The Thinkube installer
+installs them by running `00_install.yaml`, which runs the playbooks listed
+under Deployment and then `17_configure_discovery.yaml`. They are not
+installed on their own.
+
 ## Features
 
 - Full deployment of Argo Workflows and Argo Events with Keycloak SSO integration
 - Configuration of artifact storage using S3-compatible storage (SeaweedFS)
-- Secure UI and gRPC access with TLS certificates (via cert-manager)
+- Secure UI and gRPC access with TLS: the gateway terminates TLS with the wildcard certificate
 - CLI installation and token-based authentication
 - Test workflow execution
 - Complete rollback capability
 
 ## Prerequisites
 
-- Canonical k8s-snap Kubernetes cluster (CORE-001 and CORE-002)
-- Cert-Manager (CORE-003) for TLS certificates
-- Keycloak (CORE-004) for SSO authentication
+- Kubernetes (kubeadm) cluster
+- Wildcard TLS certificate in the default namespace (`infrastructure/acme-certificates`)
+- Keycloak for SSO authentication
 - S3-compatible storage (SeaweedFS) for artifact storage
 
 ## Deployment
@@ -28,7 +35,7 @@ The deployment process consists of five sequential stages:
 2. **11_deploy.yaml** - Deploy Argo Workflows & Events (requires Keycloak client from step 1)
 3. **12_setup_token.yaml** - Set Up CLI & Token Authentication (requires Argo deployment from step 2)
 4. **13_setup_artifacts.yaml** - Configure Artifact Storage (requires Argo deployment from step 2)
-5. **15_configure_gitea_events.yaml** - Configure Argo Events for Gitea Webhooks (optional, for CI/CD integration)
+5. **15_configure_gitea_events.yaml** - Configure Argo Events for Gitea Webhooks (for CI/CD integration)
 
 ### 1. Configure Keycloak Client
 
@@ -47,10 +54,10 @@ ADMIN_PASSWORD=your_password ./scripts/run_ansible.sh ansible/40_thinkube/core/a
 ```
 
 This installs both Argo Workflows and Argo Events using Helm and configures:
-- TLS certificates for UI and gRPC access
+- The wildcard TLS certificate, copied from the default namespace
 - OIDC authentication with Keycloak
 - Resource limits for all components
-- Ingress for web UI and gRPC API
+- An HTTPRoute for the web UI (`argo_domain`) and a GRPCRoute for the gRPC API (`argo_grpc_domain`)
 
 ### 3. Set Up CLI & Token Authentication
 
@@ -73,7 +80,7 @@ This integrates Argo with S3-compatible storage for artifact storage, creating:
 - Artifact repository configuration
 - Test workflow with artifact storage
 
-### 5. Configure Argo Events for Gitea Webhooks (Optional)
+### 5. Configure Argo Events for Gitea Webhooks
 
 ```bash
 cd ~/thinkube
@@ -83,7 +90,7 @@ ADMIN_PASSWORD=your_password ./scripts/run_ansible.sh ansible/40_thinkube/core/a
 This sets up Argo Events infrastructure to receive webhooks from Gitea:
 - Creates EventBus for message processing
 - Deploys EventSource to receive webhooks on port 12000
-- Creates Service and Ingress for webhook endpoint
+- Creates Service and HTTPRoute for webhook endpoint
 - Configures Sensor to trigger Argo Workflows on push events
 - Sets up webhook secret for authentication
 
@@ -110,9 +117,9 @@ The test script verifies:
 
 ## Accessing Argo
 
-After deployment, Argo UI is available at: `https://argo.thinkube.com`
+After deployment, Argo UI is available at: `https://argo.<domain_name>`
 
-The gRPC API endpoint is available at: `https://grpc-argo.thinkube.com`
+The gRPC API endpoint is available at: `https://grpc-argo.<domain_name>`
 
 ## Rollback
 
@@ -126,7 +133,7 @@ cd ~/thinkube
 This removes:
 - Helm releases
 - Namespace and all resources
-- Ingress configurations
+- Route configurations
 - All Argo Events resources (EventBus, EventSource, Sensor)
 - (Optionally) CLI binary
 
@@ -138,14 +145,16 @@ The following variables are used:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `domain_name` | Base domain name | `thinkube.com` |
+| `domain_name` | Base domain name | set by the installer |
 | `admin_username` | Admin username | `tkadmin` |
 | `auth_realm_username` | Realm username for SSO | `thinkube` |
 | `argo_namespace` | Kubernetes namespace | `argo` |
-| `object_storage_s3_hostname` | S3 API hostname | `s3.thinkube.com` |
-| `kubeconfig` | Kubernetes config path | `/etc/kubernetes/admin.conf` |
-| `kubectl_bin` | Path to kubectl binary | `kubectl` |
-| `helm_bin` | Path to helm binary | `helm` |
+| `object_storage_s3_hostname` | S3 API hostname | `s3.{{ domain_name }}` |
+| `argo_domain` | UI hostname | `argo.{{ domain_name }}` |
+| `argo_grpc_domain` | gRPC API hostname | `grpc-argo.{{ domain_name }}` |
+| `kubeconfig` | Kubernetes config path | `/home/{{ system_username }}/.kube/config` |
+| `kubectl_bin` | Path to kubectl binary | `/home/{{ system_username }}/.local/bin/kubectl` |
+| `helm_bin` | Path to helm binary | `/home/{{ system_username }}/.local/bin/helm` |
 
 ## Environment Variables
 

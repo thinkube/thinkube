@@ -1,13 +1,21 @@
 # Valkey Component
 
-Valkey is an open-source, Redis-compatible in-memory data store. This deployment provides a persistent Valkey instance for infrastructure use, primarily as a backend for Penpot and other services requiring Redis-compatible storage.
+Valkey is an open-source, Redis-compatible in-memory data store. This deployment provides a persistent Valkey instance for infrastructure use. The optional components Argilla and Langfuse require it.
+
+## Installation
+
+Valkey is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install (it runs `10_deploy.yaml` and then
+`17_configure_discovery.yaml`), `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. The component catalogue lists no required components.
 
 ## Overview
 
 - **Component Type**: Optional
 - **Namespace**: `valkey`
-- **Version**: 8.1.0 (built from Alpine edge)
-- **Access**: Internal cluster service only
+- **Image**: `{{ harbor_registry }}/library/valkey:7.2-alpine`
+- **Access**: Cluster service, plus TCP port 6379 on the gateway at `valkey.{{ domain_name }}`
 - **Persistence**: Yes, 5Gi PVC with AOF and snapshot backups
 
 ## Deployment Structure
@@ -22,42 +30,24 @@ Valkey is an open-source, Redis-compatible in-memory data store. This deployment
 
 ## Requirements
 
-- Kubernetes (k8s-snap) cluster
+- Kubernetes (kubeadm) cluster
 - Storage class: `k8s-hostpath`
-- Harbor registry configured (core component)
-- Custom Valkey image built and available in Harbor registry
+- Harbor registry configured (core component), with the `valkey:7.2-alpine` image mirrored into the `library` project
+- The gateway's TCP listener and TCPRoute for port 6379 (`infrastructure/gateway-api/10_deploy.yaml`)
 - HARBOR_ROBOT_TOKEN in ~/.env (created during Harbor setup)
+- ADMIN_PASSWORD set: it becomes the Valkey password
 
 ## Image Requirements
 
-Valkey uses a custom Docker image built from Alpine Linux with Valkey installed from Alpine edge repository. The image is built in Harbor's base images playbook:
+`10_deploy.yaml` uses the upstream image `docker.io/valkey/valkey:7.2-alpine`,
+mirrored into Harbor from `thinkube-metadata/mirror_images.json`:
 
 ```
-ansible/40_thinkube/core/harbor/14_build_base_images.yaml
+{{ harbor_registry }}/library/valkey:7.2-alpine
 ```
 
-Expected image location:
-```
-{{ harbor_registry }}/library/valkey:8.1.0
-```
-
-## Deployment
-
-Deploy Valkey:
-
-```bash
-cd ~/thinkube
-
-# Run orchestrator (recommended)
-./scripts/run_ansible.sh ansible/40_thinkube/optional/valkey/00_install.yaml
-
-# Or run individually:
-# Step 1: Deploy Valkey
-./scripts/run_ansible.sh ansible/40_thinkube/optional/valkey/10_deploy.yaml
-
-# Step 2: Configure service discovery
-./scripts/run_ansible.sh ansible/40_thinkube/optional/valkey/17_configure_discovery.yaml
-```
+`core/harbor-images/14_build_base_images.yaml` also builds a custom
+`library/valkey:8.1.0` image from Alpine edge, but this playbook does not use it.
 
 ## Service Endpoints
 
@@ -65,6 +55,7 @@ Valkey is accessible within the Kubernetes cluster at:
 
 - **ClusterIP Service**: `valkey.valkey.svc.cluster.local:6379`
 - **Headless Service**: `valkey-headless.valkey.svc.cluster.local:6379`
+- **External**: `valkey.{{ domain_name }}:6379`, through the gateway's TCPRoute. The deploy creates the ReferenceGrant `allow-gateway-tcp` so the route may reach the Service.
 
 ## Persistence Configuration
 
@@ -102,13 +93,8 @@ The test playbook verifies:
 
 ## Rollback
 
-Remove Valkey deployment:
-
-```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/valkey/19_rollback.yaml
-```
-
-**Warning**: Rollback deletes the PVC and all stored data. Backup data before rollback if needed.
+Removing Valkey from the Optional Components page runs `19_rollback.yaml`.
+It deletes the PVC and all stored data. Back up data first if needed.
 
 ## Usage by Other Services
 
@@ -118,11 +104,10 @@ Services can connect to Valkey using standard Redis clients. Example connection 
 - **Port**: `6379`
 - **Protocol**: Redis/Valkey protocol
 
-No authentication is configured (protected-mode is disabled) as Valkey is only accessible within the cluster network.
+Valkey requires a password (`--requirepass`). The password is `ADMIN_PASSWORD`, stored in the Secret `valkey-auth` (key `password`). Protected mode is disabled.
 
 ## Notes
 
 - Valkey is Redis-compatible and can be used as a drop-in replacement for Redis
-- Version 8.1 is from Alpine Linux edge repository
-- The deployment uses a custom-built image to ensure compatibility with Harbor's base images
+- `maxmemory-policy` is `noeviction`
 - Data is persisted across pod restarts and deletions

@@ -5,10 +5,22 @@ host before Kubernetes is brought up. The overlay choice is driven by the
 inventory variable `overlay_provider` (`zerotier` or `tailscale`),
 collected from the user by the installer.
 
-> **Note on naming:** despite this directory's history (it was originally
-> ZeroTier-and-DNS-only), DNS is no longer here — BIND9 and CoreDNS are in
-> `../40_thinkube/core/infrastructure/dns-server/` and `coredns/` because
-> they need a working Kubernetes cluster.
+DNS is not in this directory. BIND9 and CoreDNS are in
+`../40_thinkube/core/infrastructure/dns-server/` and `coredns/`, because
+they need a working Kubernetes cluster.
+
+## Installation
+
+The Thinkube installer runs these playbooks. They are not run on their own.
+
+- `05_install_zerotier.yaml` or `06_install_tailscale.yaml`: on the
+  installer's overlay setup page (`overlay-setup.tsx`).
+- `10_setup_zerotier.yaml` or `11_setup_tailscale.yaml`: in the deploy
+  queue (`deploy.tsx`).
+
+No installer screen runs `18_test_zerotier.yaml`,
+`19_reset_zerotier.yaml` or `25_configure_remote_controller.yaml`. They
+are for maintainers.
 
 ## Playbook Overview
 
@@ -36,9 +48,9 @@ collected from the user by the installer.
 - **When:** `overlay_provider == 'tailscale'`
 - Verifies that every node in `overlay_nodes` is in
   `BackendState=Running` on the tailnet and fails fast otherwise.
-  Mostly a sanity check between `06_install_tailscale.yaml` and the k8s
-  install — the previous subnet-route workaround was removed in favour
-  of the Tailscale Kubernetes Operator (see below).
+  It is a check between `06_install_tailscale.yaml` and the k8s install.
+  Routing to cluster services is done by the Tailscale Kubernetes
+  Operator (see below).
 
 ### `18_test_zerotier.yaml`
 - Tests ZeroTier connectivity between nodes and reports diagnostics.
@@ -55,7 +67,8 @@ collected from the user by the installer.
 
 ## Order of Execution
 
-The installer's deploy queue (`deploy.tsx`) drives the order. Roughly:
+The installer drives the order: the overlay setup page, then the deploy
+queue (`deploy.tsx`). Roughly:
 
 ```
 ... env / SSH setup ...
@@ -79,7 +92,8 @@ Envoy Gateway Service status.
 ## Provider-Specific Notes
 
 ### ZeroTier mode
-- Cilium's k8s-snap built-in load balancer (L2 mode) claims static IPs
+- Cilium's L2 load balancer, set up by `k8s/10_install_k8s.yaml` in
+  ZeroTier mode only, claims static IPs
   from the user-defined overlay subnet. The control plane advertises
   the load-balancer IP range so the rest of the network can route to it.
 - Inventory carries `overlay_cidr`, `overlay_subnet_prefix`,

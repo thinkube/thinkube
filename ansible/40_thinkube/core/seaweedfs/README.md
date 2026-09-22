@@ -2,6 +2,12 @@
 
 SeaweedFS is a distributed file storage system with S3-compatible API for object storage.
 
+## Installation
+
+SeaweedFS is a core component. The Thinkube installer installs it by running
+`00_install.yaml`, which runs `10_deploy.yaml`, `15_configure.yaml` and
+`17_configure_discovery.yaml` in that order. It is not installed on its own.
+
 ## Overview
 
 SeaweedFS provides:
@@ -45,7 +51,7 @@ This creates:
 - SeaweedFS namespace
 - Master, Volume, and Filer servers
 - OAuth2 proxy for UI authentication
-- Ingresses for UI and S3 API
+- HTTPRoutes for the UI and the S3 API
 
 ### 2. Configure S3 Access
 ```bash
@@ -54,8 +60,8 @@ This creates:
 
 This:
 - Sets up S3 credentials
-- Creates initial buckets (argo-artifacts, harbor-storage, etc.)
-- Configures Argo Workflows to use SeaweedFS
+- Creates initial buckets: argo-artifacts, harbor-storage, backup, data
+- Prints the Argo artifact settings; Argo itself is configured by `argo-workflows/13_setup_artifacts.yaml`
 
 ### 3. Test Deployment
 ```bash
@@ -69,9 +75,8 @@ This:
 
 ## Access Points
 
-- **Web UI**: https://seaweedfs.{{ domain_name }} (Keycloak protected)
-- **S3 API**: https://s3.{{ domain_name }} (API key required)
-- **WebDAV**: https://webdav.{{ domain_name }} (if enabled)
+- **Web UI**: https://storage.{{ domain_name }} (`object_storage_ui_hostname`, Keycloak protected)
+- **S3 API**: https://s3.{{ domain_name }} (`object_storage_s3_hostname`, API key required)
 
 ## S3 Configuration
 
@@ -125,7 +130,7 @@ s3cmd put file.txt s3://bucket-name/
 ## Integration Examples
 
 ### Argo Workflows
-The configuration playbook automatically sets up Argo to use SeaweedFS for artifacts. The `13_setup_artifacts.yaml` playbook in the Argo Workflows component:
+The Argo Workflows component sets up Argo to use SeaweedFS for artifacts. Its `13_setup_artifacts.yaml` playbook in the Argo Workflows component:
 - Retrieves S3 credentials from the SeaweedFS secret
 - Creates the `argo-artifacts` bucket
 - Configures the artifact repository with path-style URLs
@@ -167,10 +172,9 @@ curl http://seaweedfs-filer.seaweedfs.svc.cluster.local:8888/metrics
 
 ## Scaling
 
-To add more volume servers:
-1. Edit `volume_replicas` in the deployment playbook
-2. Re-run the deployment
-3. SeaweedFS automatically rebalances data
+`10_deploy.yaml` sets one replica each for master, volume and filer, and
+pins all three to the control plane node with a `kubernetes.io/hostname`
+nodeSelector. There is no variable for the number of volume servers.
 
 ## Troubleshooting
 

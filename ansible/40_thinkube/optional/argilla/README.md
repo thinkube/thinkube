@@ -2,6 +2,19 @@
 
 Component #44 in the Thinkube Platform stack.
 
+## Installation
+
+Argilla is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control. It is not installed on its own.
+
+- Install: [00_install.yaml](00_install.yaml)
+- Test: [18_test.yaml](18_test.yaml)
+- Uninstall: [19_rollback.yaml](19_rollback.yaml)
+- Required components: Harbor, Keycloak, OpenSearch, Valkey
+
+The page checks the required components, streams the playbook log while it
+runs, and checks the service health afterwards.
+
 ## Overview
 
 Argilla is an open-source data annotation and curation platform for AI projects. It provides collaborative annotation tools for NLP and LLM tasks, enabling teams to create high-quality training datasets, collect human feedback, and implement active learning workflows. In the Thinkube Platform, Argilla serves as the data labeling infrastructure for supervised learning, RLHF (Reinforcement Learning from Human Feedback), and dataset quality improvement.
@@ -27,8 +40,7 @@ Argilla requires the following Thinkube components:
 
 ```yaml
 kubernetes:
-  distribution: k8s-snap
-  version: "1.34.0"
+  distribution: kubeadm
 
 core_components:
   - name: keycloak
@@ -49,123 +61,14 @@ harbor:
 
 ## Playbooks
 
-Deployment is automatically orchestrated by thinkube-control via [00_install.yaml](00_install.yaml:20-27).
-
-### **Configure Keycloak OIDC** - [10_configure_keycloak.yaml](10_configure_keycloak.yaml)
-
-Creates Keycloak OIDC client for Argilla authentication using the standardized `keycloak_setup` role. Argilla uses custom OAuth2 provider integration with OIDC endpoint configuration.
-
-**Client Configuration**:
-- Client ID: `argilla`
-- Protocol: `openid-connect`
-- Flow: Standard flow + direct access grants
-- Public client: `false` (confidential)
-- Redirect URIs: `/oauth/keycloak/callback`, wildcard
-- Default scopes: `email`, `profile`, `openid`, `offline_access`
-- Access token lifespan: 3600s
-- No custom roles (Argilla manages permissions internally via workspaces and user roles)
-
-**Kubernetes Secret**: Client ID and secret stored in `argilla-oauth-secret` in `argilla` namespace.
-
-### **Deploy Argilla** - [11_deploy.yaml](11_deploy.yaml)
-
-Deploys Argilla with OpenSearch backend, Valkey cache, and Keycloak OIDC authentication.
-
-**Step 1: Namespace and Variable Verification** (lines 43-59)
-- Creates `argilla` namespace
-- Verifies required inventory variables (domain, kubeconfig, Harbor registry, admin credentials)
-
-**Step 2: API Key Generation** (lines 61-81)
-- Generates random API key with format `argilla.apikey.<32-chars>`
-- Creates `argilla-secrets` Kubernetes secret with:
-  - `ARGILLA_API_KEY`: Generated API key for SDK/API access
-  - `DEFAULT_USER_ENABLED`: `true` (creates default admin user)
-  - `DEFAULT_USER_USERNAME`: Admin username from inventory
-  - `DEFAULT_USER_PASSWORD`: Admin password from environment
-  - `DEFAULT_USER_API_KEY`: Same as `ARGILLA_API_KEY`
-
-**Step 3: OpenSearch Service Discovery** (lines 83-91)
-- Queries Kubernetes for `opensearch-cluster-master` service in `opensearch` namespace
-- Validates OpenSearch is deployed and accessible
-
-**Step 4: Deployment** (lines 93-180)
-- Init container: Waits for OpenSearch on port 9200 (busybox netcat)
-- Main container: Argilla latest from Harbor
-  - Port 6900 (HTTP API and web interface)
-  - Search engine: `opensearch`
-  - OpenSearch connection: HTTPS with basic auth (`admin:<password>`), SSL verification disabled
-  - Valkey connection: `redis://valkey.valkey.svc.cluster.local:6379/0` (database 0)
-  - Home path: `/var/lib/argilla` (internal data directory)
-  - OAuth configuration: Mounted from ConfigMap at `/app/.oauth.yml`
-  - Environment from secrets: `USERNAME`, `PASSWORD`, `API_KEY`
-  - Keycloak OIDC endpoint: `https://auth.example.com/realms/thinkube`
-  - Probes: `/api/status` endpoint (60s liveness initial delay, 30s readiness)
-  - Resources: 250m-1 CPU, 512Mi-2Gi memory
-
-**Step 5: Service** (lines 182-198)
-- ClusterIP service on port 6900
-- Internal-only (no external LoadBalancer)
-
-**Step 6: TLS Certificate** (lines 200-223)
-- Copies wildcard TLS certificate from `default` namespace
-- Creates `argilla-tls-secret` in `argilla` namespace
-
-**Step 7: OAuth Configuration** (lines 225-255)
-- Retrieves OAuth client credentials from `argilla-oauth-secret`
-- Creates `.oauth.yml` ConfigMap with Keycloak provider configuration:
-  - Provider name: `keycloak`
-  - Client ID and secret from Keycloak setup
-
-**Step 8: Ingress** (lines 257-286)
-- NGINX ingress with TLS
-- Hostname: `argilla.example.com`
-- Annotations: 100m max body size (for large dataset uploads)
-- Path: `/` (all routes to Argilla service port 6900)
-
-**Step 9: Readiness Check and CLI Configuration** (lines 288-333)
-- Waits for deployment to have all replicas ready (30 retries, 10s delay)
-- Creates config template at `/tmp/argilla-config.yaml`
-- Copies to code-server pod at `/home/thinkube/.argilla/config.yaml`
-- Sets permissions to 600
-- Displays access information: URL, admin username/password, API key
-
-### **Configure Service Discovery** - [17_configure_discovery.yaml](17_configure_discovery.yaml)
-
-Registers Argilla with thinkube-control service discovery system.
-
-**Metadata Extraction** (lines 38-51)
-- Reads `argilla-secrets` Kubernetes secret
-- Extracts `ARGILLA_API_KEY` for environment injection
-
-**ConfigMap Creation** (lines 53-116)
-- Name: `thinkube-service-config` in `argilla` namespace
-- Labels: `thinkube.io/managed`, `thinkube.io/service-type: optional`, `thinkube.io/service-name: argilla`
-- Service metadata:
-  - Display name: "Argilla"
-  - Description: "Data annotation and curation platform for AI"
-  - Category: `ai`
-  - Icon: `/icons/tk_design.svg`
-  - Primary endpoint: Dashboard (`https://argilla.example.com`)
-  - API endpoint: `/api`
-  - Health URL: `/api/status`
-  - Dependencies: `opensearch`, `valkey`
-  - Scaling: Deployment `argilla`, min 1 replica, can disable
-  - Authentication: `jwt_oidc`, OIDC client ID `argilla`
-  - Features: Data annotation, dataset curation, active learning, human feedback collection
-  - Environment variables: `ARGILLA_API_URL`, `ARGILLA_API_KEY`
-
-**Environment Update** (line 133): Updates code-server environment with Argilla API URL and key via `code_server_env_update` role.
-
-## Deployment
-
-Automatically deployed via thinkube-control Optional Components interface at https://thinkube.example.com/optional-components.
-
-The web interface provides:
-- One-click deployment with real-time progress monitoring
-- Automatic dependency verification (Keycloak, OpenSearch, Valkey)
-- WebSocket-based log streaming during installation
-- Health check validation post-deployment
-- Rollback capability if deployment fails
+| Playbook | What it does |
+|---|---|
+| [00_install.yaml](00_install.yaml) | Runs 10, 11 and 17 in order. |
+| [10_configure_keycloak.yaml](10_configure_keycloak.yaml) | Creates the `argilla` namespace and the confidential Keycloak OIDC client `argilla`, and stores its ID and secret in the `argilla-oauth-secret` Secret. |
+| [11_deploy.yaml](11_deploy.yaml) | Creates the `argilla-secrets` Secret with a generated API key, deploys Argilla from Harbor with OpenSearch and Valkey, the Service on port 6900, the TLS secret, the `argilla-oauth-config` ConfigMap and the `argilla-dashboard-route` HTTPRoute, then writes `~/.argilla/config.yaml` into the code-server pod. |
+| [17_configure_discovery.yaml](17_configure_discovery.yaml) | Creates the `thinkube-service-config` ConfigMap for thinkube-control and adds `ARGILLA_API_URL` and `ARGILLA_API_KEY` to the code-server environment. |
+| [18_test.yaml](18_test.yaml) | Test playbook. The file checks the `litellm` namespace and the LiteLLM endpoints. It does not test Argilla. |
+| [19_rollback.yaml](19_rollback.yaml) | Deletes the `argilla` namespace and the Keycloak client `argilla`. |
 
 ## Access Points
 
@@ -237,6 +140,18 @@ Environment variable points to config file:
 ARGILLA_AUTH_OAUTH_CFG=/app/.oauth.yml
 SOCIAL_AUTH_KEYCLOAK_OIDC_ENDPOINT=https://auth.example.com/realms/thinkube
 ```
+
+### Keycloak Client
+
+Created by `10_configure_keycloak.yaml` with the `keycloak_setup` role:
+
+- Client ID: `argilla`, protocol `openid-connect`, confidential (not public)
+- Standard flow and direct access grants enabled
+- Redirect URIs: `https://argilla.<domain>/oauth/keycloak/callback` and `https://argilla.<domain>/*`
+- Default scopes: `email`, `profile`, `openid`, `offline_access`
+- Access token lifespan: 3600 s
+- No roles and no protocol mappers. Argilla manages permissions itself, with workspaces and user roles.
+- Client ID and secret are stored in the `argilla-oauth-secret` Secret in the `argilla` namespace.
 
 ### Default User
 
@@ -763,66 +678,36 @@ kubectl patch deployment -n argilla argilla -p '
 
 **Symptom**: Large dataset uploads fail with 413 or timeout errors
 
-```bash
-# Check ingress body size limit
-kubectl get ingress -n argilla argilla-dashboard -o jsonpath='{.metadata.annotations}'
-```
+Traffic reaches Argilla through the `argilla-dashboard-route` HTTPRoute on the
+Envoy Gateway (`thinkube-gateway` in `gateway-system`). There is no NGINX
+Ingress. The playbooks set no body size or timeout on this route.
 
-**Fix**: Increase body size limit for large uploads
 ```bash
-# Patch ingress annotation
-kubectl patch ingress -n argilla argilla-dashboard -p '
-{
-  "metadata": {
-    "annotations": {
-      "nginx.ingress.kubernetes.io/proxy-body-size": "500m",
-      "nginx.ingress.kubernetes.io/proxy-read-timeout": "300",
-      "nginx.ingress.kubernetes.io/proxy-send-timeout": "300"
-    }
-  }
-}'
+# Check the route and its status
+kubectl get httproute -n argilla argilla-dashboard-route -o yaml
 ```
 
 ## Testing
 
-Tests are defined in [18_test.yaml](18_test.yaml):
-
-```bash
-# Run test playbook
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/argilla/18_test.yaml
-```
-
-**Test Coverage**:
-- Health endpoint responds 200
-- OpenSearch backend connectivity
-- Valkey cache connectivity
-- Keycloak OIDC authentication flow
-- API key authentication
-- Dataset creation via API
-- Record ingestion via SDK
-- Annotation workflow via UI
+[18_test.yaml](18_test.yaml) is the test playbook the Optional Components page
+runs. The file checks the `litellm` namespace and the LiteLLM endpoints. It
+does not test Argilla.
 
 ## Rollback
 
-Rollback is defined in [19_rollback.yaml](19_rollback.yaml):
-
-```bash
-# Rollback Argilla deployment
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/argilla/19_rollback.yaml
-```
+[19_rollback.yaml](19_rollback.yaml) runs when Argilla is removed from the
+Optional Components page.
 
 **Rollback Actions**:
-- Deletes Argilla deployment, service, ingress
-- Removes `argilla` namespace
-- Deletes Keycloak `argilla` client
-- **Preserves** OpenSearch indices (data retention - datasets and annotations remain)
-- **Does not affect** Valkey (shared cache, no Argilla-specific data persistence)
-- Removes service discovery ConfigMap
-- Updates code-server environment to remove Argilla variables
+- Deletes the `argilla` namespace, with the deployment, service, HTTPRoute,
+  secrets and the service discovery ConfigMap in it
+- Deletes the Keycloak `argilla` client
+- Does not touch OpenSearch: the indices with datasets and annotations remain
+- Does not touch Valkey (shared cache, no Argilla data kept there)
+- Does not remove the Argilla variables from the code-server environment or
+  `~/.argilla/config.yaml` in the code-server pod
 
-**Note**: OpenSearch index preservation allows re-deployment without data loss. Manual cleanup required if full data deletion is desired.
+**Note**: Because the OpenSearch indices remain, a new install finds the old data. Delete them by hand if you want all data gone.
 
 ## References
 

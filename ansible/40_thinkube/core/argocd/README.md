@@ -2,46 +2,40 @@
 
 This directory contains playbooks for deploying, configuring, and testing ArgoCD - a GitOps continuous delivery tool for Kubernetes.
 
+## Installation
+
+ArgoCD is a core component. The Thinkube installer installs it by running
+`00_install.yaml`, which runs `10_configure_keycloak.yaml`, `11_deploy.yaml`,
+`12_get_credentials.yaml`, `13_setup_serviceaccount.yaml` and
+`17_configure_discovery.yaml` in that order. It is not installed on its own.
+
 ## Security Notice
 
-The ArgoCD deployment uses TLS for secure connections:
+The ArgoCD server runs in insecure mode (`server.insecure: "true"` in the
+Helm values). It serves plain HTTP, and the cluster gateway (Envoy Gateway)
+terminates TLS:
 
-1. ArgoCD server is configured with TLS termination at the Ingress level
-2. The wildcard certificate from the default namespace is used for TLS
-3. CLI commands connect securely through the gRPC Ingress
+1. One HTTPRoute, `argocd-httproute`, sends `argocd.<domain_name>` to the
+   `argocd-server` service. The gateway's `https` listener uses the wildcard
+   certificate.
+2. Envoy Gateway cannot mix TLS passthrough and TLS termination on the same
+   port. So ArgoCD cannot keep its own TLS behind the shared gateway.
+3. The `argocd-server` service sets `appProtocol: kubernetes.io/h2c`. Envoy
+   then talks HTTP/2 cleartext to the backend. gRPC needs HTTP/2; over
+   HTTP/1.1 the gRPC calls fail with 404.
 
-**Important Note on Ingress Configuration:**
-
-According to the [official ArgoCD documentation](https://argo-cd.readthedocs.io/en/stable/operator-manual/ingress/), when using separate Ingress resources for HTTP and gRPC (as we do in this deployment), the ArgoCD server must run in insecure mode. This is a requirement for the gRPC API to work properly with Nginx Ingress.
-
-The server is still accessible only via HTTPS because TLS termination happens at the Ingress level:
-- The HTTP/HTTPS Ingress uses the `nginx.ingress.kubernetes.io/backend-protocol: "HTTP"` annotation
-- The gRPC Ingress uses the `nginx.ingress.kubernetes.io/backend-protocol: "GRPC"` annotation
-- Both Ingresses use the same TLS certificate
-
-For more details, see [How to eat the gRPC cake and have it too!](https://blog.argoproj.io/how-to-eat-the-grpc-cake-and-have-it-too-77bc4ed555f6) from the ArgoCD team.
+The server is still reached only over HTTPS, because TLS ends at the gateway.
+See the [official ArgoCD documentation](https://argo-cd.readthedocs.io/en/stable/operator-manual/ingress/).
 
 ### ArgoCD CLI Configuration
 
-The ArgoCD CLI must use the `--insecure` flag when connecting to the ArgoCD API server because:
-
-1. The server is running in insecure mode (required for the gRPC ingress to work)
-2. The gRPC connection between CLI and server requires this special handling
-3. This does not compromise security as TLS termination happens at the Ingress level
-
-As explained in the [official ArgoCD documentation](https://argo-cd.readthedocs.io/en/stable/operator-manual/ingress/):
-
-> When using separate hostnames for the UI and gRPC API, the API server should be run with TLS disabled. This is because the gRPC API server and the UI server cannot share the same TLS certificate if they each have their own hostname.
-
-This is why the following configuration is used:
-- The ArgoCD server runs with the `--insecure` flag in the Helm chart
-- The `argocd_cli_insecure` variable is set to `true` in the service account setup playbook
-- API calls to the server use the `-k` flag with curl
-
-If you're using the ArgoCD CLI manually, you'll need to include the `--insecure` flag:
+The UI and the gRPC API share one hostname: `argocd_hostname` and
+`argocd_grpc_hostname` are both `argocd.{{ domain_name }}` in the inventory.
+The CLI connects over TLS through the gateway, without `--insecure`
+(`argocd_cli_insecure: false` in `13_setup_serviceaccount.yaml`):
 
 ```bash
-argocd login argocd-grpc.thinkube.com --insecure --username admin --password $ADMIN_PASSWORD
+argocd login argocd.<domain_name> --username admin --password $ADMIN_PASSWORD
 ```
 
 ## Component Overview
@@ -59,9 +53,9 @@ ArgoCD enables declarative, Git-based management of Kubernetes resources. It is 
 
 ## Dependencies
 
-- CORE-001: k8s-snap Control Node
-- CORE-003: Cert-Manager (for TLS certificates)
-- CORE-004: Keycloak (for authentication)
+- Kubernetes (kubeadm) control plane
+- Wildcard TLS certificate (`infrastructure/acme-certificates`) and the Gateway API gateway
+- Keycloak (for authentication)
 
 ## Playbooks
 
@@ -80,7 +74,7 @@ Deploys ArgoCD via Helm with proper configuration:
 - Creates ArgoCD namespace
 - Copies wildcard certificate from default namespace
 - Deploys ArgoCD Helm chart with custom admin username
-- Configures ingress for both web UI and gRPC API
+- Creates the HTTPRoute for the web UI and gRPC API
 - Sets up OIDC and RBAC configuration
 
 ### 12_get_credentials.yaml
@@ -99,18 +93,22 @@ Configures service account and installs ArgoCD CLI:
 - Verifies token functionality
 - Saves token to .env file
 
+### 17_configure_discovery.yaml
+
+Creates the service-discovery ConfigMap that describes ArgoCD's endpoints.
+
 ### 18_test.yaml
 
 Tests ArgoCD deployment:
 - Verifies pods are running
-- Tests ingress and TLS certificates
+- Tests the route and TLS certificate
 - Checks OIDC and RBAC configuration
 - Validates API access
 
 ### 19_rollback.yaml
 
 Removes ArgoCD installation:
-- Removes ingress resources
+- Removes route resources
 - Uninstalls Helm release
 - Deletes service accounts and bindings
 - Cleans up namespace
@@ -146,7 +144,7 @@ Each playbook can be run individually:
 ## Access Information
 
 - Web UI: https://argocd.[domain_name]
-- gRPC API: https://argocd-grpc.[domain_name]
+- gRPC API: https://argocd.[domain_name] (same hostname)
 - Admin username: `admin` (ArgoCD requires this specific username)
 - Admin password: Initially random, then changed to ADMIN_PASSWORD value by 13_setup_serviceaccount.yaml
 - SSO User: Realm user in Keycloak with access via argocd-admins group

@@ -4,6 +4,14 @@ Installs `kubeadm`, `kubelet`, `kubectl` from the upstream `pkgs.k8s.io`
 apt repository at a pinned version, applies kubeadm's preflight
 requirements, and holds the packages.
 
+
+## Installation
+
+This role is part of the Kubernetes install. The Thinkube installer runs
+`40_thinkube/core/infrastructure/k8s/10_install_k8s.yaml` (control plane)
+and `20_join_workers.yaml` (workers), and both import this role. It is not
+installed on its own.
+
 ## What it provides
 
 - `kubeadm`, `kubelet`, `kubectl` from

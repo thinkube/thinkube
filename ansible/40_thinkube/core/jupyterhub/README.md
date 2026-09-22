@@ -1,102 +1,92 @@
-# JupyterHub with Dynamic Image Discovery
+# JupyterHub
 
-Fast-deploying Jupyter notebook environment with GPU flexibility, SeaweedFS storage, and dynamic image discovery from thinkube-control.
+Fast-deploying Jupyter notebook environment with GPU flexibility, JuiceFS storage, and runtime configuration from thinkube-control.
+
+## Installation
+
+JupyterHub is a core component. The Thinkube installer installs it by running
+`00_install.yaml`, which runs `10_configure_keycloak.yaml`, `11_deploy.yaml`,
+`16_configure_code_server_storage.yaml` and `17_configure_discovery.yaml` in
+that order. It is not installed on its own. `99_build_venvs.yaml` is not part
+of the install: maintainers run it to build new venv releases.
 
 ## Overview
 
 JupyterHub deployment features:
 - **Fast Deployment**: 2 minutes (images built separately)
 - **GPU Flexibility**: Notebooks run on any GPU node
-- **Mandatory Dependencies**: Keycloak, SeaweedFS, thinkube-control (no fallbacks)
-- **Dynamic Discovery**: Images queried from thinkube-control at runtime
-- **Hybrid Storage**: SeaweedFS persistence + local scratch performance
+- **Mandatory Dependencies**: Keycloak, JuiceFS, thinkube-control (no fallbacks)
+- **Dynamic Discovery**: Cluster resources and JupyterHub configuration queried from thinkube-control at spawn time
+- **Hybrid Storage**: JuiceFS persistence + local scratch and venvs for performance
 - **No Conditionals**: Fails fast if dependencies unavailable
 
 ## Architecture
 
 ### Volume Mount Strategy
 
-The JupyterHub deployment uses a specific volume mount architecture to preserve Python packages installed in Docker images while providing persistent storage:
+The notebook image runs as user `thinkube` (UID 1000) with home
+`/home/thinkube/`. Volumes mount at subdirectories. The home folder itself is
+never mounted over:
 
 ```
-/home/jovyan/                    # User home (NOT mounted - preserves .local/bin/)
-├── .local/                      # Python packages from image (preserved)
-│   └── bin/                     # Contains jupyterhub-singleuser binary
-├── .thinkube_env                # Environment variables (from image)
-└── thinkube/                    # Mount point for persistent volumes
-    └── notebooks/               # User's persistent storage
-        ├── templates/           # Read-only examples (symlink to /opt/thinkube/examples)
-        ├── examples/            # Editable copies of examples
-        │   ├── tk-jupyter-ml-cpu/     # CPU image examples
-        │   ├── tk-jupyter-ml-gpu/     # GPU image examples
-        │   └── tk-jupyter-scipy/      # SciPy image examples
-        ├── datasets/            # Shared datasets (500GB)
-        └── models/              # Shared models (200GB)
+/home/thinkube/                  # User home (NOT mounted - keeps image content)
+├── .local/  .config/  .cache/   # Created in the image, owned by the user; ~/.local/bin is on PATH
+├── .config/thinkube/            # Service discovery env file (emptyDir, written by an init container)
+├── venvs/                       # Python venvs (hostPath /var/lib/jupyterhub-venvs on each node)
+├── scratch/                     # Local scratch (emptyDir, 100Gi limit)
+└── thinkube/
+    ├── notebooks/               # User's persistent storage (JuiceFS, 100Gi)
+    │   └── examples/            # Editable copies of examples (copied once)
+    ├── templates/               # Examples repository (emptyDir, re-cloned on every start)
+    ├── datasets/                # Shared datasets (JuiceFS, 500Gi)
+    ├── models/                  # Shared models (JuiceFS, 200Gi)
+    └── mlflow/                  # MLflow artifacts (same JuiceFS volume MLflow writes to)
 ```
 
 **Key Design Decisions:**
-- Volumes mount at `/home/jovyan/thinkube/` subdirectories, NOT at `/home/jovyan/`
-- This preserves the `.local/` directory containing Python packages
-- No separate home PVC - simplifies architecture
-- Each image type gets its own examples folder to prevent conflicts
+- Volumes mount at `/home/thinkube/thinkube/` subdirectories (and `venvs/`, `scratch/`), NOT at `/home/thinkube/`
+- This preserves what the image puts in the home folder
+- No separate home PVC - simplifies architecture. User settings in the home folder last only until the server stops.
 
 ### Why This Architecture?
 
-The critical issue: Docker's overlay filesystem behavior when mounting volumes:
-- If we mount at `/home/jovyan/`, it hides everything in that directory from the image
-- This includes `/home/jovyan/.local/bin/` where `jupyterhub-singleuser` is installed
-- Result: "jupyterhub-singleuser: not found" errors and pod startup failures
+A volume mounted over a directory hides everything the image put in that
+directory:
+- If a volume is mounted at the home folder, it hides `~/.local/`, `~/.config/` and `~/.cache/` from the image
+- Anything installed there is lost; a command installed in `~/.local/bin/` is no longer found
+- In older images `jupyterhub-singleuser` was installed in `~/.local/bin/`. Mounting over the home folder then gave "jupyterhub-singleuser: not found" errors and pod startup failures
+- `tk-jupyter-base` installs JupyterLab and JupyterHub in the system Python. The home rule still holds for the rest of the home folder
+- Kubernetes creates any missing parent of a mount as root. So the image creates `~/.config`, `~/.cache` and `~/.local/share` owned by the user before anything mounts beneath them
 
-The solution: Mount at subdirectories under `/home/jovyan/thinkube/`:
-- Preserves all image-installed packages in `.local/`
+The solution: Mount at subdirectories under `/home/thinkube/thinkube/`:
+- Preserves all image content in the home folder
 - Provides persistent storage for user work
 - Maintains clean separation between image content and user data
 
-## Docker Images
+## Notebook Image and Venvs
 
-All images use `--user` installation to install packages in `/home/jovyan/.local/`:
+JupyterHub uses one image, `tk-jupyter-base`, built by
+`../harbor-images/15_build_jupyter_images.yaml`:
+- Base: NVIDIA PyTorch from NGC
+- JupyterLab 4.5.0 and JupyterHub 5.3.0 (required for the jupyterhub-singleuser command), installed in the system Python
 
-1. **tk-jupyter-scipy** - Scientific Python computing
-   - Base: jupyter/scipy-notebook:latest
-   - Python: 3.12
-   - Includes: NumPy, Pandas, Matplotlib, Seaborn, Scikit-learn
-   - All Thinkube service clients
-
-2. **tk-jupyter-ml-cpu** - Machine Learning without GPU
-   - Base: Ubuntu 24.04 (built from scratch)
-   - Python: 3.12
-   - PyTorch CPU: 2.5.1+cpu with CPU-optimized binaries
-   - Includes: Transformers, Datasets, Accelerate
-   - All Thinkube service clients (PostgreSQL, Redis, Qdrant, OpenSearch, MLflow, etc.)
-
-3. **tk-jupyter-ml-gpu** - Machine Learning with CUDA
-   - Base: NVIDIA CUDA 12.6 with cuDNN
-   - Python: 3.12
-   - PyTorch: 2.5.1 with CUDA 12.6 support
-   - Includes: Transformers, Datasets, Accelerate
-   - All Thinkube service clients
-
-### Package Management
-
-All packages are pinned to specific versions for reproducibility:
-- JupyterLab: 4.4.9
-- JupyterHub: 5.3.0 (required for jupyterhub-singleuser command)
-- PyTorch: 2.5.1 (GPU) / 2.5.1+cpu (CPU)
-- Transformers: 4.56.2
-- See Dockerfiles for complete version list
+ML packages are not in the image. They live in Python venvs:
+- An init container, `setup-venvs`, downloads the `fine-tuning` and `agent-dev` venvs for the node's architecture from https://github.com/thinkube/thinkube-venvs/releases (version `jupyter_venvs_version`, default `v0.1.0`) and registers them as Jupyter kernels
+- The venvs are kept on each node at `/var/lib/jupyterhub-venvs` and mounted at `/home/thinkube/venvs`
+- `99_build_venvs.yaml` builds new venv tarballs for every GPU architecture in the cluster and uploads them to a GitHub release (needs `gh` authenticated). The package list is `venv-packages.txt`
 
 ## Prerequisites
 
 1. **Core Components**:
-   - CORE-001: Kubernetes (k8s-snap) cluster with GPU operator (if using GPUs)
-   - CORE-002: Keycloak deployed (mandatory for authentication)
-   - CORE-004: Harbor registry deployed
-   - SeaweedFS deployed with CSI driver
+   - Kubernetes (kubeadm) cluster with GPU operator (if using GPUs)
+   - Keycloak deployed (mandatory for authentication)
+   - Harbor registry deployed, with `tk-jupyter-base` built
+   - JuiceFS deployed (`juicefs-rwx` StorageClass and the MLflow volume)
+   - thinkube-control running
    - TLS certificates configured
 
 2. **Environment Variables**:
-   - `HARBOR_ROBOT_TOKEN`: Harbor robot account token
-   - `KEYCLOAK_ADMIN_PASSWORD`: Keycloak admin password
+   - `ADMIN_PASSWORD`: Keycloak admin password
 
 3. **Required Variables** (from inventory):
    - `harbor_registry`: Registry domain
@@ -108,25 +98,17 @@ All packages are pinned to specific versions for reproducibility:
 
 JupyterHub uses a public GitHub repository for example notebooks:
 - **Repository**: https://github.com/thinkube/thinkube-notebooks-examples
-- **Structure**: Organized by image type (common, ml-cpu, ml-gpu, fine-tuning, agent-dev)
-- **Auto-sync**: Examples updated daily via CronJob
+- **Auto-sync**: Cloned again on every pod start by the `clone-templates` init container
 - **Fail-fast**: Deployment fails if examples repository unavailable
 
 ### Examples Architecture
 
 ```
-/home/jovyan/thinkube/
-├── examples-repo/          # Read-only mount of cloned repository
-│   └── thinkube-notebooks-examples/
-│       ├── common/         # Examples for all images
-│       ├── ml-cpu/        # CPU-specific examples
-│       ├── ml-gpu/        # GPU-specific examples
-│       ├── fine-tuning/   # Fine-tuning examples
-│       └── agent-dev/     # Agent development examples
-├── notebooks/
-│   ├── templates/         # Symlink to examples-repo (read-only)
-│   └── examples/          # Editable copies per image type
-└── ...
+/home/thinkube/thinkube/
+├── templates/             # Repository contents (emptyDir, re-cloned on every start)
+│   └── examples/
+└── notebooks/
+    └── examples/          # Editable copies, made once (guarded by .copied)
 ```
 
 ### Managing Examples
@@ -166,29 +148,31 @@ nbstripout notebook.ipynb
 
 ## Deployment Process
 
-### 1. Build Custom ML/AI Images
+### 1. Build the Notebook Image
 
 ```bash
 cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/14_build_base_images.yaml
+./scripts/run_ansible.sh ansible/40_thinkube/core/harbor-images/15_build_jupyter_images.yaml
 ```
 
-This builds and pushes all Jupyter images to Harbor registry.
+This builds and pushes `tk-jupyter-base` to Harbor registry.
 
 ### 2. Deploy JupyterHub
 
 ```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/11_deploy.yaml
+./scripts/run_ansible.sh ansible/40_thinkube/core/jupyterhub/10_configure_keycloak.yaml
+./scripts/run_ansible.sh ansible/40_thinkube/core/jupyterhub/11_deploy.yaml
 ```
 
-This will:
-- Retrieve OIDC secret from existing Keycloak configuration
-- Create SeaweedFS volumes for persistent storage (notebooks, datasets, models)
-- Deploy JupyterHub with dynamic image discovery
-- Configure volume mounts at `/home/jovyan/thinkube/` to preserve packages
-- Set up Ingress for external access
+`11_deploy.yaml` will:
+- Read the OIDC secret `jupyterhub-oidc-secret` created by `10_configure_keycloak.yaml`
+- Create JuiceFS PVCs for persistent storage (notebooks 100Gi, datasets 500Gi, models 200Gi) and a static PV for the MLflow artifacts volume
+- Deploy JupyterHub (Helm) with the spawn form that queries thinkube-control
+- Configure volume mounts at `/home/thinkube/thinkube/` to preserve the home folder
+- Create the HTTPRoute `jupyterhub-httproute` for `notebooks.<domain_name>`
 
-**Note**: Keycloak must already be configured with the JupyterHub client. The deployment retrieves the existing OIDC secret.
+`16_configure_code_server_storage.yaml` then mounts the same JuiceFS paths in
+code-server, through static PVs.
 
 ### 3. Examples
 
@@ -199,11 +183,11 @@ templates track the repository without a scheduled job.
 ### 4. Verify Deployment
 
 ```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/18_test.yaml
+./scripts/run_ansible.sh ansible/40_thinkube/core/jupyterhub/18_test.yaml
 ```
 
 This verifies:
-- SeaweedFS volume accessibility
+- JuiceFS volume accessibility
 - Examples repository availability
 - Custom image availability
 - GPU detection (if available)
@@ -212,7 +196,7 @@ This verifies:
 
 ## Access Information
 
-- **URL**: `https://jupyter.<domain_name>`
+- **URL**: `https://notebooks.<domain_name>`
 - **Authentication**: Keycloak SSO (mandatory)
 - **Admin User**: `<admin_username>` from inventory
 
@@ -220,84 +204,47 @@ This verifies:
 
 ### Profile Selection
 
-JupyterHub dynamically discovers available images from thinkube-control. Users can choose from:
-
-- **tk-jupyter-scipy** - Scientific computing with SciPy stack
-- **tk-jupyter-ml-cpu** - Machine learning development (CPU-optimized PyTorch)
-- **tk-jupyter-ml-gpu** - Deep learning with GPU acceleration (CUDA PyTorch)
+The image is fixed to `tk-jupyter-base`. Users choose the node, CPU and
+memory in the spawn form, and pick a venv as the kernel in JupyterLab.
 
 ### Working with Storage
 
-#### Directory Structure
-```
-/home/jovyan/thinkube/
-├── examples-repo/              # Read-only cloned repository
-│   └── thinkube-notebooks-examples/
-│       ├── common/             # Examples for all images
-│       ├── ml-cpu/
-│       ├── ml-gpu/
-│       ├── fine-tuning/
-│       └── agent-dev/
-├── notebooks/
-│   ├── templates/              # Symlink to examples-repo (read-only)
-│   ├── examples/               # Your editable copies (per image type)
-│   │   ├── tk-jupyter-ml-cpu/
-│   │   ├── tk-jupyter-ml-gpu/
-│   │   ├── tk-jupyter-fine-tuning/
-│   │   └── tk-jupyter-agent-dev/
-│   ├── projects/               # Your project notebooks
-│   └── experiments/            # Experimental work
-├── datasets/                   # Shared datasets (500GB SeaweedFS)
-└── models/                     # Trained models (200GB SeaweedFS)
-```
-
-#### Persistent Storage (SeaweedFS)
-- `/home/jovyan/thinkube/notebooks` - Your notebooks and work (100GB)
-- `/home/jovyan/thinkube/datasets` - Shared datasets across all pods
-- `/home/jovyan/thinkube/models` - Saved models accessible from any pod
+#### Persistent Storage (JuiceFS)
+- `/home/thinkube/thinkube/notebooks` - Your notebooks and work (100Gi)
+- `/home/thinkube/thinkube/datasets` - Shared datasets across all pods (500Gi)
+- `/home/thinkube/thinkube/models` - Saved models accessible from any pod (200Gi)
+- `/home/thinkube/thinkube/mlflow` - MLflow artifacts, the same files MLflow stores
 
 #### Environment Variables
-- `.thinkube_env` - Automatically sourced, contains service endpoints
+- `~/.config/thinkube/service-env-jh.sh` - Written at pod start by the service-discovery init container and sourced, contains service endpoints
 
-### Example Workflows
+### Example Workflow
 
-1. **GPU Training with PyTorch**:
-   - Select `tk-jupyter-ml-gpu` image
-   - Work in `/home/jovyan/thinkube/notebooks/`
-   - Load datasets from `/home/jovyan/thinkube/datasets/`
-   - Save models to `/home/jovyan/thinkube/models/`
-   - Example notebooks in `/home/jovyan/thinkube/notebooks/templates/`
-
-2. **CPU-based ML Development**:
-   - Select `tk-jupyter-ml-cpu` image (optimized PyTorch CPU binaries)
-   - Develop in `/home/jovyan/thinkube/notebooks/`
-   - Use transformers and datasets libraries
-   - Connect to Thinkube services via environment variables
-
-3. **Scientific Computing**:
-   - Select `tk-jupyter-scipy` image
-   - Use NumPy, Pandas, Matplotlib for analysis
-   - Save results to persistent notebooks directory
+- Pick the `fine-tuning` or `agent-dev` kernel
+- Work in `/home/thinkube/thinkube/notebooks/`
+- Load datasets from `/home/thinkube/thinkube/datasets/`
+- Save models to `/home/thinkube/thinkube/models/`
+- Example notebooks in `/home/thinkube/thinkube/templates/`
 
 ## Maintenance
 
 ### Rebuild Images
 
-To update the Jupyter images:
+To update the Jupyter image:
 
 ```bash
 cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/14_build_base_images.yaml
+./scripts/run_ansible.sh ansible/40_thinkube/core/harbor-images/15_build_jupyter_images.yaml
 ```
 
-Images are automatically discovered by JupyterHub from thinkube-control.
+The Helm values set `pullPolicy: Always`, so new servers pull the new image.
 
 ### Rollback
 
 To remove JupyterHub completely:
 
 ```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/jupyterhub/19_rollback.yaml
+./scripts/run_ansible.sh ansible/40_thinkube/core/jupyterhub/19_rollback.yaml
 ```
 
 ## Troubleshooting
@@ -322,14 +269,13 @@ kubectl logs -n jupyterhub jupyter-<username>
 ### Common Issues
 
 1. **"jupyterhub-singleuser: not found" Error**:
-   - **Cause**: Volume mounted at `/home/jovyan/` hides `.local/bin/`
-   - **Solution**: Ensure volumes mount at `/home/jovyan/thinkube/` subdirectories
-   - Verify Dockerfiles use `--user` installation, not system-wide
-   - Check that jupyterhub package is installed in the image
+   - **Cause**: the jupyterhub package is missing from the image, or a volume mounted over the folder that holds the command hides it (for example a volume at `/home/thinkube/` hides `~/.local/bin/`)
+   - **Solution**: Ensure volumes mount at `/home/thinkube/thinkube/` subdirectories, never at the home folder
+   - Check that the jupyterhub package is installed in the image (`tk-jupyter-base` installs it in the system Python)
 
 2. **Storage Not Accessible**:
-   - Verify SeaweedFS is running: `kubectl get pods -n seaweedfs`
-   - Check CSI driver: `kubectl get pods -n seaweedfs-csi`
+   - Verify JuiceFS CSI driver: `kubectl get pods -n kube-system -l app.kubernetes.io/name=juicefs-csi-driver`
+   - Verify PostgreSQL and SeaweedFS (JuiceFS metadata and data) are running
    - Ensure PVCs are bound: `kubectl get pvc -n jupyterhub`
 
 3. **GPU Not Available**:
@@ -339,7 +285,7 @@ kubectl logs -n jupyterhub jupyter-<username>
 
 4. **Image Pull Errors**:
    - Verify Harbor connectivity: `curl -k https://registry.<domain>/api/v2.0/health`
-   - Check image exists in Harbor: `registry.<domain>/library/tk-jupyter-*`
+   - Check image exists in Harbor: `registry.<domain>/library/tk-jupyter-base`
    - Verify images are properly pushed during build
 
 5. **Authentication Issues**:
@@ -360,15 +306,15 @@ kubectl logs -n jupyterhub jupyter-<username>
 
 ## Performance Considerations
 
-- **SeaweedFS**: Optimized for small files (notebooks), may be slower for large datasets
-- **Scratch Space**: Use `/home/jovyan/scratch/` for temporary large files requiring fast I/O
+- **Venvs**: Kept on local node disk, because JuiceFS is slow with many small files
+- **Scratch Space**: Use `/home/thinkube/scratch/` for temporary large files requiring fast I/O
 - **GPU Scheduling**: Auto-select profile uses Kubernetes scheduler for optimal placement
 - **Image Sizes**: GPU images are large (~10GB), initial pull may take time
 
 ## Security Notes
 
 - Keycloak provides mandatory SSO authentication
-- All traffic is TLS-encrypted via ingress
+- All traffic is TLS-encrypted; the gateway terminates TLS
 - Shared-code mount is read-only to prevent accidental modifications
 - No fallback authentication - if Keycloak is down, JupyterHub is inaccessible
 
@@ -378,14 +324,12 @@ The examples repository and volume mount strategy provides:
 
 1. **Decoupled Updates**: Examples updated without rebuilding Docker images
 2. **Version Control**: Public GitHub repository enables community contributions
-3. **Auto-Sync**: Daily updates keep examples fresh automatically
+3. **Auto-Sync**: Templates are cloned again on every pod start
 4. **Fail-Fast**: Deployment fails immediately if dependencies unavailable
-5. **Image-Aware**: Each image type gets relevant examples only
-6. **Package Preservation**: Python packages in `.local/` remain accessible
-7. **Clean Separation**: Image content and user data don't conflict
-8. **Multi-Image Support**: Different images can coexist without conflicts
-9. **Persistence**: SeaweedFS ensures notebooks survive pod restarts
-10. **Dynamic Discovery**: New images automatically available without config changes
+5. **Home Preservation**: Image content in the home folder remains accessible
+6. **Clean Separation**: Image content and user data don't conflict
+7. **Persistence**: JuiceFS ensures notebooks survive pod restarts and are visible on every node
+8. **Dynamic Discovery**: The spawn form reads cluster resources from thinkube-control
 
 ## License
 

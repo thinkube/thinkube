@@ -2,45 +2,38 @@
 
 PgAdmin is a web-based administration tool for PostgreSQL databases. This deployment provides a fully-featured PgAdmin instance with Keycloak OIDC authentication.
 
+## Installation
+
+PgAdmin is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install, `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. It requires the `postgresql` and `keycloak` components.
+
 ## Overview
 
 - **Component Type**: Optional
 - **Namespace**: `pgadmin`
-- **Default Access**: https://pgadmin.{{ domain_name }}
+- **Default Access**: https://pgadmin.{{ domain_name }} (`pgadmin_hostname`)
 - **Authentication**: OIDC with Keycloak (single sign-on)
 
 ## Deployment Structure
 
 ```
+00_install.yaml             # Runs 10, 11 and 17 in order
 10_configure_keycloak.yaml  # Create Keycloak client for PgAdmin
 11_deploy_with_oidc.yaml    # Deploy PgAdmin with OIDC authentication
+17_configure_discovery.yaml # Create the service-discovery ConfigMap
 18_test.yaml                # Validate deployment and configuration
 19_rollback.yaml            # Remove PgAdmin and cleanup resources
 ```
 
 ## Requirements
 
-- Kubernetes (k8s-snap) cluster with ingress controller
-- Cert-manager with wildcard certificate
+- Kubernetes (kubeadm) cluster with the Gateway API gateway
+- Wildcard TLS certificate (`infrastructure/acme-certificates`)
 - PostgreSQL databases to manage
 - Keycloak instance running and accessible
 - ADMIN_PASSWORD environment variable set
-
-## Deployment
-
-Deploy PgAdmin with OIDC authentication:
-
-```bash
-cd ~/thinkube
-# Set admin password
-export ADMIN_PASSWORD='your-admin-password'
-
-# Step 1: Create Keycloak client
-./scripts/run_ansible.sh ansible/40_thinkube/optional/pgadmin/10_configure_keycloak.yaml
-
-# Step 2: Deploy PgAdmin with OIDC
-./scripts/run_ansible.sh ansible/40_thinkube/optional/pgadmin/11_deploy_with_oidc.yaml
-```
 
 ## PostgreSQL Configuration
 
@@ -68,10 +61,9 @@ Validate the deployment:
 Tests verify:
 - Namespace and resources exist
 - Pods are running
-- Service and ingress configured
+- Service and HTTPRoute (`pgadmin-httproute`) configured
 - TLS certificate present
 - HTTP connectivity working
-- OIDC configuration (if enabled)
 
 ## Configuration Variables
 
@@ -79,12 +71,12 @@ Required inventory variables:
 - `domain_name`: Base domain for the cluster
 - `admin_username`: Admin username for applications
 - `kubectl_bin`: Path to kubectl binary
-- `primary_ingress_class`: Ingress class to use
+- `pgadmin_hostname`: `pgadmin.{{ domain_name }}` in `inventory/group_vars/k8s.yml`
 
 For OIDC configuration:
 - `keycloak_url`: Keycloak server URL
 - `keycloak_realm`: Keycloak realm name
-- `KEYCLOAK_ADMIN_PASSWORD`: Environment variable with admin password
+- `ADMIN_PASSWORD`: Environment variable with the Keycloak admin password
 
 ## Features
 
@@ -97,14 +89,13 @@ For OIDC configuration:
 
 ### Security
 - TLS encryption for all connections
-- Optional OIDC authentication
+- OIDC authentication
 - Session management
 - Secure cookie configuration
 
 ### Integration
 - Keycloak SSO support
 - Kubernetes-native deployment
-- Persistent storage support
 - Configurable resource limits
 
 ## Troubleshooting
@@ -115,10 +106,10 @@ kubectl get pods -n pgadmin
 kubectl logs -n pgadmin -l app=pgadmin
 ```
 
-### Verify Ingress
+### Verify HTTPRoute
 ```bash
-kubectl get ingress -n pgadmin
-kubectl describe ingress pgadmin-ingress -n pgadmin
+kubectl get httproute -n pgadmin
+kubectl describe httproute pgadmin-httproute -n pgadmin
 ```
 
 ### OIDC Issues
@@ -129,20 +120,14 @@ kubectl describe ingress pgadmin-ingress -n pgadmin
 
 ## Rollback
 
-Remove PgAdmin deployment:
-
-```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/pgadmin/19_rollback.yaml
-```
-
-This will:
-- Delete all PgAdmin resources
-- Remove the namespace
-- Clean up Keycloak client (if configured)
+Removing PgAdmin from the Optional Components page runs `19_rollback.yaml`.
+It:
+- Deletes the HTTPRoute, Service, Deployment, ConfigMaps and TLS secret
+- Removes the namespace
+- Does not remove the `pgadmin` Keycloak client
 
 ## Notes
 
-- Default deployment uses basic authentication
-- OIDC configuration replaces basic auth completely
+- OIDC is the only login; there is no basic authentication
 - Database connections are configured through the UI
-- Consider persistent volumes for production use
+- PgAdmin data is in `emptyDir` volumes, so it is lost when the pod restarts

@@ -2,6 +2,15 @@
 
 Component #31 in the Thinkube Platform stack.
 
+## Installation
+
+Prometheus is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install (it runs `10_install_tools.yaml`,
+`11_deploy.yaml` and `17_service_discovery.yaml` in order), `18_test.yaml` to
+test and `19_rollback.yaml` to remove it. The component catalogue lists no
+required components.
+
 ## Overview
 
 Prometheus is a complete metrics collection and monitoring system deployed via the [kube-prometheus](https://github.com/prometheus-operator/kube-prometheus) stack. It provides comprehensive observability for the entire Thinkube platform with recording rules optimized for Kubernetes workloads.
@@ -11,7 +20,6 @@ Prometheus is a complete metrics collection and monitoring system deployed via t
 - **Recording Rules**: Pre-configured kubernetes-mixin rules for efficient metric aggregation
 - **Multi-component Exporters**: kube-state-metrics, node-exporter, blackbox-exporter, prometheus-adapter
 - **GPU Monitoring**: NVIDIA DCGM exporter integration for ML workload metrics
-- **Ingress Monitoring**: NGINX Ingress Controller metrics collection
 - **Perses Integration**: Recording rules compatible with Perses community dashboards
 
 ## Dependencies
@@ -25,8 +33,7 @@ This component depends on the following Thinkube components:
 ```yaml
 requirements:
   kubernetes:
-    version: "1.34.0"
-    provider: "k8s-snap"
+    provider: "kubeadm"
 
   resources:
     prometheus:
@@ -113,8 +120,11 @@ Deploys Prometheus Operator with kube-prometheus stack following the official qu
 
 - **ServiceMonitor Configuration**
   - Creates ServiceMonitor for NVIDIA DCGM Exporter (gpu-operator namespace)
-  - Creates ServiceMonitor for NGINX Ingress Controller (ingress namespace)
-  - Configures 30s scrape interval for both
+  - Configures 30s scrape interval
+
+- **DNS probes and Cilium drops**
+  - Opens 9100/tcp on every node for node-exporter
+  - Deploys the DNS probe exporter and the PodMonitors described below
 
 ### **Service Discovery**
 **File**: [17_service_discovery.yaml](17_service_discovery.yaml)
@@ -127,8 +137,8 @@ Registers Prometheus with Thinkube service discovery system:
   - Icon: `/icons/tk_monitoring.svg`
 
 - **Endpoints Registered**:
-  - Primary: Prometheus server at `https://prometheus.example.com` (health: `/-/healthy`)
-  - Secondary: Alertmanager at `https://alertmanager.example.com` (health: `/-/healthy`)
+  - Primary: Prometheus server at `https://{{ prometheus_hostname }}` (health: `/-/healthy`)
+  - Secondary: Alertmanager at `https://{{ alertmanager_hostname }}` (health: `/-/healthy`)
 
 - **Metadata**:
   - Authentication: `none` (port-forward access)
@@ -136,14 +146,14 @@ Registers Prometheus with Thinkube service discovery system:
   - License: `Apache-2.0`
 
 - **Environment Variables**:
-  - `PROMETHEUS_URL`: `https://prometheus.example.com`
-  - `ALERTMANAGER_URL`: `https://alertmanager.example.com`
+  - `PROMETHEUS_URL`: `https://{{ prometheus_hostname }}`
+  - `ALERTMANAGER_URL`: `https://{{ alertmanager_hostname }}`
 
 ## Deployment
 
-This component is automatically deployed via the **thinkube-control Optional Components interface**:
+This component is deployed from the **Optional Components** page in thinkube-control:
 
-1. Navigate to https://thinkube.example.com/optional-components
+1. Open the Optional Components page
 2. Locate the **Prometheus** card in the **Monitoring** section
 3. Click **Install** to deploy the component
 4. Monitor real-time deployment progress via WebSocket streaming
@@ -157,12 +167,12 @@ The deployment executes the orchestrator playbook at `/ansible/40_thinkube/optio
 3. Apply setup manifests (namespace, CRDs)
 4. Apply main manifests (Prometheus, Alertmanager, exporters, recording rules)
 5. Configure network policies for Perses integration
-6. Create ServiceMonitors for GPU and Ingress metrics
+6. Create the ServiceMonitor for GPU metrics, the DNS probe exporter and the PodMonitors
 7. Register with service discovery
 
 ## Access Points
 
-Prometheus does not have ingress configured by default. Access is via port-forward:
+Prometheus has no HTTPRoute. Access is via port-forward:
 
 ### Prometheus Server
 
@@ -204,7 +214,7 @@ kubectl get prometheusrule -n monitoring -o yaml
 
 ### External Labels
 
-Prometheus is configured with a `cluster` external label (defaults to empty string). This can be customized in the [11_deploy.yaml](11_deploy.yaml:109) manifest patching step.
+Prometheus is configured with a `cluster` external label (defaults to empty string). This can be customized in the manifest patching step of [11_deploy.yaml](11_deploy.yaml).
 
 ### ServiceMonitor Configuration
 
@@ -213,7 +223,7 @@ Prometheus automatically discovers metrics endpoints via ServiceMonitor resource
 **Included ServiceMonitors**:
 - All kube-prometheus built-in monitors (kubelet, apiserver, kube-state-metrics, node-exporter)
 - NVIDIA DCGM Exporter (GPU metrics from `gpu-operator` namespace)
-- NGINX Ingress Controller (HTTP metrics from `ingress` namespace)
+- PodMonitors `dns-probe` and `cilium-agent` (see "DNS probes, Cilium drops and node-exporter")
 
 To add additional ServiceMonitors, create them in the `monitoring` namespace with appropriate selectors.
 
@@ -257,17 +267,6 @@ ServiceMonitor automatically discovers NVIDIA DCGM Exporter metrics:
 - **Scrape Interval**: 30s
 
 Metrics include GPU utilization, memory usage, temperature, power consumption, etc.
-
-### Ingress Monitoring
-
-ServiceMonitor collects NGINX Ingress Controller metrics:
-
-- **Namespace**: `ingress`
-- **Service Labels**: `app.kubernetes.io/name: ingress-nginx`, `app.kubernetes.io/component: controller`
-- **Port**: `metrics`
-- **Scrape Interval**: 30s
-
-Metrics include request rates, latencies, upstream response times, etc.
 
 ## Troubleshooting
 
@@ -363,21 +362,15 @@ kubectl get pvc -n monitoring
 The test playbook [18_test.yaml](18_test.yaml) verifies:
 - Prometheus Operator deployment is running
 - Prometheus StatefulSet has ready replicas
-- Alertmanager StatefulSet has ready replicas
-- PrometheusRule resources exist
-- Recording rules are loaded
-- ServiceMonitors are configured
+- PrometheusRule resources exist, including the kubernetes-mixin rules
+- Prometheus API is healthy and a recording rule returns data
+- DNS probe exporter DaemonSet and the `dns-probe` / `cilium-agent` PodMonitors exist
+- Every DNS probe, Cilium agent and node-exporter is scraped
 
 ## Rollback
 
-To uninstall Prometheus:
-
-```bash
-cd ~/thinkube
-./scripts/tk_ansible ansible/40_thinkube/optional/prometheus/19_rollback.yaml
-```
-
-**Warning**: This will delete all Prometheus data and configurations. Backup any important data before uninstalling.
+Removing Prometheus from the Optional Components page runs `19_rollback.yaml`.
+It deletes all Prometheus data and configuration. Back up any data you need first.
 
 ## DNS probes, Cilium drops and node-exporter
 

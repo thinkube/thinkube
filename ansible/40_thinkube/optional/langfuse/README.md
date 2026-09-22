@@ -1,5 +1,15 @@
 # Langfuse - LLM Observability Platform
 
+## Installation
+
+Langfuse is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install, `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. It requires PostgreSQL, Keycloak, ClickHouse and Valkey.
+
+`00_install.yaml` runs `10_configure_keycloak.yaml`, `11_deploy.yaml` and
+`17_configure_discovery.yaml`.
+
 ## Overview
 
 Langfuse is an open-source LLM engineering platform for tracing, evaluating, and monitoring LLM applications. It provides observability into production LLM applications with detailed trace analysis, cost tracking, and performance metrics.
@@ -18,30 +28,28 @@ Langfuse is an open-source LLM engineering platform for tracing, evaluating, and
 
 ### Components
 
-- **Web Application**: Next.js application (port 3000)
-- **PostgreSQL Database**: Persistent storage for traces and metadata
+- **Web Application** (`langfuse` deployment): Next.js application (port 3000), image `{{ harbor_registry }}/library/langfuse:3.173.0`
+- **Worker** (`langfuse-worker` deployment): processes events from the Valkey queue, image `{{ harbor_registry }}/library/langfuse-worker:3.173.0`
 - **Keycloak OIDC**: Single sign-on authentication
+- **HTTPRoute**: exposes `langfuse.{{ domain_name }}` through the Gateway API gateway
 
 ### Storage
 
-- **PostgreSQL**: Stores all traces, prompts, datasets, and user data
-- **No additional storage**: All data in PostgreSQL
+`11_deploy.yaml` connects Langfuse to these services:
+- **PostgreSQL** (core): relational data, through `DATABASE_URL`
+- **ClickHouse** (optional component): trace data, at `clickhouse-clickhouse.clickhouse.svc.cluster.local` (8123 HTTP, 9000 for migrations), user `default`
+- **Valkey** (optional component): queue and cache, at `valkey.valkey.svc.cluster.local:6379`
+- **SeaweedFS S3** (core): buckets `langfuse-events` and `langfuse-media`, created by `11_deploy.yaml`
 
 ## Deployment
 
 ### Prerequisites
 
-- Kubernetes (k8s-snap) cluster running
-- PostgreSQL deployed (core component)
-- Keycloak deployed (core component)
-- Harbor registry with Langfuse image
-
-### Install
-
-```bash
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/langfuse/00_install.yaml
-```
+- Kubernetes (kubeadm) cluster running
+- PostgreSQL and Keycloak (core components)
+- ClickHouse and Valkey (optional components)
+- SeaweedFS (core component) with the `seaweedfs-s3-config` secret
+- Harbor registry with the `langfuse` and `langfuse-worker` images
 
 ### Test
 
@@ -49,17 +57,11 @@ cd ~/thinkube
 ./scripts/run_ansible.sh ansible/40_thinkube/optional/langfuse/18_test.yaml
 ```
 
-### Rollback
-
-```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/langfuse/19_rollback.yaml
-```
-
 ## Usage
 
 ### Access Langfuse
 
-URL: `https://langfuse.thinkube.com`
+URL: `https://langfuse.<domain_name>`
 Authentication: Keycloak SSO
 
 ### Python SDK Example
@@ -71,7 +73,7 @@ from langfuse import Langfuse
 langfuse = Langfuse(
     public_key="your-public-key",
     secret_key="your-secret-key",
-    host="https://langfuse.thinkube.com"
+    host="https://langfuse.<domain_name>"
 )
 
 # Create a trace
@@ -98,7 +100,7 @@ from langchain.chains import LLMChain
 langfuse_handler = LangfuseCallbackHandler(
     public_key="your-public-key",
     secret_key="your-secret-key",
-    host="https://langfuse.thinkube.com"
+    host="https://langfuse.<domain_name>"
 )
 
 # Use with LangChain
@@ -117,7 +119,7 @@ from llama_index import VectorStoreIndex
 langfuse_handler = LangfuseCallbackHandler(
     public_key="your-public-key",
     secret_key="your-secret-key",
-    host="https://langfuse.thinkube.com"
+    host="https://langfuse.<domain_name>"
 )
 
 # Use with LlamaIndex
@@ -161,7 +163,7 @@ response = litellm.completion(
     metadata={
         "langfuse_public_key": "your-public-key",
         "langfuse_secret_key": "your-secret-key",
-        "langfuse_host": "https://langfuse.thinkube.com"
+        "langfuse_host": "https://langfuse.<domain_name>"
     }
 )
 ```
@@ -192,7 +194,7 @@ Generate API keys in the Langfuse UI:
 ### Health Check
 
 ```bash
-curl https://langfuse.thinkube.com/api/public/health
+curl https://langfuse.<domain_name>/api/public/health
 ```
 
 ### Check Pod Status
@@ -205,6 +207,7 @@ kubectl get pods -n langfuse
 
 ```bash
 kubectl logs -n langfuse deployment/langfuse -f
+kubectl logs -n langfuse deployment/langfuse-worker -f
 ```
 
 ### Database Connection

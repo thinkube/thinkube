@@ -5,18 +5,25 @@
 Ollama provides fast local LLM inference with GPU acceleration.
 Achieves ~50 tok/s on DGX Spark vs ~2.3 tok/s with BitsAndBytes quantization.
 
+## Installation
+
+Ollama is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install, `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. It requires Harbor.
+
 ## Requirements
 
 - Harbor (for mirrored image)
-- GPU node (nodeSelector configured in inventory)
-- JuiceFS MLflow volume (for accessing fine-tuned GGUF models)
+- GPU node. The LLM Gateway sets the nodeSelector and GPU requests on each pod when it creates it.
+- JuiceFS MLflow volume (for accessing fine-tuned GGUF models). JupyterHub creates the shared `jupyterhub-mlflow-root` PV.
 
 ## Playbooks
 
 | Playbook | Description |
 |----------|-------------|
 | `00_install.yaml` | Orchestrator - runs all installation playbooks |
-| `10_deploy.yaml` | Main deployment (StatefulSet, Service, Ingress, PVCs) |
+| `10_deploy.yaml` | Main deployment: Deployment with `replicas: 0`, Service, HTTPRoute, PV and PVC `ollama-mlflow-pvc`. The LLM Gateway creates the pods at runtime. |
 | `17_configure_discovery.yaml` | Service discovery ConfigMap (CRITICAL for env vars in JupyterHub) |
 | `18_test.yaml` | Validation tests |
 | `19_rollback.yaml` | Cleanup and uninstall |
@@ -87,22 +94,4 @@ requests.post(f"{OLLAMA_BASE}/api/generate", json={
 
 # List loaded models
 requests.get(f"{OLLAMA_BASE}/api/ps")
-```
-
-## Installation
-
-Ollama is installed via the thinkube-control UI as an optional component.
-
-Manual installation (not recommended):
-```bash
-cd ~/thinkube
-./scripts/tk_ansible ansible/40_thinkube/optional/ollama/00_install.yaml
-```
-
-## Uninstallation
-
-Via thinkube-control UI, or manually:
-```bash
-cd ~/thinkube
-./scripts/tk_ansible ansible/40_thinkube/optional/ollama/19_rollback.yaml
 ```

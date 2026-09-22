@@ -2,6 +2,12 @@
 
 This component manages SSL/TLS certificates using acme.sh and Let's Encrypt with Cloudflare DNS validation.
 
+## Installation
+
+ACME certificates are a core component. The Thinkube installer installs them
+by running `10_deploy.yaml` and then `15_configure_renewal_hook.yaml` in this
+folder. They are not installed on their own.
+
 ## Overview
 
 This is an alternative to cert-manager that provides:
@@ -15,7 +21,7 @@ This is an alternative to cert-manager that provides:
 1. **Cloudflare API Token** with DNS edit permissions
 2. **Required inventory variables**:
    ```yaml
-   domain_name: thinkube.com
+   domain_name: example.com
    cloudflare_api_token: your-token-here
    admin_email: admin@example.com
    ```
@@ -29,8 +35,8 @@ This is an alternative to cert-manager that provides:
 ## Certificate Coverage
 
 The playbook requests a single certificate covering:
-- `thinkube.com` (base domain)
-- `*.thinkube.com` (wildcard)
+- `<domain_name>` (base domain)
+- `*.<domain_name>` (wildcard)
 
 ## Usage
 
@@ -40,27 +46,10 @@ cd ~/thinkube
 ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/acme-certificates/10_deploy.yaml
 ```
 
-### Migration from cert-manager:
-
-1. First ensure you have the required variable in inventory:
-   ```yaml
-   cloudflare_api_token: "your-cf-api-token"
-   ```
-
-2. Run the acme.sh deployment:
-   ```bash
-   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/acme-certificates/10_deploy.yaml
-   ```
-
-3. Verify the secret was created:
-   ```bash
-   kubectl get secret -n default thinkube-com-tls
-   ```
-
-4. Remove cert-manager (optional):
-   ```bash
-   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/cert-manager/19_rollback.yaml
-   ```
+### Install the renewal hook:
+```bash
+./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/acme-certificates/15_configure_renewal_hook.yaml
+```
 
 ## How it Works
 
@@ -76,11 +65,15 @@ cd ~/thinkube
    - Encrypts certificates before storing
    - Automatically backs up when certificates are issued/renewed
 6. **Auto-renewal**: Sets up cron job for automatic renewal
+7. **Renewal hook**: acme.sh runs `/etc/ssl/thinkube/scripts/sync-k8s-tls.sh`
+   after each renewal. It patches every Kubernetes TLS secret that still
+   holds the old wildcard certificate. Other TLS secrets are not touched.
+   Envoy Gateway reloads the certificates by watching the secrets.
 
 ## Certificate Locations
 
-- **Files**: `/etc/ssl/thinkube/thinkube.com/`
-- **Kubernetes Secret**: `default/thinkube-com-tls`
+- **Files**: `/etc/ssl/thinkube/<domain_name>/`
+- **Kubernetes Secret**: `default/<domain_name with dots as dashes>-tls` (for example `default/example-com-tls`)
 
 ## Advantages over cert-manager
 
@@ -94,12 +87,12 @@ cd ~/thinkube
 
 ### Check certificate status:
 ```bash
-openssl x509 -in /etc/ssl/thinkube/thinkube.com/fullchain.cer -text -noout
+openssl x509 -in /etc/ssl/thinkube/<domain_name>/fullchain.cer -text -noout
 ```
 
 ### Manual renewal:
 ```bash
-sudo -u <system_username> ~/.acme.sh/acme.sh --renew -d thinkube.com --force
+sudo -u <system_username> ~/.acme.sh/acme.sh --renew -d <domain_name> --force
 ```
 
 ### View acme.sh logs:

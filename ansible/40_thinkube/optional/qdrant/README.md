@@ -2,6 +2,15 @@
 
 Qdrant is a vector database for semantic search and AI applications, providing high-performance similarity search capabilities.
 
+## Installation
+
+Qdrant is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install (it runs `10_deploy.yaml` and then
+`17_configure_discovery.yaml`), `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. The component catalogue lists no required components; the
+playbook uses Keycloak and Harbor, which are core components.
+
 ## Overview
 
 Qdrant is designed for:
@@ -33,32 +42,26 @@ User → Browser → Qdrant Dashboard → OAuth2 Proxy → Keycloak
 
 ### Prerequisites
 
-1. Kubernetes (k8s-snap) must be deployed
-2. Keycloak must be deployed (CORE-006)
-3. TLS certificates must be configured (CORE-004)
+1. Kubernetes (kubeadm) must be deployed
+2. Keycloak must be deployed
+3. The wildcard TLS certificate must exist (`infrastructure/acme-certificates`)
 4. Set environment variable:
    ```bash
    export ADMIN_PASSWORD='your-admin-password'
    ```
 
-### Deploy Qdrant
+### Test the deployment
 
 ```bash
 cd ~/thinkube
-
-# Deploy Qdrant with OAuth2 authentication
-./scripts/run_ansible.sh ansible/40_thinkube/optional/qdrant/10_deploy.yaml
-
-# Test the deployment
 ./scripts/run_ansible.sh ansible/40_thinkube/optional/qdrant/18_test.yaml
 ```
 
 ### Rollback
 
-```bash
-# Remove Qdrant and all resources
-./scripts/run_ansible.sh ansible/40_thinkube/optional/qdrant/19_rollback.yaml
-```
+Removing Qdrant from the Optional Components page runs `19_rollback.yaml`.
+It deletes the `qdrant` namespace (with the data volume) and the `qdrant` Helm
+repository.
 
 ## Configuration
 
@@ -77,14 +80,14 @@ Default resources:
 
 ### Network Configuration
 
-Two ingress configurations:
-1. **Dashboard** (`https://qdrant-dashboard.thinkube.com`)
+Gateway API HTTPRoutes:
+1. **Dashboard** (`https://qdrant-dashboard.<domain_name>`, `qdrant_dashboard_hostname`)
    - Protected by OAuth2 authentication
-   - Redirects `/` to `/dashboard`
-2. **API** (`https://qdrant.thinkube.com`)
+   - Route `qdrant-root-redirect` redirects `/` to `/dashboard`
+2. **API** (`https://qdrant.<domain_name>`, `qdrant_hostname`)
    - Direct access without authentication
-   - Supports REST API on port 6333
-   - gRPC API on port 6334
+   - REST API, backend port 6333
+   - gRPC is enabled on the service, port 6334, inside the cluster only; no route exposes it
 
 ## API Usage
 
@@ -92,13 +95,13 @@ Two ingress configurations:
 
 ```bash
 # Check health
-curl https://qdrant.thinkube.com/health
+curl https://qdrant.<domain_name>/health
 
 # List collections
-curl https://qdrant.thinkube.com/collections
+curl https://qdrant.<domain_name>/collections
 
 # Create a collection
-curl -X PUT https://qdrant.thinkube.com/collections/my_collection \
+curl -X PUT https://qdrant.<domain_name>/collections/my_collection \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": {
@@ -108,7 +111,7 @@ curl -X PUT https://qdrant.thinkube.com/collections/my_collection \
   }'
 
 # Insert vectors
-curl -X PUT https://qdrant.thinkube.com/collections/my_collection/points \
+curl -X PUT https://qdrant.<domain_name>/collections/my_collection/points \
   -H "Content-Type: application/json" \
   -d '{
     "points": [
@@ -121,7 +124,7 @@ curl -X PUT https://qdrant.thinkube.com/collections/my_collection/points \
   }'
 
 # Search vectors
-curl -X POST https://qdrant.thinkube.com/collections/my_collection/points/search \
+curl -X POST https://qdrant.<domain_name>/collections/my_collection/points/search \
   -H "Content-Type: application/json" \
   -d '{
     "vector": [0.1, 0.2, ..., 0.768],
@@ -131,14 +134,14 @@ curl -X POST https://qdrant.thinkube.com/collections/my_collection/points/search
 
 ### gRPC API
 
-The gRPC API is available at `qdrant.thinkube.com:6334` for high-performance applications.
+The gRPC API is available inside the cluster at `qdrant.qdrant.svc.cluster.local:6334`. It has no external route.
 
 ## Access
 
 Once deployed, Qdrant is available at:
-- **Dashboard**: `https://qdrant-dashboard.thinkube.com`
-- **REST API**: `https://qdrant.thinkube.com`
-- **gRPC API**: `qdrant.thinkube.com:6334`
+- **Dashboard**: `https://qdrant-dashboard.<domain_name>`
+- **REST API**: `https://qdrant.<domain_name>`
+- **gRPC API**: `qdrant.qdrant.svc.cluster.local:6334` (inside the cluster)
 
 ## Troubleshooting
 
@@ -150,7 +153,7 @@ kubectl -n qdrant describe pod <pod-name>
 
 ### View Logs
 ```bash
-kubectl -n qdrant logs deployment/qdrant
+kubectl -n qdrant logs statefulset/qdrant
 kubectl -n qdrant logs deployment/oauth2-proxy
 kubectl -n qdrant logs deployment/ephemeral-valkey
 ```
@@ -180,7 +183,7 @@ kubectl get pv
 from qdrant_client import QdrantClient
 
 client = QdrantClient(
-    url="https://qdrant.thinkube.com",
+    url="https://qdrant.<domain_name>",
     prefer_grpc=False
 )
 
@@ -196,7 +199,7 @@ client.create_collection(
 import { QdrantClient } from '@qdrant/js-client-rest';
 
 const client = new QdrantClient({
-    url: 'https://qdrant.thinkube.com',
+    url: 'https://qdrant.<domain_name>',
 });
 
 // Create collection
@@ -220,8 +223,8 @@ await client.createCollection('my_collection', {
 
 - **JupyterHub** - For AI model development
 - **SeaweedFS** - For model and data storage (S3-compatible)
-- **Argo Workflows** (CORE-010) - For ML pipeline orchestration
-- **Harbor** (CORE-005) - For ML container images
+- **Argo Workflows** - For ML pipeline orchestration
+- **Harbor** - Holds the Qdrant image (`library/qdrant:v1.18.0`)
 
 ---
 *Component of the Thinkube Platform - Optional Services*

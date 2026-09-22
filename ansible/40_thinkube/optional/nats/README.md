@@ -1,5 +1,13 @@
 # NATS - Real-time Messaging System
 
+## Installation
+
+NATS is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install, `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. `00_install.yaml` runs `10_deploy.yaml` and
+`17_configure_discovery.yaml`.
+
 ## Overview
 
 NATS is a high-performance messaging system for cloud-native applications and microservices. This deployment includes JetStream for persistent messaging and stream processing.
@@ -8,7 +16,7 @@ NATS is a high-performance messaging system for cloud-native applications and mi
 
 - **High Performance**: Low-latency pub/sub messaging
 - **JetStream**: Persistent messaging with stream processing
-- **Cluster Mode**: 3-node cluster for high availability
+- **Single Server**: cluster mode is off (`cluster.enabled: false`, 1 replica)
 - **RAFT Consensus**: Distributed state management
 - **Multiple Protocols**: Core NATS, JetStream, Key/Value, Object Store
 
@@ -16,10 +24,15 @@ NATS is a high-performance messaging system for cloud-native applications and mi
 
 ### Components
 
-- **NATS Server**: Core messaging server (single replica)
+- **NATS Server**: Core messaging server (single replica), Helm chart `nats/nats`, image `{{ harbor_registry }}/library/nats:2.12.0-alpine`
 - **JetStream**: Persistent storage layer (10Gi)
 - **Monitoring**: Built-in monitoring endpoint on port 8222
-- **nats-box**: CLI tool for testing and management
+- **nats-box**: CLI tool for testing and management (`{{ harbor_registry }}/library/nats-box:0.18.1`)
+
+### External Access
+
+- **Monitoring**: HTTPRoute `nats-monitoring-route` sends `nats.{{ domain_name }}` to port 8222
+- **Clients**: the gateway's TCP listener on port 4222 reaches the NATS service. The TCPRoute is created by `core/infrastructure/gateway-api/10_deploy.yaml`. `10_deploy.yaml` here creates the ReferenceGrant `allow-gateway-tcp` that allows it.
 
 ### Ports
 
@@ -30,7 +43,7 @@ NATS is a high-performance messaging system for cloud-native applications and mi
 ### Storage
 
 JetStream uses persistent volumes for message storage:
-- 10Gi persistent volume
+- 10Gi persistent volume, default storage class (`storageClassName: ""`)
 - Survives pod restarts
 - Single replica (suitable for single-user scale)
 
@@ -38,27 +51,15 @@ JetStream uses persistent volumes for message storage:
 
 ### Prerequisites
 
-- Kubernetes (k8s-snap) cluster running
+- Kubernetes (kubeadm) cluster running
 - Helm installed
 - Harbor registry with NATS images
-
-### Install
-
-```bash
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/nats/00_install.yaml
-```
+- Wildcard TLS certificate in the default namespace
 
 ### Test
 
 ```bash
 ./scripts/run_ansible.sh ansible/40_thinkube/optional/nats/18_test.yaml
-```
-
-### Rollback
-
-```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/nats/19_rollback.yaml
 ```
 
 ## Usage
@@ -242,7 +243,7 @@ kubectl exec -n nats nats-0 -- df -h /data
 
 ```bash
 kubectl run -i --rm --restart=Never nats-test \
-  --image=harbor.example.com/library/nats-box:0.14.5 \
+  --image=<harbor_registry>/library/nats-box:0.18.1 \
   --namespace=nats \
   -- nats pub test "hello" --server=nats://nats:4222
 ```

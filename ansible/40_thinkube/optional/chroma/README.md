@@ -20,30 +20,30 @@ Chroma is an open-source embedding database designed to make it easy to build LL
 - **Deployment Type**: StatefulSet (single replica)
 - **Persistence**: PersistentVolumeClaim for data storage
 - **Authentication**: Token-based authentication using admin credentials
-- **Networking**: Exposed via Ingress at `chroma.<domain>`
+- **Networking**: Exposed via Gateway API HTTPRoute `chroma-httproute` at `chroma.<domain>`
 - **Namespace**: `chroma`
 
 ## Installation
 
-### Prerequisites
+Chroma is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install, `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. It requires Harbor.
 
-- Kubernetes (k8s-snap) cluster with ingress controller
-- DNS configured for the domain
-- `ADMIN_PASSWORD` environment variable set
-
-### Deploy Chroma
-
-```bash
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/chroma/00_install.yaml
-```
-
-This will:
+`00_install.yaml` runs `10_deploy.yaml` and `17_configure_discovery.yaml`.
+Together they:
 1. Create the `chroma` namespace
 2. Deploy Chroma with token authentication
 3. Configure persistent storage
-4. Set up ingress for HTTPS access
+4. Create the HTTPRoute for HTTPS access
 5. Register with service discovery
+
+### Prerequisites
+
+- Kubernetes (kubeadm) cluster with the Gateway API gateway
+- DNS configured for the domain
+- `ADMIN_PASSWORD` environment variable set
+- The `chroma` image mirrored into the Harbor `library` project
 
 ### Verify Installation
 
@@ -160,17 +160,15 @@ The deployment sets the following key environment variables:
 
 - `CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER`: Token authentication provider
 - `CHROMA_SERVER_AUTH_PROVIDER`: Token auth server provider
-- `CHROMA_SERVER_AUTH_TOKEN_TRANSPORT_HEADER`: `X_CHROMA_TOKEN`
-- `IS_PERSISTENT`: `True`
-- `PERSIST_DIRECTORY`: `/chroma/chroma`
-- `ANONYMIZED_TELEMETRY`: `False`
-- `CHROMA_SERVER_CORS_ALLOW_ORIGINS`: `["*"]`
+- `CHROMA_SERVER_AUTH_TOKEN_TRANSPORT_HEADER`: `X-Chroma-Token`
+- `CHROMA_SERVER_AUTH_CREDENTIALS`: from the `chroma-auth` secret, key `auth-token`
+- `ANONYMIZED_TELEMETRY`: `FALSE`
 
 ### Storage
 
-- **PVC Size**: 10Gi (configurable in playbook)
+- **PVC**: `chroma-data-pvc`, 10Gi (`chroma_capacity` in `10_deploy.yaml`)
 - **Storage Class**: `k8s-hostpath`
-- **Mount Path**: `/chroma/chroma`
+- **Mount Path**: `/data`
 
 ### Resource Limits
 
@@ -200,22 +198,15 @@ kubectl -n chroma delete pod backup
 To update the Chroma version:
 
 1. Edit the `chroma_image` variable in `10_deploy.yaml`
-2. Re-run the deployment playbook
+   (default `{{ harbor_registry }}/library/chroma:latest`)
+2. Reinstall from the Optional Components page
 3. Verify with the test playbook
 
 ### Rollback
 
-To remove Chroma while preserving data:
-
-```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/chroma/19_rollback.yaml
-```
-
-To completely remove Chroma including data:
-
-```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/chroma/19_rollback.yaml -e remove_data=true
-```
+Chroma is removed from the Optional Components page, which runs
+`19_rollback.yaml`. The playbook keeps the PVC `chroma-data-pvc` unless the
+variable `remove_data` is true. Its default is false.
 
 ## Troubleshooting
 
@@ -232,7 +223,7 @@ kubectl -n chroma logs -f statefulset/chroma
 ### Common Issues
 
 1. **Authentication Errors**: Ensure `ADMIN_PASSWORD` is set and used in `X-Chroma-Token` header
-2. **Connection Refused**: Check ingress and DNS configuration
+2. **Connection Refused**: Check the HTTPRoute (`kubectl -n chroma get httproute`) and DNS configuration
 3. **Out of Memory**: Increase memory limits in the deployment
 4. **Data Loss**: Ensure PVC is not deleted during rollback
 5. **CORS Issues**: The deployment allows all origins by default
@@ -240,8 +231,8 @@ kubectl -n chroma logs -f statefulset/chroma
 ### Health Checks
 
 ```bash
-# Check heartbeat
-curl https://chroma.<domain>/api/v1/heartbeat
+# Check heartbeat (the pod probes use this path)
+curl https://chroma.<domain>/api/v2/heartbeat
 
 # Check version
 curl -H "X-Chroma-Token: ${ADMIN_PASSWORD}" \
@@ -292,7 +283,7 @@ Chroma registers with thinkube-control for service discovery:
 - **Category**: AI
 - **Type**: Optional
 - **Primary Endpoint**: `https://chroma.<domain>`
-- **Health Endpoint**: `https://chroma.<domain>/api/v1/heartbeat`
+- **Health Endpoint**: `https://chroma.<domain>/api/v2/heartbeat`
 
 ## License
 

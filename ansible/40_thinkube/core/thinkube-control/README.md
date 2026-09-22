@@ -1,12 +1,18 @@
 # Thinkube Control
 
-Thinkube Control is the central management interface for the Thinkube platform. It provides a unified API and web interface for platform management, with plans to evolve into an MCP (Model Context Protocol) server for LLM-based management.
+Thinkube Control is the central management interface for the Thinkube platform. It provides an API, a web interface and an MCP (Model Context Protocol) server for platform management.
+
+## Installation
+
+Thinkube Control is a core component. The Thinkube installer installs it by
+running `00_install.yaml`, which runs the playbooks listed under Deployment
+Order. It is not installed on its own.
 
 ## Architecture
 
 The control system consists of:
-- **Frontend**: Vue.js application with DaisyUI components
-- **Backend**: FastAPI application with Keycloak integration (evolving to MCP server)
+- **Frontend**: React application
+- **Backend**: FastAPI application with Keycloak integration and an MCP server
 - **Authentication**: OAuth2 Proxy with Keycloak OIDC
 - **Session Management**: Redis for OAuth2 session storage
 - **Build System**: Argo Workflows with Kaniko
@@ -51,10 +57,17 @@ cd ~/thinkube
 
 The orchestrator runs playbooks in this sequence:
 
-1. `10_deploy_webhook_adapter.yaml` - Deploy Harbor webhook adapter (bootstrap mode)
-2. `11_deploy_sync_webhook.yaml` - Deploy ArgoCD sync webhook
+1. `10_deploy_sync_webhook.yaml` - Deploy ArgoCD sync webhook
+2. `11_deploy_webhook_adapter.yaml` - Deploy Harbor webhook adapter (bootstrap mode)
 3. `12_deploy.yaml` - Main thinkube-control deployment
-4. `13_configure_code_server.yaml` - Configure code-server integration
+4. `13_configure_code_server.yaml` - Configure code-server with the API token and the Claude Code MCP integration
+5. `14_deploy_tk_package_version.yaml` - Deploy the tk-package-version MCP server
+6. `16_publish_packages.yaml` - Build the thinkube Python packages and publish them to DevPI
+
+Other playbooks in this folder are not run by the installer:
+`12_deploy_dev.yaml` and `12_deploy_dev_test.yaml` (development helpers),
+`15_update_manifests.yaml` (update manifests only), `18_test.yaml` and
+`19_rollback.yaml`.
 
 Note: The webhook adapters deploy first to enable the GitOps workflow for thinkube-control itself.
 
@@ -92,7 +105,7 @@ Tests include:
 ## Access
 
 Once deployed, the control interface is accessible at:
-- URL: `https://control.thinkube.com`
+- URL: `https://control.<domain_name>`
 - Authentication: Via Keycloak SSO
 - Authorized users: Admin user configured during deployment
 
@@ -122,23 +135,24 @@ Thinkube Control integrates with MLflow for AI model mirroring. The authenticati
 7. Once initialized, banner disappears and model mirroring is available
 
 **Programmatic Authentication (Model Download Workflows)**:
-1. Argo Workflow reads credentials from `mlflow-auth-config` secret (argo namespace)
+1. Argo Workflow reads credentials from the `mlflow-auth-config` secret (argo namespace)
 2. Workflow fetches OAuth2 access token from Keycloak using Resource Owner Password Credentials flow:
    - `grant_type: password`
    - `client_id: mlflow`
    - `client_secret: <from secret>`
-   - `username: <admin username>`
+   - `username: <realm username>`
    - `password: <admin password>`
 3. Sets `MLFLOW_TRACKING_TOKEN` environment variable with access token
 4. MLflow Python SDK uses token for authenticated API calls
 
 **Secret Creation**:
-The `mlflow-auth-config` secret is created during thinkube-control deployment (step 7) and contains:
-- `keycloak-token-url`: Keycloak OAuth2 token endpoint
+`12_deploy.yaml` creates the `mlflow-auth-config` secret in two namespaces,
+`argo` and `thinkube-control` (step 7 above). It contains:
+- `keycloak-token-url`: Keycloak OAuth2 token endpoint (`{{ keycloak_url }}/realms/{{ auth_realm_username }}/protocol/openid-connect/token`)
 - `client-id`: MLflow OAuth2 client ID (`mlflow`)
-- `client-secret`: MLflow OAuth2 client secret (copied from mlflow namespace)
-- `username`: Admin username from deployment config
-- `password`: Admin password from environment
+- `client-secret`: MLflow OAuth2 client secret (copied from the `oauth2-proxy-secret` secret in the mlflow namespace)
+- `username`: the realm user (`auth_realm_username`)
+- `password`: Admin password from the `ADMIN_PASSWORD` environment variable
 
 This approach provides seamless single-user authentication while maintaining OAuth2 security standards.
 
@@ -178,7 +192,7 @@ This removes all control resources including:
 
 ### Authentication Issues
 - Verify Keycloak client configuration
-- Check OAuth2 Proxy logs: `kubectl logs -n control-hub -l app.kubernetes.io/name=oauth2-proxy`
+- Check OAuth2 Proxy logs: `kubectl logs -n thinkube-control -l app.kubernetes.io/name=oauth2-proxy`
 - Ensure user has `control-user` role in Keycloak
 
 ### Build Issues
@@ -189,15 +203,7 @@ This removes all control resources including:
 ### Deployment Issues
 - Verify ArgoCD applications: `kubectl -n argocd get applications`
 - Check application sync status in ArgoCD UI
-- Review pod logs in control-hub namespace
-
-## Future Development
-
-This application is designed to evolve into an MCP server that will:
-- Provide LLM-friendly APIs for platform management
-- Enable natural language control of Thinkube services
-- Offer structured tool interfaces following the MCP specification
-- Support autonomous platform operations
+- Review pod logs in the thinkube-control namespace
 
 ## Development Workflow
 
@@ -205,7 +211,7 @@ After deployment, the thinkube-control code is available in Gitea:
 
 1. **Clone from Gitea**:
    ```bash
-   git clone https://git.thinkube.com/thinkube-deployments/thinkube-control-deployment.git
+   git clone https://git.<domain_name>/thinkube-deployments/thinkube-control.git
    ```
 
 2. **Make changes**:

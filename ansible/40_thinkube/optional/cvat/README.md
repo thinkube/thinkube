@@ -2,6 +2,10 @@
 
 Component #45 in the Thinkube Platform stack.
 
+## Installation
+
+CVAT is an optional component. It is installed and removed from the Optional Components page in thinkube-control, not on its own. thinkube-control runs `00_install.yaml` to install, `18_test.yaml` to test and `19_rollback.yaml` to remove it. It runs on amd64 nodes only.
+
 ## Overview
 
 CVAT (Computer Vision Annotation Tool) is an open-source web-based annotation platform for computer vision tasks. It provides advanced labeling capabilities for images and videos, supporting object detection, semantic segmentation, instance segmentation, and keypoint annotation. In the Thinkube Platform, CVAT serves as the primary annotation infrastructure for computer vision datasets, enabling teams to create high-quality training data for deep learning models with AI-assisted labeling, automated tracking, and collaborative workflows.
@@ -28,8 +32,7 @@ CVAT requires the following Thinkube components:
 
 ```yaml
 kubernetes:
-  distribution: k8s-snap
-  version: "1.34.0"
+  distribution: kubeadm
 
 core_components:
   - name: postgresql
@@ -55,177 +58,15 @@ harbor:
 
 ## Playbooks
 
-Deployment is automatically orchestrated by thinkube-control via [00_install.yaml](00_install.yaml:21-25).
+| Playbook | What it does |
+|---|---|
+| [00_install.yaml](00_install.yaml) | Runs `10_deploy.yaml`, then `17_configure_discovery.yaml`. |
+| [10_deploy.yaml](10_deploy.yaml) | Creates the `cvat` namespace, secrets, four PVCs and the `cvat` database; deploys the backend, UI and OPA with their services; copies the wildcard certificate; deploys an ephemeral Valkey and OAuth2 Proxy; creates the HTTPRoutes `cvat-api-route` (`/api`) and `cvat-main-route` (`/`, `/static`, `/django-rq`); writes the CLI config to `/home/thinkube/.cvat/config.yaml` in the code-server pod. |
+| [17_configure_discovery.yaml](17_configure_discovery.yaml) | Creates the `thinkube-service-config` ConfigMap in `cvat` for thinkube-control (endpoints, dependencies `postgresql`, `valkey`, `clickhouse`, variables `CVAT_API_URL`, `CVAT_USERNAME`, `CVAT_PASSWORD`) and updates the code-server environment. |
+| [18_test.yaml](18_test.yaml) | Test playbook. Its tasks check the LiteLLM deployment, not CVAT (see Testing). |
+| [19_rollback.yaml](19_rollback.yaml) | Deletes the `cvat` namespace and the `cvat` Keycloak client. |
 
-### **Deploy CVAT** - [10_deploy.yaml](10_deploy.yaml)
-
-Deploys CVAT with PostgreSQL backend, ClickHouse analytics, Valkey cache, OAuth2 Proxy authentication, and OPA (Open Policy Agent) authorization.
-
-**Step 1: Namespace and Variable Verification** (lines 68-84)
-- Creates `cvat` namespace
-- Verifies required inventory variables (domain, kubeconfig, Harbor registry, admin credentials)
-
-**Step 2: Secret Generation** (lines 86-108)
-- Generates Django secret key (50 characters for session security)
-- Creates `cvat-secrets` Kubernetes secret with:
-  - `DJANGO_SUPERUSER_USERNAME`: Admin username from inventory
-  - `DJANGO_SUPERUSER_PASSWORD`: Admin password from environment
-  - `DJANGO_SUPERUSER_EMAIL`: `admin@<domain>`
-  - `SECRET_KEY`: Django session encryption key
-  - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`: PostgreSQL credentials
-
-**Step 3: Persistent Storage** (lines 110-130)
-- Creates 4 PersistentVolumeClaims:
-  - `cvat-data-pvc`: 20Gi (annotation data, images, videos)
-  - `cvat-keys-pvc`: 1Gi (SSH keys for git integration)
-  - `cvat-logs-pvc`: 5Gi (application logs)
-  - `cvat-models-pvc`: 10Gi (AI model weights for auto-annotation)
-
-**Step 4: Database Initialization** (lines 132-169)
-- Creates one-shot pod `cvat-db-init` with postgres:18-alpine
-- Runs PostgreSQL command to create `cvat` database if not exists
-- Waits for pod to reach Succeeded state (30 retries, 5s delay)
-
-**Step 5: Valkey Service Discovery** (lines 171-179)
-- Queries Kubernetes for `valkey` service in `valkey` namespace
-- Validates Valkey is deployed and accessible
-
-**Step 6: CVAT Backend Deployment** (lines 181-413)
-- Init containers (3 wait checks):
-  - `wait-for-db`: PostgreSQL port 5432
-  - `wait-for-valkey`: Valkey port 6379
-  - `wait-for-clickhouse`: ClickHouse port 8123
-  - `create-superuser`: Runs Django migrations, creates superuser if not exists
-- Main container: `cvat-server:latest` from Harbor
-  - Port 8080 (HTTP API and Django backend)
-  - Command: `./backend_entrypoint.sh init run server`
-  - Analytics enabled: `CVAT_ANALYTICS=1`
-  - ClickHouse connection: HTTP port 8123, basic auth
-  - PostgreSQL connection: `postgresql-official.postgres.svc.cluster.local:5432`
-  - Valkey connections (3 separate endpoints for different use cases):
-    - `CVAT_REDIS_HOST`: General cache
-    - `CVAT_REDIS_INMEM_HOST`: In-memory cache for fast access
-    - `CVAT_REDIS_ONDISK_HOST`: Persistent cache
-  - Server config: `CVAT_SERVER_HOST=cvat.example.com`, `CVAT_HTTPS=1`
-  - OAuth2 integration: Custom Django settings module `cvat.settings.thinkube_sso`
-  - OPA integration: `IAM_OPA_BUNDLE=1`
-  - Volume mounts:
-    - 4 PVCs for data/keys/logs/models
-    - OAuth2 middleware ConfigMap at `/home/django/cvat/apps/thinkube_auth`
-    - Django settings overlay at `/home/django/cvat/settings/thinkube_sso.py`
-  - Probes: `/api/server/about` endpoint (60s liveness initial delay, 15s readiness)
-  - Resources: 250m-1 CPU, 512Mi-2Gi memory
-  - Security context: `fsGroup: 1000` (Django user permissions)
-
-**Step 7: OAuth2 Middleware ConfigMaps** (lines 415-443)
-- Creates `cvat-oauth2-middleware` ConfigMap with:
-  - `middleware.py`: OAuth2 Proxy RemoteUser middleware (from template)
-  - `__init__.py`: Python package initialization
-- Creates `cvat-django-settings-overlay` ConfigMap with Django settings extension (from template)
-
-**Step 8: CVAT Backend Service** (lines 445-461)
-- ClusterIP service on port 8080
-- Selector: `app=cvat-backend`
-
-**Step 9: OPA (Open Policy Agent) Deployment** (lines 463-530)
-- Deployment with 1 replica
-- Image: `opa:0.63.0` from Harbor
-- Configuration:
-  - Server mode with error-level logging
-  - CVAT service: `http://cvat-backend:8080`
-  - Bundle polling: 5-15 seconds
-  - Resource endpoint: `/api/auth/rules`
-  - Persistence: `true` (bundle caching)
-- Port 8181 (HTTP API)
-- Resources: 100m-200m CPU, 128Mi-256Mi memory
-- EmptyDir volume for OPA data persistence
-
-**Step 10: OPA Service** (lines 514-530)
-- ClusterIP service on port 8181
-
-**Step 11: CVAT UI Deployment** (lines 532-582)
-- Deployment with 1 replica
-- Image: `cvat-ui:latest` from Harbor
-- Port 8000 (static React frontend)
-- Resources: 100m-200m CPU, 128Mi-512Mi memory
-
-**Step 12: CVAT UI Service** (lines 566-582)
-- ClusterIP service on port 80 → 8000
-
-**Step 13: TLS Certificate** (lines 584-607)
-- Copies wildcard TLS certificate from `default` namespace
-- Creates `cvat-tls-secret` in `cvat` namespace
-
-**Step 14: Ephemeral Valkey Deployment** (lines 609-613)
-- Deploys ephemeral Valkey instance for OAuth2 Proxy sessions
-- Uses `valkey/ephemeral_valkey` role
-- Separate from core Valkey (session isolation)
-
-**Step 15: OAuth2 Proxy Deployment** (lines 615-617)
-- Deploys OAuth2 Proxy with Keycloak integration
-- Uses `oauth2_proxy` role
-- Configuration:
-  - Client ID: `cvat`
-  - OIDC issuer: `https://auth.example.com/realms/thinkube`
-  - Cookie domain: `.example.com`
-  - Redirect URL: `https://cvat.example.com/oauth2/callback`
-  - Session store: Redis (ephemeral Valkey)
-  - Cookie SameSite: `none` (cross-site compatibility)
-
-**Step 16: API Ingress (No OAuth2)** (lines 619-653)
-- NGINX ingress for `/api` path
-- **NO OAuth2 authentication** (allows cvat-cli basic auth)
-- Annotations:
-  - Body size: 1024m (large video uploads)
-  - Timeouts: 1200s (long-running annotation jobs)
-  - Buffer size: 16k
-- Backend: `cvat-backend:8080`
-- TLS termination with wildcard certificate
-
-**Step 17: Main Ingress (OAuth2 Protected)** (lines 655-705)
-- NGINX ingress for `/`, `/static`, `/django-rq` paths
-- OAuth2 Proxy annotations:
-  - `auth-url`: `https://$host/oauth2/auth`
-  - `auth-signin`: `https://$host/oauth2/start?rd=$escaped_request_uri`
-  - Response headers: User, Email, Access-Token, Groups
-- Backends:
-  - `/static`, `/django-rq`: `cvat-backend:8080`
-  - `/`: `cvat-ui:80`
-- Annotations: Same body size and timeout as API ingress
-
-**Step 18: Readiness Check and CLI Configuration** (lines 710-755)
-- Waits for CVAT backend deployment to have all replicas ready (30 retries, 10s delay)
-- Creates config template at `/tmp/cvat-config.yaml`
-- Copies to code-server pod at `/home/thinkube/.cvat/config.yaml`
-- Sets permissions to 600
-- Displays access information: URL, admin username/password, SSO note, computer vision features
-
-### **Configure Service Discovery** - [17_configure_discovery.yaml](17_configure_discovery.yaml)
-
-Registers CVAT with thinkube-control service discovery system.
-
-**Credentials Extraction** (lines 31-34)
-- Retrieves admin username from inventory
-- Retrieves admin password from `ADMIN_PASSWORD` environment variable
-
-**ConfigMap Creation** (lines 43-111)
-- Name: `thinkube-service-config` in `cvat` namespace
-- Labels: `thinkube.io/managed`, `thinkube.io/service-type: optional`, `thinkube.io/service-name: cvat`
-- Service metadata:
-  - Display name: "CVAT"
-  - Description: "Computer Vision Annotation Tool for image and video labeling"
-  - Category: `ai`
-  - Icon: `/icons/tk_design.svg`
-  - Primary endpoint: Dashboard (`https://cvat.example.com`) - internal health check via backend
-  - API endpoint: `/api`
-  - Health URL: Internal service endpoint (not exposed externally)
-  - Dependencies: `postgresql`, `valkey`, `clickhouse`
-  - Scaling: Deployment `cvat-backend`, min 1 replica, can disable
-  - Authentication: `jwt_oidc`, OIDC client ID `cvat`
-  - Features: Image annotation, video annotation, object detection, semantic segmentation, AI-assisted labeling
-  - Environment variables: `CVAT_API_URL`, `CVAT_USERNAME`, `CVAT_PASSWORD`
-
-**Environment Update** (line 129): Updates code-server environment with CVAT API URL and credentials via `code_server_env_update` role.
+Pods run with the node selector that thinkube-control passes as `component_node_selector` (`kubernetes.io/arch: amd64`).
 
 ## Deployment
 
@@ -238,7 +79,7 @@ The web interface provides:
 - Health check validation post-deployment
 - Rollback capability if deployment fails
 
-**Note**: CVAT is marked as hidden in v0.1.0 release but remains fully functional for early adopters.
+CVAT is listed on the Optional Components page. The CVAT images are built for amd64 only. thinkube-control offers the install only when the cluster has an amd64 node, and pins the CVAT pods to amd64 nodes.
 
 ## Access Points
 
@@ -359,7 +200,7 @@ MIDDLEWARE += ['cvat.apps.thinkube_auth.middleware.OAuth2ProxyRemoteUserMiddlewa
 AUTHENTICATION_BACKENDS += ['cvat.apps.thinkube_auth.middleware.OAuth2ProxyRemoteUserBackend']
 ```
 
-**Ingress Routing**:
+**HTTP routes** (Gateway API):
 - `/api/*`: Direct to backend (NO OAuth2 - basic auth for CLI/SDK)
 - `/`, `/static`, `/django-rq`: OAuth2 Proxy protected (SSO required)
 
@@ -868,16 +709,13 @@ curl -s "https://auth.example.com/admin/realms/thinkube/clients?clientId=cvat" \
 **Symptom**: cvat-cli returns 401 Unauthorized
 
 ```bash
-# Verify API ingress does NOT have OAuth2 annotations
-kubectl get ingress -n cvat cvat-api-ingress -o yaml | grep -E "(auth-url|auth-signin)"
-# Should return nothing
+# The API route must send /api straight to cvat-backend, not through OAuth2 Proxy
+kubectl get httproute -n cvat cvat-api-route -o jsonpath='{.spec.rules[*].matches[*].path.value} -> {.spec.rules[*].backendRefs[*].name}'
+# Should show: /api -> cvat-backend
 ```
 
-**Fix**: Ensure API ingress bypasses OAuth2
+**Fix**: Check that the backend accepts basic auth
 ```bash
-# Check ingress path routing
-kubectl get ingress -n cvat cvat-api-ingress -o jsonpath='{.spec.rules[0].http.paths[*].path}'
-# Should show: /api
 
 # Test API access directly
 curl -u admin:password https://cvat.example.com/api/server/about
@@ -909,24 +747,11 @@ kubectl rollout restart deployment/opa -n cvat
 **Symptom**: Large video uploads timeout or fail
 
 ```bash
-# Check ingress body size limit
-kubectl get ingress -n cvat cvat-api-ingress -o jsonpath='{.metadata.annotations}'
+# Check the request timeout on the routes (10_deploy.yaml sets 1200s)
+kubectl get httproute -n cvat cvat-api-route cvat-main-route -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.rules[*].timeouts.request}{"\n"}{end}'
 ```
 
-**Fix**: Increase timeouts and body size
-```bash
-# Patch ingress annotations
-kubectl patch ingress -n cvat cvat-api-ingress -p '
-{
-  "metadata": {
-    "annotations": {
-      "nginx.ingress.kubernetes.io/proxy-body-size": "2048m",
-      "nginx.ingress.kubernetes.io/proxy-read-timeout": "1800",
-      "nginx.ingress.kubernetes.io/proxy-send-timeout": "1800"
-    }
-  }
-}'
-```
+**Fix**: Raise `timeouts.request` on the HTTPRoutes in `10_deploy.yaml` and reinstall CVAT from the Optional Components page.
 
 ### Storage Full Errors
 
@@ -955,48 +780,22 @@ for task in old_tasks:
 
 ## Testing
 
-Tests are defined in [18_test.yaml](18_test.yaml):
+thinkube-control runs [18_test.yaml](18_test.yaml) as the CVAT test playbook.
 
-```bash
-# Run test playbook
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/cvat/18_test.yaml
-```
-
-**Test Coverage**:
-- Backend health endpoint responds
-- PostgreSQL database connectivity
-- Valkey cache connectivity
-- ClickHouse analytics connectivity
-- OAuth2 Proxy authentication flow
-- OPA authorization policy evaluation
-- Task creation via API
-- Image upload and annotation workflow
-- Annotation export in multiple formats
+The file is a copy of the LiteLLM test playbook. Its tasks check the `litellm` namespace, deployment, service, HTTPRoute and API. They do not test CVAT.
 
 ## Rollback
 
-Rollback is defined in [19_rollback.yaml](19_rollback.yaml):
-
-```bash
-# Rollback CVAT deployment
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/cvat/19_rollback.yaml
-```
+thinkube-control runs [19_rollback.yaml](19_rollback.yaml) when CVAT is removed from the Optional Components page.
 
 **Rollback Actions**:
-- Deletes CVAT deployments (backend, UI, OPA, OAuth2 Proxy, ephemeral Valkey)
-- Deletes CVAT services and ingresses
-- Removes `cvat` namespace
-- Deletes Keycloak `cvat` client
-- **Preserves** PostgreSQL `cvat` database (data retention - projects, tasks, annotations)
-- **Preserves** PersistentVolumeClaims (cvat-data, cvat-keys, cvat-logs, cvat-models)
-- **Preserves** ClickHouse analytics data
-- **Does not affect** core Valkey (shared cache)
-- Removes service discovery ConfigMap
-- Updates code-server environment to remove CVAT variables
+- Deletes the `cvat` namespace. This removes everything in it: deployments, services, HTTPRoutes, the service discovery ConfigMap, the ephemeral Valkey and the four PVCs.
+- Deletes the Keycloak `cvat` client.
+- **Keeps** the PostgreSQL `cvat` database (projects, tasks, annotation metadata).
+- **Keeps** ClickHouse analytics data and core Valkey.
+- Does not remove the CVAT variables from the code-server environment.
 
-**Note**: Database and PVC preservation allows re-deployment without data loss. Manual cleanup required if full data deletion is desired.
+**Note**: The PVCs are deleted with the namespace, so uploaded images, videos and models are lost. Drop the `cvat` database by hand if a full cleanup is needed.
 
 ## References
 

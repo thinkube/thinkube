@@ -2,6 +2,20 @@
 
 VS Code in the browser for cloud-based development, integrated with Thinkube platform.
 
+## Installation
+
+Code Server is a core component. The Thinkube installer installs it by
+running `00_install.yaml`, which runs `10_deploy.yaml`,
+`13_clone_repositories.yaml`, `14_configure_shell.yaml`,
+`15_configure_environment.yaml`, `16_configure_gitea_integration.yaml` and
+`17_configure_discovery.yaml` in that order. It is not installed on its own.
+
+`20_redeploy.yaml` rebuilds the image and redeploys code-server on a running
+installation. It runs the same playbooks except `13_clone_repositories.yaml`,
+so the repositories in the workspace are left untouched. It restarts the
+code-server pod, so it must not run from inside code-server; thinkube-control
+runs it (`redeploy_code_server`).
+
 ## Overview
 
 Code Server provides a full VS Code experience in the browser, allowing developers to:
@@ -35,9 +49,9 @@ User → Browser → Code Server → OAuth2 Proxy → Keycloak
 
 ### Prerequisites
 
-1. Keycloak must be deployed (CORE-006)
-2. TLS certificates must be configured (CORE-004)
-3. Harbor registry must be available (CORE-005)
+1. Keycloak must be deployed
+2. The wildcard TLS certificate must be in the default namespace
+3. Harbor registry must be available
 4. Set environment variable:
    ```bash
    export ADMIN_PASSWORD='your-admin-password'
@@ -55,8 +69,21 @@ cd ~/thinkube
 # Deploy Code Server with OAuth2 authentication
 ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/10_deploy.yaml
 
+# Clone the platform and template repositories into the workspace.
+# Resets existing clones to origin: uncommitted work in them is lost.
+./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/13_clone_repositories.yaml
+
+# Configure the shells (bash, zsh, fish) in the container
+./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/14_configure_shell.yaml
+
 # Configure environment (Node.js, Claude, Python, Ansible)
 ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/15_configure_environment.yaml
+
+# Configure Gitea integration (git config, example workflows, SSH key)
+./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/16_configure_gitea_integration.yaml
+
+# Quick refresh of the configuration without a redeploy
+./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/16_refresh_config.yaml
 
 # Configure service discovery
 ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/17_configure_discovery.yaml
@@ -79,9 +106,8 @@ cd ~/thinkube
 The deployment uses a shared code directory that is accessible from:
 - Code Server (for development)
 - JupyterHub (for AI notebooks)
-- Repository monitor service
 
-Default location: `/home/thinkube/shared-code`
+Default location: `/home/{{ system_username }}/shared-code`
 
 ### Authentication
 
@@ -93,18 +119,22 @@ Default location: `/home/thinkube/shared-code`
 ### Resource Limits
 
 Default resource allocation:
-- CPU: 500m request, 2 CPU limit
-- Memory: 2Gi request, 4Gi limit
+- CPU: 100m request, 4 CPU limit
+- Memory: 512Mi request, 8Gi limit
 - Adjust in the deployment playbook if needed
 
 ## CI/CD Integration
 
-### Current Approach (File Monitoring)
+### Gitea Integration
 
-The `15_configure.yaml` playbook sets up:
-1. Argo CLI in Code Server
-2. Repository monitor service that watches for commit files
-3. Automatic workflow submission to Argo Workflows
+`15_configure_environment.yaml` writes the Argo CLI configuration in the
+container (`~/.config/argo/config`).
+
+`16_configure_gitea_integration.yaml` sets up:
+1. A `.gitconfig` with the Gitea admin token
+2. Example Gitea Actions workflows (Python, Node.js) and an Argo Workflow example
+3. Scripts to create Gitea repositories and set up workflows
+4. The code-server SSH public key in `authorized_keys` on the control plane nodes
 
 ### Recommended Approach (Gitea Runner)
 
@@ -132,7 +162,7 @@ jobs:
 ## Access
 
 Once deployed, Code Server is available at:
-- URL: `https://code.thinkube.com`
+- URL: `https://ide.<domain_name>` (`code_server_hostname` in `10_deploy.yaml`)
 - Login: Via Keycloak SSO
 - Users: Any user with assigned roles
 
@@ -150,12 +180,6 @@ kubectl -n code-server logs deployment/oauth2-proxy
 kubectl -n code-server get secret code-server-oauth-secret -o yaml
 ```
 
-### Repository Monitor
-```bash
-sudo systemctl status repo-monitor
-sudo journalctl -u repo-monitor -f
-```
-
 ## Next Steps
 
 1. **Deploy Gitea Runner** for better CI/CD integration
@@ -165,10 +189,7 @@ sudo journalctl -u repo-monitor -f
 
 ## Related Components
 
-- **Gitea** (CORE-008) - Git repository hosting
-- **Argo Workflows** (CORE-010) - CI/CD pipeline execution
-- **Harbor** (CORE-005) - Container registry
-- **ArgoCD** (CORE-011) - GitOps deployment
-
----
-*Component of the Thinkube Platform - Optional Services*
+- **Gitea** - Git repository hosting
+- **Argo Workflows** - CI/CD pipeline execution
+- **Harbor** - Container registry
+- **ArgoCD** - GitOps deployment

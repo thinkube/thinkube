@@ -2,6 +2,14 @@
 
 This directory contains playbooks for deploying Knative on the Thinkube platform.
 
+## Installation
+
+Knative is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install, `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. `00_install.yaml` runs `10_deploy.yaml` and
+`17_configure_discovery.yaml`.
+
 ## Overview
 
 Knative provides serverless capabilities for Kubernetes, including:
@@ -19,39 +27,29 @@ Knative provides serverless capabilities for Kubernetes, including:
 ## Prerequisites
 
 Before deploying Knative, ensure the following components are installed:
-- Kubernetes (k8s-snap) cluster
+- Kubernetes (kubeadm) cluster
 - Gateway API (Envoy Gateway) with `thinkube-gateway`
 - CoreDNS properly configured
 - Harbor registry deployed and accessible
 - ACME certificates deployed with wildcard certificate in default namespace
-- Environment variable `HARBOR_ROBOT_TOKEN` set for registry authentication
+- `HARBOR_ROBOT_TOKEN` in `~/.env` for registry authentication (`10_deploy.yaml` reads it from there)
 
-## Deployment Instructions
+## Testing the deployment
 
-1. **Deploy Knative**:
-   ```bash
-   cd ~/thinkube
-   ./scripts/tk_ansible ansible/40_thinkube/optional/knative/10_deploy.yaml
-   ```
-
-2. **Test the deployment**:
-   ```bash
-   ./scripts/tk_ansible ansible/40_thinkube/optional/knative/18_test.yaml
-   ```
-
-3. **Rollback if needed**:
-   ```bash
-   ./scripts/tk_ansible ansible/40_thinkube/optional/knative/19_rollback.yaml
-   ```
+```bash
+cd ~/thinkube
+./scripts/tk_ansible ansible/40_thinkube/optional/knative/18_test.yaml
+```
 
 ## Configuration
 
 The deployment uses these key variables from inventory:
 - `domain_name`: Base domain for the cluster
 - `harbor_registry`: Harbor registry URL for container images
+- `gateway_name` / `gateway_namespace`: `thinkube-gateway` / `gateway-system`
 
 Knative services use DomainMapping to be accessible at:
-- `{name}.{{ domain_name }}` (e.g., `helloworld-python.thinkube.com`)
+- `{name}.{{ domain_name }}` (e.g., `helloworld-python.<domain_name>`)
 
 All traffic routes through the main `thinkube-gateway` in `gateway-system`.
 
@@ -71,7 +69,7 @@ The test playbook validates:
 
 1. **Webhook not ready**: The deployment handles webhook readiness checks and will patch the webhook configuration if needed.
 
-2. **Registry authentication fails**: Ensure `HARBOR_ROBOT_TOKEN` environment variable is set:
+2. **Registry authentication fails**: Ensure `HARBOR_ROBOT_TOKEN` is set in `~/.env`:
    ```bash
    source ~/.env
    echo $HARBOR_ROBOT_TOKEN

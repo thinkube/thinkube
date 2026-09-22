@@ -2,6 +2,10 @@
 
 Component #40 in the Thinkube Platform stack.
 
+## Installation
+
+Perses is an optional component. It is installed and removed from the Optional Components page in thinkube-control, not on its own. thinkube-control runs `00_install.yaml` to install, `18_test.yaml` to test and `19_rollback.yaml` to remove it.
+
 ## Overview
 
 Perses is a modern, open-source observability visualization platform designed as a cloud-native alternative to Grafana. It provides native support for Prometheus metrics (PromQL), Tempo distributed tracing, Loki log aggregation, and Pyroscope continuous profiling. Perses features Dashboard-as-Code capabilities using Kubernetes CRDs, making dashboards versionable and deployable alongside applications.
@@ -14,7 +18,7 @@ This component depends on the following Thinkube components:
 
 - **Kubernetes (#6)** - Provides the container orchestration platform
 - **ACME Certificates (#12)** - Secures HTTPS connections
-- **Ingress (#13)** - Routes external traffic to Perses web interface
+- **Gateway API** - Routes external traffic to Perses web interface (HTTPRoute `perses`)
 - **Keycloak (#15)** - Provides SSO authentication for Perses
 - **Prometheus (#31)** - Provides metrics datasource (required dependency)
 
@@ -29,8 +33,8 @@ perses_hostname: "perses.example.com"
 
 # Kubernetes configuration
 kubeconfig: "/path/to/kubeconfig"
-kubectl_bin: "/snap/bin/kubectl"
-helm_bin: "/snap/bin/helm"
+kubectl_bin: "/home/<system_username>/.local/bin/kubectl"
+helm_bin: "/home/<system_username>/.local/bin/helm"
 
 # Namespace
 perses_namespace: "perses"
@@ -41,8 +45,9 @@ keycloak_url: "https://keycloak.example.com"
 keycloak_realm: "thinkube"
 admin_username: "admin"
 
-# Ingress
-primary_ingress_class: "nginx"
+# Gateway (defaults used by 11_deploy.yaml)
+gateway_name: "thinkube-gateway"
+gateway_namespace: "gateway-system"
 
 # Environment variables
 ADMIN_PASSWORD: "your-admin-password"  # Required for deployment
@@ -50,181 +55,19 @@ ADMIN_PASSWORD: "your-admin-password"  # Required for deployment
 
 ## Playbooks
 
-### **00_install.yaml** - Main Orchestrator
-
-Coordinates the complete Perses deployment by executing all component playbooks in the correct sequence.
-
-**Tasks:**
-1. Imports `10_configure_keycloak.yaml` to create OIDC client
-2. Imports `11_deploy.yaml` to deploy Perses with Helm
-3. Imports `14_import_dashboards_percli.yaml` to import monitoring dashboards
-4. Imports `17_configure_discovery.yaml` to register service endpoints
-
-### **10_configure_keycloak.yaml** - Keycloak OIDC Configuration
-
-Configures Keycloak authentication for Perses with role-based access control.
-
-**Configuration Steps:**
-
-**Step 1: Create Perses Realm Roles**
-- Creates `perses-admin` role for full administrative access
-- Creates `perses-user` role for standard user access
-- Uses `keycloak/keycloak_bulk_roles` role for role creation
-
-**Step 2: Setup Keycloak OIDC Client**
-- Creates OIDC client with client ID `perses`
-- Configures redirect URIs: `https://perses.example.com/api/auth/providers/oidc/keycloak/callback`
-- Enables standard OpenID Connect flow
-- Disables implicit flow for security
-- Enables direct access grants for API authentication
-- Configures as confidential client (not public)
-- Sets access token lifespan to 3600 seconds
-- Includes default scopes: email, profile, roles, openid, offline_access
-- Configures web origins with wildcard support
-
-**Step 3: Configure Protocol Mappers**
-- **perses-realm-role-mapper**: Maps realm roles to `realm_access.roles` claim
-- **perses-audience-mapper**: Adds `perses` audience to access tokens
-- **perses-client-role-mapper**: Maps client roles to `resource_access.perses.roles` claim
-- All mappers include claims in ID token, access token, and userinfo endpoint
-- Enables multivalued role arrays in JWT
-
-**Step 4: Assign Admin Role**
-- Assigns `perses-admin` role to the admin user specified in inventory
-- Grants full administrative access to Perses dashboards and configuration
-
-### **11_deploy.yaml** - Perses Helm Deployment
-
-Deploys Perses observability platform using the official Helm chart with Thinkube-specific configuration.
-
-**Configuration Steps:**
-
-**Step 1: Namespace and TLS Setup**
-- Creates `perses` namespace for component isolation
-- Retrieves wildcard TLS certificate from `default` namespace
-- Copies certificate to `perses` namespace as `perses-tls-secret`
-
-**Step 2: Retrieve Keycloak Client Secret**
-- Obtains Keycloak admin token from master realm
-- Queries Keycloak API for Perses client UUID
-- Retrieves client secret for OIDC authentication
-- Stores secret as Ansible fact for template processing
-
-**Step 3: Process Helm Values Template**
-- Creates temporary directory for Helm values
-- Templates `values-thinkube.yaml` with configuration:
-  - **Authentication**: Enables both native and OIDC authentication
-  - **OIDC Provider**: Keycloak with slug_id "keycloak"
-  - **Security**: Guest permissions set to full admin (allows initial setup)
-  - **Frontend**: Explorer mode enabled
-  - **Ingress**: NGINX ingress with SSL redirect
-  - **Resources**: 100m CPU / 128Mi memory requests, 500m CPU / 512Mi limits
-  - **Persistence**: 1Gi PVC for dashboard storage
-  - **Sidecar**: Enabled to load dashboards from ConfigMaps with label `perses.dev/resource: true`
-  - **Environment Variables**: OIDC configuration via `PERSES_*` variables
-
-**Step 4: Deploy Perses with Helm**
-- Adds Perses Helm repository: `https://perses.github.io/helm-charts`
-- Updates Helm repositories
-- Deploys Perses chart version 0.17.1 (app version 0.52.0)
-- Waits for deployment completion (10 minute timeout)
-- Monitors pod readiness
-
-**Step 5: Create Native Admin User**
-- Creates native Perses user with admin username
-- Uses ADMIN_PASSWORD from environment for authentication
-- Enables fallback authentication when Keycloak is unavailable
-- Returns HTTP 200/201 on success, 409 if user exists
-
-**Step 6: Deployment Verification**
-- Waits for Perses pod to reach Running state
-- Verifies container readiness
-- Displays deployment summary with URL and authentication details
-- Lists supported datasources: Prometheus, Tempo, Loki, Pyroscope
-
-### **14_import_dashboards_percli.yaml** - Dashboard Import
-
-Imports a curated collection of monitoring dashboards from the thinkube-monitor repository using percli.
-
-**Import Process:**
-
-**Step 1: Preparation**
-- Retrieves ADMIN_PASSWORD from environment
-- Cleans and creates work directory at `/tmp/perses-dashboards`
-
-**Step 2: Clone thinkube-monitor Repository**
-- Clones https://github.com/thinkube/thinkube-monitor
-- Uses main branch for latest dashboards
-- Depth 1 for faster clone
-- Verifies cloned commit hash
-
-**Step 3: percli Authentication**
-- Logs in to Perses using native authentication
-- Username: admin (from inventory)
-- Password: ADMIN_PASSWORD from environment
-
-**Step 4: Create Perses Projects**
-- Creates 6 projects for dashboard organization:
-  - **kubernetes**: Kubernetes cluster monitoring (18 dashboards)
-  - **node-exporter**: System metrics (2 dashboards)
-  - **prometheus**: Prometheus server monitoring (2 dashboards)
-  - **alertmanager**: Alert management (1 dashboard)
-  - **applications**: Application monitoring - NGINX Ingress (1 dashboard)
-  - **gpu**: GPU monitoring - NVIDIA DCGM (1 dashboard)
-
-**Step 5: Create Prometheus Datasources**
-- Creates Prometheus datasource for each project
-- URL: `http://prometheus-k8s.monitoring.svc.cluster.local:9090`
-- Configures allowed endpoints for PromQL queries:
-  - `/api/v1/labels` (POST)
-  - `/api/v1/series` (POST)
-  - `/api/v1/metadata` (GET)
-  - `/api/v1/query` (POST)
-  - `/api/v1/query_range` (POST)
-  - `/api/v1/label/{label}/values` (GET)
-- Sets as default datasource for each project
-
-**Step 6: Import thinkube-monitor Dashboards**
-- Imports dashboards by category using percli
-- Dashboard modifications:
-  - Adapted for single-cluster deployments (no cluster variable)
-  - Simplified PromQL queries (no cluster filters)
-  - Custom NGINX dashboard with essential metrics
-  - Migrated NVIDIA DCGM dashboard to Perses format
-- Total dashboard count: 25+ monitoring dashboards
-
-**Step 7: Import Summary**
-- Lists all imported dashboards by project
-- Displays comprehensive summary with dashboard categories
-- Provides access URL for Perses UI
-
-### **17_configure_discovery.yaml** - Service Discovery Configuration
-
-Registers Perses endpoints and metadata with the Thinkube service discovery system for integration with the control plane.
-
-**Tasks:**
-1. Reads component version from `VERSION` file (0.1.0)
-2. Creates `thinkube-service-config` ConfigMap with:
-   - Service metadata: name, display name, description, type (optional), category (observability)
-   - Component version: 0.1.0
-   - Icon: `/icons/tk_monitoring.svg`
-   - Endpoint: Web interface at `https://perses.example.com` with health check at `/api/health`
-   - Dependencies: prometheus, keycloak
-   - Scaling configuration: Deployment `perses` in `perses` namespace, min 1 replica, can be disabled
-   - Features: PromQL native support, Tempo tracing, Loki logs, Dashboard-as-Code (CRD), Keycloak SSO
-3. Updates code-server environment variables via `code_server_env_update` role
-4. Displays service registration summary
+| Playbook | What it does |
+|---|---|
+| [00_install.yaml](00_install.yaml) | Runs `10_configure_keycloak.yaml`, `11_deploy.yaml`, `14_import_dashboards_percli.yaml` and `17_configure_discovery.yaml` in that order. |
+| [10_configure_keycloak.yaml](10_configure_keycloak.yaml) | Creates the realm roles `perses-admin` and `perses-user`, the confidential OIDC client `perses` with its role and audience mappers, and gives the admin user `perses-admin`. |
+| [11_deploy.yaml](11_deploy.yaml) | Creates the `perses` namespace, copies the wildcard certificate, reads the Keycloak client secret, deploys Helm chart 0.17.1 (Perses 0.52.0) with `values-thinkube.yaml`, sets priority class `thinkube-workload` on the `perses` StatefulSet, creates the HTTPRoute `perses`, and creates the native admin user. |
+| [14_import_dashboards_percli.yaml](14_import_dashboards_percli.yaml) | Clones [thinkube-monitor](https://github.com/thinkube/thinkube-monitor), logs in with percli, creates six projects and a Prometheus datasource (`http://prometheus-k8s.monitoring.svc.cluster.local:9090`) in each, and imports the dashboards. |
+| [17_configure_discovery.yaml](17_configure_discovery.yaml) | Creates the `thinkube-service-config` ConfigMap for thinkube-control (web endpoint, health check `/api/health`, dependencies `prometheus` and `keycloak`, variables `PERSES_URL`, `PERSES_USER`, `PERSES_PASSWORD`) and updates the code-server environment. |
+| [18_test.yaml](18_test.yaml) | Checks the namespace, the running pod, the service, the HTTPRoute, the HTTPS endpoint and the service discovery ConfigMap. |
+| [19_rollback.yaml](19_rollback.yaml) | Uninstalls the Helm release, deletes the `perses` namespace, and deletes the Keycloak client and the Perses realm roles. |
 
 ## Deployment
 
 Perses is automatically deployed via the **thinkube-control Optional Components** interface at `https://thinkube.example.com/optional-components`.
-
-To deploy manually:
-
-```bash
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/perses/00_install.yaml
-```
 
 The deployment process typically takes 5-7 minutes and includes:
 1. Keycloak OIDC client configuration with role mappings
@@ -664,9 +507,9 @@ kubectl logs -n perses -l app.kubernetes.io/name=perses
 # Verify service
 kubectl get svc -n perses
 
-# Check ingress
-kubectl get ingress -n perses
-kubectl describe ingress -n perses perses
+# Check the HTTPRoute
+kubectl get httproute -n perses
+kubectl describe httproute -n perses perses
 ```
 
 ### Authentication Issues
@@ -678,7 +521,7 @@ kubectl describe ingress -n perses perses
 # (requires keycloak admin credentials)
 
 # Check OIDC environment variables
-kubectl get deployment -n perses perses -o jsonpath='{.spec.template.spec.containers[0].env}' | jq
+kubectl get statefulset -n perses perses -o jsonpath='{.spec.template.spec.containers[0].env}' | jq
 
 # Test native authentication fallback
 curl -X POST https://perses.example.com/api/v1/auth/login \
@@ -720,7 +563,7 @@ kubectl logs -n perses -l app.kubernetes.io/name=perses -c sidecar
 percli get datasources --project kubernetes
 
 # Test Prometheus connectivity from Perses pod
-kubectl exec -n perses deployment/perses -- \
+kubectl exec -n perses statefulset/perses -- \
   wget -qO- http://prometheus-k8s.monitoring.svc.cluster.local:9090/api/v1/query?query=up
 
 # Check Prometheus is running
@@ -751,21 +594,7 @@ kubectl get pvc -n perses perses -o jsonpath='{.status.phase}'
    kubectl top pod -n perses
    ```
 
-2. **Increase resources** if needed:
-   ```bash
-   # Edit values and re-deploy
-   cat > /tmp/perses-values.yaml <<EOF
-   resources:
-     requests:
-       cpu: 200m
-       memory: 256Mi
-     limits:
-       cpu: 1000m
-       memory: 1Gi
-   EOF
-
-   helm upgrade perses perses/perses -n perses -f /tmp/perses-values.yaml
-   ```
+2. **Increase resources** if needed: change `resources` in `values-thinkube.yaml`, then remove and reinstall Perses from the Optional Components page.
 
 3. **Optimize PromQL queries**: Use recording rules in Prometheus for complex calculations
 
@@ -810,7 +639,7 @@ percli get dashboards --all-projects
 
 ```bash
 # Test Prometheus query from Perses pod
-kubectl exec -n perses deployment/perses -- \
+kubectl exec -n perses statefulset/perses -- \
   wget -qO- "http://prometheus-k8s.monitoring.svc.cluster.local:9090/api/v1/query?query=up" | jq
 
 # Expected: JSON response with metric data

@@ -14,18 +14,18 @@ LiteLLM is a unified LLM API proxy that provides a single interface for multiple
 
 ## Installation
 
-```bash
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/litellm/00_install.yaml
-```
+LiteLLM is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install, `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. It requires Harbor, Keycloak, PostgreSQL and SeaweedFS.
 
 ## Components
 
 ### Playbooks
 
-- `00_install.yaml` - Main installation orchestrator
-- `10_deploy.yaml` - Deploy LiteLLM on Kubernetes
-- `15_configure_keycloak.yaml` - Configure OIDC authentication
+- `00_install.yaml` - Main installation orchestrator: runs 10, 11 and 17
+- `10_configure_keycloak.yaml` - Configure OIDC authentication
+- `11_deploy.yaml` - Deploy LiteLLM on Kubernetes
 - `17_configure_discovery.yaml` - Register service discovery
 - `18_test.yaml` - Verify deployment
 - `19_rollback.yaml` - Remove LiteLLM from cluster
@@ -34,11 +34,15 @@ cd ~/thinkube
 
 - **Namespace**: `litellm`
 - **Deployment**: LiteLLM proxy server
-- **Service**: Internal service on port 80
-- **Ingress**: HTTPS access at `litellm.{{ domain_name }}`
-- **PVC**: 5Gi storage for SQLite database
+- **Service**: Internal service on port 80 (container port 4000)
+- **HTTPRoute**: HTTPS access at `litellm.{{ domain_name }}` through the Gateway API gateway
+- **PVC**: `litellm-data-pvc`, 5Gi, mounted at `/app/data`
 - **ConfigMap**: LiteLLM configuration
-- **Secret**: Master key and credentials
+- **Secret**: `litellm-secrets`, with the master key and credentials
+
+LiteLLM uses these core services:
+- **PostgreSQL**: database `litellm` on `postgresql-official.postgres.svc.cluster.local`
+- **SeaweedFS S3**: response cache in bucket `litellm-cache`
 
 ## Access
 
@@ -102,12 +106,8 @@ cd ~/thinkube
 
 ## Uninstall
 
-To remove LiteLLM from the cluster:
-
-```bash
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/litellm/19_rollback.yaml
-```
+LiteLLM is removed from the Optional Components page, which runs
+`19_rollback.yaml`.
 
 ## Troubleshooting
 
@@ -117,9 +117,9 @@ kubectl get pods -n litellm
 kubectl logs -n litellm deployment/litellm
 ```
 
-### Verify Ingress
+### Verify Route
 ```bash
-kubectl get ingress -n litellm
+kubectl get httproute -n litellm
 curl -I https://litellm.{{ domain_name }}/health/readiness
 ```
 
@@ -127,9 +127,9 @@ curl -I https://litellm.{{ domain_name }}/health/readiness
 If you need to reset the master key, update the secret and restart the deployment:
 ```bash
 kubectl delete secret -n litellm litellm-secrets
-# Re-run the deployment playbook
-./scripts/run_ansible.sh ansible/40_thinkube/optional/litellm/10_deploy.yaml
 ```
+Then reinstall LiteLLM from the Optional Components page. `11_deploy.yaml`
+generates a new master key.
 
 ## References
 

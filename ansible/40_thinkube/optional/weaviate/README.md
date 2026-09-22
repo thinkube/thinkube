@@ -20,29 +20,29 @@ Weaviate is an open-source vector database designed for AI applications. It prov
 - **Deployment Type**: StatefulSet (single replica)
 - **Persistence**: PersistentVolumeClaim for data storage
 - **Authentication**: API key authentication using admin credentials
-- **Networking**: Exposed via Ingress at `weaviate.<domain>`
+- **Networking**: HTTPRoute at `weaviate.<domain>` (port 8080) and GRPCRoute at `weaviate-grpc.<domain>` (port 50051)
 - **Namespace**: `weaviate`
 
 ## Installation
 
+Weaviate is an optional component. It is installed and removed from the
+Optional Components page in thinkube-control, not on its own. The page runs
+`00_install.yaml` to install (it runs `10_deploy.yaml` and then
+`17_configure_discovery.yaml`), `18_test.yaml` to test and `19_rollback.yaml`
+to remove it. It requires the `harbor` component.
+
 ### Prerequisites
 
-- Kubernetes (k8s-snap) cluster with ingress controller
+- Kubernetes (kubeadm) cluster with the Gateway API gateway
 - DNS configured for the domain
 - `ADMIN_PASSWORD` environment variable set
 
-### Deploy Weaviate
+### What the install does
 
-```bash
-cd ~/thinkube
-./scripts/run_ansible.sh ansible/40_thinkube/optional/weaviate/00_install.yaml
-```
-
-This will:
 1. Create the `weaviate` namespace
 2. Deploy Weaviate with API key authentication
 3. Configure persistent storage
-4. Set up ingress for HTTPS access
+4. Create the HTTPRoute and GRPCRoute for HTTPS access
 5. Register with service discovery
 
 ### Verify Installation
@@ -175,23 +175,15 @@ kubectl -n weaviate delete pod backup
 
 To update the Weaviate version:
 
-1. Edit the `weaviate_image` variable in `10_deploy.yaml`
-2. Re-run the deployment playbook
+1. The image is `{{ harbor_registry }}/library/weaviate:latest` (`weaviate_image` in `10_deploy.yaml`)
+2. Change the image in Harbor or the variable, then reinstall from the Optional Components page
 3. Verify with the test playbook
 
 ### Rollback
 
-To remove Weaviate while preserving data:
-
-```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/weaviate/19_rollback.yaml
-```
-
-To completely remove Weaviate including data:
-
-```bash
-./scripts/run_ansible.sh ansible/40_thinkube/optional/weaviate/19_rollback.yaml -e remove_data=true
-```
+Removing Weaviate from the Optional Components page runs `19_rollback.yaml`.
+By default it keeps the PVC `weaviate-data-pvc` and its data. The playbook
+deletes the PVC only when `remove_data=true` is passed.
 
 ## Troubleshooting
 
@@ -208,7 +200,7 @@ kubectl -n weaviate logs -f statefulset/weaviate
 ### Common Issues
 
 1. **Authentication Errors**: Ensure `ADMIN_PASSWORD` is set correctly
-2. **Connection Refused**: Check ingress and DNS configuration
+2. **Connection Refused**: Check the HTTPRoute and DNS configuration
 3. **Out of Memory**: Increase memory limits in the deployment
 4. **Data Loss**: Ensure PVC is not deleted during rollback
 
