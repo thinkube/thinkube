@@ -26,7 +26,7 @@ Mirrors 50+ essential public images from multiple sources to Harbor's `library` 
 
 **Mirrored images**:
 - **Base**: alpine, busybox, debian:bookworm-slim, ubuntu:24.04, nginx:alpine
-- **Languages**: python:3.12-slim, golang:1.25.3-alpine, node:24-alpine, rust:alpine
+- **Languages**: python:3.12-slim, golang:1.27-alpine, node:24-alpine, rust:alpine
 - **Databases**: postgres:18-alpine, valkey:7.2-alpine, pgadmin4
 - **Vector DBs**: qdrant, weaviate, chroma
 - **AI**: litellm, argilla, cvat, tensorrt-llm:1.2.0rc2
