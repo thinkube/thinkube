@@ -35,7 +35,7 @@
   vars:
     clickhouse_namespace: clickhouse
     # Get admin password from environment
-    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
     clickhouse_hostname: "clickhouse.{{ domain_name }}"
     clickhouse_http_port: 8123
     clickhouse_native_port: 9000
@@ -148,8 +148,8 @@
             namespace: "{{ clickhouse_namespace }}"
           spec:
             parentRefs:
-              - name: "{{ gateway_name | default('thinkube-gateway') }}"
-                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
                 sectionName: https
             hostnames:
               - "{{ clickhouse_hostname }}"
@@ -162,8 +162,29 @@
                   - name: clickhouse-clickhouse
                     port: "{{ clickhouse_http_port }}"
 
-    # TCP routing for ClickHouse (port 9000) is handled by the Gateway API
-    # TCPRoute created in gateway-api/10_deploy.yaml — no ingress patching needed.
+    # Clients reach this service through the TCPRoute gateway-api/10_deploy.yaml
+    # creates in the gateway's namespace. A route may send traffic to a Service
+    # in another namespace only when that namespace grants it, and the grant
+    # lives in this namespace, which a rollback can delete; the deploy creates
+    # it with the namespace.
+    - name: Allow the gateway's TCP routes to reach the Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1beta1
+          kind: ReferenceGrant
+          metadata:
+            name: allow-gateway-tcp
+            namespace: "{{ clickhouse_namespace }}"
+          spec:
+            from:
+              - group: gateway.networking.k8s.io
+                kind: TCPRoute
+                namespace: "{{ gateway_namespace }}"
+            to:
+              - group: ""
+                kind: Service
 
     - name: Create ClickHouse config from template
       ansible.builtin.template:

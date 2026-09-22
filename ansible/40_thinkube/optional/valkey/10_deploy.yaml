@@ -50,9 +50,15 @@
     valkey_hostname: "valkey.{{ domain_name }}"
     valkey_tls_secret_name: "{{ valkey_namespace }}-tls-secret"
     # Password from environment (same as admin password)
-    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
 
   tasks:
+    - name: Verify the admin password is provided
+      ansible.builtin.assert:
+        that:
+          - admin_password != ""
+        fail_msg: "ADMIN_PASSWORD is not set: it is the Valkey password; set it in ~/.env or in the environment that runs this playbook."
+
     - name: Load Harbor robot token from .env file
       ansible.builtin.shell: |
         if [ -f "{{ ansible_facts.env.HOME }}/.env" ]; then
@@ -263,8 +269,29 @@
             tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
             tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
 
-    # TCP routing for Valkey (port 6379) is handled by the Gateway API
-    # TCPRoute created in gateway-api/10_deploy.yaml — no ingress patching needed.
+    # Clients reach this service through the TCPRoute gateway-api/10_deploy.yaml
+    # creates in the gateway's namespace. A route may send traffic to a Service
+    # in another namespace only when that namespace grants it, and the grant
+    # lives in this namespace, which a rollback can delete; the deploy creates
+    # it with the namespace.
+    - name: Allow the gateway's TCP routes to reach the Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1beta1
+          kind: ReferenceGrant
+          metadata:
+            name: allow-gateway-tcp
+            namespace: "{{ valkey_namespace }}"
+          spec:
+            from:
+              - group: gateway.networking.k8s.io
+                kind: TCPRoute
+                namespace: "{{ gateway_namespace }}"
+            to:
+              - group: ""
+                kind: Service
 
     - name: Final Valkey info
       ansible.builtin.debug:
