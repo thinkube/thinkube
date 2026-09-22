@@ -1,0 +1,99 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for thinkube-control by creating a ConfigMap
+#   that describes the service and the environment variables it provides:
+#   the LLM Gateway address and the platform API token. code-server
+#   (service-env-cs.sh) and the notebook servers (service-env-jh.sh) read
+#   them from this ConfigMap.
+#
+# Requirements:
+#   - thinkube-control deployed (12_deploy.yaml creates the mcp-default-token Secret)
+#   - Kubernetes kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/thinkube-control/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain name for services
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Configure thinkube-control service discovery
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    component_version: "{{ lookup('file', playbook_dir + '/VERSION') }}"
+
+  tasks:
+    - name: Check the platform API token Secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: thinkube-control
+        name: mcp-default-token
+      register: api_token_secret
+      failed_when: >-
+        api_token_secret.resources | length == 0 or
+        'token' not in api_token_secret.resources[0].data
+
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: thinkube-control
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "core"
+              thinkube.io/service-name: "thinkube-control"
+              thinkube.io/component-version: "{{ component_version }}"
+          data:
+            service.yaml: |
+              service:
+                name: thinkube-control
+                display_name: "thinkube-control"
+                description: "The platform's control panel, API and MCP server"
+                type: core
+                category: infrastructure
+                component_version: "{{ component_version }}"
+
+                endpoints:
+                  - name: web
+                    type: http
+                    url: "https://control.{{ domain_name }}"
+                    health_url: "http://backend.thinkube-control.svc.cluster.local:8000/health"
+                    description: "Web interface and API"
+                    primary: true
+
+                dependencies: []
+
+                scaling:
+                  resource_type: deployment
+                  resource_name: thinkube-control-backend
+                  namespace: thinkube-control
+                  min_replicas: 1
+                  can_disable: false
+
+                environment_variables:
+                  - name: LLM_GATEWAY_URL
+                    value: "https://llm.{{ domain_name }}"
+                  - name: THINKUBE_API_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        namespace: thinkube-control
+                        name: mcp-default-token
+                        key: token
+
+    - name: Update code-server environment with the variables services provide
+      ansible.builtin.include_role:
+        name: code_server_env_update

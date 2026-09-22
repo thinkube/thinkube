@@ -43,9 +43,9 @@
   register: service_configmaps
   when: code_server_pod_name != ""
 
-- name: Extract environment variables from all services
+- name: Collect the environment variables all services declare
   ansible.builtin.set_fact:
-    all_env_vars: >-
+    declared_env_vars: >-
       {{
         service_configmaps.resources
         | map(attribute='data')
@@ -59,12 +59,66 @@
         | selectattr('environment_variables', 'defined')
         | map(attribute='environment_variables')
         | flatten
-        | selectattr('value', 'defined')
         | list
       }}
   when:
     - code_server_pod_name != ""
     - service_configmaps.resources | length > 0
+
+# A variable is declared either with a literal value or with
+# valueFrom.secretKeyRef (namespace, name, key); anything else is an error.
+- name: Refuse a variable declared without a value or a Secret reference
+  ansible.builtin.fail:
+    msg: >-
+      Service discovery declares {{ item.name }} with neither `value` nor
+      `valueFrom.secretKeyRef` (namespace, name, key).
+  loop: "{{ declared_env_vars | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: >-
+    item.value is not defined and
+    (item.valueFrom is not defined or item.valueFrom.secretKeyRef is not defined or
+     item.valueFrom.secretKeyRef.namespace is not defined or
+     item.valueFrom.secretKeyRef.name is not defined or
+     item.valueFrom.secretKeyRef.key is not defined)
+
+- name: Read the Secrets the declared variables refer to
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ item.valueFrom.secretKeyRef.namespace }}"
+    name: "{{ item.valueFrom.secretKeyRef.name }}"
+  loop: "{{ declared_env_vars | default([]) | rejectattr('value', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: env_secrets
+  failed_when: >-
+    env_secrets.resources | length == 0 or
+    item.valueFrom.secretKeyRef.key not in (env_secrets.resources[0].data | default({}))
+
+- name: Start the resolved variable list
+  ansible.builtin.set_fact:
+    all_env_vars: []
+  when: code_server_pod_name != ""
+
+- name: Add the variables declared with a literal value
+  ansible.builtin.set_fact:
+    all_env_vars: "{{ all_env_vars + [{'name': item.name, 'value': item.value}] }}"
+  loop: "{{ declared_env_vars | default([]) | selectattr('value', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: code_server_pod_name != ""
+
+- name: Add the variables read from Secrets
+  ansible.builtin.set_fact:
+    all_env_vars: >-
+      {{ all_env_vars + [{'name': item.item.name,
+                          'value': item.resources[0].data[item.item.valueFrom.secretKeyRef.key] | b64decode}] }}
+  loop: "{{ env_secrets.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: code_server_pod_name != ""
 
 - name: Generate service environment file content (Bash/Zsh)
   ansible.builtin.set_fact:
@@ -124,10 +178,11 @@
     EOF'
   when: code_server_pod_name != ""
 
-- name: Make service environment files executable
+# The files hold Secret values; the shells source them, so only the owner reads them.
+- name: Restrict the service environment files to their owner
   ansible.builtin.shell: |
     {{ kubectl_bin }} exec -n code-server {{ code_server_pod_name }} -- \
-      bash -c "chmod +x /home/thinkube/.config/thinkube/service-env-cs.sh /home/thinkube/.config/thinkube/service-env-cs.fish"
+      bash -c "chmod 600 /home/thinkube/.config/thinkube/service-env-cs.sh /home/thinkube/.config/thinkube/service-env-cs.fish"
   when: code_server_pod_name != ""
 
 - name: Add service-env-cs.sh to .bashrc if not present
