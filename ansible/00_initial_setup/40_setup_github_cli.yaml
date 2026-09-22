@@ -14,8 +14,9 @@
 #   - Environment variables should include GITHUB_TOKEN
 #
 # Variables:
-#   - github_user: GitHub username (default from inventory)
-#   - github_email: GitHub email (default from inventory)
+#   - git_author_name: full name used as git commit author (from inventory)
+#   - git_author_email: email used as git commit author (from inventory)
+#   - github_user: GitHub login for the gh hosts file (from environment variable GITHUB_USER)
 #   - github_token: GitHub token for authentication (from environment variable)
 #
 # Run with:
@@ -64,19 +65,35 @@
           - Source the file with: source ~/.env
           
           REFERENCE: See docs/architecture/VARIABLE_HANDLING.md
-    
+
+    - name: Stop when the git author name is not set
+      ansible.builtin.assert:
+        that:
+          - git_author_name is defined and (git_author_name | string | trim | length > 0)
+        fail_msg: >-
+          git_author_name is not set. Set git_author_name in the inventory
+          (all.vars in inventory.yaml) to the full name used as the author
+          of git commits.
+        quiet: true
+
+    - name: Stop when the git author email is not set
+      ansible.builtin.assert:
+        that:
+          - git_author_email is defined and (git_author_email | string | trim | length > 0)
+        fail_msg: >-
+          git_author_email is not set. Set git_author_email in the inventory
+          (all.vars in inventory.yaml) to the email used as the author of
+          git commits.
+        quiet: true
+
     # Check for optional variables
     - name: Check if GitHub user is defined in environment
       ansible.builtin.set_fact:
         github_user: "{{ lookup('env', 'GITHUB_USER') }}"
     
-    - name: Check if GitHub email is defined in environment
-      ansible.builtin.set_fact:
-        github_email: "{{ lookup('env', 'GITHUB_EMAIL') }}"
-        
     - name: Show GitHub user status
       ansible.builtin.debug:
-        msg: "GitHub username {{ 'is defined' if github_user | length > 0 else 'is not defined. Will use git config if available.' }}"
+        msg: "GitHub username {{ 'is defined' if github_user | length > 0 else 'is not defined in GITHUB_USER' }}"
       changed_when: false
       
     # Phase 2: Install GitHub CLI
@@ -110,14 +127,21 @@
       when: gh_installed.rc != 0
       
     # Phase 3: Configure Git and GitHub CLI
-    - name: Configure Git username if provided
-      ansible.builtin.command: git config --global user.name "{{ github_user }}"
-      when: github_user is defined and github_user | length > 0
-      changed_when: false
-      
-    - name: Configure Git email if provided
-      ansible.builtin.command: git config --global user.email "{{ github_email }}"
-      when: github_email is defined and github_email | length > 0
+    # Each value is passed as its own argument, with no shell in between,
+    # so names with apostrophes, quotes or accents reach git unchanged.
+    - name: Configure the git commit author
+      ansible.builtin.command:
+        argv:
+          - git
+          - config
+          - --global
+          - "{{ item.key }}"
+          - "{{ item.value }}"
+      loop:
+        - { key: user.name, value: "{{ git_author_name }}" }
+        - { key: user.email, value: "{{ git_author_email }}" }
+      loop_control:
+        label: "{{ item.key }}"
       changed_when: false
       
     - name: Create GitHub CLI config directory

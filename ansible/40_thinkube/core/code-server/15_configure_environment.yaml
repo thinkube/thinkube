@@ -38,6 +38,28 @@
       ansible.builtin.include_role:
         name: common/github_username
 
+    # Commits made in code-server carry the name and email of the person who
+    # installed Thinkube, given on the installer's configuration screen.
+    - name: Stop when the git author name is not set
+      ansible.builtin.assert:
+        that:
+          - git_author_name is defined and (git_author_name | string | trim | length > 0)
+        fail_msg: >-
+          git_author_name is not set. Set git_author_name in the inventory
+          (all.vars in inventory.yaml) to the full name that code-server
+          uses as the author of git commits.
+        quiet: true
+
+    - name: Stop when the git author email is not set
+      ansible.builtin.assert:
+        that:
+          - git_author_email is defined and (git_author_email | string | trim | length > 0)
+        fail_msg: >-
+          git_author_email is not set. Set git_author_email in the inventory
+          (all.vars in inventory.yaml) to the email that code-server uses
+          as the author of git commits.
+        quiet: true
+
   tasks:
     # Same retry as 13_clone_repositories: the pod may not exist yet when this
     # runs (see the comment there). `{.items[0]...}` errors on an empty list,
@@ -1137,14 +1159,27 @@
         echo '✅ Harbor/Docker credentials configured'
       no_log: true
 
+    # Each value is passed as its own argument, with no shell in between,
+    # so names with apostrophes, quotes or accents reach git unchanged.
     - name: Configure git user settings
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "
-            git config --global user.name '{{ github_username }}'
-            git config --global user.email '{{ admin_email }}'
-            echo '✅ Git user settings configured'
-          "
+      ansible.builtin.command:
+        argv:
+          - "{{ kubectl_bin }}"
+          - exec
+          - -n
+          - "{{ code_server_namespace }}"
+          - "{{ pod_name.stdout }}"
+          - --
+          - git
+          - config
+          - --global
+          - "{{ item.key }}"
+          - "{{ item.value }}"
+      loop:
+        - { key: user.name, value: "{{ git_author_name }}" }
+        - { key: user.email, value: "{{ git_author_email }}" }
+      loop_control:
+        label: "{{ item.key }}"
 
     - name: Configure service environment variables from deployed services
       include_role:
