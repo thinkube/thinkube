@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Paused backend server for Thinkube services.
 Shows a nice "Resource Optimized" page when services are scaled to zero.
