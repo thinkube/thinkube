@@ -76,20 +76,3 @@ journalctl -u thinkube-node-ip-sync-watch.service
 ```
 
 If the timer or the script is missing, run `10_install_k8s.yaml` (control plane) or `20_join_workers.yaml` (workers) again. They install and enable it.
-
-## `16_test_kubelet_protection.yaml` and `18_test_control.yaml` fail on a working cluster
-
-**Symptom.**
-
-- `16_test_kubelet_protection.yaml` fails at "Read kubelet args file".
-- `18_test_control.yaml` fails at "Check if k8s-snap is installed".
-
-**Cause.** Both playbooks check files and commands that this install does not create:
-
-- `/var/snap/k8s/common/args/kubelet`
-- `snap list k8s` and `k8s status`
-- a UFW rule for port 6400
-
-On this install, the kubelet memory settings are in the `KubeletConfiguration` of `templates/kubeadm-init-config.yaml.j2` and `templates/kubeadm-join-config.yaml.j2`.
-
-**Fix.** No playbook fix exists. A failure of these two playbooks says nothing about the health of the cluster. `28_test_worker.yaml` checks workers against this install.

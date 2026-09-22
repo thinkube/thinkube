@@ -4,155 +4,109 @@
 ---
 # Test playbook for kubelet memory protection configuration
 # Description:
-#   Verifies kubelet is configured with resource reservations and eviction thresholds
+#   Verifies each node's kubelet runs with the resource reservations and
+#   eviction thresholds set in templates/kubeadm-init-config.yaml.j2 and
+#   templates/kubeadm-join-config.yaml.j2.
 #   Tests include:
-#   - system-reserved and kube-reserved are set
-#   - Eviction thresholds are configured
-#   - Node allocatable is less than capacity (proving reservations work)
+#   - systemReserved and kubeReserved are set
+#   - evictionHard and evictionSoft memory thresholds are set
+#   - enforceNodeAllocatable includes pods
+#   - Node allocatable memory is less than capacity (reservations are active)
+#
+#   kubeadm writes the kubelet configuration each node runs with to
+#   /var/lib/kubelet/config.yaml; that file is what is checked.
 #
 # Usage:
 #   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/k8s/16_test_kubelet_protection.yaml
 
 - name: Test Kubelet Memory Protection Configuration
-  hosts: k8s_control_plane
+  hosts: k8s_control_plane:k8s_workers
   gather_facts: false
 
+  vars:
+    control_plane_host: "{{ groups['k8s_control_plane'][0] }}"
+    control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+    control_plane_kubeconfig: "/home/{{ system_username }}/.kube/config"
+
   tasks:
-    - name: Read kubelet args file
+    - name: Read kubelet configuration
       ansible.builtin.slurp:
-        src: /var/snap/k8s/common/args/kubelet
-      register: kubelet_args_raw
+        src: /var/lib/kubelet/config.yaml
+      register: kubelet_config_raw
       become: true
 
-    - name: Parse kubelet args
+    - name: Parse kubelet configuration
       ansible.builtin.set_fact:
-        kubelet_args: "{{ kubelet_args_raw.content | b64decode }}"
+        kubelet_config: "{{ kubelet_config_raw.content | b64decode | from_yaml }}"
 
-    - name: Verify system-reserved is configured
+    - name: Verify systemReserved is configured
       ansible.builtin.assert:
         that:
-          - "'--system-reserved=' in kubelet_args"
-          - "'memory=4Gi' in kubelet_args"
-        fail_msg: "system-reserved is not configured in kubelet args"
-        success_msg: "system-reserved is configured correctly"
+          - kubelet_config.systemReserved is defined
+          - kubelet_config.systemReserved.memory == '4Gi'
+        fail_msg: "systemReserved memory is not 4Gi in /var/lib/kubelet/config.yaml"
+        success_msg: "systemReserved is configured correctly"
 
-    - name: Verify kube-reserved is configured
+    - name: Verify kubeReserved is configured
       ansible.builtin.assert:
         that:
-          - "'--kube-reserved=' in kubelet_args"
-        fail_msg: "kube-reserved is not configured in kubelet args"
-        success_msg: "kube-reserved is configured correctly"
+          - kubelet_config.kubeReserved is defined
+          - kubelet_config.kubeReserved.memory == '2Gi'
+        fail_msg: "kubeReserved memory is not 2Gi in /var/lib/kubelet/config.yaml"
+        success_msg: "kubeReserved is configured correctly"
 
-    - name: Verify eviction-hard is configured
+    - name: Verify evictionHard is configured
       ansible.builtin.assert:
         that:
-          - "'--eviction-hard=' in kubelet_args"
-          - "'memory.available<2Gi' in kubelet_args"
-        fail_msg: "eviction-hard is not configured in kubelet args"
-        success_msg: "eviction-hard is configured correctly"
+          - kubelet_config.evictionHard is defined
+          - kubelet_config.evictionHard['memory.available'] == '2Gi'
+        fail_msg: "evictionHard memory.available is not 2Gi in /var/lib/kubelet/config.yaml"
+        success_msg: "evictionHard is configured correctly"
 
-    - name: Verify eviction-soft is configured
+    - name: Verify evictionSoft is configured
       ansible.builtin.assert:
         that:
-          - "'--eviction-soft=' in kubelet_args"
-          - "'memory.available<4Gi' in kubelet_args"
-        fail_msg: "eviction-soft is not configured in kubelet args"
-        success_msg: "eviction-soft is configured correctly"
+          - kubelet_config.evictionSoft is defined
+          - kubelet_config.evictionSoft['memory.available'] == '4Gi'
+        fail_msg: "evictionSoft memory.available is not 4Gi in /var/lib/kubelet/config.yaml"
+        success_msg: "evictionSoft is configured correctly"
 
-    - name: Verify enforce-node-allocatable is configured
+    - name: Verify enforceNodeAllocatable includes pods
       ansible.builtin.assert:
         that:
-          - "'--enforce-node-allocatable=' in kubelet_args"
-        fail_msg: "enforce-node-allocatable is not configured in kubelet args"
-        success_msg: "enforce-node-allocatable is configured correctly"
+          - kubelet_config.enforceNodeAllocatable is defined
+          - "'pods' in kubelet_config.enforceNodeAllocatable"
+        fail_msg: "enforceNodeAllocatable does not include pods in /var/lib/kubelet/config.yaml"
+        success_msg: "enforceNodeAllocatable is configured correctly"
 
     - name: Get node allocatable memory
       ansible.builtin.command: >
-        {{ kubectl_bin }} get node {{ inventory_hostname }}
+        {{ control_plane_kubectl }} get node {{ inventory_hostname }}
         -o jsonpath='{.status.allocatable.memory}'
+      delegate_to: "{{ control_plane_host }}"
+      environment:
+        KUBECONFIG: "{{ control_plane_kubeconfig }}"
       register: node_allocatable_memory
       changed_when: false
 
     - name: Get node capacity memory
       ansible.builtin.command: >
-        {{ kubectl_bin }} get node {{ inventory_hostname }}
+        {{ control_plane_kubectl }} get node {{ inventory_hostname }}
         -o jsonpath='{.status.capacity.memory}'
+      delegate_to: "{{ control_plane_host }}"
+      environment:
+        KUBECONFIG: "{{ control_plane_kubeconfig }}"
       register: node_capacity_memory
       changed_when: false
-
-    - name: Display node memory info
-      ansible.builtin.debug:
-        msg: >
-          Node {{ inventory_hostname }}:
-          Capacity={{ node_capacity_memory.stdout }},
-          Allocatable={{ node_allocatable_memory.stdout }}.
-          Reservations should reduce allocatable by ~6Gi from capacity.
 
     - name: Verify allocatable is less than capacity
       ansible.builtin.assert:
         that:
+          - node_allocatable_memory.stdout | length > 0
           - node_allocatable_memory.stdout != node_capacity_memory.stdout
         fail_msg: >
           Allocatable ({{ node_allocatable_memory.stdout }}) equals
           capacity ({{ node_capacity_memory.stdout }}) - reservations not active
         success_msg: >
           Allocatable ({{ node_allocatable_memory.stdout }}) is less than
-          capacity ({{ node_capacity_memory.stdout }}) - reservations are active
-
-- name: Test Kubelet Memory Protection on Workers
-  hosts: k8s_workers
-  gather_facts: false
-
-  tasks:
-    - name: Read kubelet args file
-      ansible.builtin.slurp:
-        src: /var/snap/k8s/common/args/kubelet
-      register: kubelet_args_raw
-      become: true
-
-    - name: Parse kubelet args
-      ansible.builtin.set_fact:
-        kubelet_args: "{{ kubelet_args_raw.content | b64decode }}"
-
-    - name: Verify system-reserved is configured on worker
-      ansible.builtin.assert:
-        that:
-          - "'--system-reserved=' in kubelet_args"
-          - "'memory=4Gi' in kubelet_args"
-        fail_msg: "system-reserved is not configured on worker kubelet"
-        success_msg: "system-reserved is configured correctly on worker"
-
-    - name: Verify eviction-hard is configured on worker
-      ansible.builtin.assert:
-        that:
-          - "'--eviction-hard=' in kubelet_args"
-          - "'memory.available<2Gi' in kubelet_args"
-        fail_msg: "eviction-hard is not configured on worker kubelet"
-        success_msg: "eviction-hard is configured correctly on worker"
-
-    - name: Get worker node allocatable memory
-      ansible.builtin.command: >
-        {{ kubectl_bin }} get node {{ inventory_hostname }}
-        -o jsonpath='{.status.allocatable.memory}'
-      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
-      register: node_allocatable_memory
-      changed_when: false
-
-    - name: Get worker node capacity memory
-      ansible.builtin.command: >
-        {{ kubectl_bin }} get node {{ inventory_hostname }}
-        -o jsonpath='{.status.capacity.memory}'
-      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
-      register: node_capacity_memory
-      changed_when: false
-
-    - name: Verify worker allocatable is less than capacity
-      ansible.builtin.assert:
-        that:
-          - node_allocatable_memory.stdout != node_capacity_memory.stdout
-        fail_msg: >
-          Worker allocatable ({{ node_allocatable_memory.stdout }}) equals
-          capacity ({{ node_capacity_memory.stdout }}) - reservations not active
-        success_msg: >
-          Worker allocatable ({{ node_allocatable_memory.stdout }}) is less than
           capacity ({{ node_capacity_memory.stdout }}) - reservations are active

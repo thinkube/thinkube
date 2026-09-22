@@ -23,8 +23,8 @@ The GPU operator is a separate component. See [`../gpu_operator/`](../gpu_operat
 | `10_install_k8s.yaml` | Control plane. Checks the host, sets up the `k8s0` interface and UFW, installs containerd and kubeadm, runs `kubeadm init`, installs kubectl and helm for the user, then Cilium and OpenEBS Rawfile CSI. |
 | `12_configure_resource_policies.yaml` | Creates four PriorityClasses: `thinkube-critical` (1000000), `thinkube-platform` (100000), `thinkube-workload` (10000, the cluster default) and `thinkube-batch` (1000). |
 | `13_test_resource_policies.yaml` | Checks the four PriorityClasses and that `thinkube-workload` is the default. Checks LimitRanges and ResourceQuotas in the gateway, PostgreSQL, Harbor and Argo CD namespaces, so it passes only after those components are installed. Creates a test pod to confirm a LimitRange applies its default memory limit. |
-| `16_test_kubelet_protection.yaml` | Reads kubelet arguments from `/var/snap/k8s/common/args/kubelet`. This install does not create that file, so the playbook fails. |
-| `18_test_control.yaml` | Checks the control plane with `snap list k8s`, `k8s status` and a UFW rule for port 6400. This install uses none of these, so the playbook fails. |
+| `16_test_kubelet_protection.yaml` | On every node, reads `/var/lib/kubelet/config.yaml` and checks the memory reservations (system 4Gi, kube 2Gi), the eviction thresholds (hard 2Gi, soft 4Gi) and that node allocatable is enforced for pods. Checks that allocatable memory is less than capacity. |
+| `18_test_control.yaml` | Checks the control plane: containerd and kubelet running, `k8s0` with the stable API address, the kubeconfig endpoint, kubectl and helm, node Ready without the NoSchedule taint, CoreDNS and Cilium running, the `k8s-hostpath` and `rawfile-localpv` storage classes, the node-ip sync timer, the kubectl aliases, the UFW forward policy and the control plane ports. |
 | `19_rollback_control.yaml` | Removes the cluster from the control plane. See [Rollback](#rollback). |
 | `20_join_workers.yaml` | Workers. Sets up UFW, the `k8s0` interface and a local API proxy, the node-ip sync and the link watchdog, installs containerd and kubeadm, and runs `kubeadm join`. Then pins CoreDNS to the control plane and adds the workers to the SSH config used by code-server. |
 | `28_test_worker.yaml` | Checks each worker: kubelet active, kubeadm installed, `k8s0` carries `172.16.0.1`, the API answers through the local proxy, `kubelet.conf` points at `https://172.16.0.1:6443`, node Ready, node InternalIP equals `lan_ip`, Cilium running, UFW forward policy ACCEPT. Then runs a test pod on each worker and calls the in-cluster API from it. |
@@ -77,7 +77,7 @@ The role READMEs explain why the versions are pinned and held:
 - The control-plane `NoSchedule` taint is removed. Platform workloads run on the control plane.
 - Cilium attaches only to `k8s0 en+ eth+ wl+ bond+`. The ZeroTier interfaces are left out.
 - ZeroTier mode only: Cilium L2 announcements hand out LoadBalancer addresses from `overlay_subnet_prefix` + `lb_ip_start_octet` to `lb_ip_end_octet`. In Tailscale mode this is off.
-- Storage classes: `csi-rawfile-default` and `k8s-hostpath`. `k8s-hostpath` uses the same provisioner (`rawfile.csi.openebs.io`) and is marked as the default class.
+- Storage classes: `rawfile-localpv` and `k8s-hostpath`. `k8s-hostpath` uses the same provisioner (`rawfile.csi.openebs.io`) and is marked as the default class.
 - After workers join, CoreDNS is pinned to the control plane.
 
 ### User tools
@@ -147,7 +147,7 @@ It removes:
 
 - The cluster. It stops kubelet, removes the static pod manifests, stops all containers, restarts containerd, then runs `kubeadm reset`.
 - The packages `kubeadm`, `kubelet`, `kubectl` and `containerd.io`. They are unheld and purged.
-- `/etc/kubernetes`, `/etc/cni/net.d`, `/etc/containerd`, `/var/lib/kubelet`, `/var/lib/containerd`, `/var/lib/etcd`, `/var/openebs`, `/var/lib/rawfile-localpv`, `/var/csi`. All volume data on `csi-rawfile-default` and `k8s-hostpath` is lost.
+- `/etc/kubernetes`, `/etc/cni/net.d`, `/etc/containerd`, `/var/lib/kubelet`, `/var/lib/containerd`, `/var/lib/etcd`, `/var/openebs`, `/var/lib/rawfile-localpv`, `/var/csi`. All volume data on `rawfile-localpv` and `k8s-hostpath` is lost.
 - `~/.kube`, `~/.local/bin/kubectl`, `~/.local/bin/helm` and the k8s alias files.
 - `/etc/modules-load.d/thinkube-k8s.conf` and `/etc/sysctl.d/99-thinkube-k8s.conf`.
 - The Kubernetes and Docker apt sources and keys.
