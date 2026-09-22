@@ -31,12 +31,6 @@ OpenSearch is an open-source search and analytics engine used for log aggregatio
    - Deploys OpenSearch Dashboards
    - Configures ingress for external access
 
-2. **16_deploy_fluent_bit.yaml** - Continuous log collection
-   - Deploys Fluent Bit as a DaemonSet
-   - Continuously collects logs from all containers
-   - Ships logs to OpenSearch in real-time
-   - Provides ongoing log aggregation
-
 4. **18_test.yaml** - Test playbook
    - Verifies pods are running
    - Tests authentication
@@ -47,7 +41,6 @@ OpenSearch is an open-source search and analytics engine used for log aggregatio
    - Removes all OpenSearch resources
    - Cleans up Keycloak configuration
    - Deletes persistent volumes
-   - Removes Fluent Bit if deployed
 
 ### Configuration Details
 
@@ -78,9 +71,6 @@ export ADMIN_PASSWORD='your-secure-password'
 
 # Deploy OpenSearch
 ./scripts/run_ansible.sh ansible/40_thinkube/optional/opensearch/10_deploy.yaml
-
-# Deploy continuous log collection (recommended)
-./scripts/run_ansible.sh ansible/40_thinkube/optional/opensearch/16_deploy_fluent_bit.yaml
 ```
 
 ### Test Deployment
