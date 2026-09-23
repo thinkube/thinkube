@@ -175,6 +175,117 @@
         msg: "Cloudflare API token is not set in cloudflare_api_token variable"
       when: cf_token.stdout == ""
 
+    # ------------------------------------------------------------------
+    # Recovery from the GitHub backup
+    #
+    # The backup written at the end of this playbook is the only copy that
+    # outlives the machine: a reinstalled disk keeps nothing, and
+    # thinkube-wipe.sh empties the home directory, taking acme.sh's own
+    # record of the certificate with it. Restoring here, ahead of the
+    # checks that decide whether to issue, lets a rebuilt machine carry on
+    # with the certificate it already had instead of asking Let's Encrypt
+    # for another one — the same set of names may only be issued five
+    # times a week.
+    #
+    # None of this has to succeed. With no repository, nothing in it, or a
+    # backup password that no longer matches, the checks below find no
+    # certificate and issue one, which is the behaviour this playbook had
+    # before the restore existed.
+    # ------------------------------------------------------------------
+    - name: Set backup variables
+      ansible.builtin.set_fact:
+        cert_backup_password: "{{ lookup('env', 'ANSIBLE_BECOME_PASSWORD') }}"
+        github_certificates_repo: "thinkube-certificates"
+      when:
+        - github_token is defined
+
+    - name: Check what the machine still has of the certificate
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: cert_state_before_restore
+      loop:
+        - "{{ tls_crt_path }}"
+        - "{{ acme_home }}/{{ domain_name }}_ecc/{{ domain_name }}.conf"
+
+    - name: Restore the certificate from the GitHub backup
+      when:
+        - github_token is defined
+        - cert_state_before_restore.results | rejectattr('stat.exists') | list | length > 0
+      block:
+        - name: Create temporary directory for the restore
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: _cert_restore
+          register: restore_temp_dir
+
+        - name: Clone the certificate backup repository
+          ansible.builtin.shell: |
+            git clone --depth 1 \
+              https://{{ github_token }}@github.com/{{ github_username }}/{{ github_certificates_repo }}.git \
+              {{ restore_temp_dir.path }}/repo
+          register: restore_clone
+          failed_when: false
+          changed_when: false
+          no_log: true
+          args:
+            executable: /bin/bash
+
+        # Exit 90 says the backup holds no certificate, which is not a
+        # failure: the repository exists because some earlier run created
+        # it, and an empty one is the same as none at all.
+        - name: Decrypt the certificate and the acme.sh record into place
+          ansible.builtin.shell: |
+            set -euo pipefail
+            repo={{ restore_temp_dir.path }}/repo
+            decrypt() {
+              openssl enc -d -aes-256-cbc -pbkdf2 -in "$1" -out "$2" -k "{{ cert_backup_password }}"
+            }
+
+            [ -f "$repo/{{ domain_name }}.crt.enc" ] || exit 90
+
+            decrypt "$repo/{{ domain_name }}.crt.enc" {{ tls_crt_path }}
+            decrypt "$repo/{{ domain_name }}.key.enc" {{ tls_key_path }}
+            if [ -f "$repo/{{ domain_name }}.cer.enc" ]; then
+              decrypt "$repo/{{ domain_name }}.cer.enc" {{ cert_dir }}/{{ domain_name }}/{{ domain_name }}.cer
+            fi
+            chmod 0600 {{ cert_dir }}/{{ domain_name }}/*
+
+            # acme.sh renews and installs from this record, not from the
+            # files above. Without it the certificate cannot be renewed and
+            # cannot be given a reload hook, so a backup that predates the
+            # record is only worth the files it carries.
+            if [ -f "$repo/{{ domain_name }}.acme.tar.gz.enc" ]; then
+              decrypt "$repo/{{ domain_name }}.acme.tar.gz.enc" {{ restore_temp_dir.path }}/acme.tar.gz
+              mkdir -p {{ acme_home }}
+              tar -C {{ acme_home }} -xzf {{ restore_temp_dir.path }}/acme.tar.gz
+              chmod -R go-rwx {{ acme_home }}/{{ domain_name }}_ecc
+            fi
+          register: restore_result
+          failed_when: false
+          changed_when: restore_result.rc == 0
+          no_log: true
+          when: restore_clone.rc == 0
+          args:
+            executable: /bin/bash
+
+        - name: Report what the restore recovered
+          ansible.builtin.debug:
+            msg: >-
+              {{
+                'No backup repository to restore from; the certificate will be issued.'
+                if restore_clone.rc != 0 else
+                'The backup holds no certificate; one will be issued.'
+                if restore_result.rc | default(90) == 90 else
+                'Certificate restored from the backup.'
+                if restore_result.rc | default(1) == 0 else
+                'The backup could not be restored (wrong backup password?); the certificate will be issued.'
+              }}
+
+        - name: Clean up the restore directory
+          ansible.builtin.file:
+            path: "{{ restore_temp_dir.path }}"
+            state: absent
+
     - name: Check existing certificate
       ansible.builtin.stat:
         path: "{{ tls_crt_path }}"
@@ -204,11 +315,28 @@
       become: false
       become_user: "{{ system_username }}"
 
+    # acme.sh keeps its own record of a certificate — the names, the CA, the
+    # key length, the reload command — under <domain>_ecc, _ecc because the
+    # certificate is issued with --keylength ec-256. Renewal and
+    # --install-cert both work from that record and not from the files in
+    # {{ cert_dir }}, so a certificate acme.sh has no record of cannot be
+    # renewed and cannot be given a reload hook: 15_configure_renewal_hook
+    # fails on it outright. The two halves part company whenever the files
+    # outlive the home directory, which is what thinkube-wipe.sh leaves
+    # behind, so the record is worth checking on its own.
+    - name: Check the acme.sh record of the certificate
+      ansible.builtin.stat:
+        path: "{{ acme_home }}/{{ domain_name }}_ecc/{{ domain_name }}.conf"
+      register: acme_record
+      become: false
+      become_user: "{{ system_username }}"
+
     - name: Determine if certificate needs renewal
       ansible.builtin.set_fact:
         needs_renewal: >-
           {{
             not cert_file.stat.exists or
+            not acme_record.stat.exists or
             cert_expiry_check.rc != 0 or
             (existing_domains.stdout_lines | default([]) | sort) != (certificate_domains | sort)
           }}
@@ -217,6 +345,7 @@
       ansible.builtin.debug:
         msg:
           - "Certificate exists: {{ cert_file.stat.exists }}"
+          - "acme.sh has a record of it: {{ acme_record.stat.exists }}"
           - "Certificate domains match: {{ (existing_domains.stdout_lines | default([]) | sort) == (certificate_domains | sort) if cert_file.stat.exists else 'N/A' }}"
           - "Certificate expiry check: {{ 'Valid' if cert_expiry_check.rc | default(1) == 0 else 'Needs renewal' if cert_file.stat.exists else 'N/A' }}"
           - "Needs renewal: {{ needs_renewal }}"
@@ -392,13 +521,8 @@
           - "Secret created: {{ secret_check.rc == 0 }}"
 
     # GitHub Backup Block - Optional certificate backup to user's GitHub repository
-    - name: Set backup variables
-      ansible.builtin.set_fact:
-        cert_backup_password: "{{ lookup('env', 'ANSIBLE_BECOME_PASSWORD') }}"
-        github_certificates_repo: "thinkube-certificates"
-      when: 
-        - github_token is defined
-
+    # cert_backup_password and github_certificates_repo are set further up,
+    # where the restore needs them.
     - name: Check if GitHub backup repository exists
       ansible.builtin.uri:
         url: "https://api.github.com/repos/{{ github_username }}/{{ github_certificates_repo }}"
@@ -460,16 +584,32 @@
           - Backup Date: {{ ansible_facts.date_time.iso8601 }}
           - Domains Covered: {{ certificate_domains | join(', ') }}
 
+          ## Contents
+
+          - `{{ domain_name }}.crt.enc` — the full chain
+          - `{{ domain_name }}.cer.enc` — the leaf certificate
+          - `{{ domain_name }}.key.enc` — the private key
+          - `{{ domain_name }}.acme.tar.gz.enc` — acme.sh's own record of the
+            certificate (`~/.acme.sh/{{ domain_name }}_ecc/`), without which
+            the certificate above cannot be renewed
+
+          10_deploy.yaml restores all of this by itself on a machine that has
+          lost it, so a rebuilt machine keeps its certificate instead of
+          asking Let's Encrypt for another.
+
           ## Decryption Instructions
 
-          To decrypt the certificate files:
+          To decrypt the certificate files by hand:
 
           ```bash
           # Decrypt certificate file
           openssl enc -aes-256-cbc -d -pbkdf2 -in {{ domain_name }}.crt.enc -out {{ domain_name }}.crt
 
-          # Decrypt key file  
+          # Decrypt key file
           openssl enc -aes-256-cbc -d -pbkdf2 -in {{ domain_name }}.key.enc -out {{ domain_name }}.key
+
+          # Decrypt acme.sh's record, into ~/.acme.sh/
+          openssl enc -aes-256-cbc -d -pbkdf2 -in {{ domain_name }}.acme.tar.gz.enc | tar -C ~/.acme.sh -xz
           ```
 
           You will be prompted for the decryption password that was configured during backup.
@@ -510,6 +650,35 @@
       ansible.builtin.shell: |
         openssl enc -aes-256-cbc -pbkdf2 -in {{ tls_key_path }} -out {{ backup_temp_dir.path }}/{{ domain_name }}.key.enc -k "{{ cert_backup_password }}"
       when: 
+        - github_token is defined
+      no_log: true
+      args:
+        executable: /bin/bash
+
+    # The leaf certificate on its own: --cert-file writes it and
+    # 15_configure_renewal_hook names it, so a restore that skipped it
+    # would leave the machine a file short of what it had.
+    - name: Encrypt and backup the leaf certificate
+      ansible.builtin.shell: |
+        openssl enc -aes-256-cbc -pbkdf2 -in {{ cert_dir }}/{{ domain_name }}/{{ domain_name }}.cer -out {{ backup_temp_dir.path }}/{{ domain_name }}.cer.enc -k "{{ cert_backup_password }}"
+      when:
+        - github_token is defined
+      no_log: true
+      args:
+        executable: /bin/bash
+
+    # acme.sh's record of the certificate. The files above are of no use
+    # without it: acme.sh renews and installs from this directory, so a
+    # machine restored without it holds a certificate nothing can renew.
+    # The certificate's private key is in here as well, and is already in
+    # this repository beside it; the ACME account key is deliberately left
+    # out, since the playbook registers an account when it finds none.
+    - name: Encrypt and backup the acme.sh record
+      ansible.builtin.shell: |
+        set -o pipefail
+        tar -C {{ acme_home }} -cz {{ domain_name }}_ecc | \
+          openssl enc -aes-256-cbc -pbkdf2 -out {{ backup_temp_dir.path }}/{{ domain_name }}.acme.tar.gz.enc -k "{{ cert_backup_password }}"
+      when:
         - github_token is defined
       no_log: true
       args:
