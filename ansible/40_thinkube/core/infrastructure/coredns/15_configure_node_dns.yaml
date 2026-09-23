@@ -84,8 +84,6 @@
           [Resolve]
           # Primary DNS: BIND9 for network and domain resolution
           DNS={{ coredns_external_ip }}
-          # Fallback DNS servers
-          FallbackDNS=8.8.8.8 8.8.4.4
           Domains={% if overlay_provider | default('') == 'tailscale' %}~{{ domain_name }}{% endif %}
 
           DNSStubListener=yes
@@ -113,8 +111,6 @@
           [Resolve]
           # Primary DNS: BIND9 for network and domain resolution
           DNS={{ coredns_external_ip }}
-          # Fallback DNS servers
-          FallbackDNS=8.8.8.8 8.8.4.4
           Domains={% if overlay_provider | default('') == 'tailscale' %}~{{ domain_name }}{% endif %}
 
           DNSStubListener=yes
@@ -134,33 +130,6 @@
         state: started
         daemon_reload: yes
       become: true
-      
-    # For LXD VMs, also configure netplan to preserve DNS settings
-    - name: Check if netplan config exists
-      ansible.builtin.stat:
-        path: /etc/netplan/50-cloud-init.yaml
-      register: netplan_config
-      
-    - name: Remove incorrectly placed DNS configuration block
-      ansible.builtin.blockinfile:
-        path: /etc/netplan/50-cloud-init.yaml
-        marker: "            # {mark} ANSIBLE MANAGED BLOCK - DNS Configuration"
-        state: absent
-      become: true
-      when:
-        - netplan_config.stat.exists
-        - inventory_hostname in groups['k8s']
-
-    - name: Update netplan DNS configuration for nodes
-      ansible.builtin.replace:
-        path: /etc/netplan/50-cloud-init.yaml
-        regexp: "addresses: \\['8.8.8.8', '8.8.4.4'\\]"
-        replace: "addresses: ['{{ coredns_external_ip }}', '8.8.8.8']"
-      become: true
-      when:
-        - netplan_config.stat.exists
-        - inventory_hostname in groups['k8s']
-      notify: apply netplan
       
     # Create a systemd service to ensure DNS is configured after network is up
     - name: Create DNS configuration verification service
@@ -192,10 +161,6 @@
         name: systemd-resolved
         state: restarted
         daemon_reload: true
-      become: true
-
-    - name: apply netplan
-      ansible.builtin.command: netplan apply
       become: true
 
     - name: enable dns verify service
