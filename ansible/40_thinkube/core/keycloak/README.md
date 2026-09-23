@@ -33,7 +33,7 @@ This component deploys and configures Keycloak as the identity provider for the 
 
 ## Requirements
 
-- Canonical k8s-snap cluster with ingress controller
+- Kubernetes (kubeadm) cluster with Envoy Gateway (Gateway API)
 - Cert-Manager deployed (CORE-003)
 - Environment variable: `ADMIN_PASSWORD`
 

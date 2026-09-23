@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Thinkube is a collection of Ansible playbooks for deploying a complete Kubernetes platform on Ubuntu servers. The playbooks provision bare-metal hosts, install Canonical k8s-snap, and deploy 17 core services plus 17+ optional services (AI tools, databases, monitoring).
+Thinkube is a collection of Ansible playbooks for deploying a complete Kubernetes platform on Ubuntu servers. The playbooks provision bare-metal hosts, install Kubernetes with kubeadm, and deploy 17 core services plus 17+ optional services (AI tools, databases, monitoring).
 
 **Version**: 0.1.0 (under active development)
 
@@ -96,7 +96,7 @@ Use `19_rollback.yaml` when a deployment failed and you need a clean slate, or w
 
 Deployed in dependency order:
 
-1. **infrastructure/** - k8s-snap cluster, Gateway API (Envoy Gateway), ACME certificates, CoreDNS, GPU operator
+1. **infrastructure/** - Kubernetes (kubeadm) cluster, Gateway API (Envoy Gateway), ACME certificates, CoreDNS, GPU operator
 2. **postgresql/** - Shared database
 3. **seaweedfs/** - S3-compatible object storage
 4. **juicefs/** - POSIX filesystem layer + MLflow gateway
@@ -147,7 +147,7 @@ Variables are defined in inventory group vars (`/home/thinkube/.ansible/inventor
 
 The deployment branches on `overlay_provider`:
 
-- **ZeroTier mode**: Cilium's k8s-snap built-in load balancer (L2 mode)
+- **ZeroTier mode**: Cilium's load balancer with L2 announcements
   claims static IPs from the user-defined overlay subnet. Inventory carries
   `overlay_cidr`, `overlay_subnet_prefix`, `lb_ip_start_octet` /
   `lb_ip_end_octet`, `primary_gateway_ip_octet`, `dns_external_ip_octet`,
