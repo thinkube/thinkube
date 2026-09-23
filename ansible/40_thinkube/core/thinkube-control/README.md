@@ -15,7 +15,7 @@ The control system consists of:
 - **Backend**: FastAPI application with Keycloak integration and an MCP server
 - **Authentication**: OAuth2 Proxy with Keycloak OIDC
 - **Session Management**: Redis for OAuth2 session storage
-- **Build System**: Argo Workflows with Kaniko
+- **Build System**: Argo Workflows with Buildah
 - **Deployment**: GitOps via ArgoCD, synced from Gitea on request: harbor-webhook-adapter commits a build's image tags and calls argocd-sync-webhook
 
 ## GitOps Workflow
@@ -158,7 +158,7 @@ This approach provides seamless single-user authentication while maintaining OAu
 
 ### Container Builds
 - Argo Workflows builds frontend and backend images
-- Kaniko used for rootless container builds
+- Buildah builds in unprivileged pods, with the layer cache in Harbor
 - Images pushed to Harbor registry
 
 ### GitOps Deployment
@@ -198,7 +198,7 @@ This removes all control resources including:
 ### Build Issues
 - Check Argo Workflows: `kubectl -n argo get workflows`
 - Verify GitHub token is valid
-- Check Kaniko service account permissions
+- Check the `image-builder` service account permissions
 
 ### Deployment Issues
 - Verify ArgoCD applications: `kubectl -n argocd get applications`
