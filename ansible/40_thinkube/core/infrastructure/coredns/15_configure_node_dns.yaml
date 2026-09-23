@@ -23,12 +23,6 @@
   gather_facts: true
   become: false
 
-  vars:
-    # Determine subnet prefix based on network mode
-    subnet_prefix: "{{ overlay_subnet_prefix if network_mode == 'overlay' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
-    k8s_cluster_domain: "cluster.local"
-    coredns_cluster_ip: "10.152.183.10"  # Standard CoreDNS cluster IP
-
   pre_tasks:
     # The address every node will be told to use for DNS is the IP that
     # bind9-external is actually reachable on — the value Cilium L2 LB
@@ -64,19 +58,6 @@
         coredns_external_ip: "{{ bind9_lookup.stdout }}"
 
   tasks:
-    # Get CoreDNS IP from Kubernetes
-    - name: Get CoreDNS service IP
-      ansible.builtin.command: |
-        {{ kubectl_bin }} get svc -n kube-system kube-dns -o jsonpath='{.spec.clusterIP}'
-      register: coredns_ip
-      when: inventory_hostname in groups['k8s_control_plane']
-      ignore_errors: true
-      
-    - name: Share CoreDNS IP with all nodes
-      ansible.builtin.set_fact:
-        cluster_dns_ip: "{{ hostvars[groups['k8s_control_plane'][0]]['coredns_ip']['stdout'] | default('10.152.183.10') }}"
-      when: groups['k8s_control_plane'][0] is defined and groups['k8s_control_plane'][0] in hostvars
-      
     # Create systemd-resolved directory for drop-in configs
     - name: Create systemd-resolved directory
       ansible.builtin.file:
@@ -144,26 +125,6 @@
       become: true
       when: "inventory_hostname not in groups['k8s']"
       notify: restart systemd-resolved
-      
-    # Configure Kubernetes DNS settings for Kubernetes pods
-    - name: Configure Kubernetes DNS settings for Kubernetes pods
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: lxd-dns-config
-            namespace: kube-system
-          data:
-            resolve.conf: |
-              nameserver {{ cluster_dns_ip | default('10.152.183.10') }}
-              search default.svc.{{ k8s_cluster_domain }} svc.{{ k8s_cluster_domain }} {{ k8s_cluster_domain }}
-              options ndots:5
-      when: inventory_hostname in groups['k8s_control_plane']
-      run_once: true
-      ignore_errors: true
       
     # Ensure systemd-resolved is enabled to start on boot
     - name: Enable systemd-resolved to start on boot
