@@ -42,6 +42,7 @@ usage() {
     echo "  mirror                            Mirror public images to Harbor"
     echo "  build-base                        Build base container images"
     echo "  build-jupyter                     Build Jupyter image"
+    echo "  venvs                             Build custom venvs for architectures they miss"
     echo "  uncordon node1,node2              Uncordon specified nodes"
     echo "  status                            Show build status and cordoned nodes"
     echo ""
@@ -205,6 +206,31 @@ for pod in data.get('items', []):
     done <<< "$daemonsets_to_fix"
 }
 
+# Custom venvs are built for the architectures the cluster has when each is
+# built. Once the images exist and the nodes are schedulable, thinkube-control
+# builds every custom venv that is missing one of the cluster's architectures;
+# venvs already built for it are left alone.
+build_venvs_for_architectures() {
+    if [ -z "$THINKUBE_API_TOKEN" ]; then
+        echo -e "${RED}THINKUBE_API_TOKEN is not set; a new code-server terminal loads it${NC}"
+        return 1
+    fi
+    local domain
+    domain=$(python3 -c "import yaml; print(yaml.safe_load(open('${INVENTORY_DIR}/inventory.yaml'))['all']['vars']['domain_name'])") || return 1
+    local arch answer
+    for arch in $($KUBECTL get nodes -o jsonpath='{range .items[*]}{.metadata.labels.kubernetes\.io/arch}{"\n"}{end}' | sort -u); do
+        if ! answer=$(curl -sS --fail-with-body -X POST \
+                -H "Authorization: Bearer $THINKUBE_API_TOKEN" -H "Content-Type: application/json" \
+                -d "{\"architecture\": \"$arch\"}" \
+                "https://control.${domain}/api/v1/jupyter-venvs/build-for-architecture"); then
+            echo -e "${RED}Custom venv build for $arch refused: $answer${NC}"
+            return 1
+        fi
+        echo -e "${CYAN}Custom venvs for $arch: $answer${NC}"
+    done
+    echo -e "${YELLOW}Venv builds run in thinkube-control; the Kernels page shows each one's status.${NC}"
+}
+
 # Sets UNCORDON_FAILED=1 if any node could not be verified uncordoned.
 UNCORDON_FAILED=0
 uncordon_nodes() {
@@ -318,6 +344,11 @@ case "$COMMAND" in
                 echo ""
                 uncordon_nodes "$UNCORDON_NODES"
             fi
+            VENV_FAILED=0
+            if [ "$UNCORDON_FAILED" -eq 0 ]; then
+                echo ""
+                build_venvs_for_architectures || VENV_FAILED=1
+            fi
             echo ""
             echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
             echo -e "${GREEN}  All images built successfully!${NC}"
@@ -330,7 +361,10 @@ case "$COMMAND" in
                 echo -e "${YELLOW}  Remember to uncordon nodes: tk_images uncordon node1,node2${NC}"
             fi
             echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
-            if [ "$UNCORDON_FAILED" -ne 0 ]; then
+            if [ "$VENV_FAILED" -ne 0 ]; then
+                echo -e "${RED}  Custom venvs were not started for the new architectures; see the message above.${NC}"
+            fi
+            if [ "$UNCORDON_FAILED" -ne 0 ] || [ "$VENV_FAILED" -ne 0 ]; then
                 exit 1
             fi
         else
@@ -353,6 +387,10 @@ case "$COMMAND" in
 
     build-jupyter)
         run_playbook "15_build_jupyter_images.yaml" "Build Jupyter image"
+        ;;
+
+    venvs)
+        build_venvs_for_architectures
         ;;
 
     uncordon)
