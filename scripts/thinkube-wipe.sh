@@ -37,7 +37,8 @@
 #   Ubuntu itself, its packages from the base install, the kernel, netplan
 #   The 'thinkube' account, its home directory, its sudo rights
 #   sshd, and password login (checked before any key is removed)
-#   /etc/sudoers.d/thinkube and the account's group memberships
+#   The account's group memberships, so sudo works with its password
+#   (checked before the passwordless rule is removed)
 #   The NVIDIA driver: it describes the hardware, not the cluster
 #
 # The home directory is emptied and refilled from /etc/skel, which is what a
@@ -63,6 +64,9 @@
 #                   and Tailscale apt repositories and keyrings
 #   Home            everything under it, including shared-code, replaced by
 #                   the contents of /etc/skel
+#   Sudo            /etc/sudoers.d/thinkube, the passwordless rule the
+#                   installer's SSH setup writes; sudo asks for the password
+#                   again, as on a fresh machine
 #
 # Logging tailscale out matters. Purging the package alone leaves the node
 # registered, so the next install joins as a duplicate and the tailnet fills
@@ -82,9 +86,11 @@
 #
 # WHERE THIS SCRIPT LIVES
 # -----------------------
-# In the thinkube repository, under scripts/. It installs itself to
-# /usr/local/sbin/thinkube-wipe, outside the home, so that wiping the home
-# does not delete the script mid-run.
+# In the thinkube repository, under scripts/. Install it outside the home
+# before running it, so the copy you run is not among the files it deletes:
+#
+#   sudo install -m 755 ~/shared-code/thinkube-platform/core/thinkube/scripts/thinkube-wipe.sh \
+#        /usr/local/sbin/thinkube-wipe
 #
 #
 # DRIVING THE REINSTALL
@@ -188,6 +194,27 @@ else
     echo "  Removing the SSH keys would leave this machine unreachable."
     echo "  Enable PasswordAuthentication, or run with --keep-home."
     [ "$KEEP_HOME" -eq 0 ] && exit 1
+fi
+
+###############################################################################
+# Sudo must work with a password before the passwordless rule is removed, or
+# the machine is left without a way to become root.
+###############################################################################
+say "Checking sudo works with a password"
+if ! id -nG "${WIPE_USER}" | tr ' ' '\n' | grep -qx sudo; then
+    echo "  ${WIPE_USER} is not in the sudo group."
+    echo "  Removing /etc/sudoers.d/${WIPE_USER} would leave no way to use sudo."
+    echo "  Add it with: usermod -aG sudo ${WIPE_USER}"
+    [ "$DRY" -eq 0 ] && exit 1
+elif [ "$(id -u)" -ne 0 ]; then
+    echo "  in the sudo group; the password status needs root, and this is a dry run as ${WIPE_USER}"
+elif [ "$(passwd -S "${WIPE_USER}" | awk '{print $2}')" != "P" ]; then
+    echo "  ${WIPE_USER} has no usable password (passwd -S: $(passwd -S "${WIPE_USER}" | awk '{print $2}'))."
+    echo "  Without the passwordless rule, sudo would ask for a password that does not exist."
+    echo "  Set one with: passwd ${WIPE_USER}"
+    [ "$DRY" -eq 0 ] && exit 1
+else
+    echo "  ${WIPE_USER}: in the sudo group, password set"
 fi
 
 ###############################################################################
@@ -333,6 +360,10 @@ say "Resetting UFW to its packaged state"
 run ufw --force disable
 run ufw --force reset
 
+say "Removing the passwordless sudo rule the installer added"
+echo "  rm -f /etc/sudoers.d/${WIPE_USER}"
+run rm -f "/etc/sudoers.d/${WIPE_USER}"
+
 ###############################################################################
 # The home directory
 ###############################################################################
@@ -388,6 +419,8 @@ for d in /etc/kubernetes /etc/cni /etc/containerd /var/lib/kubelet \
     [ -e "$d" ] && note "still present: $d"
 done
 
+[ -e "/etc/sudoers.d/${WIPE_USER}" ] && note "still present: /etc/sudoers.d/${WIPE_USER}"
+
 for p in kubeadm kubelet kubectl containerd.io podman buildah skopeo tailscale; do
     dpkg -l "$p" 2>/dev/null | grep -q '^ii' && note "still installed: $p"
 done
@@ -421,8 +454,8 @@ fi
 say "Complete"
 cat <<EOF
 
-  Still present: Ubuntu, the '${WIPE_USER}' account, its home, sudo, sshd,
-  password login, netplan, and the NVIDIA driver.
+  Still present: Ubuntu, the '${WIPE_USER}' account, its home, sudo (with
+  the password), sshd, password login, netplan, and the NVIDIA driver.
 
   NOT cleared by this script — only a reboot clears them:
     pinned BPF maps in /sys/fs/bpf
