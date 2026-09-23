@@ -15,13 +15,16 @@ The Thinkube platform uses two separate DNS systems:
    - Handles `*.cluster.local` domains
    - Provides service discovery for pods
    - Runs as the kubeadm `kube-dns` Service in `kube-system`
-   - ClusterIP: 10.96.0.10 (service CIDR `10.96.0.0/12`, set in `k8s/10_install_k8s.yaml`)
+   - ClusterIP: 10.96.0.10 in both overlay modes. kubeadm gives kube-dns the
+     10th address of the service CIDR `10.96.0.0/12` (`service_cidr` in
+     `k8s/10_install_k8s.yaml`)
 
 2. **BIND9** (Network DNS) - THIS COMPONENT
    - Handles `*.<domain_name>` domains
    - Forwards external queries to public DNS
    - Provides DNS for all network clients
-   - LoadBalancer IP (Service `bind9-external`): 10.200.0.205 in the example below
+   - LoadBalancer IP (Service `bind9-external`): depends on `overlay_provider`,
+     see [Configuration](#configuration)
 
 ## Why Separate DNS Systems?
 
@@ -38,23 +41,45 @@ cd ~/thinkube
 
 ## Configuration
 
-The addresses depend on `overlay_provider`:
+`10_deploy.yaml` chooses two addresses: the BIND9 address (Service
+`bind9-external`, playbook fact `bind9_advertised_ip`) and the gateway address
+(the Envoy Gateway Service, playbook fact `effective_gateway_ip`). How it
+chooses them depends on `overlay_provider` in the inventory.
 
-- **ZeroTier**: each address is the overlay subnet prefix plus an octet from
-  the inventory. `primary_gateway_ip_octet` (installer default `200`) is the
-  gateway. `dns_external_ip_octet` (installer default `205`) is BIND9. With
-  prefix `10.200.0.` this gives 10.200.0.200 and 10.200.0.205.
-- **Tailscale**: the Tailscale operator assigns both IPs. The playbook reads
-  them from the Service status. It also sets Tailscale split DNS so that
-  `<domain_name>` queries go to BIND9.
+| | ZeroTier | Tailscale |
+|---|---|---|
+| Who assigns the IPs | Cilium L2 load balancer, at the fixed IP the playbook asks for | Tailscale operator (`loadBalancerClass: tailscale`), a tailnet IP (`100.x.y.z`) that it picks |
+| BIND9 IP | `overlay_subnet_prefix` + `dns_external_ip_octet` | read from `bind9-external` `status.loadBalancer.ingress` |
+| Gateway IP | `overlay_subnet_prefix` + `primary_gateway_ip_octet` | read from the Envoy Gateway Service `status.loadBalancer.ingress` |
+| BIND9 tailnet name | none | `<cluster_name>-dns` (annotation `tailscale.com/hostname`) |
+| Gateway tailnet name | none | `gateway_hostname` (written by the installer, used by `gateway-api/10_deploy.yaml`) |
+| Node A records | each node's `overlay_ip` | each node's `lan_ip` |
+| Split DNS | none | Tailscale split DNS sends `<domain_name>` queries to the BIND9 IP (needs `tailscale_api_token`) |
 
-The BIND9 server is configured with (ZeroTier example):
+ZeroTier values come from the installer (`inventoryGenerator.js`, ZeroTier
+mode only). `overlay_subnet_prefix` is the first three octets of the overlay
+CIDR. `primary_gateway_ip_octet` defaults to `200` and
+`dns_external_ip_octet` to `205`. With overlay CIDR `10.200.0.0/24` this gives
+gateway 10.200.0.200 and BIND9 10.200.0.205. The installer does not write
+these variables in Tailscale mode, so no address in the overlay subnet is
+used there.
+
+In Tailscale mode the IPs are known only after the operator assigns them. To
+see them:
+
+```bash
+kubectl get svc -n dns-system bind9-external
+kubectl get svc -n envoy-gateway-system \
+  -l gateway.envoyproxy.io/owning-gateway-name=thinkube-gateway
+```
+
+The BIND9 zone for `<domain_name>` holds:
 
 - **Wildcard domains**:
-  - `*.<domain_name>` → 10.200.0.200 (primary gateway: the Envoy Gateway)
+  - `*.<domain_name>` → the gateway IP (the Envoy Gateway)
 
 - **Specific records**:
-  - `ns1.<domain_name>` and `dns.<domain_name>` → 10.200.0.205
+  - `ns1.<domain_name>` and `dns.<domain_name>` → the BIND9 IP
   - Node hostnames → their ZeroTier IPs (ZeroTier) or LAN IPs (Tailscale)
 
 - **Forwarding**:
@@ -69,9 +94,9 @@ Inside the cluster, BIND9 is also reachable as the `bind9-internal` ClusterIP Se
 # Run test playbook
 ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/dns-server/18_test.yaml
 
-# Manual tests
-dig @10.200.0.205 test.<domain_name>
-dig @10.200.0.205 google.com
+# Manual tests (<bind9-ip> is the BIND9 IP from the table above)
+dig @<bind9-ip> test.<domain_name>
+dig @<bind9-ip> google.com
 ```
 
 ## Troubleshooting
