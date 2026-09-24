@@ -31,6 +31,10 @@
   vars:
     keycloak_namespace: keycloak
     theme_name: thinkube
+    theme_fonts:
+      - poppins-latin-400-normal.woff2
+      - poppins-latin-500-normal.woff2
+      - poppins-latin-600-normal.woff2
     admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
   tasks:
@@ -182,6 +186,21 @@
               Created example theme structure at {{ playbook_dir }}/theme
               Customize the files and re-run this playbook to deploy.
 
+    - name: Read font files for the ConfigMap
+      ansible.builtin.slurp:
+        src: "{{ playbook_dir }}/theme/login/resources/fonts/{{ item }}"
+      loop: "{{ theme_fonts }}"
+      register: theme_font_files
+      delegate_to: localhost
+
+    # Keys are the flat ConfigMap names that setup-theme.sh copies; slurp content is already base64
+    - name: Build font entries for the ConfigMap
+      ansible.builtin.set_fact:
+        theme_font_data: "{{ theme_font_data | default({}) | combine({'login-fonts-' + item.item: item.content}) }}"
+      loop: "{{ theme_font_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
     - name: Create ConfigMap from theme files
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -195,23 +214,13 @@
           data:
             # Use flat keys with content that will be organized by init container
             "login-theme.properties": |
-              parent=base
-              import=common/keycloak
-              
-              # Theme configuration
-              styles=css/login.css
-              stylesCommon=
-              
-              # Disable PatternFly
-              kcLoginClass=
-              kcFormClass=
-              kcFormCardClass=
-              kcFormHeaderClass=
-              
-              # Localization
-              locales=en
+              {{ lookup('file', playbook_dir + '/theme/login/theme.properties') | indent(14) }}
             "login-css-login.css": |
               {{ lookup('file', playbook_dir + '/theme/login/resources/css/login.css') | indent(14) }}
+            "login-js-terrain-bg.js": |
+              {{ lookup('file', playbook_dir + '/theme/login/resources/js/terrain-bg.js') | indent(14) }}
+            "login-js-password-toggle.js": |
+              {{ lookup('file', playbook_dir + '/theme/login/resources/js/password-toggle.js') | indent(14) }}
             "login-img-logo.svg": |
               {{ lookup('file', playbook_dir + '/theme/login/resources/img/tk_full_logo.svg') | indent(14) }}
             "login-template.ftl": |
@@ -223,10 +232,17 @@
               # Create theme directory structure
               mkdir -p /opt/keycloak/themes/{{ theme_name }}/login/resources/css
               mkdir -p /opt/keycloak/themes/{{ theme_name }}/login/resources/img
-              
+              mkdir -p /opt/keycloak/themes/{{ theme_name }}/login/resources/js
+              mkdir -p /opt/keycloak/themes/{{ theme_name }}/login/resources/fonts
+
               # Copy theme files to correct locations
               cp /theme-data/login-theme.properties /opt/keycloak/themes/{{ theme_name }}/login/theme.properties
               cp /theme-data/login-css-login.css /opt/keycloak/themes/{{ theme_name }}/login/resources/css/login.css
+              cp /theme-data/login-js-terrain-bg.js /opt/keycloak/themes/{{ theme_name }}/login/resources/js/terrain-bg.js
+              cp /theme-data/login-js-password-toggle.js /opt/keycloak/themes/{{ theme_name }}/login/resources/js/password-toggle.js
+              {% for font in theme_fonts %}
+              cp /theme-data/login-fonts-{{ font }} /opt/keycloak/themes/{{ theme_name }}/login/resources/fonts/{{ font }}
+              {% endfor %}
               cp /theme-data/login-img-logo.svg /opt/keycloak/themes/{{ theme_name }}/login/resources/img/logo.svg
               cp /theme-data/login-template.ftl /opt/keycloak/themes/{{ theme_name }}/login/template.ftl
               cp /theme-data/login-login.ftl /opt/keycloak/themes/{{ theme_name }}/login/login.ftl
@@ -234,6 +250,7 @@
               # Set proper permissions
               chmod -R 755 /opt/keycloak/themes/{{ theme_name }}
               echo "Theme {{ theme_name }} setup complete"
+          binaryData: "{{ theme_font_data }}"
 
     - name: Update Keycloak deployment to mount theme
       kubernetes.core.k8s:

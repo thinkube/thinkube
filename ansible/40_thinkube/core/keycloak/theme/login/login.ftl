@@ -1,7 +1,7 @@
 <#import "template.ftl" as layout>
 <@layout.registrationLayout displayInfo=false displayMessage=true displayRequiredFields=false; section>
     <#if section = "header">
-        <div class="logo-section"></div>
+        ${msg("loginAccountTitle")}
     <#elseif section = "form">
         <div id="kc-form">
             <div id="kc-form-wrapper">
@@ -31,7 +31,7 @@
                             </div>
                         </div>
 
-                        <div class="form-group ${properties.kcFormGroupClass!}">
+                        <div class="form-options">
                             <div id="kc-form-options">
                                 <#if realm.rememberMe && !usernameEditDisabled??>
                                     <div class="checkbox">
@@ -45,7 +45,7 @@
                                     </div>
                                 </#if>
                             </div>
-                            <div class="${properties.kcFormOptionsWrapperClass!}">
+                            <div>
                                 <#if realm.resetPasswordAllowed>
                                     <span><a tabindex="5" href="${url.loginResetCredentialsUrl}">${msg("doForgotPassword")}</a></span>
                                 </#if>
@@ -54,7 +54,7 @@
 
                         <div id="kc-form-buttons" class="form-group">
                             <input type="hidden" id="id-hidden-input" name="credentialId" <#if auth.selectedCredential?has_content>value="${auth.selectedCredential}"</#if>/>
-                            <input tabindex="4" class="btn btn-primary btn-block btn-lg" name="login" id="kc-login" type="submit" value="${msg("doLogIn")}"/>
+                            <input tabindex="4" class="btn-primary" name="login" id="kc-login" type="submit" value="${msg("doLogIn")}"/>
                         </div>
                     </form>
                 </#if>
