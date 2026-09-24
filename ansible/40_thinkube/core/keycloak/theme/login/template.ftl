@@ -15,14 +15,15 @@
     </#if>
     <title>${msg("loginTitle",(realm.displayName!''))}</title>
     <link rel="icon" href="${url.resourcesPath}/img/favicon.ico" />
+    <#-- tkAssetVersion changes with the theme files, so browsers fetch new files after each deploy -->
     <#if properties.styles?has_content>
         <#list properties.styles?split(' ') as style>
-            <link href="${url.resourcesPath}/${style}" rel="stylesheet" />
+            <link href="${url.resourcesPath}/${style}?v=${properties.tkAssetVersion}" rel="stylesheet" />
         </#list>
     </#if>
     <#if properties.scripts?has_content>
         <#list properties.scripts?split(' ') as script>
-            <script src="${url.resourcesPath}/${script}" type="text/javascript"></script>
+            <script src="${url.resourcesPath}/${script}?v=${properties.tkAssetVersion}" type="text/javascript"></script>
         </#list>
     </#if>
     <#if scripts??>
@@ -37,7 +38,7 @@
     <canvas class="tk-bg" data-tk-terrain data-accent="#005474" data-warm="#ff6b36" data-background="#fdfaf3" aria-hidden="true"></canvas>
     <main class="tk-shell">
         <div class="tk-card">
-            <img src="${url.resourcesPath}/img/logo.svg" alt="Thinkube" class="tk-logo" />
+            <img src="${url.resourcesPath}/img/logo.svg?v=${properties.tkAssetVersion}" alt="Thinkube" class="tk-logo" />
 
             <h1 id="kc-page-title"><#nested "header"></h1>
 
