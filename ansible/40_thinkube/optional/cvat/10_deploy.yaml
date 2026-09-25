@@ -78,6 +78,14 @@
           - admin_password is defined
         fail_msg: "Required variables are not defined. Please check your inventory."
 
+    # CVAT ships linux/amd64 images only; thinkube-control passes the node
+    # selector from the component catalog's architectures.
+    - name: Verify the node selector is passed
+      ansible.builtin.assert:
+        that:
+          - component_node_selector is defined
+        fail_msg: "component_node_selector is not set. Install CVAT from thinkube-control, which passes it from the component catalog."
+
     - name: Create CVAT namespace
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -109,6 +117,7 @@
             POSTGRES_USER: "{{ admin_username }}"
             POSTGRES_PASSWORD: "{{ admin_password }}"
             POSTGRES_DB: "cvat"
+            VALKEY_PASSWORD: "{{ admin_password }}"
 
     - name: Create PersistentVolumeClaims for CVAT
       kubernetes.core.k8s:
@@ -144,7 +153,7 @@
             namespace: "{{ cvat_namespace }}"
           spec:
             restartPolicy: Never
-            nodeSelector: "{{ component_node_selector | default({}) }}"
+            nodeSelector: "{{ component_node_selector }}"
             containers:
               - name: create-db
                 image: "{{ harbor_registry }}/{{ library_project | default('library') }}/postgres:18-alpine"
@@ -205,7 +214,7 @@
                 priorityClassName: thinkube-workload
                 securityContext:
                   fsGroup: 1000
-                nodeSelector: "{{ component_node_selector | default({}) }}"
+                nodeSelector: "{{ component_node_selector }}"
                 containers:
                   - name: cvat-backend
                     image: "{{ cvat_server_image }}"
@@ -237,10 +246,20 @@
                         value: "valkey.valkey.svc.cluster.local"
                       - name: CVAT_REDIS_INMEM_PORT
                         value: "6379"
+                      - name: CVAT_REDIS_INMEM_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: VALKEY_PASSWORD
                       - name: CVAT_REDIS_ONDISK_HOST
                         value: "valkey.valkey.svc.cluster.local"
                       - name: CVAT_REDIS_ONDISK_PORT
                         value: "6379"
+                      - name: CVAT_REDIS_ONDISK_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: VALKEY_PASSWORD
                       - name: CVAT_POSTGRES_HOST
                         value: "postgresql-official.postgres.svc.cluster.local"
                       - name: CVAT_POSTGRES_PORT
@@ -487,7 +506,7 @@
                   app: opa
               spec:
                 priorityClassName: thinkube-workload
-                nodeSelector: "{{ component_node_selector | default({}) }}"
+                nodeSelector: "{{ component_node_selector }}"
                 containers:
                   - name: opa
                     image: "{{ harbor_registry }}/{{ library_project | default('library') }}/opa:0.63.0"
@@ -558,7 +577,7 @@
                   app: cvat-ui
               spec:
                 priorityClassName: thinkube-workload
-                nodeSelector: "{{ component_node_selector | default({}) }}"
+                nodeSelector: "{{ component_node_selector }}"
                 containers:
                   - name: cvat-ui
                     image: "{{ cvat_ui_image }}"
