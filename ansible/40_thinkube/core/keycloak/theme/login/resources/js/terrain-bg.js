@@ -22,15 +22,16 @@
  * static frame, redrawn only on resize). Scene is authored in a 1440x900
  * logical space and scaled to cover the canvas.
  *
- * Cost limits, so the page stays responsive without GPU acceleration: at most
- * MAX_FPS frames per second; the canvas is drawn at CSS-pixel resolution (the
- * background is soft, so high-DPI sharpness is not needed); dots are filled in
- * a few batched paths per row instead of one fill per dot.
+ * Cost limits, so the page stays responsive without GPU acceleration: the
+ * canvas is drawn at RES times its CSS size whatever the pixel density (the
+ * background is soft, so the browser's upscaling does not show); dots are
+ * filled in a few batched paths per row instead of one fill per dot. Every
+ * display frame is drawn, so the motion stays smooth.
  */
 (function (global) {
   'use strict';
 
-  var LW = 1440, LH = 900, MAX_FPS = 30;
+  var LW = 1440, LH = 900, RES = 0.75;
 
   function rgba(hex, a) {
     var h = (hex || '#000000').replace('#', '');
@@ -75,8 +76,8 @@
 
     function resize() {
       var r = canvas.getBoundingClientRect();
-      canvas.width = Math.max(1, Math.round(r.width));
-      canvas.height = Math.max(1, Math.round(r.height));
+      canvas.width = Math.max(1, Math.round(r.width * RES));
+      canvas.height = Math.max(1, Math.round(r.height * RES));
       var s = Math.max(r.width / LW, r.height / LH);
       view = { s: s, ox: (r.width - LW * s) / 2, oy: (r.height - LH * s) / 2 };
       if (reduce) frame(0);
@@ -108,7 +109,7 @@
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.fillStyle = cfg.background;
       ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.setTransform(view.s, 0, 0, view.s, view.ox, view.oy);
+      ctx.setTransform(RES * view.s, 0, 0, RES * view.s, RES * view.ox, RES * view.oy);
 
       for (var r = 0; r < rows; r++) {
         var u = r / (rows - 1), Z = Z0 + (Z1 - Z0) * Math.pow(u, 1.6);
@@ -145,7 +146,6 @@
     function loop(ts) {
       if (dead) return;
       raf = global.requestAnimationFrame(loop);
-      if (last && ts - last < 1000 / MAX_FPS - 2) return;   // skip frames above MAX_FPS
       var dt = (last ? Math.min(100, ts - last) : 16) * cfg.speed; last = ts;
       t += dt;
       frame(dt);
