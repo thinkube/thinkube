@@ -34,8 +34,8 @@
 </head>
 
 <body class="${properties.kcBodyClass!}">
-    <#-- Colours are the thinkube-style tokens in hex: --primary, --tk-tide-4, --background -->
-    <canvas class="tk-bg" data-tk-terrain data-accent="#005474" data-warm="#46bb91" data-background="#fdfaf3" aria-hidden="true"></canvas>
+    <#-- Colours are the thinkube-style tokens in hex: --primary, --chart-4, --background -->
+    <canvas class="tk-bg" data-tk-terrain data-accent="#005474" data-warm="#d14e95" data-background="#fdfaf3" aria-hidden="true"></canvas>
     <main class="tk-shell">
         <div class="tk-card">
             <img src="${url.resourcesPath}/img/logo.svg?v=${properties.tkAssetVersion}" alt="Thinkube" class="tk-logo" />
