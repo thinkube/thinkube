@@ -76,29 +76,17 @@
       ansible.builtin.set_fact:
         test_results: "{{ test_results + ['DevPi service exists: ' + (service_check.rc == 0) | string] }}"
 
-    - name: Check Redis deployment
+    - name: Check the gateway login policy on the dashboard route
       ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} get deployment -n {{ devpi_namespace }} ephemeral-redis -o json"  # Valkey deployment
+        cmd: "{{ kubectl_bin }} get securitypolicy -n {{ devpi_namespace }} oauth2-proxy-devpi-oidc -o json"
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      register: redis_check
+      register: oidc_policy_check
       failed_when: false
 
-    - name: Record Redis test result
+    - name: Record login policy test result
       ansible.builtin.set_fact:
-        test_results: "{{ test_results + ['Redis deployment exists: ' + (redis_check.rc == 0) | string] }}"
-
-    - name: Check OAuth2 Proxy deployment
-      ansible.builtin.command:
-        cmd: "{{ kubectl_bin }} get deployment -n {{ devpi_namespace }} oauth2-proxy -o json"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: oauth_check
-      failed_when: false
-
-    - name: Record OAuth2 Proxy test result
-      ansible.builtin.set_fact:
-        test_results: "{{ test_results + ['OAuth2 Proxy deployment exists: ' + (oauth_check.rc == 0) | string] }}"
+        test_results: "{{ test_results + ['Gateway login policy exists: ' + (oidc_policy_check.rc == 0) | string] }}"
 
     - name: Check HTTPRoutes
       ansible.builtin.command:
@@ -118,11 +106,11 @@
 
     - name: Check for dashboard HTTPRoute
       ansible.builtin.set_fact:
-        dashboard_httproute_exists: "{{ 'devpi-http-route' in httproute_names }}"
+        dashboard_httproute_exists: "{{ 'devpi-http-httproute' in httproute_names }}"
 
     - name: Check for API HTTPRoute
       ansible.builtin.set_fact:
-        api_httproute_exists: "{{ 'devpi-api-route' in httproute_names }}"
+        api_httproute_exists: "{{ 'devpi-api-httproute' in httproute_names }}"
 
     - name: Record HTTPRoute test results
       ansible.builtin.set_fact:
@@ -163,18 +151,20 @@
       ansible.builtin.set_fact:
         test_results: "{{ test_results + ['API endpoint accessible: ' + (api_test.status == 200) | string] }}"
 
-    - name: Test dashboard endpoint (should redirect to OAuth2)
+    - name: Test dashboard endpoint without a login
       ansible.builtin.uri:
         url: "https://{{ devpi_dashboard_hostname }}/"
-        validate_certs: false
         follow_redirects: none
-        status_code: [302, 200]
+        status_code: [302, 303, 200]
       register: dashboard_test
       failed_when: false
 
-    - name: Record dashboard test result
+    - name: Record dashboard login test result
       ansible.builtin.set_fact:
-        test_results: "{{ test_results + ['Dashboard endpoint accessible: ' + (dashboard_test.status in [302, 200]) | string] }}"
+        test_results: >-
+          {{ test_results + ['Dashboard requires Keycloak login: ' ~
+             (dashboard_test.status in [302, 303] and (dashboard_test.location | default('')).startswith(
+               keycloak_url ~ '/realms/' ~ keycloak_realm ~ '/protocol/openid-connect/auth')) | string] }}
 
     - name: Check if CLI is installed
       ansible.builtin.command:

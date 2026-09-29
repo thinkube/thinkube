@@ -22,8 +22,8 @@ This deployment provides:
 
 ### Components
 - **DevPi Server**: The main package index server
-- **OAuth2 Proxy**: Provides Keycloak authentication for web UI
-- **Valkey** (`ephemeral-redis`): Session storage for OAuth2 Proxy
+- **Gateway login**: the dashboard route requires a Keycloak login at the
+  gateway (Envoy Gateway `SecurityPolicy`, role `gateway_oidc`)
 - **HTTPRoutes**: Two routes
   - Protected dashboard: `packages.{{ domain_name }}` (`devpi_dashboard_hostname`)
   - Open API endpoint: `packages-api.{{ domain_name }}` (`devpi_api_hostname`)
@@ -147,7 +147,7 @@ The image goes to the Harbor `library` project; `10_deploy.yaml` sets
 - Web UI protected by Keycloak OIDC authentication
 - API endpoint is intentionally unauthenticated for pip compatibility
 - All traffic uses HTTPS with valid certificates
-- OAuth2 sessions stored in Valkey
+- Login sessions are kept in encrypted cookies set by the gateway
 - Container images stored in private Harbor registry
 
 ## Troubleshooting
@@ -160,7 +160,7 @@ kubectl get pods -n devpi
 ### View logs
 ```bash
 kubectl logs -n devpi deploy/devpi
-kubectl logs -n devpi deploy/oauth2-proxy
+kubectl get securitypolicy -n devpi oauth2-proxy-devpi-oidc -o yaml
 ```
 
 ### Verify routes
