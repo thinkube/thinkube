@@ -12,14 +12,14 @@ Usage:
     from thinkube_models import load_model_for_finetuning, register_finetuned_model
 
     # Load a model from MLflow (uses local JuiceFS, no HuggingFace download)
-    model, tokenizer = load_model_for_finetuning("openai/gpt-oss-20b")
+    model, tokenizer = load_model_for_finetuning("unsloth/Qwen3.5-4B")
 
     # After fine-tuning with Unsloth:
     register_finetuned_model(
         model=model,
         tokenizer=tokenizer,
-        name="gpt-oss-tool-use",
-        base_model="openai/gpt-oss-20b",
+        name="qwen35-4b-tool-use",
+        base_model="unsloth/Qwen3.5-4B",
         description="Fine-tuned for tool use",
         quantization="FP8"  # or "BF16" for no quantization
     )
@@ -86,7 +86,7 @@ def load_model_for_finetuning(model_id: str, device_map: str = "auto"):
     using local JuiceFS storage instead of downloading from the internet.
 
     Args:
-        model_id: HuggingFace model ID (e.g., "unsloth/gpt-oss-20b")
+        model_id: HuggingFace model ID (e.g., "unsloth/Qwen3.5-4B")
         device_map: Device mapping for model loading (default: "auto")
 
     Returns:
@@ -96,7 +96,7 @@ def load_model_for_finetuning(model_id: str, device_map: str = "auto"):
         from thinkube_models import load_model_for_finetuning
 
         # Load from MLflow (uses local JuiceFS, no HuggingFace download)
-        model, tokenizer = load_model_for_finetuning("unsloth/gpt-oss-20b")
+        model, tokenizer = load_model_for_finetuning("unsloth/Qwen3.5-4B")
 
         # Then fine-tune with Unsloth as usual
         model = FastLanguageModel.get_peft_model(model, ...)
@@ -456,8 +456,8 @@ def register_finetuned_model(
     Args:
         model: The fine-tuned model (Unsloth FastLanguageModel or HuggingFace model)
         tokenizer: The tokenizer
-        name: Model name for the catalog (e.g., "gpt-oss-tool-use")
-        base_model: Original model ID (e.g., "unsloth/gpt-oss-20b")
+        name: Model name for the catalog (e.g., "qwen35-4b-tool-use")
+        base_model: Original model ID (e.g., "unsloth/Qwen3.5-4B")
         task: Model task (default: "text-generation")
         server_type: Target server (default: "tensorrt-llm")
         description: Optional description
@@ -480,8 +480,8 @@ def register_finetuned_model(
         result = register_finetuned_model(
             model=model,
             tokenizer=tokenizer,
-            name="gpt-oss-tool-use",
-            base_model="unsloth/gpt-oss-20b",
+            name="qwen35-4b-tool-use",
+            base_model="unsloth/Qwen3.5-4B",
             description="Fine-tuned for tool use",
             quantization="FP8"
         )
