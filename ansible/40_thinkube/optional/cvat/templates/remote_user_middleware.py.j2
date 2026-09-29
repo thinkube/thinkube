@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Custom Django RemoteUserMiddleware for CVAT OAuth2 Proxy Integration
+Custom Django RemoteUserMiddleware for the CVAT gateway login
 
 This middleware enables seamless SSO by:
-1. Reading X-Auth-Request-Email header from OAuth2 proxy
+1. Reading the X-Auth-Request-Email header, which only the gateway sets:
+   it removes any copy a client sends and sets it from the verified
+   Keycloak token
 2. Auto-creating users if they don't exist
 3. Auto-authenticating users based on email header
 4. Providing zero-friction authentication experience
@@ -22,14 +24,14 @@ User = get_user_model()
 
 class OAuth2ProxyRemoteUserMiddleware(RemoteUserMiddleware):
     """
-    Middleware that authenticates users based on OAuth2 proxy headers.
-    Reads X-Auth-Request-Email from OAuth2 proxy and sets REMOTE_USER.
+    Middleware that authenticates users from the gateway's identity header.
+    Reads X-Auth-Request-Email and sets REMOTE_USER.
     """
     header = 'HTTP_X_AUTH_REQUEST_EMAIL'
     force_logout_if_no_header = False
 
     def process_request(self, request):
-        # Get email from OAuth2 proxy header
+        # Email from the gateway's identity header
         email = request.META.get(self.header)
 
         if email:
@@ -42,13 +44,13 @@ class OAuth2ProxyRemoteUserMiddleware(RemoteUserMiddleware):
 
 class OAuth2ProxyRemoteUserBackend(RemoteUserBackend):
     """
-    Authentication backend that creates users from OAuth2 proxy headers.
+    Authentication backend that creates users from the gateway's identity header.
     Auto-creates users with email from X-Auth-Request-Email header.
     """
 
     def authenticate(self, request, remote_user):
         """
-        Authenticate user based on email from OAuth2 proxy.
+        Authenticate user based on the email the gateway sets.
         Auto-create user if doesn't exist.
         """
         if not remote_user:
@@ -68,7 +70,7 @@ class OAuth2ProxyRemoteUserBackend(RemoteUserBackend):
             try:
                 user = User.objects.get(username=username)
             except User.DoesNotExist:
-                # Create new user with email from OAuth2 proxy
+                # Create new user with the email the gateway sets
                 user = User.objects.create_user(
                     username=username,
                     email=email,
@@ -85,7 +87,7 @@ class OAuth2ProxyRemoteUserBackend(RemoteUserBackend):
         Configure a user after creation.
         Sets first name from username if not already set.
         """
-        # Get additional info from OAuth2 proxy headers if available
+        # User name from X-Auth-Request-User when present
         user_name = request.META.get('HTTP_X_AUTH_REQUEST_USER', user.username)
 
         if not user.first_name:

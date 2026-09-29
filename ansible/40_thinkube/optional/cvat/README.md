@@ -24,7 +24,7 @@ CVAT (Computer Vision Annotation Tool) is an open-source web-based annotation pl
 CVAT requires the following Thinkube components:
 
 - **PostgreSQL (#14)** - Primary database for projects, tasks, jobs, annotations metadata
-- **Keycloak (#15)** - OAuth2/OIDC authentication for web interface (via OAuth2 Proxy)
+- **Keycloak (#15)** - OIDC login for the web interface, required at the gateway
 - **ClickHouse (#34)** - Analytics database for usage statistics and metrics
 - **Valkey (#36)** - Redis-compatible caching for task queues, session storage, and real-time updates
 
@@ -61,9 +61,9 @@ harbor:
 | Playbook | What it does |
 |---|---|
 | [00_install.yaml](00_install.yaml) | Runs `10_deploy.yaml`, then `17_configure_discovery.yaml`. |
-| [10_deploy.yaml](10_deploy.yaml) | Creates the `cvat` namespace, secrets, four PVCs and the `cvat` database; deploys the backend, UI and OPA with their services; copies the wildcard certificate; deploys an ephemeral Valkey and OAuth2 Proxy; creates the HTTPRoutes `cvat-api-route` (`/api`) and `cvat-main-route` (`/`, `/static`, `/django-rq`); writes the CLI config to `/home/thinkube/.cvat/config.yaml` in the code-server pod. |
+| [10_deploy.yaml](10_deploy.yaml) | Creates the `cvat` namespace, secrets, four PVCs and the `cvat` database; deploys the backend, UI and OPA with their services; copies the wildcard certificate; creates the HTTPRoutes `cvat-api-route` (`/api`) and `cvat-main-route` (`/`, `/static`, `/django-rq`) on `cvat.<domain>` and `cvat-cli-api-route` (`/api`) on `cvat-api.<domain>`; creates the Keycloak client `cvat` and the gateway login policy `cvat-oidc` (role `gateway_oidc`); writes the CLI config to `/home/thinkube/.cvat/config.yaml` in the code-server pod. |
 | [17_configure_discovery.yaml](17_configure_discovery.yaml) | Creates the `thinkube-service-config` ConfigMap in `cvat` for thinkube-control (endpoints, dependencies `postgresql`, `valkey`, `clickhouse`, variables `CVAT_API_URL`, `CVAT_USERNAME`, `CVAT_PASSWORD`) and updates the code-server environment. |
-| [18_test.yaml](18_test.yaml) | Test playbook. Its tasks check the LiteLLM deployment, not CVAT (see Testing). |
+| [18_test.yaml](18_test.yaml) | Checks the deployments, routes and login policy, and tests both logins (see Testing). |
 | [19_rollback.yaml](19_rollback.yaml) | Deletes the `cvat` namespace and the `cvat` Keycloak client. |
 
 Pods run with the node selector that thinkube-control passes as `component_node_selector` (`kubernetes.io/arch: amd64`).
@@ -87,13 +87,16 @@ CVAT is listed on the Optional Components page. The CVAT images are built for am
 
 **URL**: https://cvat.example.com
 
-**Authentication**: Keycloak SSO (OAuth2 Proxy)
+**Authentication**: Keycloak login at the gateway
 
 **Login Flow**:
 1. Navigate to https://cvat.example.com
-2. OAuth2 Proxy redirects to Keycloak login
-3. After SSO authentication, redirected back to CVAT UI
-4. Session stored in ephemeral Valkey via secure cookie
+2. The gateway redirects to the Keycloak login
+3. After login, the gateway sends the browser back to CVAT and keeps the
+   session in an encrypted cookie
+4. On each request the gateway verifies the Keycloak token and sets
+   `X-Auth-Request-Email`; CVAT logs the user in from it and creates the
+   user on first login
 
 **Features**:
 - Project and task management dashboard
@@ -105,9 +108,11 @@ CVAT is listed on the Optional Components page. The CVAT images are built for am
 
 ### API Endpoints
 
-**Base URL**: https://cvat.example.com/api
+**Base URL**: https://cvat-api.example.com/api
 
-**Authentication**: Basic auth (username/password) - OAuth2 NOT required for API
+**Authentication**: CVAT's own login: username and password, or a CVAT
+access token (`Authorization: Bearer <token>`). This host has no Keycloak
+login and serves only `/api`. `CVAT_API_URL` in the IDE points to it.
 
 **Key Endpoints**:
 - Server info: `/api/server/about`
@@ -122,14 +127,14 @@ CVAT is listed on the Optional Components page. The CVAT images are built for am
 from cvat_sdk import make_client
 
 client = make_client(
-    host="https://cvat.example.com",
+    host="https://cvat-api.example.com",
     credentials=("admin", "password")
 )
 ```
 
 **CLI**:
 ```bash
-cvat-cli --auth admin:password --server-host cvat.example.com
+cvat-cli --auth admin:password --server-host cvat-api.example.com
 ```
 
 ## Configuration
@@ -178,31 +183,31 @@ cvat-models-pvc: 10Gi
 # Note: All three point to same Valkey instance (different logical databases)
 ```
 
-**Valkey (Ephemeral - OAuth2 Sessions)**:
-```bash
-# Service: ephemeral-valkey.cvat.svc.cluster.local
-# Purpose: OAuth2 Proxy session storage
-# Isolation: Separate from core Valkey to avoid session/cache conflicts
-```
+### Gateway Login Integration
 
-### OAuth2 Proxy Integration
+The gateway login policy `cvat-oidc` covers both routes on `cvat.<domain>`:
 
-CVAT uses custom Django middleware to integrate with OAuth2 Proxy:
+1. Without a session cookie, the gateway redirects to Keycloak.
+2. With a session, the gateway passes the Keycloak access token as
+   `Authorization: Bearer` to its JWT check, which sets `X-Auth-Request-Email`
+   from the token's `email` claim.
+3. Every rule on these routes removes `Authorization` again, because CVAT
+   reads any Bearer token as one of its own access tokens.
+4. The gateway removes any `X-Auth-Request-*` header a client sends
+   (ClientTrafficPolicy `strip-identity-headers` in `gateway-system`), so the
+   header can only come from a verified token.
 
 **Middleware** (`cvat-oauth2-middleware` ConfigMap):
-- `OAuth2ProxyRemoteUserMiddleware`: Extracts user from `X-Auth-Request-User` header
-- `OAuth2ProxyRemoteUserBackend`: Django authentication backend for remote user
+- `OAuth2ProxyRemoteUserMiddleware`: Reads `X-Auth-Request-Email` and logs the user in
+- `OAuth2ProxyRemoteUserBackend`: Finds or creates the user for that email
 
-**Settings Overlay** (`cvat-django-settings-overlay` ConfigMap):
-```python
-# Extended from base settings
-MIDDLEWARE += ['cvat.apps.thinkube_auth.middleware.OAuth2ProxyRemoteUserMiddleware']
-AUTHENTICATION_BACKENDS += ['cvat.apps.thinkube_auth.middleware.OAuth2ProxyRemoteUserBackend']
-```
+**Settings Overlay** (`cvat-django-settings-overlay` ConfigMap) inserts the
+middleware after Django's `AuthenticationMiddleware` and puts the backend
+first in `AUTHENTICATION_BACKENDS`.
 
 **HTTP routes** (Gateway API):
-- `/api/*`: Direct to backend (NO OAuth2 - basic auth for CLI/SDK)
-- `/`, `/static`, `/django-rq`: OAuth2 Proxy protected (SSO required)
+- `cvat.<domain>`: `/api`, `/static`, `/django-rq` to the backend, `/` to the UI; Keycloak login required
+- `cvat-api.<domain>`: `/api` to the backend; CVAT's own login only
 
 ### OPA Authorization
 
@@ -265,7 +270,7 @@ from PIL import Image
 
 # Initialize client
 client = make_client(
-    host="https://cvat.example.com",
+    host="https://cvat-api.example.com",
     credentials=("admin", "password")
 )
 
@@ -318,7 +323,7 @@ for shape in annotations.shapes:
 ```python
 from cvat_sdk import make_client, models
 
-client = make_client(host="https://cvat.example.com", credentials=("admin", "password"))
+client = make_client(host="https://cvat-api.example.com", credentials=("admin", "password"))
 
 # Create task for object detection
 task = client.tasks.create(
@@ -361,7 +366,7 @@ client.tasks.update_annotations(task.id, annotations)
 ```python
 from cvat_sdk import make_client, models
 
-client = make_client(host="https://cvat.example.com", credentials=("admin", "password"))
+client = make_client(host="https://cvat-api.example.com", credentials=("admin", "password"))
 
 # Create task for video annotation
 task = client.tasks.create(
@@ -414,7 +419,7 @@ client.tasks.update_annotations(task.id, annotations)
 ```python
 from cvat_sdk import make_client
 
-client = make_client(host="https://cvat.example.com", credentials=("admin", "password"))
+client = make_client(host="https://cvat-api.example.com", credentials=("admin", "password"))
 
 # Export in COCO format
 coco_export = client.tasks.retrieve_dataset(
@@ -441,7 +446,7 @@ with zipfile.ZipFile(io.BytesIO(yolo_export.read())) as z:
 
 ```bash
 # Configure CLI
-cvat-cli --auth admin:password --server-host cvat.example.com
+cvat-cli --auth admin:password --server-host cvat-api.example.com
 
 # Create task
 cvat-cli create task \
@@ -475,7 +480,7 @@ from detectron2.engine import DefaultPredictor
 from detectron2.config import get_cfg
 from detectron2 import model_zoo
 
-client = make_client(host="https://cvat.example.com", credentials=("admin", "password"))
+client = make_client(host="https://cvat-api.example.com", credentials=("admin", "password"))
 
 # Load pre-trained Mask R-CNN model
 cfg = get_cfg()
@@ -511,7 +516,7 @@ for frame in range(task.size):
 from cvat_sdk import make_client
 from ultralytics import YOLO
 
-client = make_client(host="https://cvat.example.com", credentials=("admin", "password"))
+client = make_client(host="https://cvat-api.example.com", credentials=("admin", "password"))
 
 # Load YOLOv8 model
 model = YOLO("yolov8n.pt")
@@ -544,7 +549,7 @@ for frame_idx in range(task.size):
 from cvat_sdk import make_client
 from datasets import load_dataset
 
-client = make_client(host="https://cvat.example.com", credentials=("admin", "password"))
+client = make_client(host="https://cvat-api.example.com", credentials=("admin", "password"))
 
 # Load dataset from Hugging Face
 hf_dataset = load_dataset("detection-datasets/coco", split="train[:100]")
@@ -592,7 +597,7 @@ kubectl get pods -n cvat
 
 # Check all components
 kubectl get pods -n cvat -o wide
-# Should show: cvat-backend, cvat-ui, opa, oauth2-proxy, ephemeral-valkey
+# Should show: cvat-backend, cvat-ui, opa
 ```
 
 ### Logs
@@ -606,9 +611,6 @@ kubectl logs -n cvat deployment/cvat-ui -f
 
 # OPA logs
 kubectl logs -n cvat deployment/opa -f
-
-# OAuth2 Proxy logs
-kubectl logs -n cvat deployment/oauth2-proxy -f
 
 # Init container logs (superuser creation)
 kubectl logs -n cvat deployment/cvat-backend -c create-superuser
@@ -635,7 +637,7 @@ kubectl exec -n cvat deployment/cvat-backend -- curl -s http://clickhouse-clickh
 ```python
 from cvat_sdk import make_client
 
-client = make_client(host="https://cvat.example.com", credentials=("admin", "password"))
+client = make_client(host="https://cvat-api.example.com", credentials=("admin", "password"))
 
 # List all tasks
 tasks = client.tasks.list()
@@ -676,23 +678,17 @@ kubectl exec -n postgres statefulset/postgresql-official -- psql -U admin -l | g
 kubectl exec -n cvat deployment/cvat-backend -- python manage.py migrate
 ```
 
-### OAuth2 Authentication Failures
+### Login Failures
 
-**Symptom**: Infinite redirect loop or 401 errors on login
+**Symptom**: Infinite redirect loop, or 401 errors after login
 
 ```bash
-# Check OAuth2 Proxy logs
-kubectl logs -n cvat deployment/oauth2-proxy -f
-
-# Verify cookie configuration
-kubectl get deployment -n cvat oauth2-proxy -o yaml | grep -A 5 cookie
+# The policy must be Accepted; its message names the problem otherwise
+kubectl get securitypolicy -n cvat cvat-oidc -o jsonpath='{.status.ancestors[0].conditions}'
 ```
 
-**Fix**: Verify OAuth2 Proxy and Keycloak configuration
+**Fix**: Verify the Keycloak client
 ```bash
-# Check OAuth2 Proxy secret
-kubectl get secret -n cvat oauth2-proxy-secret -o yaml
-
 # Verify Keycloak client
 ADMIN_TOKEN=$(curl -s -X POST "https://auth.example.com/realms/master/protocol/openid-connect/token" \
   -d "client_id=admin-cli" \
@@ -709,8 +705,8 @@ curl -s "https://auth.example.com/admin/realms/thinkube/clients?clientId=cvat" \
 **Symptom**: cvat-cli returns 401 Unauthorized
 
 ```bash
-# The API route must send /api straight to cvat-backend, not through OAuth2 Proxy
-kubectl get httproute -n cvat cvat-api-route -o jsonpath='{.spec.rules[*].matches[*].path.value} -> {.spec.rules[*].backendRefs[*].name}'
+# The CLI host must send /api straight to cvat-backend
+kubectl get httproute -n cvat cvat-cli-api-route -o jsonpath='{.spec.rules[*].matches[*].path.value} -> {.spec.rules[*].backendRefs[*].name}'
 # Should show: /api -> cvat-backend
 ```
 
@@ -718,7 +714,7 @@ kubectl get httproute -n cvat cvat-api-route -o jsonpath='{.spec.rules[*].matche
 ```bash
 
 # Test API access directly
-curl -u admin:password https://cvat.example.com/api/server/about
+curl -u admin:password https://cvat-api.example.com/api/server/about
 ```
 
 ### OPA Authorization Errors
@@ -772,7 +768,7 @@ kubectl patch pvc cvat-data-pvc -n cvat -p '{"spec":{"resources":{"requests":{"s
 
 # Or delete old tasks via API
 from cvat_sdk import make_client
-client = make_client(host="https://cvat.example.com", credentials=("admin", "password"))
+client = make_client(host="https://cvat-api.example.com", credentials=("admin", "password"))
 old_tasks = [t for t in client.tasks.list() if t.updated_date < "2024-01-01"]
 for task in old_tasks:
     client.tasks.destroy(task.id)
@@ -782,14 +778,18 @@ for task in old_tasks:
 
 thinkube-control runs [18_test.yaml](18_test.yaml) as the CVAT test playbook.
 
-The file is a copy of the LiteLLM test playbook. Its tasks check the `litellm` namespace, deployment, service, HTTPRoute and API. They do not test CVAT.
+It checks that the backend, UI and OPA are ready, that the three HTTPRoutes
+exist and that the login policy is accepted. It then checks that
+`cvat.<domain>` sends a request without a login to Keycloak, that
+`cvat-api.<domain>/api` refuses a request without credentials and one with a
+forged `X-Auth-Request-Email`, and accepts the admin password.
 
 ## Rollback
 
 thinkube-control runs [19_rollback.yaml](19_rollback.yaml) when CVAT is removed from the Optional Components page.
 
 **Rollback Actions**:
-- Deletes the `cvat` namespace. This removes everything in it: deployments, services, HTTPRoutes, the service discovery ConfigMap, the ephemeral Valkey and the four PVCs.
+- Deletes the `cvat` namespace. This removes everything in it: deployments, services, HTTPRoutes, the service discovery ConfigMap, the login policy and the four PVCs.
 - Deletes the Keycloak `cvat` client.
 - **Keeps** the PostgreSQL `cvat` database (projects, tasks, annotation metadata).
 - **Keeps** ClickHouse analytics data and core Valkey.
