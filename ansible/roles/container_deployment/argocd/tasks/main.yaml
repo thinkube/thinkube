@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-# IMPORTANT: This file has a duplicate that must be kept in sync!
-# Original: /home/thinkube/thinkube/ansible/roles/container_deployment/argocd/tasks/main.yaml
-# Copy: /home/thinkube/thinkube/thinkube-control/ansible/roles/container_deployment/argocd/tasks/main.yaml
-# If you modify this file, ensure the changes are reflected in both locations.
+# ArgoCD's SSH known hosts are not set here: the ArgoCD Helm chart owns
+# them, with GitHub in its defaults and Gitea added by the
+# argocd_gitea_known_hosts role.
 
 - name: Read SSH private key from remote host for ArgoCD
   ansible.builtin.slurp:
@@ -30,37 +29,6 @@
         sshPrivateKey: "{{ ssh_private_key_content.content | b64decode }}"
         type: git
   when: use_github
-
-# - name: Ensure ssh-keyscan is installed (openssh-client)
-#   become: yes
-#   package:
-#     name: openssh-client
-#     state: present
-#   delegate_to: localhost
-#   when: use_github
-
-- name: Retrieve GitHub SSH host keys (RSA, ECDSA, ED25519)
-  delegate_to: localhost
-  shell: ssh-keyscan -t rsa,ecdsa,ed25519 github.com
-  register: github_keyscan
-  changed_when: true
-  when: use_github
-
-- name: Update argocd-ssh-known-hosts-cm with fresh GitHub known_hosts
-  kubernetes.core.k8s:
-    kubeconfig: "{{ kubeconfig }}"
-    state: present
-    definition:
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
-        name: argocd-ssh-known-hosts-cm
-        namespace: "{{ argocd_namespace }}"
-        labels:
-          app.kubernetes.io/part-of: argocd
-      data:
-        ssh_known_hosts: "{{ github_keyscan.stdout }}"
-  when: use_github and github_keyscan.stdout is defined
 
 - name: Get Gitea admin token from secret
   kubernetes.core.k8s_info:
@@ -106,63 +74,9 @@
         url: "ssh://git@{{ gitea_hostname }}:2222/{{ gitea_org }}/{{ gitea_repo_name }}.git"
         sshPrivateKey: "{{ gitea_ssh_key_secret.resources[0].data['ssh-privatekey'] | b64decode }}"
         type: git
-  when: 
+  when:
     - not use_github
     - gitea_ssh_key_secret.resources | length > 0
-
-# Also need to update SSH known hosts for Gitea
-- name: Retrieve Gitea SSH host keys
-  delegate_to: localhost
-  shell: ssh-keyscan -p 2222 -t rsa,ecdsa,ed25519 {{ gitea_hostname }}
-  register: gitea_keyscan
-  changed_when: true
-  when: not use_github
-
-- name: Update argocd-ssh-known-hosts-cm with Gitea known_hosts
-  kubernetes.core.k8s:
-    kubeconfig: "{{ kubeconfig }}"
-    state: present
-    definition:
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
-        name: argocd-ssh-known-hosts-cm
-        namespace: "{{ argocd_namespace }}"
-        labels:
-          app.kubernetes.io/part-of: argocd
-      data:
-        ssh_known_hosts: |
-          {{ github_keyscan.stdout if use_github else '' }}
-          {{ gitea_keyscan.stdout if not use_github else '' }}
-  when: (use_github and github_keyscan.stdout is defined) or (not use_github and gitea_keyscan.stdout is defined)
-
-# Restart the repo-server AFTER all known-hosts entries are written to the
-# ConfigMap so the new pod boots with the complete SSH config. Restarting
-# earlier creates a race: the new pod starts with stale known-hosts, and
-# kubelet's ConfigMap volume sync (up to ~60s) may not propagate the Gitea
-# entry before the hard-refresh below runs, leaving the Application stuck
-# in ComparisonError ("ssh: handshake failed: knownhosts: key is unknown")
-# until something else triggers a re-refresh.
-- name: Restart ArgoCD repo server to pick up new SSH configuration
-  ansible.builtin.shell: |
-    {{ kubectl_bin }} -n {{ argocd_namespace }} rollout restart deployment argocd-repo-server
-    echo "Restarted ArgoCD repo server to pick up new SSH configuration"
-  register: argocd_restart
-  changed_when: true
-
-# `kubectl rollout status` only returns success when the new pod is
-# actually serving — checking `readyReplicas==1` (the previous approach)
-# is satisfied by the OLD pod during a rolling restart and races against
-# the kubelet ConfigMap volume sync, which leaves the next ArgoCD-touching
-# task to absorb ~75s of "knownhosts: key is unknown" retries. Wait
-# properly, then move on.
-- name: Wait for ArgoCD repo server rollout
-  ansible.builtin.command: >
-    {{ kubectl_bin }} -n {{ argocd_namespace }}
-    rollout status deployment/argocd-repo-server --timeout=120s
-  register: argocd_ready_wait
-  when: argocd_restart.changed
-  changed_when: false
 
 - name: Create ArgoCD Application
   kubernetes.core.k8s:
