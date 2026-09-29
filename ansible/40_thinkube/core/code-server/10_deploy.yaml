@@ -4,7 +4,7 @@
 ---
 # ansible/40_thinkube/optional/code-server/10_deploy.yaml
 # Description:
-#   Deploy Code Server on Kubernetes with Keycloak authentication via OAuth2 Proxy
+#   Deploy Code Server on Kubernetes with a Keycloak login at the gateway
 #
 # Requirements:
 #   - Kubernetes (kubeadm) must be installed
@@ -34,7 +34,7 @@
 #
 # 🤖 [AI-generated]
 
-- name: Deploy Code Server secured with OAuth2 Proxy
+- name: Deploy Code Server secured with a Keycloak login
   hosts: k8s_control_plane
   gather_facts: true
 
@@ -60,9 +60,6 @@
     code_server_redirect_uri: "https://{{ code_server_hostname }}/oauth2/callback"
     code_server_web_origins: "https://{{ code_server_hostname }}"
     code_server_lifespan: "3600"
-    
-    # OAuth2 Proxy settings
-    oauth2_proxy_cookie_domain: ".{{ domain_name }}"
     
     # Control hub configuration - following thinkube-control pattern
     control_host: "control.{{ domain_name }}"
@@ -877,7 +874,7 @@
       changed_when: false
 
     ###################################################################
-    # 6) Create code‑server Service and Ingress (secured via oauth2‑proxy)
+    # 6) Create code‑server Service and HTTPRoute
     ###################################################################
     - name: Create code-server Service
       ansible.builtin.shell: |
@@ -902,7 +899,7 @@
         KUBECONFIG: "{{ kubeconfig }}"
       changed_when: false
 
-    - name: Create code-server HTTPRoute (OAuth2 handled by oauth2-proxy role)
+    - name: Create code-server HTTPRoute
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
         apiVersion: gateway.networking.k8s.io/v1
@@ -932,151 +929,35 @@
       changed_when: false
 
     ###################################################################
-    # 7) Deploy ephemeral Valkey for oauth2-proxy session storage
+    # 7) Require a Keycloak login at the gateway
     ###################################################################
-    - name: Deploy ephemeral Valkey (Deployment) in "{{ code_server_namespace }}"
+    # The gateway handles the login itself. An oauth2-proxy route for
+    # /oauth2 on this host would take the gateway's /oauth2/callback, so any
+    # oauth2-proxy route, release and session store is removed.
+    - name: Remove the oauth2-proxy route, release and session store
       ansible.builtin.shell: |
-        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
-        apiVersion: apps/v1
-        kind: Deployment
-        metadata:
-          name: ephemeral-valkey
-          labels:
-            app: ephemeral-valkey
-        spec:
-          replicas: 1
-          selector:
-            matchLabels:
-              app: ephemeral-valkey
-          template:
-            metadata:
-              labels:
-                app: ephemeral-valkey
-            spec:
-              priorityClassName: thinkube-workload
-              containers:
-                - name: valkey
-                  image: "{{ harbor_registry }}/library/valkey:7.2-alpine"
-                  command: ["valkey-server", "--save", "", "--appendonly", "no"]
-                  ports:
-                    - containerPort: 6379
-                      name: valkey
-                  resources:
-                    requests:
-                      cpu: 50m
-                      memory: 64Mi
-                    limits:
-                      cpu: 200m
-                      memory: 256Mi
-        EOF
+        {{ kubectl_bin }} delete httproute oauth2-proxy -n {{ code_server_namespace }} --ignore-not-found
+        {{ kubectl_bin }} delete deployment,service ephemeral-valkey -n {{ code_server_namespace }} --ignore-not-found
+        if {{ helm_bin }} status oauth2-proxy -n {{ code_server_namespace }} >/dev/null 2>&1; then
+          {{ helm_bin }} uninstall oauth2-proxy -n {{ code_server_namespace }}
+        fi
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
+      register: oauth2_proxy_removal
+      changed_when: "'deleted' in oauth2_proxy_removal.stdout or 'uninstalled' in oauth2_proxy_removal.stdout"
 
-    - name: Deploy ephemeral Valkey (Service) in "{{ code_server_namespace }}"
-      ansible.builtin.shell: |
-        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
-        apiVersion: v1
-        kind: Service
-        metadata:
-          name: ephemeral-valkey
-          labels:
-            app: ephemeral-valkey
-        spec:
-          type: ClusterIP
-          selector:
-            app: ephemeral-valkey
-          ports:
-            - name: valkey
-              port: 6379
-              targetPort: 6379
-        EOF
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
+    - name: Require a Keycloak login on the code-server route
+      ansible.builtin.include_role:
+        name: gateway_oidc
+      vars:
+        gateway_oidc_namespace: "{{ code_server_namespace }}"
+        gateway_oidc_route_names: ["code-server"]
+        gateway_oidc_hostname: "{{ code_server_hostname }}"
+        gateway_oidc_client_id: "{{ code_server_client_id }}"
+        gateway_oidc_client_secret: "{{ code_server_client_secret }}"
 
     ###################################################################
-    # 8) Deploy oauth2-proxy via Helm (using Valkey for session storage)
-    ###################################################################
-    - name: Add oauth2-proxy Helm repository
-      kubernetes.core.helm_repository:
-        binary_path: "{{ helm_bin }}"
-        name: oauth2-proxy
-        repo_url: "https://oauth2-proxy.github.io/manifests"
-        state: present
-
-    - name: Update Helm repo for oauth2-proxy
-      ansible.builtin.command: "{{ helm_bin }} repo update"
-      changed_when: false
-      failed_when: false
-
-    - name: Deploy oauth2-proxy (no PKCE, using Valkey session store)
-      kubernetes.core.helm:
-        binary_path: "{{ helm_bin }}"
-        name: "oauth2-proxy"
-        chart_ref: "oauth2-proxy/oauth2-proxy"
-        release_namespace: "{{ code_server_namespace }}"
-        create_namespace: false
-        reset_values: true
-        force: true
-        update_repo_cache: true
-        values:
-          ingress:
-            enabled: false
-          service:
-            type: ClusterIP
-            portNumber: 80
-          extraArgs:
-            - --provider=keycloak-oidc
-            - --client-id={{ code_server_client_id }}
-            - --client-secret={{ code_server_client_secret }}
-            - --redirect-url=https://{{ code_server_hostname }}/oauth2/callback
-            - --oidc-issuer-url={{ keycloak_url }}/realms/{{ keycloak_realm }}
-            - --cookie-domain={{ oauth2_proxy_cookie_domain }}
-            - --cookie-secure=true
-            - --cookie-samesite=none
-            - --cookie-refresh=1h
-            - --reverse-proxy
-            - --set-xauthrequest=true
-            - --session-store-type=redis
-            - --redis-connection-url=redis://ephemeral-valkey.{{ code_server_namespace }}.svc.cluster.local:6379
-      register: oauth2_proxy_helm_result
-      retries: 3
-      delay: 30
-      until: oauth2_proxy_helm_result is not failed
-
-    ###################################################################
-    # 9) Create oauth2-proxy Ingress for /oauth2 routing
-    ###################################################################
-    - name: Create oauth2-proxy HTTPRoute for /oauth2
-      ansible.builtin.shell: |
-        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
-        apiVersion: gateway.networking.k8s.io/v1
-        kind: HTTPRoute
-        metadata:
-          name: oauth2-proxy
-        spec:
-          parentRefs:
-            - name: "{{ gateway_name }}"
-              namespace: "{{ gateway_namespace }}"
-              sectionName: https
-          hostnames:
-            - "{{ code_server_hostname }}"
-          rules:
-            - matches:
-                - path:
-                    type: PathPrefix
-                    value: /oauth2
-              backendRefs:
-                - name: oauth2-proxy
-                  port: 80
-        EOF
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
-
-    ###################################################################
-    # 10) Force restart: Verify ConfigMap and delete code-server pods
+    # 8) Force restart: Verify ConfigMap and delete code-server pods
     ###################################################################
     - name: Verify code-server ConfigMap (ensure auth is set to "none")
       ansible.builtin.shell: |
@@ -1121,7 +1002,7 @@
       changed_when: false
 
     ###################################################################
-    # 11) GitHub access for code-server
+    # 9) GitHub access for code-server
     ###################################################################
     # gh runs inside the code-server pod: the image provides it, and the login
     # it stores lands in the workspace home, wherever this playbook runs from.
@@ -1225,7 +1106,7 @@
       tags: [github_access]
 
     ###################################################################
-    # 12) Configure VS Code tasks for Claude Code
+    # 10) Configure VS Code tasks for Claude Code
     ###################################################################
     # Create VS Code tasks configuration for Claude Code
     - name: Ensure .vscode directory exists in shared code directory
@@ -1270,7 +1151,7 @@
           - "To reload extensions: Press Ctrl+R in code-server"
 
     ###################################################################
-    # 13) Final information
+    # 11) Final information
     ###################################################################
     - name: Final info for code-server setup
       ansible.builtin.debug:

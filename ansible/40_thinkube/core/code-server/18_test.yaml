@@ -50,31 +50,6 @@
         - deployment_check.resources | length == 0
         - deployment_check.resources[0].status.readyReplicas != 1
 
-    - name: Check OAuth2 Proxy deployment
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: Deployment
-        namespace: "{{ code_server_namespace }}"
-        label_selectors:
-          - "app.kubernetes.io/name=oauth2-proxy"
-      register: oauth_deployment
-      failed_when: 
-        - oauth_deployment.resources | length == 0
-        - oauth_deployment.resources[0].status.readyReplicas is not defined
-
-    - name: Check Valkey deployment
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: Deployment
-        namespace: "{{ code_server_namespace }}"
-        name: ephemeral-valkey
-      register: valkey_deployment
-      failed_when: 
-        - valkey_deployment.resources | length == 0
-        - valkey_deployment.resources[0].status.readyReplicas != 1
-
     ###################################################################
     # 2) Check services
     ###################################################################
@@ -87,16 +62,6 @@
         name: code-server
       register: service_check
       failed_when: service_check.resources | length == 0
-
-    - name: Check OAuth2 Proxy service
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Service
-        namespace: "{{ code_server_namespace }}"
-        name: oauth2-proxy
-      register: oauth_service
-      failed_when: oauth_service.resources | length == 0
 
     ###################################################################
     # 3) Check HTTPRoute
@@ -112,15 +77,17 @@
       failed_when:
         - httproute_check.resources | length == 0
 
-    - name: Check OAuth2 HTTPRoute
+    - name: Check the gateway login policy on the route
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
-        api_version: gateway.networking.k8s.io/v1
-        kind: HTTPRoute
+        api_version: gateway.envoyproxy.io/v1alpha1
+        kind: SecurityPolicy
         namespace: "{{ code_server_namespace }}"
-        name: oauth2-proxy
-      register: oauth_httproute
-      failed_when: oauth_httproute.resources | length == 0
+        name: code-server-oidc
+      register: oidc_policy
+      failed_when: >-
+        oidc_policy.resources | length == 0
+        or 'code-server' not in (oidc_policy.resources[0].spec.targetRefs | map(attribute='name') | list)
 
     ###################################################################
     # 4) Check secrets
@@ -177,21 +144,22 @@
     ###################################################################
     # 6) Test HTTP connectivity
     ###################################################################
-    - name: Test Code Server URL (should redirect to auth)
+    - name: Test Code Server URL without a login
       ansible.builtin.uri:
         url: "https://{{ code_server_hostname }}/"
         follow_redirects: none
-        validate_certs: false
-        status_code: [302, 303]
+        status_code: [200, 302, 303]
       register: url_test
-      failed_when: false
 
-    - name: Verify auth redirect
+    - name: Verify the request is sent to the Keycloak login
       ansible.builtin.assert:
         that:
           - url_test.status in [302, 303]
-          - "'oauth2' in url_test.location or 'auth' in url_test.location"
-        fail_msg: "Code Server is not properly redirecting to authentication"
+          - url_test.location.startswith(keycloak_url ~ '/realms/' ~ keycloak_realm ~ '/protocol/openid-connect/auth')
+        fail_msg: >-
+          https://{{ code_server_hostname }}/ without a login answered
+          {{ url_test.status }} {{ url_test.location | default('') }} instead
+          of a redirect to Keycloak. The IDE is reachable without a login.
 
     ###################################################################
     # 7) Check repository monitor (if configured)
@@ -247,9 +215,8 @@
           
           Component Status:
           ✓ Code Server deployment: Running
-          ✓ OAuth2 Proxy: Running
-          ✓ Valkey session store: Running
-          ✓ Ingress configured: Yes
+          ✓ Gateway login policy: Present
+          ✓ HTTPRoute configured: Yes
           ✓ TLS certificate: Present
           ✓ Keycloak client: Configured
           ✓ Authentication redirect: Working
@@ -274,6 +241,6 @@
           Troubleshooting Commands:
           - kubectl -n {{ code_server_namespace }} get pods
           - kubectl -n {{ code_server_namespace }} logs deployment/code-server
-          - kubectl -n {{ code_server_namespace }} logs deployment/oauth2-proxy
+          - kubectl -n {{ code_server_namespace }} get securitypolicy code-server-oidc -o yaml
           
           ════════════════════════════════════════════════════════

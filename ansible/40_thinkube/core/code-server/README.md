@@ -27,7 +27,7 @@ Code Server provides a full VS Code experience in the browser, allowing develope
 ## Architecture
 
 ```
-User → Browser → Code Server → OAuth2 Proxy → Keycloak
+User → Browser → Gateway (Keycloak login) → Code Server
                       ↓
               Shared Code Directory ← JupyterHub
                       ↓
@@ -39,11 +39,10 @@ User → Browser → Code Server → OAuth2 Proxy → Keycloak
 ## Components
 
 1. **Code Server** - VS Code in the browser
-2. **OAuth2 Proxy** - Authentication layer
-3. **Valkey** - Redis-compatible session storage (BSD licensed)
-4. **Keycloak Integration** - SSO authentication
-5. **Development Tools** - Node.js, Claude Code, Python, Ansible
-6. **Gitea Integration** - CI/CD with Gitea Actions
+2. **Gateway login** - Envoy Gateway `SecurityPolicy` with OIDC (role `gateway_oidc`)
+3. **Keycloak Integration** - SSO authentication
+4. **Development Tools** - Node.js, Claude Code, Python, Ansible
+5. **Gitea Integration** - CI/CD with Gitea Actions
 
 ## Deployment
 
@@ -66,7 +65,7 @@ cd ~/thinkube
 ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/00_install.yaml
 
 # Option 2: Individual steps
-# Deploy Code Server with OAuth2 authentication
+# Deploy Code Server with a Keycloak login
 ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/10_deploy.yaml
 
 # Clone the platform and template repositories into the workspace.
@@ -112,7 +111,10 @@ Default location: `/home/{{ system_username }}/shared-code`
 ### Authentication
 
 - Uses Keycloak for SSO
-- OAuth2 Proxy handles the authentication flow
+- The gateway handles the login: the `code-server-oidc` SecurityPolicy on
+  the `code-server` HTTPRoute sends any request without a session to
+  Keycloak, and handles the callback at `/oauth2/callback`
+- code-server itself runs with `--auth=none`; the gateway is the only check
 - Users need the `code-server-admin` or `code-server-user` role
 - Admin user is automatically granted access during deployment
 
@@ -174,10 +176,10 @@ kubectl -n code-server get pods
 kubectl -n code-server logs deployment/code-server
 ```
 
-### OAuth2 Proxy Issues
+### Login Issues
 ```bash
-kubectl -n code-server logs deployment/oauth2-proxy
-kubectl -n code-server get secret code-server-oauth-secret -o yaml
+kubectl -n code-server get securitypolicy code-server-oidc -o yaml
+kubectl -n envoy-gateway-system logs deployment/envoy-gateway | grep code-server
 ```
 
 ## Next Steps
