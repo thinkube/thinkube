@@ -452,6 +452,16 @@ hub:
             <script type="application/json" id="thinkube-node-limits">{{ profile.node_limits | tojson }}</script>
           {%- endif %}
         {%- endfor %}
+        <style>
+          .tk-node-servers-list { list-style: none; padding: 0; margin: 0 0 20px; }
+          .tk-node-servers-list li { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #d1cdc7; }
+          .tk-node-name { font-weight: 600; min-width: 90px; }
+          .tk-node-state { flex: 1; }
+          .tk-node-state::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #9a948c; }
+          .tk-node-state.tk-running::before { background: #16a34a; }
+          .tk-node-state.tk-starting::before { background: #eab308; }
+        </style>
+        <div id="thinkube-node-servers"></div>
         <div class="form-group" id="kubespawner-profiles-list">
           {%- for profile in profile_list %}
             <label for="profile-item-{{ profile.slug }}"
@@ -621,7 +631,78 @@ hub:
               params.set('next', jh.prefix + 'user/' + user + '/' + server + '/');
               return jh.base_url + 'spawn/' + user + '/' + server + '?' + params.toString();
             }
+            // The state of each node's server, read from the Hub API with this
+            // page's login. A running server is opened instead of started again,
+            // and a starting one shows its progress page.
+            var serverState = {};
+            var $servers = $('#thinkube-node-servers');
+            var $submit = $('#spawn_form button[type="submit"]');
+            function serverUrl(node) {
+              return window.jhdata.prefix + 'user/' + encodeURIComponent(window.jhdata.user) + '/' + encodeURIComponent(node) + '/';
+            }
+            function pendingUrl(node) {
+              return window.jhdata.base_url + 'spawn-pending/' + encodeURIComponent(window.jhdata.user) + '/' + encodeURIComponent(node);
+            }
+            function stateOf(node) {
+              var server = serverState[node];
+              if (!server) return 'stopped';
+              if (server.ready) return 'running';
+              if (server.pending) return 'starting';
+              return 'stopped';
+            }
+            function updateSubmit() {
+              var state = stateOf($nodeSelect.val());
+              $submit.text(state === 'running' ? 'Open' : state === 'starting' ? 'Show progress' : 'Start');
+            }
+            function renderServers() {
+              var $list = $('<ul class="tk-node-servers-list"></ul>');
+              Object.keys(nodeLimits).sort().forEach(function(node) {
+                var state = stateOf(node);
+                var label = state === 'running' ? 'running' : state === 'starting' ? 'starting' : 'not running';
+                var $row = $('<li></li>')
+                  .append($('<span class="tk-node-name"></span>').text(node))
+                  .append($('<span class="tk-node-state"></span>').addClass('tk-' + state).text(label));
+                if (state === 'running') {
+                  $row.append($('<a class="btn btn-jupyter btn-xs"></a>').attr('href', serverUrl(node)).text('Open'));
+                } else if (state === 'starting') {
+                  $row.append($('<a class="btn btn-default btn-xs"></a>').attr('href', pendingUrl(node)).text('Show progress'));
+                } else {
+                  $row.append($('<button type="button" class="btn btn-default btn-xs"></button>').text('Choose to start').click(function() {
+                    $nodeSelect.val(node).trigger('change');
+                  }));
+                }
+                $list.append($row);
+              });
+              $servers.empty().append($('<h3>Your notebook servers</h3>'), $list);
+              updateSubmit();
+            }
+            fetch(window.jhdata.base_url + 'api/user', {
+              credentials: 'same-origin',
+              headers: { 'X-XSRFToken': window.jhdata.xsrf_token }
+            })
+              .then(function(response) {
+                if (!response.ok) throw new Error('the Hub answered ' + response.status);
+                return response.json();
+              })
+              .then(function(user) {
+                if (!user.servers) throw new Error('the Hub did not list your servers');
+                serverState = user.servers;
+                renderServers();
+              })
+              .catch(function(err) {
+                $servers.empty().append($('<p></p>').text(
+                  'The state of your notebook servers cannot be read: ' + err.message + '. Starting a server on a free node still works.'));
+              });
+
             $('#spawn_form').submit(function(e) {
+              var chosen = $nodeSelect.val();
+              var state = stateOf(chosen);
+              if (state === 'running' || state === 'starting') {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                window.location.href = state === 'running' ? serverUrl(chosen) : pendingUrl(chosen);
+                return false;
+              }
               var action = nodeServerAction($(this).attr('action') || '');
               if (!action) {
                 e.preventDefault();
@@ -635,6 +716,7 @@ hub:
             $nodeSelect.change(function() {
               updateOptionsForNode();
               applyNodeDefaults();
+              updateSubmit();
             });
 
             // Trigger on page load
