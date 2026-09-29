@@ -188,50 +188,36 @@
       ansible.builtin.set_fact:
         test_results: "{{ test_results + ['S3 API accessible: ' + (s3_test.status in [200, 403]) | string] }}"
 
-    # Test UI endpoint (through OAuth2)
-    - name: Test UI endpoint connectivity
+    # The web UI must send a request without a login to Keycloak
+    - name: Test UI endpoint without a login
       ansible.builtin.uri:
-        url: "https://{{ object_storage_ui_hostname }}"
-        validate_certs: false
-        status_code: [200, 302]
-        follow_redirects: no
+        url: "https://{{ object_storage_ui_hostname }}/"
+        status_code: [200, 302, 303]
+        follow_redirects: none
       register: ui_test
       failed_when: false
       delegate_to: localhost
 
-    - name: Record UI test result
+    - name: Record UI login test result
       ansible.builtin.set_fact:
-        test_results: "{{ test_results + ['UI endpoint accessible: ' + (ui_test.status in [200, 302]) | string] }}"
+        test_results: >-
+          {{ test_results + ['UI requires Keycloak login: ' ~
+             (ui_test.status in [302, 303] and (ui_test.location | default('')).startswith(
+               keycloak_url ~ '/realms/' ~ keycloak_realm ~ '/protocol/openid-connect/auth')) | string] }}
 
-    # Check OAuth2 Proxy
-    - name: Check OAuth2 Proxy deployment
+    - name: Check the gateway login policy on the UI route
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: Deployment
-        name: oauth2-proxy
+        api_version: gateway.envoyproxy.io/v1alpha1
+        kind: SecurityPolicy
+        name: oauth2-proxy-seaweedfs-oidc
         namespace: "{{ seaweedfs_namespace }}"
-      register: oauth2_check
+      register: oidc_policy_check
       failed_when: false
 
-    - name: Record OAuth2 Proxy test result
+    - name: Record login policy test result
       ansible.builtin.set_fact:
-        test_results: "{{ test_results + ['OAuth2 Proxy deployed: ' + (oauth2_check.resources | length > 0) | string] }}"
-
-    # Check Redis for OAuth2
-    - name: Check Redis deployment
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: apps/v1
-        kind: Deployment
-        name: ephemeral-redis  # Valkey deployment with Redis-compatible name
-        namespace: "{{ seaweedfs_namespace }}"
-      register: redis_check
-      failed_when: false
-
-    - name: Record Redis test result
-      ansible.builtin.set_fact:
-        test_results: "{{ test_results + ['Redis deployed: ' + (redis_check.resources | length > 0) | string] }}"
+        test_results: "{{ test_results + ['Gateway login policy present: ' + (oidc_policy_check.resources | length > 0) | string] }}"
 
     # Test S3 credentials secret
     - name: Check S3 credentials secret
@@ -258,7 +244,7 @@
 
     - name: Determine overall test status
       ansible.builtin.set_fact:
-        all_tests_passed: "{{ test_results | select('search', 'false') | list | length == 0 }}"
+        all_tests_passed: "{{ test_results | select('search', ': False$') | list | length == 0 }}"
 
     - name: Final test result
       ansible.builtin.debug:

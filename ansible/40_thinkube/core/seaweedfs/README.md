@@ -22,7 +22,9 @@ SeaweedFS provides:
 1. **Master Server**: Manages cluster topology and metadata
 2. **Volume Server**: Stores actual file data
 3. **Filer**: Provides S3 API, WebDAV, and web UI
-4. **OAuth2 Proxy**: Keycloak integration for web UI authentication
+4. **Gateway login**: the web UI (`storage.<domain>`) requires a Keycloak login at
+   the gateway (Envoy Gateway `SecurityPolicy`, role `gateway_oidc`). The S3 API
+   (`s3.<domain>`) uses S3 keys and has no Keycloak login.
 
 ## Implementation Details
 
@@ -50,7 +52,7 @@ cd ~/thinkube
 This creates:
 - SeaweedFS namespace
 - Master, Volume, and Filer servers
-- OAuth2 proxy for UI authentication
+- The Keycloak client and the gateway login policy for the web UI
 - HTTPRoutes for the UI and the S3 API
 
 ### 2. Configure S3 Access

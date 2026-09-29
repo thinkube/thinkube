@@ -34,10 +34,10 @@
     app_name: seaweedfs
     seaweedfs_chart_version: "4.0.0"  # Latest stable chart version
     
-    # OAuth2 proxy settings for web UI
-    oauth2_proxy_enabled: true
-    
-    # Keycloak admin credentials (needed by oauth2_proxy role)
+    # Keycloak client for the web UI login at the gateway
+    seaweedfs_ui_client_id: "oauth2-proxy-{{ app_name }}"
+
+    # Keycloak admin credentials (needed by the keycloak_client role)
     keycloak_admin_username: "{{ admin_username }}"
     keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
     
@@ -380,42 +380,7 @@
         msg: "Rollout of StatefulSet seaweedfs-filer did not complete after the S3 config patch: {{ rollout_status.stderr }}"
       when: rollout_status.rc != 0
 
-    # Deploy OAuth2 Proxy for UI access
-    - name: Deploy Valkey for OAuth2 sessions
-      ansible.builtin.include_role:
-        name: valkey/ephemeral_valkey
-      vars:
-        valkey_namespace: "{{ seaweedfs_namespace }}"
-        valkey_registry: "{{ harbor_registry }}/library"
-        valkey_deployment_name: ephemeral-redis
-        valkey_service_name: ephemeral-redis
-        valkey_kubeconfig: "{{ kubeconfig }}"
-      when: oauth2_proxy_enabled
-
-    - name: Deploy OAuth2 Proxy for SeaweedFS UI
-      ansible.builtin.include_role:
-        name: oauth2_proxy
-      vars:
-        oauth2_proxy_namespace: "{{ seaweedfs_namespace }}"
-        oauth2_proxy_client_id: "oauth2-proxy-{{ app_name }}"
-        oauth2_proxy_dashboard_host: "{{ object_storage_ui_hostname }}"
-        oauth2_proxy_oidc_issuer_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
-        oauth2_proxy_cookie_domain: "{{ domain_name }}"
-        oauth2_proxy_ingress_host: "{{ object_storage_ui_hostname }}"
-        oauth2_proxy_ingress_tls_secret_name: "{{ tls_secret_name }}"
-        oauth2_proxy_kubeconfig: "{{ kubeconfig }}"
-        oauth2_proxy_helm_bin: "{{ helm_bin }}"
-      when: oauth2_proxy_enabled
-
-    - name: Wait for OAuth2 Proxy to be ready
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} rollout status deployment/oauth2-proxy -n {{ seaweedfs_namespace }} --timeout=300s
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: oauth2_wait_result
-      when: oauth2_proxy_enabled
-
-    - name: Create SeaweedFS UI HTTPRoute (OAuth2 handled by oauth2-proxy role)
+    - name: Create SeaweedFS UI HTTPRoute
       ansible.builtin.shell: |
         cat <<EOF | {{ kubectl_bin }} apply -f -
         apiVersion: gateway.networking.k8s.io/v1
@@ -443,7 +408,52 @@
         KUBECONFIG: "{{ kubeconfig }}"
       register: ui_httproute_result
       changed_when: "'created' in ui_httproute_result.stdout or 'configured' in ui_httproute_result.stdout"
-      when: oauth2_proxy_enabled
+
+    # --- Keycloak login for the web UI ---
+    # The gateway handles the login itself. An oauth2-proxy route for
+    # /oauth2 on this host would take the gateway's /oauth2/callback, so any
+    # oauth2-proxy route, release and session store is removed.
+    - name: Remove the oauth2-proxy route, release and session store
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete httproute oauth2-proxy-ingress -n {{ seaweedfs_namespace }} --ignore-not-found
+        {{ kubectl_bin }} delete deployment,service ephemeral-redis -n {{ seaweedfs_namespace }} --ignore-not-found
+        if {{ helm_bin }} status oauth2-proxy -n {{ seaweedfs_namespace }} >/dev/null 2>&1; then
+          {{ helm_bin }} uninstall oauth2-proxy -n {{ seaweedfs_namespace }}
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: oauth2_proxy_removal
+      changed_when: "'deleted' in oauth2_proxy_removal.stdout or 'uninstalled' in oauth2_proxy_removal.stdout"
+
+    - name: Create or update the Keycloak client for the web UI
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ seaweedfs_ui_client_id }}"
+        keycloak_client_body:
+          clientId: "{{ seaweedfs_ui_client_id }}"
+          enabled: true
+          protocol: openid-connect
+          publicClient: false
+          standardFlowEnabled: true
+          redirectUris:
+            - "https://{{ object_storage_ui_hostname }}/oauth2/callback"
+          webOrigins:
+            - "https://{{ object_storage_ui_hostname }}"
+          baseUrl: "https://{{ object_storage_ui_hostname }}"
+          attributes:
+            post.logout.redirect.uris: "+"
+
+    - name: Require a Keycloak login on the web UI route
+      ansible.builtin.include_role:
+        name: gateway_oidc
+      vars:
+        gateway_oidc_namespace: "{{ seaweedfs_namespace }}"
+        gateway_oidc_route_names: ["seaweedfs-ui-httproute"]
+        gateway_oidc_hostname: "{{ object_storage_ui_hostname }}"
+        gateway_oidc_client_id: "{{ seaweedfs_ui_client_id }}"
+        gateway_oidc_client_secret: "{{ keycloak_client_secret }}"
+    # --- end Keycloak login for the web UI ---
 
     - name: Create S3 API HTTPRoute (without auth)
       ansible.builtin.shell: |
@@ -487,9 +497,8 @@
 
     - name: Fail if expected HTTPRoutes not created
       ansible.builtin.fail:
-        msg: "Expected HTTPRoutes not found. Found {{ httproute_count }}, expected {{ '2 (UI, S3)' if oauth2_proxy_enabled else '1 (S3)' }}"
-      when:
-        - (oauth2_proxy_enabled and httproute_count | int < 2) or (not oauth2_proxy_enabled and httproute_count | int < 1)
+        msg: "Expected HTTPRoutes not found. Found {{ httproute_count }}, expected 2 (UI, S3)"
+      when: httproute_count | int < 2
 
     - name: Display deployment summary
       ansible.builtin.debug:
