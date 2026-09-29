@@ -123,6 +123,35 @@
         mode: '0600'
       no_log: true
 
+    # The Playwright MCP server reads this dotenv file (--secrets, set in
+    # thinkube-control/13_configure_code_server.yaml). When a browser tool is
+    # given the text THINKUBE_PASSWORD, the server types the real password, and
+    # it replaces the password with <secret>THINKUBE_PASSWORD</secret> in every
+    # result, so the password never reaches the agent's context.
+    - name: Stop when ADMIN_PASSWORD is not set
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'ADMIN_PASSWORD') | length > 0
+        fail_msg: >-
+          ADMIN_PASSWORD is not set in the environment. It is the Keycloak
+          password of {{ auth_realm_username }}; export it before running this
+          playbook (tk_ansible loads it from ~/.env).
+        quiet: true
+
+    - name: Create the Playwright MCP configuration directory
+      ansible.builtin.file:
+        path: "{{ shared_code_path }}/.config/playwright-mcp"
+        state: directory
+        mode: '0700'
+
+    - name: Write the Playwright MCP secrets file
+      ansible.builtin.copy:
+        dest: "{{ shared_code_path }}/.config/playwright-mcp/secrets.env"
+        content: |
+          THINKUBE_PASSWORD={{ lookup('env', 'ADMIN_PASSWORD') }}
+        mode: '0600'
+      no_log: true
+
     ###################################################################
     # Create environment setup scripts (cross-shell compatible)
     # NOTE: Stored in ~/.thinkube_shared_shell (same location as aliases/functions from playbook 14)
@@ -613,6 +642,33 @@
         done && \
         echo '✅ companion policies installed'"
       when: companion_policies_installed.rc != 0
+
+    # Tells Claude Code how to sign in to Thinkube apps with the Playwright MCP
+    # browser. The file carries the realm and user from the inventory, so it is
+    # rewritten on every run.
+    - name: Install the Claude Code browser login instructions
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "set -e; mkdir -p /home/thinkube/.claude && \
+            cat > /home/thinkube/.claude/BROWSER-LOGIN.md << 'EOF'
+        # Browser login to Thinkube apps (Thinkube platform default)
+
+        Thinkube apps sign in through Keycloak, realm \`{{ keycloak_realm }}\`. To
+        test an app in the Playwright MCP browser:
+
+        - Username: \`{{ auth_realm_username }}\`.
+        - Password: type the text \`THINKUBE_PASSWORD\` into the password field
+          with browser_type or browser_fill_form. The Playwright MCP types the
+          real password and shows it as <secret>THINKUBE_PASSWORD</secret> in
+          its output.
+        - Never read the password from a file or variable, and never write it in
+          a tool call, a file or a message.
+        - Never create or change Keycloak users to get a login.
+        - If the login fails, report the message the page shows and stop.
+        EOF
+        grep -q '@BROWSER-LOGIN.md' /home/thinkube/.claude/CLAUDE.md || \
+          printf '\n@BROWSER-LOGIN.md\n' >> /home/thinkube/.claude/CLAUDE.md
+        echo '✅ Claude Code browser login instructions installed'"
 
     - name: Configure pip to use DevPi
       ansible.builtin.shell: |

@@ -184,6 +184,17 @@
     # <shared-code>/.claude/settings.json.
     claude_settings_path: "/home/thinkube/.claude/settings.json"
     claude_settings_host_path: "/home/{{ system_username }}/shared-code/.claude/settings.json"
+    # --secrets points at the file written by
+    # code-server/15_configure_environment.yaml; it holds THINKUBE_PASSWORD,
+    # the Keycloak password the browser types when signing in to Thinkube apps.
+    playwright_mcp_server:
+      command: /home/thinkube/.npm-global/bin/playwright-mcp
+      args:
+        - --headless
+        - --executable-path
+        - /usr/bin/chromium-browser
+        - --secrets
+        - /home/thinkube/.config/playwright-mcp/secrets.env
 
   tasks:
     # The previous play restarts code-server, so for a while there is either no
@@ -249,10 +260,7 @@
               'type': 'http',
               'url': 'https://control.' + control_domain_name + '/tk-package-version/mcp'
             },
-            'playwright': {
-              'command': '/home/thinkube/.npm-global/bin/playwright-mcp',
-              'args': ['--headless', '--executable-path', '/usr/bin/chromium-browser']
-            }
+            'playwright': playwright_mcp_server
           })
         }, recursive=True) }}"
 
@@ -284,9 +292,9 @@
     - name: Register Playwright MCP server via Claude CLI
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ cs_pod_name.stdout }} -- \
-          bash -l -c "claude mcp remove playwright -s local >/dev/null 2>&1; claude mcp add-json playwright '{\"command\":\"/home/thinkube/.npm-global/bin/playwright-mcp\",\"args\":[\"--headless\",\"--executable-path\",\"/usr/bin/chromium-browser\"]}'"
+          bash -l -c 'claude mcp remove playwright -s local >/dev/null 2>&1; claude mcp add-json playwright "$1"' \
+          _ {{ playwright_mcp_server | to_json | quote }}
       register: mcp_pw_add_result
-      failed_when: false
 
     - name: Create MCP config JSON
       ansible.builtin.set_fact:
@@ -304,10 +312,7 @@
                 "type": "http",
                 "url": "https://control.{{ control_domain_name }}/tk-package-version/mcp"
               },
-              "playwright": {
-                "command": "/home/thinkube/.npm-global/bin/playwright-mcp",
-                "args": ["--headless", "--executable-path", "/usr/bin/chromium-browser"]
-              }
+              "playwright": {{ playwright_mcp_server | to_json }}
             }
           }
 
@@ -348,5 +353,5 @@
           - "Location: /home/thinkube/apps/.mcp.json"
           - "Location: /home/thinkube/thinkube-platform/.mcp.json"
           - "CLI registration (thinkube-control): {{ 'success' if mcp_add_result.rc == 0 else 'skipped (claude CLI not found)' }}"
-          - "CLI registration (playwright): {{ 'success' if mcp_pw_add_result.rc == 0 else 'skipped (claude CLI not found)' }}"
+          - "CLI registration (playwright): success"
           - "Start a new Claude Code conversation to connect"
