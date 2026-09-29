@@ -288,6 +288,32 @@
             client-id: "{{ mlflow_client_id }}"
             client-secret: "{{ keycloak_client_secret }}"
 
+    - name: Check for the MLflow session secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ mlflow_namespace }}"
+        name: mlflow-session-secret
+      register: session_secret
+
+    # SECRET_KEY signs sessions and derives the session token encryption key.
+    # It is generated once and kept, so a redeploy does not end user sessions.
+    - name: Create the MLflow session secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ mlflow_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: mlflow-session-secret
+          type: Opaque
+          stringData:
+            SECRET_KEY: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=64') }}"
+      when: session_secret.resources | length == 0
+
     - name: Create Persistent Volume Claim for MLflow local artifacts
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -354,7 +380,20 @@
                   - name: mlflow
                     image: "{{ harbor_registry }}/library/mlflow-custom:latest"
                     command: ["mlflow"]
-                    args: ["server", "--host=0.0.0.0", "--port=5000", "--backend-store-uri=postgresql://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)", "--default-artifact-root=s3://mlflow/artifacts", "--app-name", "oidc-auth"]
+                    # --allowed-hosts: MLflow rejects any other Host header; the
+                    # names are the public route and the in-cluster service.
+                    # --workers: each worker loads the whole app, so the count
+                    # sets the memory needed.
+                    args:
+                      - "server"
+                      - "--host=0.0.0.0"
+                      - "--port=5000"
+                      - "--workers=2"
+                      - "--allowed-hosts={{ mlflow_hostname }},mlflow.{{ mlflow_namespace }}.svc.cluster.local:5000"
+                      - "--backend-store-uri=postgresql://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)"
+                      - "--default-artifact-root=s3://mlflow/artifacts"
+                      - "--app-name"
+                      - "oidc-auth"
                     volumeMounts:
                       - name: mlflow-storage
                         mountPath: /mlflow/local-artifacts
@@ -434,8 +473,20 @@
                         value: "true"
                       - name: DEFAULT_LANDING_PAGE_IS_PERMISSIONS
                         value: "false"
+                      # Server-side GenAI jobs (LLM-judge scorers, prompt
+                      # optimization) run one process per job type; Thinkube
+                      # does not use them. Calling one returns an error.
+                      - name: MLFLOW_SERVER_ENABLE_JOB_EXECUTION
+                        value: "false"
+                      # Every mlflow-user may use every experiment and model: the
+                      # model mirror, notebooks and Argo jobs share one registry.
+                      - name: DEFAULT_MLFLOW_PERMISSION
+                        value: "MANAGE"
                       - name: SECRET_KEY
-                        value: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=32') }}"
+                        valueFrom:
+                          secretKeyRef:
+                            name: mlflow-session-secret
+                            key: SECRET_KEY
                       - name: OIDC_USERS_DB_URI
                         valueFrom:
                           secretKeyRef:
@@ -460,7 +511,7 @@
                       timeoutSeconds: 5
                     resources:
                       requests:
-                        memory: "256Mi"
+                        memory: "512Mi"
                         cpu: "100m"
                       limits:
                         memory: "1Gi"

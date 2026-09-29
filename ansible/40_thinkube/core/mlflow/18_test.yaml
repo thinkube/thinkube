@@ -27,6 +27,7 @@
 
   vars:
     mlflow_namespace: "mlflow"
+    mlflow_hostname: "experiments.{{ domain_name }}"
     test_results: []
 
   tasks:
@@ -53,16 +54,18 @@
           - app=mlflow
       register: pods_check
 
-    - name: Check if all pods are running
+    # A crash-looping pod keeps phase Running, so readiness is what is checked.
+    - name: Check if all pods are ready
       ansible.builtin.set_fact:
-        all_pods_running: >-
-          {{ pods_check.resources |
-             selectattr('status.phase', 'equalto', 'Running') |
-             list | length == pods_check.resources | length }}
+        all_pods_ready: >-
+          {{ (pods_check.resources | length > 0) and
+             (pods_check.resources |
+              map(attribute='status.containerStatuses') | flatten |
+              selectattr('ready', 'equalto', false) | list | length == 0) }}
 
     - name: Record pod status test result
       ansible.builtin.set_fact:
-        test_results: "{{ test_results + ['All MLflow pods running: ' + ('PASS' if all_pods_running else 'FAIL')] }}"
+        test_results: "{{ test_results + ['All MLflow pods ready: ' + ('PASS' if all_pods_ready else 'FAIL')] }}"
 
     - name: "TEST 3: Check MLflow service"
       kubernetes.core.k8s_info:
@@ -124,9 +127,9 @@
       loop:
         - mlflow-db-secret
         - mlflow-s3-secret
-        - mlflow-oauth-secret
         - oauth2-proxy-secret
-      failed_when: secrets_check.results | map(attribute='resources') | map('length') | select('equalto', 0) | list | length > 0
+        - mlflow-session-secret
+      failed_when: secrets_check.resources | length == 0
 
     - name: Record secrets test result
       ansible.builtin.set_fact:
@@ -160,19 +163,36 @@
       ansible.builtin.set_fact:
         test_results: "{{ test_results + ['Service discovery ConfigMap exists: PASS'] }}"
 
-    - name: "TEST 9: Test HTTPS endpoint"
+    - name: "TEST 9: Check MLflow health endpoint"
+      ansible.builtin.uri:
+        url: "https://{{ mlflow_hostname }}/health"
+        method: GET
+        status_code: [200]
+        timeout: 10
+      register: health_test
+      failed_when: false
+
+    - name: Record health endpoint test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['MLflow health endpoint: ' + ('PASS' if health_test.status == 200 else 'FAIL')] }}"
+
+    # A browser request without a session is redirected to the OIDC login;
+    # other clients get 401.
+    - name: "TEST 10: Test HTTPS endpoint redirects a browser to login"
       ansible.builtin.uri:
         url: "https://{{ mlflow_hostname }}/"
         method: GET
-        validate_certs: false
-        status_code: [200, 302]
+        headers:
+          Accept: "text/html"
+        follow_redirects: none
+        status_code: [302]
         timeout: 10
       register: https_test
       failed_when: false
 
     - name: Record HTTPS endpoint test result
       ansible.builtin.set_fact:
-        test_results: "{{ test_results + ['HTTPS endpoint reachable: ' + ('PASS' if https_test.status in [200, 302] else 'FAIL')] }}"
+        test_results: "{{ test_results + ['HTTPS endpoint redirects to login: ' + ('PASS' if https_test.status == 302 and '/login' in (https_test.location | default('')) else 'FAIL')] }}"
 
     - name: Calculate test summary
       ansible.builtin.set_fact:
@@ -207,7 +227,7 @@
           - "  User group: mlflow-user"
           - "  Admin group: mlflow-admin"
           - ""
-          - "Overall Status: {{ 'ALL TESTS PASSED' if failed_tests == '0' else 'FAILURES DETECTED' }}"
+          - "Overall Status: {{ 'ALL TESTS PASSED' if failed_tests | int == 0 else 'FAILURES DETECTED' }}"
           - "========================================="
 
     - name: Check for critical failures
