@@ -24,6 +24,9 @@
   hosts: k8s_control_plane
   gather_facts: true
 
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
   vars:
     test_namespace: "juicefs-test"
     test_pvc_name: "juicefs-rwx-test"
@@ -157,11 +160,25 @@
     ###########################################################################
     # Task 4: Create writer pod on first node
     ###########################################################################
-    - name: Get first worker node name
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get nodes -l node-role.kubernetes.io/worker=worker -o jsonpath='{.items[0].metadata.name}'
-      register: first_node
-      become: true
+    # The writer and reader run on nodes with a JuiceFS CSI node pod, since
+    # only those can mount the volume. The pods are sorted by node name so
+    # the choice is the same on every run.
+    - name: Find the nodes that run the JuiceFS CSI node pod
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+        namespace: kube-system
+        label_selectors:
+          - app=juicefs-csi-node
+        field_selectors:
+          - status.phase=Running
+      register: csi_node_pods
+      failed_when: csi_node_pods.resources | length == 0
+
+    - name: Set the writer node
+      ansible.builtin.set_fact:
+        first_node:
+          stdout: "{{ (csi_node_pods.resources | map(attribute='spec.nodeName') | sort)[0] }}"
 
     - name: Create writer pod on first node
       kubernetes.core.k8s:
@@ -230,11 +247,12 @@
     ###########################################################################
     # Task 5: Create reader pod on second node (multi-node RWX test)
     ###########################################################################
-    - name: Get second worker node name (if available)
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get nodes -l node-role.kubernetes.io/worker=worker -o jsonpath='{.items[1].metadata.name}' || echo "{{ first_node.stdout }}"
-      register: second_node
-      become: true
+    # On a single-node cluster the reader runs on the same node.
+    - name: Set the reader node
+      ansible.builtin.set_fact:
+        second_node:
+          stdout: "{{ (csi_node_pods.resources | map(attribute='spec.nodeName') | sort)[1]
+                      if csi_node_pods.resources | length > 1 else first_node.stdout }}"
 
     - name: Display test scenario
       ansible.builtin.debug:
