@@ -20,9 +20,13 @@ terminates TLS:
    certificate.
 2. Envoy Gateway cannot mix TLS passthrough and TLS termination on the same
    port. So ArgoCD cannot keep its own TLS behind the shared gateway.
-3. The `argocd-server` service sets `appProtocol: kubernetes.io/h2c`. Envoy
-   then talks HTTP/2 cleartext to the backend. gRPC needs HTTP/2; over
-   HTTP/1.1 the gRPC calls fail with 404.
+3. The `argocd-server` service sets `appProtocol: kubernetes.io/h2c` on
+   port 443. Envoy then talks HTTP/2 cleartext to the backend. gRPC needs
+   HTTP/2; over HTTP/1.1 the gRPC calls fail with 404.
+4. argocd-server resets HTTP/2 cleartext requests that are not gRPC. So the
+   route has two rules: requests with a `Content-Type` starting with
+   `application/grpc` (gRPC and grpc-web) go to port 443, and everything
+   else (the UI and the REST API) goes to port 80 over HTTP/1.1.
 
 The server is still reached only over HTTPS, because TLS ends at the gateway.
 See the [official ArgoCD documentation](https://argo-cd.readthedocs.io/en/stable/operator-manual/ingress/).
