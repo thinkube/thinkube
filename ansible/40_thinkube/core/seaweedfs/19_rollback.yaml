@@ -26,10 +26,9 @@
   vars:
     seaweedfs_namespace: seaweedfs
     # Admin password for Keycloak cleanup
-    keycloak_url: "https://{{ keycloak_hostname }}"
     keycloak_admin_username: "{{ admin_username }}"
     keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
-    oauth2_proxy_client_id: "oauth2-proxy-seaweedfs"
+    keycloak_ui_client_id: "oauth2-proxy-seaweedfs"
 
   tasks:
     - name: Check if SeaweedFS namespace exists
@@ -41,34 +40,11 @@
       register: namespace_check
       failed_when: false
 
-    # Clean up Keycloak OAuth2 client
-    - name: Get Keycloak admin token for cleanup
-      ansible.builtin.uri:
-        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
-        method: POST
-        validate_certs: false
-        body_format: form-urlencoded
-        body:
-          client_id: admin-cli
-          username: "{{ keycloak_admin_username }}"
-          password: "{{ keycloak_admin_password }}"
-          grant_type: password
-      register: keycloak_token
-      failed_when: false
-      when: namespace_check.resources | length > 0
-
-    - name: Delete OAuth2 client from Keycloak
-      ansible.builtin.uri:
-        url: "{{ keycloak_url }}/admin/realms/{{ domain_name }}/clients/{{ oauth2_proxy_client_id }}"
-        method: DELETE
-        validate_certs: false
-        headers:
-          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
-      when: 
-        - namespace_check.resources | length > 0
-        - keycloak_token is succeeded
-        - keycloak_token.json is defined
-      failed_when: false
+    - name: Delete the Keycloak client of the SeaweedFS web UI
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_client_delete
+      vars:
+        keycloak_client_id: "{{ keycloak_ui_client_id }}"
 
     # Delete Argo Workflows resources
     - name: Delete Argo artifact repository ConfigMap
@@ -206,5 +182,5 @@
         msg:
           - "SeaweedFS rollback completed"
           - "Removed namespace: {{ seaweedfs_namespace }}"
-          - "Removed OAuth2 client from Keycloak"
+          - "Removed the Keycloak client of the web UI"
           - "Removed Argo S3 configuration"
