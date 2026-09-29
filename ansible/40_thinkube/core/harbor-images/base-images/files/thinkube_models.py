@@ -2,80 +2,81 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Thinkube Model Registration Helper
+Thinkube model helpers for notebooks.
 
-Provides a simple interface for:
-- Loading models from MLflow Model Registry (mirrored from HuggingFace)
-- Registering fine-tuned models with FP8 quantization
+- load_model_for_finetuning: load a mirrored model from the MLflow Model
+  Registry for fine-tuning.
+- register_finetuned_model: publish a LoRA fine-tune so the LLM Gateway can
+  load it on vLLM.
 
 Usage:
-    from thinkube_models import load_model_for_finetuning, register_finetuned_model
+    import thinkube_models as tkm
 
-    # Load a model from MLflow (uses local JuiceFS, no HuggingFace download)
-    model, tokenizer = load_model_for_finetuning("unsloth/Qwen3.5-4B")
-
-    # After fine-tuning with Unsloth:
-    register_finetuned_model(
-        model=model,
-        tokenizer=tokenizer,
-        name="qwen35-4b-tool-use",
-        base_model="unsloth/Qwen3.5-4B",
-        description="Fine-tuned for tool use",
-        quantization="FP8"  # or "BF16" for no quantization
-    )
+    model, tokenizer = tkm.load_model_for_finetuning("unsloth/Qwen3.5-4B")
+    # ... fine-tune with Unsloth, logging to the MLflow run `run_id` ...
+    tkm.register_finetuned_model(model, tokenizer, catalog_entry, run_id)
 """
 
+import base64
+import json
 import os
+import shutil
+import time
+import uuid
 import requests
 from pathlib import Path
-from typing import Optional, Literal
 
 
-# Staging path for models (shared with Argo workflows via JuiceFS)
+# Staging folder for merged checkpoints, on the MLflow JuiceFS volume
 STAGING_PATH = Path.home() / "thinkube" / "mlflow" / ".staging"
 
-# Supported quantization formats
-QuantizationFormat = Literal["FP8", "NVFP4", "BF16"]
+# Environment variables the MLflow helpers read; the notebook server sets them
+MLFLOW_ENV = (
+    "MLFLOW_TRACKING_URI",
+    "MLFLOW_KEYCLOAK_TOKEN_URL",
+    "MLFLOW_KEYCLOAK_CLIENT_ID",
+    "MLFLOW_CLIENT_SECRET",
+    "MLFLOW_AUTH_USERNAME",
+    "MLFLOW_AUTH_PASSWORD",
+)
 
 
 def get_mlflow_config():
-    """Get MLflow configuration from environment."""
+    """The MLflow settings from the environment; raises if any is missing."""
+    missing = [name for name in MLFLOW_ENV if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError(
+            f"MLflow settings missing from the environment: {', '.join(missing)}. "
+            "The notebook server sets them; restart it if they are absent."
+        )
     return {
-        'tracking_uri': os.environ.get('MLFLOW_TRACKING_URI', 'http://mlflow.mlflow.svc.cluster.local:5000'),
-        'token_url': os.environ.get('MLFLOW_KEYCLOAK_TOKEN_URL'),
-        'client_id': os.environ.get('MLFLOW_KEYCLOAK_CLIENT_ID', 'mlflow'),
-        'client_secret': os.environ.get('MLFLOW_CLIENT_SECRET'),
-        'username': os.environ.get('MLFLOW_AUTH_USERNAME'),
-        'password': os.environ.get('MLFLOW_AUTH_PASSWORD'),
+        'tracking_uri': os.environ['MLFLOW_TRACKING_URI'],
+        'token_url': os.environ['MLFLOW_KEYCLOAK_TOKEN_URL'],
+        'client_id': os.environ['MLFLOW_KEYCLOAK_CLIENT_ID'],
+        'client_secret': os.environ['MLFLOW_CLIENT_SECRET'],
+        'username': os.environ['MLFLOW_AUTH_USERNAME'],
+        'password': os.environ['MLFLOW_AUTH_PASSWORD'],
     }
 
 
 def get_mlflow_token():
-    """Get authentication token for MLflow API."""
+    """A bearer token for the MLflow API, from Keycloak."""
     config = get_mlflow_config()
-
-    if not config['token_url']:
-        return None
-
-    try:
-        response = requests.post(
-            config['token_url'],
-            data={
-                'grant_type': 'password',
-                'client_id': config['client_id'],
-                'client_secret': config['client_secret'],
-                'username': config['username'],
-                'password': config['password'],
-                'scope': 'openid'
-            },
-            verify=False,
-            timeout=30
-        )
-        response.raise_for_status()
-        return response.json()['access_token']
-    except Exception as e:
-        print(f"Warning: Could not get MLflow token: {e}")
-        return None
+    response = requests.post(
+        config['token_url'],
+        data={
+            'grant_type': 'password',
+            'client_id': config['client_id'],
+            'client_secret': config['client_secret'],
+            'username': config['username'],
+            'password': config['password'],
+            'scope': 'openid'
+        },
+        verify=False,
+        timeout=30
+    )
+    response.raise_for_status()
+    return response.json()['access_token']
 
 
 def load_model_for_finetuning(model_id: str, device_map: str = "auto"):
@@ -113,12 +114,6 @@ def load_model_for_finetuning(model_id: str, device_map: str = "auto"):
     # Get MLflow configuration and token
     config = get_mlflow_config()
     token = get_mlflow_token()
-
-    if not token:
-        raise RuntimeError(
-            "Could not authenticate with MLflow. "
-            "Ensure MLFLOW_* environment variables are set."
-        )
 
     headers = {'Authorization': f'Bearer {token}'}
     mlflow_url = config['tracking_uri']
@@ -218,454 +213,238 @@ def load_model_for_finetuning(model_id: str, device_map: str = "auto"):
     return model, tokenizer
 
 
-def get_thinkube_control_url():
-    """Get thinkube-control API URL from environment."""
-    # Try service discovery first
-    url = os.environ.get('THINKUBE_CONTROL_URL')
-    if url:
-        return url.rstrip('/')
-
-    # Fallback to in-cluster service
-    return "http://backend.thinkube-control.svc.cluster.local:8000"
+# The fields of a fine-tune's catalogue entry, the same as a platform entry's
+CATALOG_FIELDS = (
+    "id", "name", "params_b", "active_params_b", "quantization", "context_length",
+    "description", "server_type", "task", "reasoning_format", "tool_use",
+    "stop_tokens", "license", "gated", "serving_name", "is_finetuned",
+)
 
 
-def get_auth_token():
-    """Get authentication token for thinkube-control API."""
-    # Try to get token from environment (set by service discovery)
-    token = os.environ.get('THINKUBE_CONTROL_TOKEN')
-    if token:
-        return token
-
-    # Try to read from JupyterHub auth
-    token_file = Path.home() / ".config" / "thinkube" / "token"
-    if token_file.exists():
-        return token_file.read_text().strip()
-
-    # Try to get from Keycloak using service account
-    keycloak_url = os.environ.get('KEYCLOAK_URL')
-    client_id = os.environ.get('KEYCLOAK_CLIENT_ID', 'thinkube-control')
-    client_secret = os.environ.get('KEYCLOAK_CLIENT_SECRET')
-
-    if keycloak_url and client_secret:
-        try:
-            realm = os.environ.get('KEYCLOAK_REALM', 'thinkube')
-            token_url = f"{keycloak_url}/realms/{realm}/protocol/openid-connect/token"
-
-            response = requests.post(
-                token_url,
-                data={
-                    'grant_type': 'client_credentials',
-                    'client_id': client_id,
-                    'client_secret': client_secret
-                },
-                timeout=10
-            )
-            response.raise_for_status()
-            return response.json()['access_token']
-        except Exception as e:
-            print(f"Warning: Could not get token from Keycloak: {e}")
-
-    return None
+def _check_catalog_entry(entry: dict) -> None:
+    """Refuse an entry that is incomplete or names a serving path other than vLLM."""
+    missing = [field for field in CATALOG_FIELDS if field not in entry]
+    if missing:
+        raise ValueError(f"catalog_entry is missing: {', '.join(missing)}")
+    # A fine-tune is published as a merged 16-bit checkpoint served by vLLM
+    required = {
+        "server_type": ["vllm"],
+        "quantization": "BF16",
+        "task": "text-generation",
+        "is_finetuned": True,
+        "serving_name": entry["id"],
+    }
+    wrong = {field: entry[field] for field, value in required.items() if entry[field] != value}
+    if wrong:
+        raise ValueError(f"catalog_entry has {wrong}; a fine-tune needs {required}")
 
 
-def quantize_model_fp8(model, tokenizer, calib_data=None, num_samples: int = 128):
-    """
-    Quantize a model to FP8 format using NVIDIA ModelOpt.
+def _mlflow_client():
+    """An MLflow client with a fresh bearer token; tokens are short-lived."""
+    import mlflow
 
-    This produces a HuggingFace-compatible checkpoint that TensorRT-LLM can
-    load directly with optimized FP8 inference.
-
-    Args:
-        model: The fine-tuned model (HuggingFace PreTrainedModel)
-        tokenizer: The tokenizer
-        calib_data: Optional calibration dataset (list of strings or Dataset)
-        num_samples: Number of calibration samples (default: 128)
-
-    Returns:
-        Quantized model ready for saving
-    """
-    import torch
-    import modelopt.torch.quantization as mtq
-    from datasets import load_dataset
-
-    print("Quantizing model to FP8 format...")
-    print(f"  Using {num_samples} calibration samples")
-
-    # Prepare calibration data
-    if calib_data is None:
-        print("  Loading default calibration dataset (cnn_dailymail)...")
-        dataset = load_dataset("cnn_dailymail", "3.0.0", split="train")
-        calib_texts = [item["article"][:1024] for item in dataset.select(range(num_samples))]
-    elif isinstance(calib_data, list):
-        calib_texts = calib_data[:num_samples]
-    else:
-        # Assume it's a HuggingFace Dataset
-        calib_texts = [item.get("text", item.get("article", str(item)))[:1024]
-                       for item in calib_data.select(range(min(num_samples, len(calib_data))))]
-
-    # Tokenize calibration data
-    print("  Tokenizing calibration data...")
-    calib_tokens = tokenizer(
-        calib_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=512
-    )
-
-    # Move to GPU if available
-    device = next(model.parameters()).device
-    calib_tokens = {k: v.to(device) for k, v in calib_tokens.items()}
-
-    # Define calibration forward loop
-    def forward_loop(model):
-        with torch.no_grad():
-            for i in range(0, len(calib_texts), 8):  # Batch size 8
-                batch = {k: v[i:i+8] for k, v in calib_tokens.items()}
-                if batch["input_ids"].shape[0] > 0:
-                    model(**batch)
-
-    # Apply FP8 quantization
-    print("  Applying FP8 quantization with calibration...")
-    config = mtq.FP8_DEFAULT_CFG
-
-    with torch.no_grad():
-        quantized_model = mtq.quantize(model, config, forward_loop)
-
-    print("  ✓ FP8 quantization complete")
-    return quantized_model
+    config = get_mlflow_config()
+    os.environ["MLFLOW_TRACKING_TOKEN"] = get_mlflow_token()
+    mlflow.set_tracking_uri(config["tracking_uri"])
+    return mlflow.MlflowClient()
 
 
-def quantize_model_nvfp4(model, tokenizer, calib_data=None, num_samples: int = 128):
-    """
-    Quantize a model to NVFP4 format using NVIDIA ModelOpt.
+def _merge_to_staging(model, tokenizer, name: str, run_id: str) -> Path:
+    """Write the merged 16-bit checkpoint of this run to the staging folder.
 
-    NVFP4 provides 4-bit quantization for maximum compression.
-    Note: Requires Blackwell GPU (GB10) for inference.
-
-    Args:
-        model: The fine-tuned model (HuggingFace PreTrainedModel)
-        tokenizer: The tokenizer
-        calib_data: Optional calibration dataset
-        num_samples: Number of calibration samples (default: 128)
-
-    Returns:
-        Quantized model ready for saving
-    """
-    import torch
-    import modelopt.torch.quantization as mtq
-    from datasets import load_dataset
-
-    print("Quantizing model to NVFP4 format...")
-    print(f"  Using {num_samples} calibration samples")
-    print("  Note: NVFP4 inference requires Blackwell GPU (GB10)")
-
-    # Prepare calibration data (same as FP8)
-    if calib_data is None:
-        print("  Loading default calibration dataset (cnn_dailymail)...")
-        dataset = load_dataset("cnn_dailymail", "3.0.0", split="train")
-        calib_texts = [item["article"][:1024] for item in dataset.select(range(num_samples))]
-    elif isinstance(calib_data, list):
-        calib_texts = calib_data[:num_samples]
-    else:
-        calib_texts = [item.get("text", item.get("article", str(item)))[:1024]
-                       for item in calib_data.select(range(min(num_samples, len(calib_data))))]
-
-    # Tokenize calibration data
-    print("  Tokenizing calibration data...")
-    calib_tokens = tokenizer(
-        calib_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=512
-    )
-
-    device = next(model.parameters()).device
-    calib_tokens = {k: v.to(device) for k, v in calib_tokens.items()}
-
-    def forward_loop(model):
-        with torch.no_grad():
-            for i in range(0, len(calib_texts), 8):
-                batch = {k: v[i:i+8] for k, v in calib_tokens.items()}
-                if batch["input_ids"].shape[0] > 0:
-                    model(**batch)
-
-    # Apply NVFP4 quantization
-    print("  Applying NVFP4 quantization with calibration...")
-    config = mtq.NVFP4_DEFAULT_CFG
-
-    with torch.no_grad():
-        quantized_model = mtq.quantize(model, config, forward_loop)
-
-    print("  ✓ NVFP4 quantization complete")
-    return quantized_model
-
-
-def save_model_to_staging(model, tokenizer, name: str, save_method: str = "merged_16bit"):
-    """
-    Save a fine-tuned model to the staging area.
-
-    Args:
-        model: The fine-tuned model (Unsloth FastLanguageModel)
-        tokenizer: The tokenizer
-        name: Model name (used as directory name)
-        save_method: How to save ("merged_16bit", "merged_4bit", "lora")
-
-    Returns:
-        Path to the saved model directory
+    A folder left by another run, or by a merge that did not finish, is
+    removed, so the checkpoint uploaded is always the one of `run_id`.
     """
     staging_dir = STAGING_PATH / name
-    staging_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Saving model to staging: {staging_dir}")
-
-    # Use Unsloth's save method
-    model.save_pretrained_merged(
-        str(staging_dir),
-        tokenizer,
-        save_method=save_method,
-    )
-
-    print(f"✓ Model saved to staging: {staging_dir}")
+    stamp = staging_dir / ".run_id"
+    if staging_dir.exists() and (not stamp.exists() or stamp.read_text().strip() != run_id):
+        print(f"Staging holds another run; removing {staging_dir}")
+        shutil.rmtree(staging_dir)
+    if (staging_dir / "config.json").exists():
+        print(f"Merged checkpoint already in staging: {staging_dir}")
+        return staging_dir
+    STAGING_PATH.mkdir(parents=True, exist_ok=True)
+    print(f"Merging the adapter into the base weights: {staging_dir}")
+    model.save_pretrained_merged(str(staging_dir), tokenizer, save_method="merged_16bit")
+    stamp.write_text(run_id)
     return staging_dir
 
 
-def register_finetuned_model(
-    model,
-    tokenizer,
-    name: str,
-    base_model: str,
-    task: str = "text-generation",
-    server_type: str = "tensorrt-llm",
-    description: str = None,
-    quantization: QuantizationFormat = "FP8",
-    calib_data=None,
-    num_calib_samples: int = 128,
-    wait: bool = False
-):
+def _upload_checkpoint(staging_dir: Path, artifact_uri: str) -> str:
+    """Upload the checkpoint to the run's model folder; returns its S3 URI."""
+    import boto3
+    from boto3.s3.transfer import TransferConfig
+    from botocore.config import Config as BotoConfig
+    from kubernetes import client as k8s_client, config as k8s_config
+
+    bucket = "mlflow"
+    if not artifact_uri.startswith(f"s3://{bucket}/"):
+        raise RuntimeError(f"the run's artifacts are at {artifact_uri}, outside the s3://{bucket} bucket")
+    prefix = f"{artifact_uri[len(f's3://{bucket}/'):]}/model"
+
+    # The S3 gateway credentials, read with the notebook pod's service account
+    k8s_config.load_incluster_config()
+    secret = k8s_client.CoreV1Api().read_namespaced_secret("mlflow-s3-secret", "mlflow")
+    creds = {key: base64.b64decode(value).decode() for key, value in secret.data.items()}
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=creds["S3_ENDPOINT_URL"],
+        aws_access_key_id=creds["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=creds["AWS_SECRET_ACCESS_KEY"],
+        # The JuiceFS gateway ignores the region; boto3 needs one to sign requests
+        region_name="us-east-1",
+        # No checksums or payload signing: both read each file through the
+        # JuiceFS mount before sending it, which fails on multi-GB weights
+        config=BotoConfig(request_checksum_calculation="when_required",
+                          s3={"payload_signing_enabled": False}),
+    )
+    transfer = TransferConfig(multipart_threshold=64 * 2**20,
+                              multipart_chunksize=64 * 2**20, max_concurrency=4)
+
+    files = sorted(p for p in staging_dir.rglob("*") if p.is_file() and p.name != ".run_id")
+    print(f"Uploading {len(files)} files to s3://{bucket}/{prefix}")
+    for path in files:
+        size_gb = path.stat().st_size / 2**30
+        if size_gb > 0.06:
+            print(f"  {path.name} ({size_gb:.1f} GB)...")
+        s3.upload_file(str(path), bucket, f"{prefix}/{path.relative_to(staging_dir)}", Config=transfer)
+    print("Upload complete")
+    return f"s3://{bucket}/{prefix}"
+
+
+def _write_catalog_entry(entry: dict) -> str:
+    """Write the entry to models.json of <GitHub user>/<GitHub user>-metadata.
+
+    thinkube-control merges that file over the platform catalogue, so the
+    entry is what makes the model known to the LLM Gateway.
     """
-    Save and register a fine-tuned model in the Thinkube Model Catalog.
+    github = requests.Session()
+    github.headers.update({
+        "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+        "Accept": "application/vnd.github+json",
+    })
+    user = github.get("https://api.github.com/user", timeout=30)
+    user.raise_for_status()
+    login = user.json()["login"]
+    repo = f"{login}/{login}-metadata"
+    found = github.get(f"https://api.github.com/repos/{repo}", timeout=30)
+    if found.status_code == 404:
+        raise RuntimeError(f"{repo} does not exist; create it as a private repository on GitHub, then call this again")
+    found.raise_for_status()
 
-    This function:
-    1. Quantizes the model to FP8/NVFP4 format (for TensorRT-LLM optimization)
-    2. Saves the quantized model to the staging area (JuiceFS shared with Argo)
-    3. Calls the thinkube-control API to register it in MLflow
-    4. Optionally waits for registration to complete
-
-    Args:
-        model: The fine-tuned model (Unsloth FastLanguageModel or HuggingFace model)
-        tokenizer: The tokenizer
-        name: Model name for the catalog (e.g., "qwen35-4b-tool-use")
-        base_model: Original model ID (e.g., "unsloth/Qwen3.5-4B")
-        task: Model task (default: "text-generation")
-        server_type: Target server (default: "tensorrt-llm")
-        description: Optional description
-        quantization: Quantization format - "FP8" (recommended), "NVFP4", or "BF16"
-        calib_data: Optional calibration dataset for quantization
-        num_calib_samples: Number of calibration samples (default: 128)
-        wait: If True, wait for registration to complete
-
-    Returns:
-        dict: Registration job info with keys:
-            - job_id: UUID of the registration job
-            - workflow_id: Argo workflow name
-            - status: Current status
-            - message: Status message
-
-    Example:
-        from thinkube_models import register_finetuned_model
-
-        # Register with FP8 quantization (recommended for TensorRT-LLM)
-        result = register_finetuned_model(
-            model=model,
-            tokenizer=tokenizer,
-            name="qwen35-4b-tool-use",
-            base_model="unsloth/Qwen3.5-4B",
-            description="Fine-tuned for tool use",
-            quantization="FP8"
-        )
-        print(f"Registration started: {result['workflow_id']}")
-    """
-    # Step 1: Get the HuggingFace model from Unsloth if needed
-    # Unsloth's FastLanguageModel wraps the actual model
-    hf_model = model
-    if hasattr(model, 'model'):
-        hf_model = model.model
-    elif hasattr(model, 'get_base_model'):
-        hf_model = model.get_base_model()
-
-    # Step 2: Apply quantization if requested
-    if quantization == "FP8":
-        print(f"Applying FP8 quantization for TensorRT-LLM optimization...")
-        quantized_model = quantize_model_fp8(hf_model, tokenizer, calib_data, num_calib_samples)
-    elif quantization == "NVFP4":
-        print(f"Applying NVFP4 quantization for maximum compression...")
-        quantized_model = quantize_model_nvfp4(hf_model, tokenizer, calib_data, num_calib_samples)
-    elif quantization == "BF16":
-        print(f"Skipping quantization, saving in BF16 format...")
-        quantized_model = hf_model
+    contents_url = f"https://api.github.com/repos/{repo}/contents/models.json"
+    current = github.get(contents_url, timeout=30)
+    if current.status_code == 404:
+        catalog, sha = {"models": []}, None
     else:
-        raise ValueError(f"Unsupported quantization format: {quantization}. Use 'FP8', 'NVFP4', or 'BF16'")
+        current.raise_for_status()
+        catalog = json.loads(base64.b64decode(current.json()["content"]))
+        sha = current.json()["sha"]
 
-    # Step 3: Save model to staging using ModelOpt export for quantized models
-    staging_dir = STAGING_PATH / name
-    staging_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Saving model to staging: {staging_dir}")
-
-    if quantization in ["FP8", "NVFP4"]:
-        # Use ModelOpt's HuggingFace export for quantized models
-        from modelopt.torch.export import export_hf_checkpoint
-        export_hf_checkpoint(quantized_model, str(staging_dir))
-        tokenizer.save_pretrained(str(staging_dir))
-    else:
-        # Save BF16 model directly
-        quantized_model.save_pretrained(str(staging_dir))
-        tokenizer.save_pretrained(str(staging_dir))
-
-    print(f"✓ Model saved to staging: {staging_dir}")
-
-    # Step 4: Call thinkube-control API to register in MLflow
-    api_url = get_thinkube_control_url()
-    token = get_auth_token()
-
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    # Include quantization info in description
-    quant_info = f" ({quantization})" if quantization != "BF16" else ""
-    full_description = description or f"Fine-tuned from {base_model}"
-    full_description = f"{full_description}{quant_info}"
-
-    payload = {
-        "name": name,
-        "source_path": name,  # Relative path in staging
-        "base_model": base_model,
-        "task": task,
-        "server_type": server_type,
-        "description": full_description,
-        "quantization": quantization
+    others = [m for m in catalog["models"] if m["id"] != entry["id"]]
+    if others + [entry] == catalog["models"]:
+        print(f"Catalogue entry already in {repo}/models.json")
+        return repo
+    body = {
+        "message": f"Add {entry['id']} to the model catalogue",
+        "content": base64.b64encode(
+            (json.dumps({**catalog, "models": others + [entry]}, indent=2) + "\n").encode()
+        ).decode(),
     }
+    if sha:
+        body["sha"] = sha
+    github.put(contents_url, json=body, timeout=30).raise_for_status()
+    print(f"Catalogue entry written to {repo}/models.json")
+    return repo
 
-    print(f"Registering model with thinkube-control...")
 
+def _record_registration(name: str) -> None:
+    """Mark the model's weights as in place in thinkube-control's database."""
+    import psycopg2
+
+    conn = psycopg2.connect(
+        host=os.environ["POSTGRES_HOST"],
+        port=int(os.environ["POSTGRES_PORT"]),
+        user=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"],
+        dbname="thinkube_control",
+    )
     try:
-        response = requests.post(
-            f"{api_url}/api/v1/models/register",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        response.raise_for_status()
-        result = response.json()
-
-        print(f"✓ Registration job submitted: {result['workflow_id']}")
-        print(f"  Status: {result['status']}")
-        print(f"  Job ID: {result['job_id']}")
-
-        if wait:
-            result = wait_for_registration(result['workflow_id'])
-
-        return result
-
-    except requests.exceptions.RequestException as e:
-        print(f"✗ Failed to register model: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"  Response: {e.response.text}")
-        raise
-
-
-def wait_for_registration(workflow_id: str, timeout: int = 600, poll_interval: int = 10):
-    """
-    Wait for a registration job to complete.
-
-    Args:
-        workflow_id: The Argo workflow ID
-        timeout: Maximum seconds to wait (default: 600)
-        poll_interval: Seconds between status checks (default: 10)
-
-    Returns:
-        dict: Final job status
-    """
-    import time
-
-    api_url = get_thinkube_control_url()
-    token = get_auth_token()
-
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    start_time = time.time()
-
-    while time.time() - start_time < timeout:
-        try:
-            response = requests.get(
-                f"{api_url}/api/v1/models/mirrors/{workflow_id}",
-                headers=headers,
-                timeout=10
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO model_mirror_jobs (id, model_id, status, workflow_name, error_message)
+                VALUES (%s, %s, 'succeeded', NULL, NULL)
+                ON CONFLICT (model_id) DO UPDATE
+                SET status = 'succeeded', error_message = NULL, updated_at = CURRENT_TIMESTAMP
+                """,
+                (str(uuid.uuid4()), name),
             )
-            response.raise_for_status()
-            status = response.json()
-
-            if status['is_complete']:
-                print(f"✓ Registration complete: {status['model_id']}")
-                return status
-            elif status['is_failed']:
-                print(f"✗ Registration failed: {status.get('error_message', 'Unknown error')}")
-                return status
-            else:
-                elapsed = int(time.time() - start_time)
-                print(f"  Waiting... ({elapsed}s) - Status: {status['status']}")
-
-        except Exception as e:
-            print(f"  Warning: Could not check status: {e}")
-
-        time.sleep(poll_interval)
-
-    print(f"✗ Timeout waiting for registration (>{timeout}s)")
-    return {"status": "timeout", "workflow_id": workflow_id}
+    finally:
+        conn.close()
+    print(f"Registration recorded for {name}")
 
 
-def list_registered_models():
-    """
-    List all registered models in the catalog.
+def register_finetuned_model(model, tokenizer, catalog_entry: dict, run_id: str, timeout: int = 600) -> str:
+    """Publish a LoRA fine-tune so the LLM Gateway can load it on vLLM.
 
-    Returns:
-        list: List of model info dictionaries
-    """
-    api_url = get_thinkube_control_url()
-    token = get_auth_token()
-
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    try:
-        response = requests.get(
-            f"{api_url}/api/v1/models/catalog",
-            headers=headers,
-            timeout=10
-        )
-        response.raise_for_status()
-        return response.json()['models']
-    except Exception as e:
-        print(f"✗ Failed to list models: {e}")
-        return []
-
-
-def get_staging_path(name: str = None):
-    """
-    Get the staging path for models.
+    Steps:
+    1. Merge the adapter into the base weights and write a 16-bit Hugging Face
+       checkpoint to the staging folder.
+    2. Upload it to the model folder of the training run `run_id`, through the
+       S3 gateway that holds MLflow's artifacts.
+    3. Register a model version linked to that run, so the model can be traced
+       back to the experiment that produced it.
+    4. Write `catalog_entry` to models.json in the private repository
+       <GitHub user>/<GitHub user>-metadata.
+    5. Record the registration in thinkube-control's database, and wait until
+       the gateway lists the model.
 
     Args:
-        name: Optional model name to get specific path
+        model: The Unsloth model with its trained LoRA adapter.
+        tokenizer: Its tokenizer.
+        catalog_entry: The model's catalogue entry, with every field in
+            CATALOG_FIELDS; server_type ["vllm"], quantization "BF16" and
+            is_finetuned true.
+        run_id: The MLflow run of the training.
+        timeout: Seconds to wait for the gateway to list the model.
 
     Returns:
-        Path object
+        The model's state in the gateway, normally "deployable".
     """
-    if name:
-        return STAGING_PATH / name
-    return STAGING_PATH
+    from mlflow.exceptions import RestException
+    from tk_llm import LLMClient
+
+    _check_catalog_entry(catalog_entry)
+    name = catalog_entry["id"]
+    registered_name = name.replace("/", "-")
+
+    client = _mlflow_client()
+    artifact_uri = client.get_run(run_id).info.artifact_uri
+    staging_dir = _merge_to_staging(model, tokenizer, name, run_id)
+    source = _upload_checkpoint(staging_dir, artifact_uri)
+
+    # A long upload can outlive the token that started it
+    client = _mlflow_client()
+    try:
+        client.create_registered_model(registered_name)
+    except RestException as e:
+        if e.error_code != "RESOURCE_ALREADY_EXISTS":
+            raise
+    version = client.create_model_version(name=registered_name, source=source, run_id=run_id)
+    print(f"Registered {registered_name} version {version.version}, linked to run {run_id}")
+
+    _write_catalog_entry(catalog_entry)
+    _record_registration(name)
+
+    # The gateway reads the catalogue again within 5 minutes
+    llm = LLMClient()
+    deadline = time.time() + timeout
+    while True:
+        listed = {m.id: m for m in llm.list_models().models}
+        if name in listed:
+            print(f"{name}: {listed[name].state}")
+            return listed[name].state
+        if time.time() > deadline:
+            raise RuntimeError(f"{name} is not listed by the gateway after {timeout} seconds")
+        time.sleep(15)
