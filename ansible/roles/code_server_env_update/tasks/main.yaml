@@ -17,16 +17,45 @@
 #
 # 🤖 AI-assisted
 
-- name: Check if code-server pod exists
-  ansible.builtin.shell: |
-    {{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo ""
+# No code-server Deployment means code-server is not installed, and there is
+# nothing to update. A Deployment without a running pod is an error.
+- name: Check if code-server is deployed
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: code-server
+    name: code-server
+  register: code_server_deployment_check
+
+- name: Find the running code-server pod
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Pod
+    namespace: code-server
+    label_selectors:
+      - app=code-server
+    field_selectors:
+      - status.phase=Running
   register: code_server_pod_check
-  changed_when: false
-  failed_when: false
+  when: code_server_deployment_check.resources | length > 0
+
+- name: Fail if code-server is deployed but has no running pod
+  ansible.builtin.fail:
+    msg: >-
+      The code-server Deployment exists but no pod with label app=code-server
+      is Running in namespace code-server, so its environment files cannot
+      be updated. Check: kubectl get pods -n code-server
+  when:
+    - code_server_deployment_check.resources | length > 0
+    - code_server_pod_check.resources | length == 0
 
 - name: Set code-server pod name fact
   ansible.builtin.set_fact:
-    code_server_pod_name: "{{ code_server_pod_check.stdout | trim }}"
+    code_server_pod_name: >-
+      {{ code_server_pod_check.resources[0].metadata.name
+         if code_server_deployment_check.resources | length > 0 else '' }}
 
 - name: Skip if code-server not deployed
   ansible.builtin.debug:
