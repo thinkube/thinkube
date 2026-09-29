@@ -23,7 +23,7 @@ Qdrant is designed for:
 ## Architecture
 
 ```
-User → Browser → Qdrant Dashboard → OAuth2 Proxy → Keycloak
+User → Browser → Gateway (Keycloak login) → Qdrant Dashboard
                       ↓
                  Qdrant API ← Direct API Access (No Auth)
                       ↓
@@ -33,10 +33,9 @@ User → Browser → Qdrant Dashboard → OAuth2 Proxy → Keycloak
 ## Components
 
 1. **Qdrant** - Vector database engine
-2. **OAuth2 Proxy** - Authentication layer for dashboard
-3. **Valkey** - Redis-compatible session storage
-4. **Keycloak Integration** - SSO authentication
-5. **Persistent Storage** - 150Gi for vector data
+2. **Gateway login** - Envoy Gateway `SecurityPolicy` `qdrant-dashboard-oidc` on the dashboard routes (role `gateway_oidc`)
+3. **Keycloak Integration** - SSO authentication
+4. **Persistent Storage** - 150Gi for vector data
 
 ## Deployment
 
@@ -76,13 +75,16 @@ Default resources:
 
 - Dashboard access requires Keycloak authentication
 - API access is unauthenticated for application integration
-- OAuth2 Proxy handles the authentication flow
+- The gateway handles the login on both dashboard routes, and handles the
+  callback at `/oauth2/callback`
+- Qdrant has no API key set, so anyone who can reach the API host can read,
+  write and delete collections
 
 ### Network Configuration
 
 Gateway API HTTPRoutes:
 1. **Dashboard** (`https://qdrant-dashboard.<domain_name>`, `qdrant_dashboard_hostname`)
-   - Protected by OAuth2 authentication
+   - Requires a Keycloak login at the gateway
    - Route `qdrant-root-redirect` redirects `/` to `/dashboard`
 2. **API** (`https://qdrant.<domain_name>`, `qdrant_hostname`)
    - Direct access without authentication
@@ -154,17 +156,11 @@ kubectl -n qdrant describe pod <pod-name>
 ### View Logs
 ```bash
 kubectl -n qdrant logs statefulset/qdrant
-kubectl -n qdrant logs deployment/oauth2-proxy
-kubectl -n qdrant logs deployment/ephemeral-valkey
 ```
 
-### OAuth2 Proxy Issues
+### Login Issues
 ```bash
-# Check OAuth2 configuration
-kubectl -n qdrant get secret oauth2-proxy -o yaml
-
-# View OAuth2 logs
-kubectl -n qdrant logs deployment/oauth2-proxy -f
+kubectl -n qdrant get securitypolicy qdrant-dashboard-oidc -o yaml
 ```
 
 ### Storage Issues
