@@ -25,7 +25,7 @@ Qdrant is designed for:
 ```
 User → Browser → Gateway (Keycloak login) → Qdrant Dashboard
                       ↓
-                 Qdrant API ← Direct API Access (No Auth)
+                 Qdrant API ← API access (api-key header)
                       ↓
               Vector Storage (150Gi PVC)
 ```
@@ -74,11 +74,12 @@ Default resources:
 ### Authentication
 
 - Dashboard access requires Keycloak authentication
-- API access is unauthenticated for application integration
+- API access requires the API key in the `api-key` header. The key is
+  created once in the `qdrant-auth` Secret and reaches the IDE and notebooks
+  as `QDRANT_API_KEY` through service discovery
+- The dashboard asks for the same API key after the Keycloak login
 - The gateway handles the login on both dashboard routes, and handles the
   callback at `/oauth2/callback`
-- Qdrant has no API key set, so anyone who can reach the API host can read,
-  write and delete collections
 
 ### Network Configuration
 
@@ -87,7 +88,7 @@ Gateway API HTTPRoutes:
    - Requires a Keycloak login at the gateway
    - Route `qdrant-root-redirect` redirects `/` to `/dashboard`
 2. **API** (`https://qdrant.<domain_name>`, `qdrant_hostname`)
-   - Direct access without authentication
+   - Requires the API key (`api-key` header); `/healthz` is open for health checks
    - REST API, backend port 6333
    - gRPC is enabled on the service, port 6334, inside the cluster only; no route exposes it
 
@@ -161,6 +162,18 @@ kubectl -n qdrant logs statefulset/qdrant
 ### Login Issues
 ```bash
 kubectl -n qdrant get securitypolicy qdrant-dashboard-oidc -o yaml
+```
+
+### API Key
+```bash
+kubectl -n qdrant get secret qdrant-auth -o jsonpath='{.data.api-key}' | base64 -d
+```
+
+```python
+from qdrant_client import QdrantClient
+import os
+client = QdrantClient(url=os.environ["QDRANT_URL"], port=443, https=True,
+                      api_key=os.environ["QDRANT_API_KEY"])
 ```
 
 ### Storage Issues

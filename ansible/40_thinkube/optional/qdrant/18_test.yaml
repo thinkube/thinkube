@@ -128,23 +128,43 @@
       register: qdrant_client
       failed_when: qdrant_client.json | length == 0
 
+    - name: Read the Qdrant API key
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ k8s_namespace }}"
+        name: qdrant-auth
+      register: qdrant_auth_secret
+      failed_when: qdrant_auth_secret.resources | length == 0
+      no_log: true
+
     - name: Test Qdrant API endpoint
       ansible.builtin.uri:
         url: "https://{{ qdrant_hostname }}/"
         method: GET
-        validate_certs: false
+        headers:
+          api-key: "{{ qdrant_auth_secret.resources[0].data['api-key'] | b64decode }}"
         status_code: 200
       register: api_info
+      no_log: true
 
     - name: Test Qdrant API collections endpoint
       ansible.builtin.uri:
         url: "https://{{ qdrant_hostname }}/collections"
         method: GET
-        validate_certs: false
         headers:
           Content-Type: "application/json"
+          api-key: "{{ qdrant_auth_secret.resources[0].data['api-key'] | b64decode }}"
         status_code: 200
       register: collections_test
+      no_log: true
+
+    - name: Test that the API refuses a request without the key
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_hostname }}/collections"
+        method: GET
+        status_code: 401
 
     - name: Test Qdrant dashboard paths without a login
       ansible.builtin.uri:
@@ -197,6 +217,7 @@
           ✓ TLS certificate: Present
           ✓ Keycloak client: Configured
           ✓ API health check: Passed
+          ✓ API key required: Yes
           ✓ Authentication redirect: Working
           ✓ Persistent storage: Configured
           
