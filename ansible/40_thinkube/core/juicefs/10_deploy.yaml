@@ -50,7 +50,11 @@
     # Admin password from environment variable
     admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
-    # Helm binary path
+    # Keycloak client for the dashboard login at the gateway
+    juicefs_dashboard_hostname: "juicefs.{{ domain_name }}"
+    juicefs_dashboard_client_id: "juicefs-dashboard"
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ admin_password }}"
 
     # JuiceFS configuration
     juicefs_volume_name: "thinkube-shared"
@@ -462,7 +466,7 @@
               namespace: "{{ gateway_namespace }}"
               sectionName: https
           hostnames:
-            - "juicefs.{{ domain_name }}"
+            - "{{ juicefs_dashboard_hostname }}"
           rules:
             - matches:
                 - path:
@@ -477,6 +481,39 @@
       register: httproute_result
       changed_when: "'created' in httproute_result.stdout or 'configured' in httproute_result.stdout"
 
+    # --- Keycloak login for the dashboard ---
+    # The dashboard shows pods and volumes from the whole cluster and has no
+    # login of its own, so the gateway requires a Keycloak login.
+    - name: Create or update the Keycloak client for the dashboard
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ juicefs_dashboard_client_id }}"
+        keycloak_client_body:
+          clientId: "{{ juicefs_dashboard_client_id }}"
+          enabled: true
+          protocol: openid-connect
+          publicClient: false
+          standardFlowEnabled: true
+          redirectUris:
+            - "https://{{ juicefs_dashboard_hostname }}/oauth2/callback"
+          webOrigins:
+            - "https://{{ juicefs_dashboard_hostname }}"
+          baseUrl: "https://{{ juicefs_dashboard_hostname }}"
+          attributes:
+            post.logout.redirect.uris: "+"
+
+    - name: Require a Keycloak login on the dashboard route
+      ansible.builtin.include_role:
+        name: gateway_oidc
+      vars:
+        gateway_oidc_namespace: kube-system
+        gateway_oidc_route_names: ["juicefs-dashboard"]
+        gateway_oidc_hostname: "{{ juicefs_dashboard_hostname }}"
+        gateway_oidc_client_id: "{{ juicefs_dashboard_client_id }}"
+        gateway_oidc_client_secret: "{{ keycloak_client_secret }}"
+    # --- end Keycloak login for the dashboard ---
+
     ###########################################################################
     # Task 11: Summary
     ###########################################################################
@@ -489,7 +526,7 @@
           - "Access Mode: ReadWriteMany (RWX)"
           - "Metadata: PostgreSQL ({{ postgres_database }} database)"
           - "Data Storage: SeaweedFS S3 ({{ s3_bucket }} bucket)"
-          - "Dashboard: https://juicefs.{{ domain_name }}"
+          - "Dashboard (Keycloak login): https://{{ juicefs_dashboard_hostname }}"
           - "=================================================="
           - "To use JuiceFS in your PVCs:"
           - "  storageClassName: {{ juicefs_storage_class_name }}"

@@ -69,6 +69,13 @@ JuiceFS is configured via inventory variables:
 - `admin_username`: PostgreSQL admin username
 - `admin_password`: PostgreSQL admin password (via ADMIN_PASSWORD env var)
 
+## Dashboard
+
+The JuiceFS CSI dashboard is at `https://juicefs.<domain_name>`. It shows
+pods and volumes from the whole cluster and has no login of its own, so the
+gateway requires a Keycloak login (Envoy Gateway `SecurityPolicy`
+`juicefs-dashboard-oidc` in `kube-system`, role `gateway_oidc`).
+
 ## Using JuiceFS in Your Applications
 
 ### StorageClass
