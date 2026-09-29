@@ -115,8 +115,9 @@ Default location: `/home/{{ system_username }}/shared-code`
   the `code-server` HTTPRoute sends any request without a session to
   Keycloak, and handles the callback at `/oauth2/callback`
 - code-server itself runs with `--auth=none`; the gateway is the only check
-- Users need the `code-server-admin` or `code-server-user` role
-- Admin user is automatically granted access during deployment
+- Any user of the Keycloak realm can log in. The deploy playbook creates
+  the realm roles `code-server-admin` and `code-server-user` and gives
+  `code-server-admin` to the admin user, but the gateway does not check them
 
 ### Resource Limits
 
