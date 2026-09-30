@@ -113,7 +113,7 @@ Deployed in dependency order:
 
 ### Optional Components (ansible/40_thinkube/optional/)
 
-AI: ollama, litellm, langfuse, argilla, cvat
+AI: ollama, langfuse, argilla, cvat
 Vector DBs: qdrant, chroma, weaviate
 Data: clickhouse, opensearch, nats
 Monitoring: prometheus, perses
