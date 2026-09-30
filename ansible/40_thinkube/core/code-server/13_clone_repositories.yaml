@@ -4,8 +4,10 @@
 ---
 # ansible/40_thinkube/core/code-server/13_clone_repositories.yaml
 # Description:
-#   Clone the thinkube platform repos, the Tandem board sidecar, and the user
-#   template repos into the code-server workspace.
+#   Clone the thinkube repository, the Tandem board sidecar, and the user
+#   template repos into the code-server workspace. The other platform
+#   repositories are for development and are cloned on demand with the
+#   tk_clone_dev command.
 #
 #   Split out of 15_configure_environment.yaml on purpose: the clone step runs
 #   `git reset --hard origin/<branch>` on repos that already exist, which
@@ -84,18 +86,9 @@
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "mkdir -p /home/thinkube/thinkube-platform"
 
-    - name: Fetch repository metadata from thinkube-metadata
-      ansible.builtin.uri:
-        url: "https://raw.githubusercontent.com/thinkube/thinkube-metadata/main/repositories.json"
-        return_content: yes
-      register: repo_metadata
-      failed_when: repo_metadata.status != 200
-
-    - name: Parse repository list for development cloning
-      ansible.builtin.set_fact:
-        repos_to_clone: "{{ (repo_metadata.content | from_json).repositories | selectattr('clone_for_development', 'equalto', true) | list }}"
-      failed_when: repos_to_clone | length == 0
-
+    # Only the thinkube repository is cloned: thinkube-control runs its
+    # playbooks from core/thinkube, and the tk_* commands live in its scripts/.
+    # The development repositories are cloned on demand with tk_clone_dev.
     - name: Render clone script from template
       ansible.builtin.template:
         src: templates/clone_platform_repos.sh.j2
@@ -103,6 +96,10 @@
         mode: '0755'
       vars:
         clone_branch: "{{ lookup('env', 'THINKUBE_BRANCH') | default('main', true) }}"
+        repos_to_clone:
+          - name: thinkube
+            category: core
+            full_name: thinkube/thinkube
 
     - name: Copy clone script into code-server pod
       ansible.builtin.shell: |

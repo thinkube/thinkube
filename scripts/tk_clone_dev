@@ -1,0 +1,52 @@
+#!/bin/bash
+
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Clone the Thinkube development repositories into ~/thinkube-platform.
+# Run from the code-server terminal.
+#
+# Usage:
+#   tk_clone_dev
+#
+# The list is the entries of thinkube-metadata's repositories.json with
+# clone_for_development: true. Each goes to ~/thinkube-platform/<category>/<name>.
+# A repository that is already there is left as it is, so local work is never
+# touched. THINKUBE_BRANCH selects the branch to clone (default: main).
+
+set -e
+
+PLATFORM_DIR="/home/thinkube/thinkube-platform"
+METADATA_URL="https://raw.githubusercontent.com/thinkube/thinkube-metadata/main/repositories.json"
+SSH_KEY="/home/thinkube/.ssh/github_ed25519"
+BRANCH="${THINKUBE_BRANCH:-main}"
+
+if [ ! -f "$SSH_KEY" ]; then
+  echo "ERROR: No GitHub SSH key at $SSH_KEY. It is created when code-server is deployed with a GitHub token."
+  exit 1
+fi
+export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o StrictHostKeyChecking=no"
+
+if ! METADATA="$(curl -fsSL "$METADATA_URL")"; then
+  echo "ERROR: Could not fetch $METADATA_URL"
+  exit 1
+fi
+
+REPOS="$(echo "$METADATA" | jq -r '.repositories[] | select(.clone_for_development == true) | "\(.category) \(.name) \(.full_name)"')"
+if [ -z "$REPOS" ]; then
+  echo "ERROR: $METADATA_URL lists no repository with clone_for_development: true"
+  exit 1
+fi
+
+while read -r category name full_name; do
+  dest="$PLATFORM_DIR/$category/$name"
+  if [ -d "$dest" ]; then
+    echo "$category/$name: already present, left as it is"
+    continue
+  fi
+  echo "$category/$name: cloning $full_name (branch $BRANCH)"
+  mkdir -p "$PLATFORM_DIR/$category"
+  git clone --quiet -b "$BRANCH" "git@github.com:$full_name.git" "$dest"
+done <<< "$REPOS"
+
+echo "Development repositories are in $PLATFORM_DIR"
