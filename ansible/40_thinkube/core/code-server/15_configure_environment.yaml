@@ -27,6 +27,13 @@
     code_source_path: "{{ shared_code_path }}"
     # Where the installer keeps the secrets it was given, on this host.
     env_file_path: "{{ ansible_facts.env.HOME }}/.env"
+    # The Keycloak password of the admin user, resolved the same way
+    # keycloak/10_deploy.yaml resolves it when it sets that password: from
+    # ADMIN_PASSWORD when the environment carries one, and otherwise from
+    # ANSIBLE_BECOME_PASSWORD, which is what an installer run provides. Read
+    # bare, this is empty during an install and the play stops on a password
+    # Keycloak was never given.
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
   pre_tasks:
     # Who is at the keyboard, learned from the token when nothing else says.
@@ -116,7 +123,7 @@
           # Ansible credentials for playbook execution from code-server
           # Created by 15_configure_environment.yaml
           ANSIBLE_BECOME_PASSWORD={{ lookup('env', 'ANSIBLE_BECOME_PASSWORD') }}
-          ADMIN_PASSWORD={{ lookup('env', 'ADMIN_PASSWORD') }}
+          ADMIN_PASSWORD={{ admin_password }}
           GITHUB_TOKEN={{ lookup('env', 'GITHUB_TOKEN') }}
           GITHUB_USERNAME={{ github_username }}
         mode: '0600'
@@ -126,14 +133,15 @@
     # given the text THINKUBE_PASSWORD, the server types the real password, and
     # it replaces the password with <secret>THINKUBE_PASSWORD</secret> in every
     # result, so the password never reaches the agent's context.
-    - name: Stop when ADMIN_PASSWORD is not set
+    - name: Stop when the admin password is not set
       ansible.builtin.assert:
         that:
-          - lookup('env', 'ADMIN_PASSWORD') | length > 0
+          - admin_password | length > 0
         fail_msg: >-
-          ADMIN_PASSWORD is not set in the environment. It is the Keycloak
-          password of {{ auth_realm_username }}; export it before running this
-          playbook (tk_ansible loads it from ~/.env).
+          Neither ADMIN_PASSWORD nor ANSIBLE_BECOME_PASSWORD is set in the
+          environment. One of them is the Keycloak password of
+          {{ auth_realm_username }}; export it before running this playbook
+          (tk_ansible loads it from ~/.env).
         quiet: true
 
     - name: Create the Playwright MCP configuration directory
@@ -146,7 +154,7 @@
       ansible.builtin.copy:
         dest: "{{ shared_code_path }}/.config/playwright-mcp/secrets.env"
         content: |
-          THINKUBE_PASSWORD={{ lookup('env', 'ADMIN_PASSWORD') }}
+          THINKUBE_PASSWORD={{ admin_password }}
         mode: '0600'
 
     ###################################################################
