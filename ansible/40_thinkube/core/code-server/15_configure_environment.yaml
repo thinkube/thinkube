@@ -485,6 +485,73 @@
           bash -lc "rtk init -g --auto-patch && echo '✅ rtk Claude Code hook registered'"
       when: rtk_hook_registered.rc != 0
 
+    # Pre-approves the Thinkube MCP servers, the playbook runner and read-only
+    # shell commands in ~/.claude/settings.json, and describes this cluster to
+    # the auto-mode classifier so it does not block routine platform work.
+    # Rules are added to the user's allow list, never removed; autoMode is
+    # owned by this task and replaced on every run. The file is created by the
+    # rtk task above; its absence is an error.
+    - name: Pre-approve Thinkube tools for Claude Code (global)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -i -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          python3 -c '
+        import json, sys
+        path = "/home/thinkube/.claude/settings.json"
+        managed = json.load(sys.stdin)
+        with open(path) as f:
+            settings = json.load(f)
+        before = json.dumps(settings, sort_keys=True)
+        allow = settings.setdefault("permissions", {}).setdefault("allow", [])
+        allow.extend(rule for rule in managed["allow"] if rule not in allow)
+        settings["autoMode"] = managed["autoMode"]
+        if json.dumps(settings, sort_keys=True) != before:
+            with open(path, "w") as f:
+                json.dump(settings, f, indent=2)
+                f.write("\n")
+            print("changed")
+        '
+      args:
+        stdin: "{{ claude_code_managed_permissions | to_json }}"
+      register: claude_permissions_result
+      changed_when: "'changed' in claude_permissions_result.stdout"
+      vars:
+        claude_code_managed_permissions:
+          allow:
+            - "mcp__thinkube-control"
+            - "mcp__thinkube-tandem"
+            - "mcp__tk-package-version"
+            - "Edit(//home/thinkube/thinkube-platform/**)"
+            - "Read(//home/thinkube/**)"
+            - "Bash(./scripts/tk_ansible *)"
+            - "Bash(rtk proxy *)"
+            - "Bash(git *)"
+            - "Bash(rtk git *)"
+            - "Bash(ls *)"
+            - "Bash(cat *)"
+            - "Bash(head *)"
+            - "Bash(tail *)"
+            - "Bash(grep *)"
+            - "Bash(find *)"
+            - "Bash(sed -n *)"
+            - "Bash(kubectl get *)"
+            - "Bash(kubectl describe *)"
+            - "Bash(kubectl logs *)"
+            - "Bash(helm list *)"
+            - "Bash(helm status *)"
+            - "Bash(helm get *)"
+            - "Bash(ansible-playbook --syntax-check *)"
+          autoMode:
+            environment:
+              - "$defaults"
+              - "This workspace is a code-server pod on the user's own private Thinkube Kubernetes cluster. The user owns every host, namespace and registry in it."
+              - "Running Ansible playbooks with ./scripts/tk_ansible from /home/thinkube/thinkube-platform/core/thinkube, and kubectl or helm against this cluster, is normal development work here."
+              - "Committing and pushing to the user's own repositories under /home/thinkube/thinkube-platform is required by the user's git policy."
+            allow:
+              - "$defaults"
+              - "Running any playbook with ./scripts/tk_ansible from /home/thinkube/thinkube-platform/core/thinkube."
+              - "Calling any tool of the thinkube-control, thinkube-tandem or tk-package-version MCP servers."
+              - "Scoped git add, commit and push (not force-push) in repositories under /home/thinkube/thinkube-platform."
+
     # Work-preservation policy for Claude Code (PLATFORM DEFAULT). Thinkube's
     # target user is a solo developer/researcher whose workspace lives in this
     # pod — one rescheduling or image rebuild away from loss — and the cluster
