@@ -113,6 +113,21 @@
 #
 #   --keep-home                 empty only Thinkube's own output, leave the
 #                               rest of the home alone (the old behaviour)
+#   --keep-images               keep the container image stores and runtimes:
+#                               /var/lib/containerd, /var/lib/containers,
+#                               ~/.local/share/containers, and containerd.io,
+#                               podman, buildah, skopeo. Everything else still
+#                               goes. The next install reuses layers instead of
+#                               pulling ~50 public images and rebuilding the
+#                               base images, which is the long middle of a run.
+#                               It is NOT a clean-baseline wipe: the install
+#                               that follows does not prove the image steps work
+#                               from nothing, and a changed Containerfile can
+#                               reuse a cached layer. Use it to iterate on the
+#                               steps after the image builds; wipe without it
+#                               before trusting a run as a clean install. The
+#                               survey says so in a box, so a kept-images run
+#                               cannot be mistaken for a clean one later.
 #   --i-have-no-work-to-lose    skip the uncommitted/unpushed guard
 #
 # AFTER IT FINISHES
@@ -135,6 +150,7 @@ CONFIRMED=0
 DO_REBOOT=0
 KEEP_HOME=0
 SKIP_WORK_GUARD=0
+KEEP_IMAGES=0
 
 for a in "$@"; do
     case "$a" in
@@ -142,8 +158,12 @@ for a in "$@"; do
         --yes-wipe-this-machine)   CONFIRMED=1 ;;
         --reboot)                  DO_REBOOT=1 ;;
         --keep-home)               KEEP_HOME=1 ;;
+        --keep-images)             KEEP_IMAGES=1 ;;
         --i-have-no-work-to-lose)  SKIP_WORK_GUARD=1 ;;
-        -h|--help)                 sed -n '2,140p' "$0"; exit 0 ;;
+        # Everything from the copyright to the end of the header box, found
+        # rather than counted: a hardcoded last line silently truncates the
+        # help the next time the header grows.
+        -h|--help)                 sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d'; exit 0 ;;
         *) echo "unknown argument: $a" >&2; exit 2 ;;
     esac
 done
@@ -285,11 +305,21 @@ else
 fi
 
 say "Purging packages the installer added"
-PURGE_PKGS="kubeadm kubelet kubectl containerd.io \
-            podman podman-compose podman-toolbox buildah skopeo \
+PURGE_PKGS="kubeadm kubelet kubectl \
+            podman-compose podman-toolbox \
             qemu-user-static binfmt-support \
             tailscale tailscale-archive-keyring \
             sshpass s3cmd apache2-utils"
+# Purging these four takes their image stores with them, so --keep-images keeps
+# the runtimes installed. The installer reinstalls them either way; what is
+# being kept is the layers underneath, not the packages. They are appended
+# rather than filtered out: podman-compose and podman-toolbox contain the word
+# podman, so stripping by name clipped them into '-compose' and '-toolbox'.
+if [ "$KEEP_IMAGES" -eq 0 ]; then
+    PURGE_PKGS="$PURGE_PKGS containerd.io podman buildah skopeo"
+else
+    echo "  keeping containerd.io, podman, buildah and skopeo (--keep-images)"
+fi
 run apt-mark unhold ${PURGE_PKGS}
 if [ "$DRY" -eq 1 ]; then
     echo "  [dry-run] apt-get purge -y ${PURGE_PKGS}"
@@ -308,11 +338,21 @@ else
 fi
 
 say "Removing cluster and runtime state"
-for d in /etc/kubernetes /etc/cni /etc/containerd \
-         /var/lib/kubelet /var/lib/containerd /var/lib/etcd \
-         /var/lib/tailscale /var/lib/cni /var/lib/containers \
-         /var/openebs /var/lib/rawfile-localpv /var/csi /var/local/openebs \
-         /opt/cni /opt/containerd; do
+# /var/lib/containerd and /var/lib/containers are the image stores: containerd's
+# for what Kubernetes runs, podman's for what the image builds produce. Both are
+# content addressed and re-derivable, which is why --keep-images may spare them
+# while every other directory here still goes.
+STATE_DIRS="/etc/kubernetes /etc/cni /etc/containerd \
+            /var/lib/kubelet /var/lib/etcd \
+            /var/lib/tailscale /var/lib/cni \
+            /var/openebs /var/lib/rawfile-localpv /var/csi /var/local/openebs \
+            /opt/cni /opt/containerd"
+if [ "$KEEP_IMAGES" -eq 0 ]; then
+    STATE_DIRS="$STATE_DIRS /var/lib/containerd /var/lib/containers"
+else
+    echo "  keeping /var/lib/containerd and /var/lib/containers (--keep-images)"
+fi
+for d in $STATE_DIRS; do
     echo "  rm -rf $d"; run rm -rf "$d"
 done
 
@@ -393,12 +433,30 @@ else
     [ -f "${HOME_DIR}/.env" ] && run cp -a "${HOME_DIR}/.env" "${KEEP_DIR}/env"
 
     say "Emptying ${HOME_DIR} and refilling it from /etc/skel"
+    # Rootless podman keeps its layers under the home, so emptying the home
+    # takes them too. With --keep-images the store is moved out of the way and
+    # put back after the refill, which is the third place images would otherwise
+    # be destroyed, after the package purge and /var/lib.
+    ROOTLESS_STORE="${HOME_DIR}/.local/share/containers"
+    STASHED_STORE="${KEEP_DIR}/rootless-containers"
     if [ "$DRY" -eq 1 ]; then
         echo "  [dry-run] rm -rf ${HOME_DIR}/* ${HOME_DIR}/.[!.]*"
         echo "  [dry-run] cp -a /etc/skel/. ${HOME_DIR}/"
+        [ "$KEEP_IMAGES" -eq 1 ] && [ -d "$ROOTLESS_STORE" ] \
+            && echo "  [dry-run] keep ${ROOTLESS_STORE} across the refill"
     else
+        if [ "$KEEP_IMAGES" -eq 1 ] && [ -d "$ROOTLESS_STORE" ]; then
+            rm -rf "$STASHED_STORE"
+            mkdir -p "$(dirname "$STASHED_STORE")"
+            mv "$ROOTLESS_STORE" "$STASHED_STORE"
+            echo "  keeping ${ROOTLESS_STORE} (--keep-images)"
+        fi
         find "${HOME_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
         cp -a /etc/skel/. "${HOME_DIR}/" 2>/dev/null || true
+        if [ "$KEEP_IMAGES" -eq 1 ] && [ -d "$STASHED_STORE" ]; then
+            mkdir -p "$(dirname "$ROOTLESS_STORE")"
+            mv "$STASHED_STORE" "$ROOTLESS_STORE"
+        fi
         chown -R "${WIPE_USER}:${WIPE_USER}" "${HOME_DIR}"
         chmod 750 "${HOME_DIR}"
     fi
@@ -412,16 +470,27 @@ say "Survey of state this script recognises as non-fresh"
 left=0
 note() { echo "  $*"; left=$((left + 1)); }
 
-for d in /etc/kubernetes /etc/cni /etc/containerd /var/lib/kubelet \
-         /var/lib/containerd /var/lib/etcd /var/lib/tailscale \
-         /var/lib/containers /var/local/openebs /opt/cni /opt/containerd \
-         /ssd/object_store /storage/filer_store; do
+SURVEY_DIRS="/etc/kubernetes /etc/cni /etc/containerd /var/lib/kubelet \
+             /var/lib/etcd /var/lib/tailscale \
+             /var/local/openebs /opt/cni /opt/containerd \
+             /ssd/object_store /storage/filer_store"
+# The image stores were kept on purpose, so they are not failures of the wipe.
+# They are reported separately below, because a run that kept them is not a
+# clean-baseline run and should never be mistaken for one later.
+if [ "$KEEP_IMAGES" -eq 0 ]; then
+    SURVEY_DIRS="$SURVEY_DIRS /var/lib/containerd /var/lib/containers"
+fi
+for d in $SURVEY_DIRS; do
     [ -e "$d" ] && note "still present: $d"
 done
 
 [ -e "/etc/sudoers.d/${WIPE_USER}" ] && note "still present: /etc/sudoers.d/${WIPE_USER}"
 
-for p in kubeadm kubelet kubectl containerd.io podman buildah skopeo tailscale; do
+SURVEY_PKGS="kubeadm kubelet kubectl tailscale"
+if [ "$KEEP_IMAGES" -eq 0 ]; then
+    SURVEY_PKGS="$SURVEY_PKGS containerd.io podman buildah skopeo"
+fi
+for p in $SURVEY_PKGS; do
     dpkg -l "$p" 2>/dev/null | grep -q '^ii' && note "still installed: $p"
 done
 
@@ -432,6 +501,9 @@ done
 if [ "$KEEP_HOME" -eq 0 ]; then
     while IFS= read -r e; do
         b=$(basename "$e")
+        # ~/.local is back only because the rootless image store was put back
+        # inside it; it is not leftover state the wipe failed to remove.
+        [ "$KEEP_IMAGES" -eq 1 ] && [ "$b" = ".local" ] && continue
         [ -e "/etc/skel/$b" ] || note "not in /etc/skel: ~/$b"
     done < <(find "${HOME_DIR}" -mindepth 1 -maxdepth 1 2>/dev/null)
 fi
@@ -447,7 +519,28 @@ while IFS= read -r key; do
 done < <(find "${HOME_DIR}" /root -maxdepth 4 -name '*_key' -o -name 'id_*' 2>/dev/null | grep -v '\.pub$')
 
 if [ "$left" -eq 0 ]; then
-    echo "  nothing found — the machine matches the fresh-Ubuntu checklist"
+    if [ "$KEEP_IMAGES" -eq 1 ]; then
+        echo "  nothing found apart from the image stores, which were kept"
+    else
+        echo "  nothing found — the machine matches the fresh-Ubuntu checklist"
+    fi
+fi
+
+if [ "$KEEP_IMAGES" -eq 1 ]; then
+    cat <<EOF
+
+  ########################################################################
+  #  --keep-images was used: THIS IS NOT A CLEAN-BASELINE WIPE           #
+  #                                                                      #
+  #  Kept: /var/lib/containerd, /var/lib/containers,                     #
+  #        ~/.local/share/containers, and the container runtimes         #
+  #                                                                      #
+  #  The install that follows reuses layers it did not pull or build,    #
+  #  so it does not prove the image steps work from nothing. Good for    #
+  #  iterating on what comes after them; not evidence of a clean         #
+  #  install. Wipe without this flag before trusting a run as one.       #
+  ########################################################################
+EOF
 fi
 
 ###############################################################################
