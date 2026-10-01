@@ -182,6 +182,22 @@
       register: helm_repo_add
       changed_when: "'has been added' in helm_repo_add.stdout or 'Update Complete' in helm_repo_add.stdout"
 
+    # Fetched before the install so a transient upstream failure costs a retry
+    # here rather than the whole deployment: the chart comes from GitHub
+    # releases, which returned 504 mid-install and failed the step three times
+    # inside 44 seconds. Installing from the local copy keeps the retry on the
+    # download, which is the flaky part, not on the cluster operation.
+    - name: Pre-fetch JuiceFS CSI chart tarball (retries on transient network errors)
+      ansible.builtin.command: >-
+        {{ helm_bin }} pull juicefs/juicefs-csi-driver
+        --version {{ juicefs_csi_version }}
+        --destination /tmp
+      register: juicefs_chart_pull
+      retries: 5
+      delay: 30
+      until: juicefs_chart_pull.rc == 0
+      changed_when: juicefs_chart_pull.rc == 0
+
     ###########################################################################
     # Task 5: Create JuiceFS configuration secret
     ###########################################################################
@@ -218,9 +234,9 @@
     # cache is reclaimed at node level under real memory pressure.
     - name: Install/Upgrade JuiceFS CSI driver via Helm using Harbor registry
       ansible.builtin.shell: |
-        {{ helm_bin }} upgrade --install juicefs-csi-driver juicefs/juicefs-csi-driver \
+        {{ helm_bin }} upgrade --install juicefs-csi-driver \
+          /tmp/juicefs-csi-driver-{{ juicefs_csi_version }}.tgz \
           --namespace kube-system \
-          --version {{ juicefs_csi_version }} \
           --set image.repository={{ harbor_registry }}/library/juicefs-csi-driver \
           --set image.tag=v{{ juicefs_csi_version }} \
           --set sidecars.livenessProbeImage.repository={{ harbor_registry }}/library/livenessprobe \

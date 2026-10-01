@@ -111,10 +111,48 @@
         ns: "{{ tailscale_namespace }}"
         tier: "critical"
 
+    # Fetched before the install so a transient upstream failure costs a retry
+    # on the download rather than on the cluster operation. This step runs
+    # before Harbor exists, so the chart can only come from upstream. The
+    # version is deliberately not pinned, so the directory is emptied first and
+    # whatever tarball the pull produced is found rather than named.
+    - name: Empty the directory for the pre-fetched Tailscale Operator chart
+      ansible.builtin.file:
+        path: /tmp/tailscale-operator-chart
+        state: "{{ item }}"
+        mode: '0755'
+      loop:
+        - absent
+        - directory
+
+    - name: Pre-fetch Tailscale Operator chart tarball (retries on transient network errors)
+      ansible.builtin.command: >-
+        {{ helm_bin }} pull {{ operator_repo_name }}/tailscale-operator
+        --destination /tmp/tailscale-operator-chart
+      register: ts_operator_chart_pull
+      retries: 5
+      delay: 30
+      until: ts_operator_chart_pull.rc == 0
+      changed_when: ts_operator_chart_pull.rc == 0
+
+    - name: Find the pre-fetched Tailscale Operator chart
+      ansible.builtin.find:
+        paths: /tmp/tailscale-operator-chart
+        patterns: "tailscale-operator-*.tgz"
+      register: ts_operator_chart
+
+    - name: Stop when the pre-fetched Tailscale Operator chart is not exactly one file
+      ansible.builtin.assert:
+        that: ts_operator_chart.files | length == 1
+        fail_msg: >-
+          Expected one tailscale-operator-*.tgz in /tmp/tailscale-operator-chart,
+          found {{ ts_operator_chart.files | length }}.
+        quiet: true
+
     - name: Install or upgrade the Tailscale Operator
       ansible.builtin.command: >
         {{ helm_bin }} upgrade --install {{ operator_release }}
-        {{ operator_repo_name }}/tailscale-operator
+        {{ ts_operator_chart.files[0].path }}
         --namespace={{ tailscale_namespace }}
         --set-string oauth.clientId={{ tailscale_oauth_client_id }}
         --set-string oauth.clientSecret={{ tailscale_oauth_client_secret }}

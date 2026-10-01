@@ -621,10 +621,28 @@
         mode: '0644'
       become_user: "{{ user }}"
 
+    # Fetched before the install so a transient upstream failure costs a retry
+    # on the download rather than on the cluster operation. This is the first
+    # chart of the deployment and runs long before Harbor exists, so it can
+    # only come from upstream.
+    - name: Pre-fetch Cilium chart tarball (retries on transient network errors)
+      ansible.builtin.command: >-
+        {{ helm_wrapper_path }} pull cilium/cilium
+        --version {{ cilium_chart_version }}
+        --destination /tmp
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      register: _cilium_chart_pull
+      retries: 5
+      delay: 30
+      until: _cilium_chart_pull.rc == 0
+      changed_when: _cilium_chart_pull.rc == 0
+
     - name: Install / upgrade Cilium
       ansible.builtin.command: >
-        {{ helm_wrapper_path }} upgrade --install cilium cilium/cilium
-        --version {{ cilium_chart_version }}
+        {{ helm_wrapper_path }} upgrade --install cilium
+        /tmp/cilium-{{ cilium_chart_version }}.tgz
         --namespace kube-system
         --values /tmp/cilium-values.yaml
         --wait
@@ -705,10 +723,25 @@
       become_user: "{{ user }}"
       changed_when: false
 
+    # Fetched before the install, for the same reason as Cilium above.
+    - name: Pre-fetch OpenEBS Rawfile CSI chart tarball (retries on transient network errors)
+      ansible.builtin.command: >-
+        {{ helm_wrapper_path }} pull openebs-rawfile/rawfile-localpv
+        --version {{ openebs_rawfile_chart_version }}
+        --destination /tmp
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ user }}"
+      register: _rawfile_chart_pull
+      retries: 5
+      delay: 30
+      until: _rawfile_chart_pull.rc == 0
+      changed_when: _rawfile_chart_pull.rc == 0
+
     - name: Install / upgrade OpenEBS Rawfile CSI
       ansible.builtin.command: >
-        {{ helm_wrapper_path }} upgrade --install rawfile-csi openebs-rawfile/rawfile-localpv
-        --version {{ openebs_rawfile_chart_version }}
+        {{ helm_wrapper_path }} upgrade --install rawfile-csi
+        /tmp/rawfile-localpv-{{ openebs_rawfile_chart_version }}.tgz
         --namespace kube-system
         --wait
         --timeout 10m

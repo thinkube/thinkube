@@ -372,10 +372,24 @@
     # daemonset volumes reference /etc/containerd and /run/containerd
     # directly. The 99-nvidia.toml drop-in lands under /etc/containerd/conf.d/
     # which our base config.toml imports — see ansible/roles/containerd_install/.
+    # Fetched before the install so a transient upstream failure costs a retry
+    # on the download rather than on the cluster operation. This step runs
+    # before Harbor exists, so the chart can only come from upstream.
+    - name: Pre-fetch GPU Operator chart tarball (retries on transient network errors)
+      ansible.builtin.command: >-
+        {{ helm_bin }} pull nvidia/gpu-operator
+        --version v26.3.1
+        --destination /tmp
+      register: gpu_operator_chart_pull
+      retries: 5
+      delay: 30
+      until: gpu_operator_chart_pull.rc == 0
+      changed_when: gpu_operator_chart_pull.rc == 0
+
     - name: Install GPU Operator
       ansible.builtin.shell: |
-        {{ helm_bin }} upgrade --install gpu-operator nvidia/gpu-operator \
-          --version v26.3.1 \
+        {{ helm_bin }} upgrade --install gpu-operator \
+          /tmp/gpu-operator-v26.3.1.tgz \
           --namespace {{ gpu_operator_namespace }} \
           --wait \
           --timeout 15m \

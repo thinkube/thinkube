@@ -435,12 +435,49 @@
               tag: v2.14.0
           {% endif %}
 
+    # Fetched before the install so a transient upstream failure costs a retry
+    # on the download rather than on the cluster operation. Harbor is the
+    # registry itself, so its own chart can never come from Harbor. The version
+    # is deliberately not pinned, so the directory is emptied first and whatever
+    # tarball the pull produced is found rather than named.
+    - name: Empty the directory for the pre-fetched Harbor chart
+      ansible.builtin.file:
+        path: /tmp/harbor-chart
+        state: "{{ item }}"
+        mode: '0755'
+      loop:
+        - absent
+        - directory
+
+    - name: Pre-fetch Harbor chart tarball (retries on transient network errors)
+      ansible.builtin.command: >-
+        {{ helm_bin }} pull harbor/harbor --destination /tmp/harbor-chart
+      register: harbor_chart_pull
+      retries: 5
+      delay: 30
+      until: harbor_chart_pull.rc == 0
+      changed_when: harbor_chart_pull.rc == 0
+
+    - name: Find the pre-fetched Harbor chart
+      ansible.builtin.find:
+        paths: /tmp/harbor-chart
+        patterns: "harbor-*.tgz"
+      register: harbor_chart
+
+    - name: Stop when the pre-fetched Harbor chart is not exactly one file
+      ansible.builtin.assert:
+        that: harbor_chart.files | length == 1
+        fail_msg: >-
+          Expected one harbor-*.tgz in /tmp/harbor-chart,
+          found {{ harbor_chart.files | length }}.
+        quiet: true
+
     - name: Deploy Harbor using Helm
       kubernetes.core.helm:
         binary_path: "{{ helm_bin }}"
         kubeconfig: "{{ kubeconfig }}"
         name: "{{ harbor_release }}"
-        chart_ref: harbor/harbor
+        chart_ref: "{{ harbor_chart.files[0].path }}"
         release_namespace: "{{ harbor_namespace }}"
         create_namespace: false
         values_files:
