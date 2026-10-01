@@ -27,9 +27,31 @@
     component_version: "{{ lookup('file', playbook_dir + '/VERSION') }}"
 
   tasks:
-    - name: Get GitHub token from environment
+    # The environment carries GITHUB_TOKEN when a person runs this by hand;
+    # an installer run does not export it, and the token is in ~/.env instead.
+    # Read bare from the environment, this is empty during an install, the
+    # secret below is skipped, and the ConfigMap would advertise a secret that
+    # was never created.
+    - name: Read GITHUB_TOKEN from .env when the environment does not carry one
+      ansible.builtin.shell: |
+        if [ -f "{{ ansible_facts.env.HOME }}/.env" ]; then
+          source {{ ansible_facts.env.HOME }}/.env
+          echo $GITHUB_TOKEN
+        else
+          echo ""
+        fi
+      args:
+        executable: /bin/bash
+      register: github_token_from_env_file
+      changed_when: false
+      no_log: true
+
+    - name: Set the GitHub token fact
       ansible.builtin.set_fact:
-        github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+        github_token: >-
+          {{ lookup('env', 'GITHUB_TOKEN')
+             | default(github_token_from_env_file.stdout | trim, true) }}
+      no_log: true
 
     - name: Create GitHub token secret
       kubernetes.core.k8s:
@@ -90,6 +112,10 @@
                   min_replicas: 1
                   can_disable: false
 
+                # Declared only when the secret above was created. Advertising a
+                # secret that does not exist fails code_server_env_update for
+                # every service deployed afterwards, not just this one.
+                {% if github_token | length > 0 %}
                 environment_variables:
                   - name: GITHUB_TOKEN
                     valueFrom:
@@ -97,6 +123,9 @@
                         namespace: code-server
                         name: github-token
                         key: token
+                {% else %}
+                environment_variables: []
+                {% endif %}
 
     - name: Verify ConfigMap creation
       kubernetes.core.k8s_info:
