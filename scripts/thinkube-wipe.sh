@@ -275,6 +275,11 @@ fi
 ###############################################################################
 # Kubernetes layer. Reset first: kubeadm is gone after the purge.
 ###############################################################################
+# kubeadm reset removes containers over CRI with no timeout and hangs when a
+# pod is wedged (a kubeadm bug open since 2018). The same sequence as
+# 19_rollback_control.yaml leaves it nothing to talk to: stop kubelet, drop the
+# static pod manifests, kill the control-plane processes, remove every pod and
+# container, restart containerd to clear its CRI state, then reset.
 say "Stopping kubelet and the control-plane static pods"
 run systemctl stop kubelet
 run systemctl disable kubelet
@@ -282,15 +287,33 @@ run rm -f /etc/kubernetes/manifests/kube-apiserver.yaml \
           /etc/kubernetes/manifests/kube-controller-manager.yaml \
           /etc/kubernetes/manifests/kube-scheduler.yaml \
           /etc/kubernetes/manifests/etcd.yaml
+for proc in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+    run pkill -9 -x "$proc"
+done
+if [ "$DRY" -eq 0 ]; then
+    for _ in $(seq 1 15); do
+        ss -ltn 2>/dev/null | grep -q ':6443 ' || break
+        sleep 1
+    done
+fi
 
+CRI="unix:///run/containerd/containerd.sock"
 if command -v crictl >/dev/null 2>&1; then
-    say "Force-stopping pods (crictl)"
-    run crictl -r unix:///run/containerd/containerd.sock rmp -fa
+    say "Force-stopping pods and containers (crictl)"
+    for id in $(crictl -r "$CRI" pods -q 2>/dev/null); do run crictl -r "$CRI" stopp "$id"; done
+    for id in $(crictl -r "$CRI" ps -aq 2>/dev/null); do run crictl -r "$CRI" stop "$id"; done
+    run crictl -r "$CRI" rmp --all --force
+    run crictl -r "$CRI" rm --all --force
+fi
+if systemctl is-active --quiet containerd 2>/dev/null; then
+    say "Restarting containerd to clear its CRI state"
+    run systemctl restart containerd
+    [ "$DRY" -eq 0 ] && sleep 3
 fi
 
 say "kubeadm reset"
 if command -v kubeadm >/dev/null 2>&1; then
-    run kubeadm reset -f
+    run kubeadm reset --force --cri-socket "$CRI"
 else
     echo "  kubeadm not installed; nothing to reset"
 fi
