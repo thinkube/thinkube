@@ -394,37 +394,33 @@
         mode: '0600'
       when: ssh_config_stat.stat.exists
 
-    # If section exists, update it
-    - name: Update existing Thinkube baremetal section
+    # Rewrite the Thinkube part of an existing config. The file is read as
+    # blank-line separated paragraphs and every paragraph this project has
+    # ever written is dropped: the BEGIN/END-THINKUBE-BAREMETAL markers (also
+    # glued to the next line, which the template did between 28 Aug and
+    # 2 Oct 2026 and left ssh reading the block as a list of host patterns),
+    # the header comments, the Host blocks reached through thinkube-node-ip
+    # or the cluster key, and the per-worker blocks 20_join_workers.yaml adds
+    # for a cluster that no longer exists. Markers alone cannot be trusted:
+    # the old surgery left blocks with one marker missing. Anything else in
+    # the file is the user's and stays, above the fresh section.
+    - name: Replace the Thinkube sections of the existing SSH config
       ansible.builtin.shell: |
-        # Create new config file
-        touch "{{ ansible_facts.user_dir }}/.ssh/config.new"
-        
-        # Add everything before the BEGIN marker
-        sed -n '1,/# BEGIN-THINKUBE-BAREMETAL/p' "{{ ansible_facts.user_dir }}/.ssh/config" | \
-        grep -v "# BEGIN-THINKUBE-BAREMETAL" > "{{ ansible_facts.user_dir }}/.ssh/config.new"
-        
-        # Add the new baremetal snippet
-        cat "{{ ansible_facts.user_dir }}/.ssh/baremetal_snippet" >> "{{ ansible_facts.user_dir }}/.ssh/config.new"
-        
-        # Add everything after the END marker
-        sed -n '/# END-THINKUBE-BAREMETAL/,$p' "{{ ansible_facts.user_dir }}/.ssh/config" | \
-        grep -v "# END-THINKUBE-BAREMETAL" >> "{{ ansible_facts.user_dir }}/.ssh/config.new"
-        
-        # Replace the original file
-        mv "{{ ansible_facts.user_dir }}/.ssh/config.new" "{{ ansible_facts.user_dir }}/.ssh/config"
+        python3 - "{{ ansible_facts.user_dir }}/.ssh/config" "{{ ansible_facts.user_dir }}/.ssh/baremetal_snippet" <<'PY'
+        import re, sys
+        path, snippet = sys.argv[1], sys.argv[2]
+        ours = re.compile(r"THINKUBE-BAREMETAL|thinkube-node-ip --connect|thinkube_cluster_key"
+                          r"|ANSIBLE MANAGED BLOCK - WORKER|Thinkube Baremetal SSH Configuration"
+                          r"|and the Thinkube contributors|20_join_workers\.yaml|10_setup_ssh_keys\.yaml")
+        paragraphs = re.split(r"\n[ \t]*\n", open(path).read())
+        kept = [p.strip("\n") for p in paragraphs if p.strip() and not ours.search(p)]
+        text = "\n\n".join(kept)
+        open(path, "w").write((text + "\n\n" if text else "") + open(snippet).read())
+        PY
         chmod 600 "{{ ansible_facts.user_dir }}/.ssh/config"
-      when: ssh_config_stat.stat.exists and has_baremetal_section.stdout == "found"
-
-    # If no section exists yet, append it
-    - name: Append baremetal section to existing SSH config
-      ansible.builtin.shell: |
-        # Add an empty line for separation
-        echo "" >> "{{ ansible_facts.user_dir }}/.ssh/config"
-        
-        # Add the baremetal snippet
-        cat "{{ ansible_facts.user_dir }}/.ssh/baremetal_snippet" >> "{{ ansible_facts.user_dir }}/.ssh/config"
-      when: ssh_config_stat.stat.exists and has_baremetal_section.stdout == "not found"
+      args:
+        executable: /bin/bash
+      when: ssh_config_stat.stat.exists
 
     # Clean up temporary files
     - name: Clean up temporary files
