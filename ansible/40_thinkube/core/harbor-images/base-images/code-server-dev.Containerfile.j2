@@ -567,6 +567,63 @@ RUN case "${TARGETARCH}" in \
 # in the Dockerfile because they would be lost when shared-code volume mounts.
 # They are installed to ~/.local via 15_configure_environment.yaml playbook.
 
+###############################################################################
+# Developer toolchain, formerly installed into the RUNNING pod by
+# code-server/15_configure_environment.yaml. At runtime /home/thinkube is the
+# shared-code hostPath mount, so anything baked under the home is invisible;
+# these live under /opt and /usr/local, which the mount does not cover, and
+# survive pod recreation. (The add-nodes flow recreates the pod for its env
+# update — that is how the tk_* symlinks went missing on 2026-10-02.)
+###############################################################################
+
+# uv: the installer honours UV_UNMANAGED_INSTALL to place uv and uvx in a
+# directory of our choosing without touching shell profiles.
+RUN curl --retry 5 --retry-delay 5 --retry-all-errors -LsSf https://astral.sh/uv/install.sh \
+        | env UV_UNMANAGED_INSTALL=/usr/local/bin sh && \
+    uv --version && uvx --version
+
+# Rust toolchain outside the home. The user owns it afterwards so
+# `cargo install` and `rustup update` still work from a terminal.
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo
+RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-delay 5 --retry-all-errors -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path && \
+    /opt/cargo/bin/rustc --version && \
+    /opt/cargo/bin/cargo --version
+
+# rtk = Rust Token Killer (github.com/rtk-ai/rtk), built from source into
+# /usr/local/bin. The crates.io `rtk` is an unrelated project, hence --git.
+# `rtk gain` is a real subcommand, so it proves the right binary was built.
+# The cargo registry and git caches are build-time only and are dropped to
+# keep the image small; cargo refetches them on demand.
+RUN /opt/cargo/bin/cargo install --git https://github.com/rtk-ai/rtk --locked --root /usr/local && \
+    /usr/local/bin/rtk gain && \
+    rm -rf /opt/cargo/registry /opt/cargo/git && \
+    chown -R thinkube:thinkube /opt/rustup /opt/cargo
+
+# Thinkube CLI entry points. The targets are in the user's shared-code
+# checkout, mounted at runtime, so the links dangle at build time and
+# resolve once the pod runs.
+RUN for t in tk_ansible tk_ssh tk_images tk_clone_dev; do \
+        ln -sf "/home/thinkube/thinkube-platform/core/thinkube/scripts/${t}" "/usr/local/bin/${t}"; \
+    done
+
+# Ubuntu's /etc/profile rebuilds PATH for login shells, so the image ENV
+# alone does not reach a terminal. bash reads /etc/profile.d, zsh gets it
+# through /etc/zsh/zprofile, fish reads /etc/fish/conf.d. /usr/local/bin is
+# on every default PATH already; only the cargo bin dir needs adding.
+RUN printf '%s\n' \
+        'export RUSTUP_HOME=/opt/rustup' \
+        'export CARGO_HOME=/opt/cargo' \
+        'case ":$PATH:" in *":/opt/cargo/bin:"*) ;; *) export PATH="/opt/cargo/bin:$PATH" ;; esac' \
+        > /etc/profile.d/thinkube-tools.sh && \
+    mkdir -p /etc/fish/conf.d && \
+    printf '%s\n' \
+        'set -gx RUSTUP_HOME /opt/rustup' \
+        'set -gx CARGO_HOME /opt/cargo' \
+        'fish_add_path --global --prepend /opt/cargo/bin' \
+        > /etc/fish/conf.d/thinkube-tools.fish
+
 USER thinkube
 
 # Add user bin to PATH for Python tools installed later, and the cargo bin dir so
@@ -576,7 +633,7 @@ USER thinkube
 # without ~/.cargo/bin here the orchestrator aborts with "rtk not found on PATH".
 # The dir is populated later at provisioning (15_configure_environment.yaml) — a PATH
 # entry does not need to exist at image-build time.
-ENV PATH="/home/thinkube/.local/bin:/home/thinkube/.cargo/bin:${PATH}"
+ENV PATH="/home/thinkube/.local/bin:/opt/cargo/bin:/home/thinkube/.cargo/bin:${PATH}"
 
 ###############################################################################
 # Configuration and Environment

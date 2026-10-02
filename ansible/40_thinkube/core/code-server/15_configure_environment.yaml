@@ -406,64 +406,45 @@
             maturin \
             && echo '✅ Python packages installed'"
 
-    - name: Install uv (fast Python package manager)
+    # uv, the Rust toolchain, rtk and the tk_* commands are built into the
+    # code-server-dev image (harbor-images/base-images/code-server-dev
+    # .Containerfile.j2), under /opt and /usr/local where the shared-code
+    # home mount does not hide them. They used to be installed here, into the
+    # running pod, and the parts outside the home were lost whenever the pod
+    # was recreated. This checks the running image is one that has them, and
+    # says what to do when it is not, rather than silently reinstalling.
+    - name: Check the running image provides the developer toolchain
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "curl -LsSf https://astral.sh/uv/install.sh | sh && echo '✅ uv installed'"
-
-    - name: Check if Rust toolchain is installed
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "test -x /home/thinkube/.cargo/bin/cargo"
-      register: rust_installed
+          bash -c "command -v uv >/dev/null && \
+            test -x /opt/cargo/bin/cargo && \
+            /usr/local/bin/rtk gain >/dev/null 2>&1 && \
+            test -L /usr/local/bin/tk_images"
+      register: image_toolchain
       failed_when: false
       changed_when: false
 
-    - name: Install Rust toolchain (rustup + cargo + rustc) via rustup
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-            sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path && \
-            /home/thinkube/.cargo/bin/rustc --version && \
-            /home/thinkube/.cargo/bin/cargo --version && \
-            echo '✅ Rust toolchain installed'"
-      when: rust_installed.rc != 0
+    - name: Stop when the running code-server image predates the built-in toolchain
+      ansible.builtin.assert:
+        that: image_toolchain.rc == 0
+        fail_msg: >-
+          The running code-server pod lacks uv, cargo, rtk or the tk_* commands.
+          They are part of the code-server-dev image since 2026-10-02; rebuild
+          and redeploy it with code-server/20_redeploy.yaml before running
+          this playbook.
+        quiet: true
 
-    # rtk = Rust Token Killer (github.com/rtk-ai/rtk), a CLI proxy that compresses
-    # command output to cut LLM tokens. Installed FROM SOURCE — the crates.io `rtk`
-    # name belongs to an unrelated project ("Rust Type Kit"), so `cargo install rtk`
-    # pulls the wrong binary. The guard runs `rtk gain` (a real Rust-Token-Killer
-    # subcommand) rather than `test -x`, so a wrong/absent binary is (re)installed.
-    - name: Check if the correct rtk (Rust Token Killer) is installed
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "/home/thinkube/.cargo/bin/rtk gain >/dev/null 2>&1"
-      register: rtk_installed
-      failed_when: false
-      changed_when: false
-
-    - name: Install rtk (Rust Token Killer) from source
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -lc "cargo install --git https://github.com/rtk-ai/rtk --locked --force && \
-            /home/thinkube/.cargo/bin/rtk gain && \
-            echo '✅ rtk (Rust Token Killer) installed'"
-      when: rtk_installed.rc != 0
-
-    # rtk lands in ~/.cargo/bin, which is on PATH only for INTERACTIVE shells (the
-    # rc scripts above). The code-server process — and the orchestrator / extension
-    # host it spawns — inherits the IMAGE's PATH (Containerfile ENV), which includes
-    # ~/.local/bin but NOT ~/.cargo/bin, so those non-interactive children never see
-    # rtk and the orchestrator aborts ("rtk binary not found on PATH"). Link rtk into
-    # ~/.local/bin — already on the image PATH — so it is visible to every process,
-    # not just login shells. Idempotent (ln -sf); the guard proves the link resolves.
-    - name: Expose rtk on the process PATH (symlink into ~/.local/bin for the orchestrator)
+    # rtk is /usr/local/bin/rtk in the image, on every PATH. A home that was set
+    # up before the move still carries ~/.local/bin/rtk -> ~/.cargo/bin/rtk, a
+    # link that now dangles; repoint it so a stale link cannot shadow the image
+    # binary for the orchestrator. Idempotent (ln -sf); the guard proves it resolves.
+    - name: Point the legacy ~/.local/bin/rtk link at the image binary
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
           bash -c "mkdir -p /home/thinkube/.local/bin && \
-            ln -sf /home/thinkube/.cargo/bin/rtk /home/thinkube/.local/bin/rtk && \
+            ln -sf /usr/local/bin/rtk /home/thinkube/.local/bin/rtk && \
             /home/thinkube/.local/bin/rtk gain >/dev/null 2>&1 && \
-            echo '✅ rtk linked into ~/.local/bin (on the process PATH)'"
+            echo '✅ ~/.local/bin/rtk -> /usr/local/bin/rtk'"
       changed_when: false
 
     # Automatic token savings: register rtk's PreToolUse hook in Claude Code so an
@@ -820,7 +801,7 @@
     - name: Install graphify (pinned, direct from PyPI)
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "UV_NO_CONFIG=1 /home/thinkube/.local/bin/uv tool install --force graphifyy==0.9.32 && \
+          bash -c "UV_NO_CONFIG=1 uv tool install --force graphifyy==0.9.32 && \
             /home/thinkube/.local/bin/graphify --version && \
             echo '✅ graphify installed'"
       when: graphify_installed.rc != 0
@@ -1068,25 +1049,10 @@
     # repos, so it must NOT run on a config re-run of this playbook — that would
     # wipe uncommitted work in the cloned repos.
 
-    - name: Create symlink for tk_ansible command inside container
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "sudo ln -sf /home/thinkube/thinkube-platform/core/thinkube/scripts/tk_ansible /usr/local/bin/tk_ansible"
-
-    - name: Create symlink for tk_ssh command inside container
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "sudo ln -sf /home/thinkube/thinkube-platform/core/thinkube/scripts/tk_ssh /usr/local/bin/tk_ssh"
-
-    - name: Create symlink for tk_images command inside container
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "sudo ln -sf /home/thinkube/thinkube-platform/core/thinkube/scripts/tk_images /usr/local/bin/tk_images"
-
-    - name: Create symlink for tk_clone_dev command inside container
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "sudo ln -sf /home/thinkube/thinkube-platform/core/thinkube/scripts/tk_clone_dev /usr/local/bin/tk_clone_dev"
+    # The tk_ansible / tk_ssh / tk_images / tk_clone_dev links in /usr/local/bin
+    # are created by the code-server-dev image (see the toolchain check above).
+    # They were made here with `kubectl exec ... ln -sf` into the container
+    # filesystem and vanished every time the pod was recreated.
 
     - name: Build hostAliases list for cluster nodes
       ansible.builtin.set_fact:
