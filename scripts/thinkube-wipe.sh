@@ -453,12 +453,20 @@ else
         fi
         find "${HOME_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
         cp -a /etc/skel/. "${HOME_DIR}/" 2>/dev/null || true
-        if [ "$KEEP_IMAGES" -eq 1 ] && [ -d "$STASHED_STORE" ]; then
-            mkdir -p "$(dirname "$ROOTLESS_STORE")"
-            mv "$STASHED_STORE" "$ROOTLESS_STORE"
-        fi
         chown -R "${WIPE_USER}:${WIPE_USER}" "${HOME_DIR}"
         chmod 750 "${HOME_DIR}"
+        # Put the image store back only AFTER the chown above. Rootless podman
+        # stores a container's uid N as the user's subordinate uid 100000+N-1,
+        # so a recursive chown over the store flattens every layer to uid 1000
+        # — container root — and every cached layer that creates files for
+        # another user is silently broken. That happened on 2026-10-01: the
+        # next `podman build` failed at its first step run as the image's
+        # user, "mkdir: cannot create directory '/home/thinkube'".
+        if [ "$KEEP_IMAGES" -eq 1 ] && [ -d "$STASHED_STORE" ]; then
+            mkdir -p "$(dirname "$ROOTLESS_STORE")"
+            chown "${WIPE_USER}:${WIPE_USER}" "$(dirname "$ROOTLESS_STORE")" "${HOME_DIR}/.local" 2>/dev/null || true
+            mv "$STASHED_STORE" "$ROOTLESS_STORE"
+        fi
     fi
     echo "  a copy of the old ~/.ssh and ~/.env is in ${KEEP_DIR}"
 fi
