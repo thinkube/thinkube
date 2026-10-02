@@ -36,6 +36,26 @@
   any_errors_fatal: true
 
   tasks:
+    # DGX OS ships docker, and its NVIDIA runtime is registered in
+    # /etc/docker/daemon.json. A DGX Spark without docker (removed by the
+    # user, or by a rollback that used to purge containerd.io) is not an
+    # error: Kubernetes uses containerd, so the two docker tasks are skipped.
+    - name: Check whether a docker service exists
+      ansible.builtin.command: systemctl list-unit-files docker.service --no-legend
+      register: docker_unit
+      changed_when: false
+      failed_when: false
+
+    - name: Record whether docker is installed
+      ansible.builtin.set_fact:
+        docker_present: "{{ (docker_unit.stdout | default('') | trim) != '' }}"
+        dgx_spark: "{{ gpu_model is defined and ('DGX Spark' in gpu_model or 'GB10' in gpu_model) }}"
+
+    - name: Say when a DGX Spark has no docker to configure
+      ansible.builtin.debug:
+        msg: "No docker service on {{ inventory_hostname }}: the NVIDIA runtime for docker is not configured; Kubernetes does not need it."
+      when: dgx_spark and not docker_present
+
     - name: Configure Docker daemon for NVIDIA runtime (DGX Spark only)
       ansible.builtin.copy:
         content: |
@@ -50,14 +70,14 @@
         dest: /etc/docker/daemon.json
         mode: '0644'
       become: true
-      when: gpu_model is defined and ('DGX Spark' in gpu_model or 'GB10' in gpu_model)
+      when: dgx_spark and docker_present
 
     - name: Restart Docker to load NVIDIA runtime (DGX Spark only)
       ansible.builtin.systemd:
         name: docker
         state: restarted
       become: true
-      when: gpu_model is defined and ('DGX Spark' in gpu_model or 'GB10' in gpu_model)
+      when: dgx_spark and docker_present
 
     - name: Check if NVIDIA driver is already installed
       ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
