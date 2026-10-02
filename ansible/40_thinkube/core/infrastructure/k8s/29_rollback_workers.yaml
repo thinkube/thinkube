@@ -116,29 +116,48 @@
       changed_when: _kubeadm_reset.rc == 0
 
     # =====================================================================
-    # apt: unhold + purge cluster packages
+    # apt: unhold + purge the cluster packages
+    #
+    # containerd.io is Docker's containerd package. On DGX OS docker-ce
+    # depends on it, and purging it there removed docker and, through
+    # autoremove, the DGX OS packages only docker kept installed
+    # (nvidia-system-extra, nv-docker-options, rasdaemon, ...). It is
+    # purged only when no other installed package depends on it, and
+    # nothing is autoremoved.
     # =====================================================================
-    - name: Unhold kubelet / kubectl / kubeadm / containerd.io
+    - name: Find installed packages that depend on containerd.io
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-cache rdepends --installed --important containerd.io 2>/dev/null \
+          | awk 'f && NF {sub(/^[ |]+/, ""); print} /^Reverse Depends:/ {f=1}' \
+          | sort -u
+      args:
+        executable: /bin/bash
+      register: _containerd_rdepends
+      changed_when: false
+      failed_when: false
+
+    - name: Decide whether containerd.io is Thinkube's to purge
+      ansible.builtin.set_fact:
+        _purge_containerd: "{{ _containerd_rdepends.stdout | trim | length == 0 }}"
+
+    - name: Keep containerd.io when another package depends on it
+      ansible.builtin.debug:
+        msg: "containerd.io stays installed: {{ _containerd_rdepends.stdout_lines | join(', ') }} depend(s) on it"
+      when: not _purge_containerd
+
+    - name: Unhold the cluster packages
       ansible.builtin.dpkg_selections:
         name: "{{ item }}"
         selection: install
-      loop:
-        - kubeadm
-        - kubelet
-        - kubectl
-        - containerd.io
+      loop: "{{ ['kubeadm', 'kubelet', 'kubectl'] + (['containerd.io'] if _purge_containerd else []) }}"
       failed_when: false
 
-    - name: Purge k8s + containerd packages
+    - name: Purge the cluster packages
       ansible.builtin.apt:
-        name:
-          - kubeadm
-          - kubelet
-          - kubectl
-          - containerd.io
+        name: "{{ ['kubeadm', 'kubelet', 'kubectl', 'kubernetes-cni'] + (['containerd.io'] if _purge_containerd else []) }}"
         state: absent
         purge: true
-        autoremove: true
       failed_when: false
 
     # =====================================================================
@@ -161,6 +180,9 @@
         - /var/lib/containerd
         - /var/openebs
         - /var/lib/rawfile-localpv
+      # A shared containerd keeps its config and store: docker's containers
+      # live in that store, and the next join renders config.toml again.
+      when: _purge_containerd or item not in ['/etc/containerd', '/var/lib/containerd']
       failed_when: false
 
     - name: Remove vanilla kubectl / helm from ~/.local/bin

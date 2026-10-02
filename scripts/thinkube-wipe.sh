@@ -52,7 +52,10 @@
 #
 # WHAT IS DESTROYED
 # -----------------
-#   Kubernetes      kubeadm reset, purge kubeadm/kubelet/kubectl/containerd.io,
+#   Kubernetes      kubeadm reset, purge kubeadm/kubelet/kubectl, and
+#                   containerd.io only when no other installed package depends
+#                   on it (on DGX OS docker-ce does, and purging it took docker
+#                   and the DGX OS extras with it); nothing is autoremoved;
 #                   /etc/kubernetes, /var/lib/kubelet, /var/lib/etcd, CNI
 #   Container tools podman, buildah, skopeo, podman-compose, podman-toolbox,
 #                   qemu-user-static, binfmt-support, and their state
@@ -315,18 +318,28 @@ PURGE_PKGS="kubeadm kubelet kubectl \
 # being kept is the layers underneath, not the packages. They are appended
 # rather than filtered out: podman-compose and podman-toolbox contain the word
 # podman, so stripping by name clipped them into '-compose' and '-toolbox'.
+# containerd.io is Docker's containerd package. On DGX OS docker-ce depends on
+# it, and purging it there removed docker and, through autoremove, the DGX OS
+# packages only docker kept installed (nvidia-system-extra, nv-docker-options,
+# rasdaemon, ...). It goes only when nothing else installed depends on it, and
+# nothing is ever autoremoved: the leftovers are small, that damage was not.
+CONTAINERD_USERS=$(apt-cache rdepends --installed --important containerd.io 2>/dev/null \
+    | awk 'f && NF {sub(/^[ |]+/, ""); print} /^Reverse Depends:/ {f=1}' | sort -u | paste -sd' ')
 if [ "$KEEP_IMAGES" -eq 0 ]; then
-    PURGE_PKGS="$PURGE_PKGS containerd.io podman buildah skopeo"
+    PURGE_PKGS="$PURGE_PKGS podman buildah skopeo"
+    if [ -z "$CONTAINERD_USERS" ]; then
+        PURGE_PKGS="$PURGE_PKGS containerd.io"
+    else
+        echo "  keeping containerd.io: ${CONTAINERD_USERS} depend on it"
+    fi
 else
     echo "  keeping containerd.io, podman, buildah and skopeo (--keep-images)"
 fi
 run apt-mark unhold ${PURGE_PKGS}
 if [ "$DRY" -eq 1 ]; then
     echo "  [dry-run] apt-get purge -y ${PURGE_PKGS}"
-    echo "  [dry-run] apt-get autoremove --purge -y"
 else
     DEBIAN_FRONTEND=noninteractive apt-get purge -y ${PURGE_PKGS} >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y >/dev/null 2>&1 || true
 fi
 
 say "Unmounting leftover kubelet pod volumes"
@@ -342,14 +355,19 @@ say "Removing cluster and runtime state"
 # for what Kubernetes runs, podman's for what the image builds produce. Both are
 # content addressed and re-derivable, which is why --keep-images may spare them
 # while every other directory here still goes.
-STATE_DIRS="/etc/kubernetes /etc/cni /etc/containerd \
+STATE_DIRS="/etc/kubernetes /etc/cni \
             /var/lib/kubelet /var/lib/etcd \
             /var/lib/tailscale /var/lib/cni \
             /var/openebs /var/lib/rawfile-localpv /var/csi /var/local/openebs \
             /opt/cni /opt/containerd"
-if [ "$KEEP_IMAGES" -eq 0 ]; then
-    STATE_DIRS="$STATE_DIRS /var/lib/containerd /var/lib/containers"
+# A shared containerd keeps /etc/containerd and its store: docker's containers
+# live in that store, and the next install renders config.toml again.
+if [ -n "$CONTAINERD_USERS" ]; then
+    echo "  keeping /etc/containerd and /var/lib/containerd: ${CONTAINERD_USERS} use containerd"
+elif [ "$KEEP_IMAGES" -eq 0 ]; then
+    STATE_DIRS="$STATE_DIRS /etc/containerd /var/lib/containerd /var/lib/containers"
 else
+    STATE_DIRS="$STATE_DIRS /etc/containerd"
     echo "  keeping /var/lib/containerd and /var/lib/containers (--keep-images)"
 fi
 for d in $STATE_DIRS; do
@@ -478,15 +496,19 @@ say "Survey of state this script recognises as non-fresh"
 left=0
 note() { echo "  $*"; left=$((left + 1)); }
 
-SURVEY_DIRS="/etc/kubernetes /etc/cni /etc/containerd /var/lib/kubelet \
+SURVEY_DIRS="/etc/kubernetes /etc/cni /var/lib/kubelet \
              /var/lib/etcd /var/lib/tailscale \
              /var/local/openebs /opt/cni /opt/containerd \
              /ssd/object_store /storage/filer_store"
 # The image stores were kept on purpose, so they are not failures of the wipe.
 # They are reported separately below, because a run that kept them is not a
 # clean-baseline run and should never be mistaken for one later.
-if [ "$KEEP_IMAGES" -eq 0 ]; then
-    SURVEY_DIRS="$SURVEY_DIRS /var/lib/containerd /var/lib/containers"
+if [ -n "$CONTAINERD_USERS" ]; then
+    SURVEY_DIRS="$SURVEY_DIRS /var/lib/containers"
+elif [ "$KEEP_IMAGES" -eq 0 ]; then
+    SURVEY_DIRS="$SURVEY_DIRS /etc/containerd /var/lib/containerd /var/lib/containers"
+else
+    SURVEY_DIRS="$SURVEY_DIRS /etc/containerd"
 fi
 for d in $SURVEY_DIRS; do
     [ -e "$d" ] && note "still present: $d"
@@ -496,7 +518,8 @@ done
 
 SURVEY_PKGS="kubeadm kubelet kubectl tailscale"
 if [ "$KEEP_IMAGES" -eq 0 ]; then
-    SURVEY_PKGS="$SURVEY_PKGS containerd.io podman buildah skopeo"
+    SURVEY_PKGS="$SURVEY_PKGS podman buildah skopeo"
+    [ -z "$CONTAINERD_USERS" ] && SURVEY_PKGS="$SURVEY_PKGS containerd.io"
 fi
 for p in $SURVEY_PKGS; do
     dpkg -l "$p" 2>/dev/null | grep -q '^ii' && note "still installed: $p"
