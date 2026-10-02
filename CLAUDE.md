@@ -180,6 +180,27 @@ The full design and migration plan is in
 
 Playbooks target host groups from inventory (e.g., `k8s_control_plane`, `baremetal`). They use the `kubernetes.core` Ansible collection for k8s operations. Sensitive values come from environment variables loaded via `$HOME/.env`.
 
+## Working rules
+
+The same rules every fresh IDE gets as `~/.claude/OPERATIONS-POLICY.md`
+(installed by `code-server/15_configure_environment.yaml`); here so a session
+on the installer host follows them too.
+
+- A wipe, reset, rollback, reboot or delete of a node, cluster or image
+  store is asked for on its own line, naming the host and what is lost, and
+  runs only on a yes to THAT line. A yes to a plan is not a yes to each step
+  inside it.
+- Reset the smallest thing that makes the test valid. A failure in
+  add-nodes resets the workers, not the control plane.
+- Diagnose until the practical fix is known, then stop. Attribution without
+  an audit source is speculation; say it is unprovable.
+- What the user says they did is a fact, not a hypothesis. Never read their
+  shell history, transcripts or personal files to check it.
+- Before trusting a tool's output, say what it measured: ICMP is not TCP,
+  `iptables -t nat` is not the ruleset, `tail -2` hides the error.
+- Verify the result, not the completion. A step that ran is not a step that
+  produced the right state.
+
 ## Path Safety
 
 This repository is the source of truth. The installer clones it to `/tmp/` for execution. Never edit files in the `/tmp/` clone - changes will be lost. Always edit and commit from this repository.
