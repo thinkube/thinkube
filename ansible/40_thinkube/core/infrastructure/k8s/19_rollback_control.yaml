@@ -104,51 +104,6 @@
       changed_when: _kubeadm_reset.rc == 0
 
     # =====================================================================
-    # apt: unhold + purge the cluster packages
-    #
-    # containerd.io is Docker's containerd package. On DGX OS docker-ce
-    # depends on it, and purging it there removed docker and, through
-    # autoremove, the DGX OS packages only docker kept installed
-    # (nvidia-system-extra, nv-docker-options, rasdaemon, ...). It is
-    # purged only when no other installed package depends on it, and
-    # nothing is autoremoved.
-    # =====================================================================
-    - name: Find installed packages that depend on containerd.io
-      ansible.builtin.shell: |
-        set -o pipefail
-        apt-cache rdepends --installed --important containerd.io 2>/dev/null \
-          | awk 'f && NF {sub(/^[ |]+/, ""); print} /^Reverse Depends:/ {f=1}' \
-          | sort -u
-      args:
-        executable: /bin/bash
-      register: _containerd_rdepends
-      changed_when: false
-      failed_when: false
-
-    - name: Decide whether containerd.io is Thinkube's to purge
-      ansible.builtin.set_fact:
-        _purge_containerd: "{{ _containerd_rdepends.stdout | trim | length == 0 }}"
-
-    - name: Keep containerd.io when another package depends on it
-      ansible.builtin.debug:
-        msg: "containerd.io stays installed: {{ _containerd_rdepends.stdout_lines | join(', ') }} depend(s) on it"
-      when: not _purge_containerd
-
-    - name: Unhold the cluster packages
-      ansible.builtin.dpkg_selections:
-        name: "{{ item }}"
-        selection: install
-      loop: "{{ ['kubeadm', 'kubelet', 'kubectl'] + (['containerd.io'] if _purge_containerd else []) }}"
-      failed_when: false
-
-    - name: Purge the cluster packages
-      ansible.builtin.apt:
-        name: "{{ ['kubeadm', 'kubelet', 'kubectl', 'kubernetes-cni'] + (['containerd.io'] if _purge_containerd else []) }}"
-        state: absent
-        purge: true
-      failed_when: false
-
-    # =====================================================================
     # Wipe state directories owned by Thinkube
     # =====================================================================
     - name: Unmount any lingering kubelet pod volumes
@@ -163,16 +118,11 @@
       loop:
         - /etc/kubernetes
         - /etc/cni/net.d
-        - /etc/containerd
         - /var/lib/kubelet
-        - /var/lib/containerd
         - /var/lib/etcd
         - /var/openebs           # OpenEBS Rawfile dataroot (default)
         - /var/lib/rawfile-localpv  # alternate OpenEBS path observed in some chart versions
         - /var/csi               # CSI persistent volume data (rawfile-localpv)
-      # A shared containerd keeps its config and store: docker's containers
-      # live in that store, and the next join renders config.toml again.
-      when: _purge_containerd or item not in ['/etc/containerd', '/var/lib/containerd']
       failed_when: false
 
     - name: Remove user kubeconfig
@@ -378,10 +328,10 @@
           - "==============================================="
           - "Removed:"
           - "  - Cluster state via kubeadm reset"
-          - "  - apt packages: kubeadm, kubelet, kubectl, kubernetes-cni purged; containerd.io only when nothing else depends on it"
+          - "  - apt packages: left installed; the install moves them to its pinned versions"
           - "  - apt repos and keys for k8s + docker (in /etc/apt/...)"
-          - "  - State directories: /etc/kubernetes, /etc/cni/net.d, /etc/containerd,"
-          - "    /var/lib/{kubelet,containerd,etcd,openebs}, /var/lib/rawfile-localpv"
+          - "  - State directories: /etc/kubernetes, /etc/cni/net.d,"
+          - "    /var/lib/{kubelet,etcd,openebs}, /var/lib/rawfile-localpv"
           - "  - Vanilla kubectl/helm from ~/.local/bin"
           - "  - Kernel module + sysctl drop-ins under /etc/{modules-load,sysctl}.d/"
           - "  - Cilium-created network interfaces"
