@@ -7,12 +7,13 @@ Usage: python3 - DOMAIN ALIAS < agent_clients_smoke.py
 
 1. The LLM gateway answers ALIAS with the final text in message.content,
    with thinking on and with thinking off.
-2. Each client (opencode, Pi, Claude Code), run once without a UI against the
+2. Each local client (opencode, Pi), run once without a UI against the
    gateway's ALIAS, calls the thinkube-control MCP tool list_services_minimal
    and answers with the number of services Thinkube Control reports.
 
-Claude Code is pointed at the gateway's Anthropic endpoint, so it needs no
-Anthropic account. Prints one line per check; exits 1 when any check fails.
+Claude Code is not checked: it works with Claude under the user's own
+Anthropic account, not with the gateway. Prints one line per check; exits 1
+when any check fails.
 """
 
 import json
@@ -125,17 +126,5 @@ assistant = [e["message"] for e in events if e.get("type") == "message_end" and 
 answer = "".join(c.get("text", "") for c in (assistant[-1]["content"] if assistant else []) if c.get("type") == "text")
 check_client("pi", called, answer, proc, expected)
 
-# Claude Code through the gateway's Anthropic endpoint (/v1/messages).
-proc, events = run(
-    ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", ALIAS,
-     "--allowedTools", f"mcp__thinkube-control__{TOOL}", PROMPT],
-    env={"ANTHROPIC_BASE_URL": GATEWAY, "ANTHROPIC_AUTH_TOKEN": TOKEN, "ANTHROPIC_API_KEY": "",
-         "ANTHROPIC_DEFAULT_HAIKU_MODEL": ALIAS, "ANTHROPIC_DEFAULT_SONNET_MODEL": ALIAS,
-         "ANTHROPIC_DEFAULT_OPUS_MODEL": ALIAS},
-)
-called = any(e.get("type") == "assistant" and any(c.get("type") == "tool_use" and c.get("name") == f"mcp__thinkube-control__{TOOL}"
-                                                   for c in e["message"].get("content", [])) for e in events)
-answer = next((e.get("result", "") for e in events if e.get("type") == "result"), "")
-check_client("claude-code", called, answer, proc, expected)
 
 sys.exit(1 if failures else 0)
