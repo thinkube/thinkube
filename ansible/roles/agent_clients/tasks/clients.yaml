@@ -165,14 +165,12 @@
 
 # Claude Code -----------------------------------------------------------------
 
-# One registration at user scope serves every directory. The removals undo the
-# places earlier playbooks wrote the same servers to: local scope, the
-# mcpServers key of ~/.claude/settings.json (which Claude Code does not read)
-# and three workspace .mcp.json files.
+# One registration at user scope serves every directory. claude mcp add-json
+# refuses a name that exists, so each server is removed first and added again.
 - name: Register the MCP servers with Claude Code (user scope)
   ansible.builtin.shell: |
     {{ kubectl_bin }} exec -n code-server {{ agent_code_server_pod }} -- \
-      bash -l -c 'claude mcp remove "$1" -s local >/dev/null 2>&1; claude mcp remove "$1" -s user >/dev/null 2>&1; claude mcp add-json -s user "$1" "$2"' \
+      bash -l -c 'claude mcp remove "$1" -s user >/dev/null 2>&1; claude mcp add-json -s user "$1" "$2"' \
       _ {{ item.name | quote }} {{ agent_claude_server | to_json | quote }}
   vars:
     agent_claude_server: "{{ {'type': 'http', 'url': item.url, 'headers': ({'Authorization': 'Bearer ' ~ agent_bearer_tokens[item.bearer_token_env]} if item.bearer_token_env is defined else {})}
@@ -181,17 +179,3 @@
   loop_control:
     label: "{{ item.name }}"
   no_log: "{{ item.bearer_token_env is defined }}"
-
-- name: Remove the MCP servers from ~/.claude/settings.json
-  ansible.builtin.include_tasks: json_file.yaml
-  vars:
-    json_file: "{{ agent_claude_dir }}/settings.json"
-    json_changes:
-      delete: "{{ agent_mcp_servers | map(attribute='name') | map('regex_replace', '^(.*)$', 'mcpServers/\\1') | map('split', '/') | list }}"
-
-- name: Remove the workspace .mcp.json files
-  ansible.builtin.file:
-    path: "{{ agent_home_host_path }}/{{ item }}"
-    state: absent
-  become: true
-  loop: "{{ agent_claude_legacy_mcp_files }}"

@@ -439,19 +439,6 @@
           with code-server/20_redeploy.yaml before running this playbook.
         quiet: true
 
-    # rtk is /usr/local/bin/rtk in the image, on every PATH. A home that was set
-    # up before the move still carries ~/.local/bin/rtk -> ~/.cargo/bin/rtk, a
-    # link that now dangles; repoint it so a stale link cannot shadow the image
-    # binary for the orchestrator. Idempotent (ln -sf); the guard proves it resolves.
-    - name: Point the legacy ~/.local/bin/rtk link at the image binary
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "mkdir -p /home/thinkube/.local/bin && \
-            ln -sf /usr/local/bin/rtk /home/thinkube/.local/bin/rtk && \
-            /home/thinkube/.local/bin/rtk gain >/dev/null 2>&1 && \
-            echo '✅ ~/.local/bin/rtk -> /usr/local/bin/rtk'"
-      changed_when: false
-
     # Automatic token savings: register rtk's PreToolUse hook in Claude Code so an
     # agent's Bash commands are transparently rewritten to run through rtk (`rtk hook
     # claude`). Idempotent — the guard greps for the hook already present in
@@ -1279,22 +1266,6 @@
       loop: "{{ extension_installs.results }}"
       loop_control:
         label: "{{ item.item }}"
-
-    # thinkube-tandem-chat (the Tandem chats in VS Code's chat panel) replaces Pi
-    # Agent Studio, which earlier images installed; a pod that has it loses it.
-    - name: List the installed extensions
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          code-server --list-extensions
-      register: installed_extensions
-      changed_when: false
-
-    - name: Remove Pi Agent Studio
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          code-server --uninstall-extension johnny-zhao.pi-agent-studio
-      when: "'johnny-zhao.pi-agent-studio' in installed_extensions.stdout_lines"
-
 
     - name: Create temporary settings file from template
       ansible.builtin.template:
