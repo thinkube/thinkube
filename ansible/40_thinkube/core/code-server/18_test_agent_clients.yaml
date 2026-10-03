@@ -1,0 +1,63 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/code-server/18_test_agent_clients.yaml
+# Description:
+#   Smoke test of the agentic clients of Thinkube IDE against the LLM gateway:
+#   the gateway answers in message.content with thinking on and off, and
+#   opencode, Pi and Claude Code each call a read-only thinkube-control MCP
+#   tool and answer with what the cluster reports (files/agent_clients_smoke.py).
+#
+# Requirements:
+#   - The model behind the alias is loaded (thinkube-control Models page, or the
+#     load_llm_model MCP tool). The test does not load it: a load takes a GPU.
+#   - thinkube-control/13_configure_code_server.yaml has configured the clients.
+#
+# Usage:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/code-server/18_test_agent_clients.yaml
+#   ./scripts/tk_ansible ansible/40_thinkube/core/code-server/18_test_agent_clients.yaml -e agent_test_alias=thinkube-deep
+
+- name: Test the agentic clients against the LLM gateway
+  hosts: k8s_control_plane
+  gather_facts: false
+  vars_files:
+    - ../thinkube-control/vars/model_aliases.yaml
+
+  vars:
+    code_server_namespace: "code-server"
+    agent_test_alias: "{{ thinkube_model_aliases | list | first }}"
+
+  tasks:
+    - name: Check the alias is one the gateway serves
+      ansible.builtin.assert:
+        that: agent_test_alias in thinkube_model_aliases
+        fail_msg: "{{ agent_test_alias }} is not in thinkube_model_aliases ({{ thinkube_model_aliases | list | join(', ') }})"
+        quiet: true
+
+    - name: Take the name of the running code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} -l app=code-server \
+          --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}'
+      register: pod_name
+      changed_when: false
+
+    - name: Run the smoke test in the code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -i -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -l -c 'python3 - "$1" "$2"' _ {{ domain_name | quote }} {{ agent_test_alias | quote }}
+      args:
+        stdin: "{{ lookup('file', 'files/agent_clients_smoke.py') }}"
+      register: smoke
+      changed_when: false
+      failed_when: false
+
+    - name: Show the results
+      ansible.builtin.debug:
+        msg: "{{ (smoke.stdout_lines + smoke.stderr_lines) }}"
+
+    - name: Fail when a check failed
+      ansible.builtin.assert:
+        that: smoke.rc == 0
+        fail_msg: "The agentic clients' smoke test failed for {{ agent_test_alias }} ({{ thinkube_model_aliases[agent_test_alias].model }}); see the results above"
+        quiet: true
