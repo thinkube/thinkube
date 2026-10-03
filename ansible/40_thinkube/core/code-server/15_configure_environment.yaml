@@ -424,8 +424,7 @@
             /usr/local/bin/rtk gain >/dev/null 2>&1 && \
             test -L /usr/local/bin/tk_images && \
             /usr/local/bin/opencode --version >/dev/null && \
-            /usr/local/bin/pi --version >/dev/null && \
-            ls /opt/agent-clients/vsix/pi-agent-studio-*.vsix >/dev/null"
+            /usr/local/bin/pi --version >/dev/null"
       register: image_toolchain
       failed_when: false
       changed_when: false
@@ -435,7 +434,7 @@
         that: image_toolchain.rc == 0
         fail_msg: >-
           The running code-server pod lacks uv, cargo, rtk, the tk_* commands
-          or the agentic clients (opencode, pi, the Pi Agent Studio vsix).
+          or the agentic clients (opencode, pi).
           They are part of the code-server-dev image; rebuild and redeploy it
           with code-server/20_redeploy.yaml before running this playbook.
         quiet: true
@@ -1248,6 +1247,7 @@
         extension_repos:
           - thinkube-theme
           - thinkube-notebook-view
+          - thinkube-agent-chat
           - thinkube-cicd-monitor
           - thinkube-tandem
         extension_branch: "{{ thinkube_ref }}"
@@ -1280,17 +1280,20 @@
       loop_control:
         label: "{{ item.item }}"
 
-    # Pi Agent Studio, the VS Code front end for Pi. The image carries its vsix
-    # at a pinned version and checksum (harbor-images/base-images/
-    # code-server-dev.Containerfile.j2); the extension drives the image's
-    # pi over RPC, so it uses the pinned Pi, its configuration and the
-    # thinkube-confirm extension (vscode-settings.json.j2 points it there).
-    - name: Install the Pi Agent Studio extension from the image
+    # thinkube-agent-chat (@pi, @opencode in VS Code's chat) replaces Pi
+    # Agent Studio, which earlier images installed; a pod that has it loses it.
+    - name: List the installed extensions
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c 'set -e; vsix=$(ls /opt/agent-clients/vsix/pi-agent-studio-*.vsix); code-server --install-extension "$vsix" --force'
-      register: pi_agent_studio_install
-      changed_when: "'was successfully installed' in pi_agent_studio_install.stdout"
+          code-server --list-extensions
+      register: installed_extensions
+      changed_when: false
+
+    - name: Remove Pi Agent Studio
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          code-server --uninstall-extension johnny-zhao.pi-agent-studio
+      when: "'johnny-zhao.pi-agent-studio' in installed_extensions.stdout_lines"
 
 
     - name: Create temporary settings file from template

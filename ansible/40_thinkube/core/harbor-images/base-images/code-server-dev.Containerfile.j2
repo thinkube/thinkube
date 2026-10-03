@@ -110,7 +110,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
 ###############################################################################
 # code-server - VSCode in the browser
 ###############################################################################
-RUN curl -fsSL https://code-server.dev/install.sh | sh
+# Pinned: thinkube-agent-chat uses VS Code's proposed chat API as defined in
+# this version (VS Code 1.140.0); a new version is taken on purpose and
+# checked with that extension.
+ARG CODE_SERVER_VERSION=4.140.0
+RUN curl -fsSL https://code-server.dev/install.sh | sh -s -- --version "${CODE_SERVER_VERSION}" && \
+    code-server --version | grep -q "^${CODE_SERVER_VERSION} "
 
 # Create code symlink for Claude Code IDE integration
 RUN if [ -f /usr/bin/code-server ]; then \
@@ -426,12 +431,12 @@ RUN ARCH="$(uname -m)" && \
 
 ###############################################################################
 # Agentic clients: opencode and Pi at the exact versions agent-clients/
-# package.json names, and the Pi Agent Studio extension at a pinned version
-# and checksum. The build resolves the dependency tree and installs exactly
-# that tree with no package scripts, except opencode-ai's postinstall, which
-# links the opencode binary for this architecture; package-lock.json stays in
-# /opt/agent-clients as the record of what the image carries. The extension is
-# installed into the user's code-server by 15_configure_environment.yaml.
+# package.json names. The build resolves the dependency tree and installs
+# exactly that tree with no package scripts, except opencode-ai's postinstall,
+# which links the opencode binary for this architecture; package-lock.json
+# stays in /opt/agent-clients as the record of what the image carries. VS
+# Code's chat reaches both through the thinkube-agent-chat extension
+# (@pi, @opencode), installed by 15_configure_environment.yaml.
 #
 # Nothing a client does leaves the cluster by default:
 #   opencode: no update check, no models.dev/models.opencode.ai catalog fetch,
@@ -452,18 +457,11 @@ ENV OPENCODE_DISABLE_AUTOUPDATE=1 \
     DISABLE_TELEMETRY=1 \
     DISABLE_ERROR_REPORTING=1 \
     DISABLE_AUTOUPDATER=1
-ARG PI_AGENT_STUDIO_VERSION=1.3.10
-ARG PI_AGENT_STUDIO_SHA256=3a7ea211fe81e0ed15a372e8e5d30e355519db27bfdd989e14573bcb4f4d9919
 COPY agent-clients/ /opt/agent-clients/
 RUN cd /opt/agent-clients && \
     npm install --package-lock-only --ignore-scripts --no-audit --no-fund && \
     npm ci --ignore-scripts --omit=dev --no-audit --no-fund && \
     (cd node_modules/opencode-ai && node postinstall.mjs) && \
-    mkdir -p vsix && \
-    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
-        "https://open-vsx.org/api/johnny-zhao/pi-agent-studio/${PI_AGENT_STUDIO_VERSION}/file/johnny-zhao.pi-agent-studio-${PI_AGENT_STUDIO_VERSION}.vsix" \
-        -o "vsix/pi-agent-studio-${PI_AGENT_STUDIO_VERSION}.vsix" && \
-    echo "${PI_AGENT_STUDIO_SHA256}  vsix/pi-agent-studio-${PI_AGENT_STUDIO_VERSION}.vsix" | sha256sum -c - && \
     rm -rf /root/.npm && \
     ln -s /opt/agent-clients/node_modules/.bin/opencode /usr/local/bin/opencode && \
     ln -s /opt/agent-clients/node_modules/.bin/pi /usr/local/bin/pi && \
