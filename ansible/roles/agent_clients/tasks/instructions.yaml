@@ -1,0 +1,76 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Writes the global operating instructions for every agentic client:
+#   opencode     ~/.config/opencode/AGENTS.md
+#   Pi           ~/.pi/agent/AGENTS.md
+#   Claude Code  ~/.claude/AGENTS.md, imported by ~/.claude/CLAUDE.md
+# AGENTS.md is one flat file: only Claude Code resolves @imports. CLAUDE.md
+# holds "@AGENTS.md" and Claude-only content (rtk's @RTK.md), so no text is in
+# both. Pi reads ~/.pi/agent only, never ~/.claude, so it gets each text once.
+
+- name: Check the inputs of the instructions
+  ansible.builtin.assert:
+    that:
+      - system_username is defined
+      - keycloak_realm is defined
+      - auth_realm_username is defined
+    fail_msg: "system_username, keycloak_realm and auth_realm_username come from the inventory"
+    quiet: true
+
+- name: Ensure the clients' configuration directories exist
+  ansible.builtin.file:
+    path: "{{ agent_home_host_path }}/{{ item }}"
+    state: directory
+    mode: '0755'
+  become: true
+  become_user: "{{ system_username }}"
+  loop:
+    - "{{ agent_opencode_dir }}"
+    - "{{ agent_pi_dir }}"
+    - "{{ agent_claude_dir }}"
+
+- name: Write AGENTS.md for opencode, Pi and Claude Code
+  ansible.builtin.template:
+    src: AGENTS.md.j2
+    dest: "{{ agent_home_host_path }}/{{ item }}/AGENTS.md"
+    mode: '0644'
+  become: true
+  become_user: "{{ system_username }}"
+  loop:
+    - "{{ agent_opencode_dir }}"
+    - "{{ agent_pi_dir }}"
+    - "{{ agent_claude_dir }}"
+
+- name: Check for ~/.claude/CLAUDE.md
+  ansible.builtin.stat:
+    path: "{{ agent_home_host_path }}/{{ agent_claude_dir }}/CLAUDE.md"
+  register: agent_claude_md_stat
+
+- name: Read ~/.claude/CLAUDE.md
+  ansible.builtin.slurp:
+    src: "{{ agent_home_host_path }}/{{ agent_claude_dir }}/CLAUDE.md"
+  register: agent_claude_md_raw
+  when: agent_claude_md_stat.stat.exists
+
+# The shim keeps every line it did not write (such as rtk's @RTK.md and the
+# user's own text) and drops the imports AGENTS.md replaces.
+- name: Write the Claude Code shim ~/.claude/CLAUDE.md
+  ansible.builtin.copy:
+    content: "{{ (['@AGENTS.md'] + agent_claude_md_kept) | join('\n') | regex_replace('\n{3,}', '\n\n') | trim }}\n"
+    dest: "{{ agent_home_host_path }}/{{ agent_claude_dir }}/CLAUDE.md"
+    mode: '0644'
+  become: true
+  become_user: "{{ system_username }}"
+  vars:
+    agent_claude_md_lines: "{{ (agent_claude_md_raw.content | b64decode).split('\n') if agent_claude_md_stat.stat.exists else [] }}"
+    agent_claude_md_owned: "{{ ['@AGENTS.md'] + (agent_claude_legacy_parts | map('regex_replace', '^(.*)$', '@\\1.md') | list) }}"
+    agent_claude_md_kept: "{{ agent_claude_md_lines | reject('in', agent_claude_md_owned) | list }}"
+
+- name: Remove the instruction files AGENTS.md replaces
+  ansible.builtin.file:
+    path: "{{ agent_home_host_path }}/{{ agent_claude_dir }}/{{ item }}.md"
+    state: absent
+  become: true
+  loop: "{{ agent_claude_legacy_parts }}"

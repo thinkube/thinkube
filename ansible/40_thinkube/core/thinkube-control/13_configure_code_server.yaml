@@ -5,7 +5,8 @@
 # ansible/40_thinkube/core/thinkube-control/13_configure_code_server.yaml
 # Description:
 #   Configure code-server with API token for CI/CD extension after thinkube-control deployment
-#   Also configures Claude Code MCP integration using the same token
+#   Also configures the agentic clients (opencode, Pi, Claude Code): the LLM
+#   gateway's models and the MCP servers
 #
 # Requirements:
 #   - thinkube-control must be deployed (creates the MCP default token)
@@ -163,38 +164,23 @@
           - ""
           - "The thinkube-cicd VS Code extension will now be able to monitor pipelines"
 
-    - name: Save token and domain for local configuration
+    - name: Save the token for the agentic clients' configuration
       ansible.builtin.set_fact:
         mcp_token_to_share: "{{ api_token }}"
-        mcp_domain_to_share: "{{ domain_name }}"
       delegate_to: localhost
       delegate_facts: true
 
-# Second play to configure Claude Code MCP in code-server pod
-- name: Configure Claude Code MCP integration
+# Second play: the agentic clients of Thinkube IDE (opencode, Pi, Claude
+# Code) get the gateway's models and the MCP servers, all from one list
+# (ansible/roles/agent_clients/vars/main.yaml).
+- name: Configure the agentic clients' models and MCP servers
   hosts: k8s_control_plane
   gather_facts: true
+  vars_files:
+    - vars/model_aliases.yaml
 
   vars:
-    cicd_api_token: "{{ hostvars['localhost']['mcp_token_to_share'] }}"
-    control_domain_name: "{{ hostvars['localhost']['mcp_domain_to_share'] }}"
     code_server_namespace: "code-server"
-    # Two names for one file: the pod mounts the node's shared-code directory
-    # at /home/thinkube, so the settings the pod reads live on the node at
-    # <shared-code>/.claude/settings.json.
-    claude_settings_path: "/home/thinkube/.claude/settings.json"
-    claude_settings_host_path: "/home/{{ system_username }}/shared-code/.claude/settings.json"
-    # --secrets points at the file written by
-    # code-server/15_configure_environment.yaml; it holds THINKUBE_PASSWORD,
-    # the Keycloak password the browser types when signing in to Thinkube apps.
-    playwright_mcp_server:
-      command: /home/thinkube/.npm-global/bin/playwright-mcp
-      args:
-        - --headless
-        - --executable-path
-        - /usr/bin/chromium-browser
-        - --secrets
-        - /home/thinkube/.config/playwright-mcp/secrets.env
 
   tasks:
     # The previous play restarts code-server, so for a while there is either no
@@ -214,141 +200,11 @@
       delay: 5
       until: cs_pod_name.stdout != ""
 
-    # Read and write the settings on the node rather than through
-    # `kubectl exec`. The old write passed the JSON through `bash -c '...'`
-    # with a heredoc, so a single apostrophe anywhere in the settings closed
-    # the quoted string: on 2026-09-08 the phrase "this project's transcripts"
-    # inside autoMode.environment left a bare `)` and the shell refused the
-    # command. Going through the host keeps the JSON out of any shell.
-    - name: Ensure the Claude configuration directory exists
-      ansible.builtin.file:
-        path: "{{ claude_settings_host_path | dirname }}"
-        state: directory
-        mode: '0755'
-        owner: "{{ system_username }}"
-        group: "{{ system_username }}"
-      become: true
-
-    - name: Check for existing Claude settings
-      ansible.builtin.stat:
-        path: "{{ claude_settings_host_path }}"
-      register: claude_settings_stat
-
-    - name: Read existing Claude settings
-      ansible.builtin.slurp:
-        src: "{{ claude_settings_host_path }}"
-      register: claude_settings_raw
-      when: claude_settings_stat.stat.exists
-
-    - name: Parse Claude settings
-      ansible.builtin.set_fact:
-        claude_settings: "{{ (claude_settings_raw.content | b64decode | from_json)
-                             if claude_settings_stat.stat.exists else {} }}"
-
-    - name: Update Claude settings with MCP servers
-      ansible.builtin.set_fact:
-        updated_claude_settings: "{{ claude_settings | combine({
-          'mcpServers': (claude_settings.mcpServers | default({})) | combine({
-            'thinkube-control': {
-              'type': 'http',
-              'url': 'https://control.' + control_domain_name + '/mcp',
-              'headers': {
-                'Authorization': 'Bearer ' + cicd_api_token
-              }
-            },
-            'tk-package-version': {
-              'type': 'http',
-              'url': 'https://control.' + control_domain_name + '/tk-package-version/mcp'
-            },
-            'playwright': playwright_mcp_server
-          })
-        }, recursive=True) }}"
-
-    - name: Write updated Claude settings
-      ansible.builtin.copy:
-        content: "{{ updated_claude_settings | to_nice_json }}\n"
-        dest: "{{ claude_settings_host_path }}"
-        mode: '0644'
-        owner: "{{ system_username }}"
-        group: "{{ system_username }}"
-      become: true
-
-    # `claude mcp add-json` refuses a name that already exists, so a drifted
-    # entry was never corrected. Each server is removed before it is added.
-    - name: Register thinkube-control MCP server via Claude CLI
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ cs_pod_name.stdout }} -- \
-          bash -l -c "claude mcp remove thinkube-control -s local >/dev/null 2>&1; claude mcp add-json thinkube-control '{\"type\":\"http\",\"url\":\"https://control.{{ control_domain_name }}/mcp\",\"headers\":{\"Authorization\":\"Bearer {{ cicd_api_token }}\"}}'"
-      register: mcp_add_result
-
-    - name: Register tk-package-version MCP server via Claude CLI
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ cs_pod_name.stdout }} -- \
-          bash -l -c "claude mcp remove tk-package-version -s local >/dev/null 2>&1; claude mcp add-json tk-package-version '{\"type\":\"http\",\"url\":\"https://control.{{ control_domain_name }}/tk-package-version/mcp\"}'"
-      register: mcp_pkg_add_result
-
-    - name: Register Playwright MCP server via Claude CLI
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ cs_pod_name.stdout }} -- \
-          bash -l -c 'claude mcp remove playwright -s local >/dev/null 2>&1; claude mcp add-json playwright "$1"' \
-          _ {{ playwright_mcp_server | to_json | quote }}
-      register: mcp_pw_add_result
-
-    - name: Create MCP config JSON
-      ansible.builtin.set_fact:
-        mcp_config_json: |
-          {
-            "mcpServers": {
-              "thinkube-control": {
-                "type": "http",
-                "url": "https://control.{{ control_domain_name }}/mcp",
-                "headers": {
-                  "Authorization": "Bearer {{ cicd_api_token }}"
-                }
-              },
-              "tk-package-version": {
-                "type": "http",
-                "url": "https://control.{{ control_domain_name }}/tk-package-version/mcp"
-              },
-              "playwright": {{ playwright_mcp_server | to_json }}
-            }
-          }
-
-    - name: Write .mcp.json to Apps workspace folder
-      ansible.builtin.copy:
-        content: "{{ mcp_config_json }}"
-        dest: "/home/{{ system_username }}/shared-code/apps/.mcp.json"
-        mode: '0600'
-        owner: "{{ system_username }}"
-        group: "{{ system_username }}"
-      become: true
-
-    - name: Write .mcp.json to Platform workspace folder
-      ansible.builtin.copy:
-        content: "{{ mcp_config_json }}"
-        dest: "/home/{{ system_username }}/shared-code/thinkube-platform/.mcp.json"
-        mode: '0600'
-        owner: "{{ system_username }}"
-        group: "{{ system_username }}"
-      become: true
-
-    - name: Write .mcp.json to User Templates workspace folder
-      ansible.builtin.copy:
-        content: "{{ mcp_config_json }}"
-        dest: "/home/{{ system_username }}/shared-code/user-templates/.mcp.json"
-        mode: '0600'
-        owner: "{{ system_username }}"
-        group: "{{ system_username }}"
-      become: true
-
-    - name: Display MCP configuration info
-      ansible.builtin.debug:
-        msg:
-          - "MCP server configured: https://control.{{ control_domain_name }}/mcp"
-          - "Token: MCP default token (from thinkube-control namespace)"
-          - "Location: {{ claude_settings_path }}"
-          - "Location: /home/thinkube/apps/.mcp.json"
-          - "Location: /home/thinkube/thinkube-platform/.mcp.json"
-          - "CLI registration (thinkube-control, tk-package-version): success"
-          - "CLI registration (playwright): success"
-          - "Start a new Claude Code conversation to connect"
+    - name: Configure opencode, Pi and Claude Code
+      ansible.builtin.include_role:
+        name: agent_clients
+        tasks_from: clients
+      vars:
+        agent_bearer_tokens:
+          THINKUBE_API_TOKEN: "{{ hostvars['localhost']['mcp_token_to_share'] }}"
+        agent_code_server_pod: "{{ cs_pod_name.stdout }}"

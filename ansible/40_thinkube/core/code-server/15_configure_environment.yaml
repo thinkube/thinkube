@@ -23,6 +23,7 @@
   
   vars:
     code_server_namespace: "code-server"
+    claude_code_version: "2.1.288"
     shared_code_path: "/home/{{ system_username }}/shared-code"
     code_source_path: "{{ shared_code_path }}"
     # Where the installer keeps the secrets it was given, on this host.
@@ -356,10 +357,12 @@
             npm config set prefix '/home/thinkube/.npm-global'
           "
 
-    - name: Install Claude Code via native installer
+    # Pinned: the installer takes the version to install. The image sets
+    # DISABLE_AUTOUPDATER=1, so the version stays until this pin changes.
+    - name: Install Claude Code {{ claude_code_version }} via native installer
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -l -c "curl -fsSL https://claude.ai/install.sh | bash"
+          bash -l -c "curl -fsSL https://claude.ai/install.sh | bash -s {{ claude_code_version }} && claude --version | grep -q '^{{ claude_code_version }} '"
 
     - name: Install Playwright MCP server globally
       ansible.builtin.shell: |
@@ -419,7 +422,10 @@
           bash -c "command -v uv >/dev/null && \
             test -x /opt/cargo/bin/cargo && \
             /usr/local/bin/rtk gain >/dev/null 2>&1 && \
-            test -L /usr/local/bin/tk_images"
+            test -L /usr/local/bin/tk_images && \
+            /usr/local/bin/opencode --version >/dev/null && \
+            /usr/local/bin/pi --version >/dev/null && \
+            ls /opt/agent-clients/vsix/pi-agent-studio-*.vsix >/dev/null"
       register: image_toolchain
       failed_when: false
       changed_when: false
@@ -428,10 +434,10 @@
       ansible.builtin.assert:
         that: image_toolchain.rc == 0
         fail_msg: >-
-          The running code-server pod lacks uv, cargo, rtk or the tk_* commands.
-          They are part of the code-server-dev image since 2026-10-02; rebuild
-          and redeploy it with code-server/20_redeploy.yaml before running
-          this playbook.
+          The running code-server pod lacks uv, cargo, rtk, the tk_* commands
+          or the agentic clients (opencode, pi, the Pi Agent Studio vsix).
+          They are part of the code-server-dev image; rebuild and redeploy it
+          with code-server/20_redeploy.yaml before running this playbook.
         quiet: true
 
     # rtk is /usr/local/bin/rtk in the image, on every PATH. A home that was set
@@ -533,235 +539,19 @@
               - "Calling any tool of the thinkube-control, thinkube-tandem or tk-package-version MCP servers."
               - "Scoped git add, commit and push (not force-push) in repositories under /home/thinkube/thinkube-platform."
 
-    # Work-preservation policy for Claude Code (PLATFORM DEFAULT). Thinkube's
-    # target user is a solo developer/researcher whose workspace lives in this
-    # pod — one rescheduling or image rebuild away from loss — and the cluster
-    # has no backup policy yet, so PUSHED-TO-REMOTE is the only durable state.
-    # Claude Code's shipped default ("commit/push only when asked") assumes a
-    # durable workstation and has cost users real work here; this inverts it:
-    # verified work is committed (scoped) and pushed immediately. Written as
-    # ~/.claude/GIT-POLICY.md + an @-reference appended to ~/.claude/CLAUDE.md,
-    # the same layering rtk uses. Idempotent via the reference grep.
-    - name: Check if the Claude Code git policy is installed
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "grep -q '@GIT-POLICY.md' /home/thinkube/.claude/CLAUDE.md"
-      register: git_policy_installed
-      failed_when: false
-      changed_when: false
-
-    - name: Install the Claude Code git policy (commit verified work, push immediately)
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "mkdir -p /home/thinkube/.claude && \
-            cat > /home/thinkube/.claude/GIT-POLICY.md << 'EOF'
-        # Git policy — work preservation (Thinkube platform default)
-
-        This workspace runs in a pod: uncommitted work is one rescheduling or
-        image rebuild away from loss, and the pushed remote is the only backup.
-
-        - When a change set is VERIFIED — tests pass, and where applicable it is
-          deployed — commit it immediately without asking. Verified work must
-          never sit uncommitted.
-        - Scope every commit: \`git add\` explicit paths only. NEVER
-          \`git add -A\` / \`git add .\`.
-        - Push right after committing, without asking.
-        - Unverified or work-in-progress changes: do not commit; say what is
-          pending instead.
-        - Destructive git operations (reset --hard, force-push, history
-          rewrites) still require an explicit ask.
-        EOF
-        printf '\n@GIT-POLICY.md\n' >> /home/thinkube/.claude/CLAUDE.md && \
-        echo '✅ Claude Code git policy installed'"
-      when: git_policy_installed.rc != 0
-
-    # Companion Claude Code policies, same layering as GIT-POLICY.md: each is a
-    # standalone file referenced from ~/.claude/CLAUDE.md.
-    #
-    # The guard names the NEWEST policy and the NEWEST rule text, so a pod
-    # carrying an older policy set or an older wording is still missing
-    # something and the task runs. Guarding on older content would leave every
-    # already-provisioned pod without the additions. The task rewrites all of
-    # these files whenever it runs: they are the platform's defaults, and a pod
-    # is not where they are edited.
-    - name: Check if the companion Claude Code policies are installed
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "grep -q '@CI-CD-POLICY.md' /home/thinkube/.claude/CLAUDE.md && \
-            grep -q 'a development environment inside the cluster' /home/thinkube/.claude/CI-CD-POLICY.md && \
-            grep -q '@OPERATIONS-POLICY.md' /home/thinkube/.claude/CLAUDE.md && \
-            grep -q 'A yes to a plan is not a yes to' /home/thinkube/.claude/OPERATIONS-POLICY.md"
-      register: companion_policies_installed
-      failed_when: false
-      changed_when: false
-
-    - name: Install the companion Claude Code policies (infra, comments, no-deferral, answer, plain English, no-fallback, CI/CD)
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "mkdir -p /home/thinkube/.claude && \
-            cat > /home/thinkube/.claude/INFRA-POLICY.md << 'EOF'
-        # Infrastructure policy — no pod-only mutations (Thinkube platform default)
-
-        - Any system-level change made to the pod (packages, config, tools,
-          links) is applied to its persistent home IN THE SAME ACT: the
-          container image for OS packages, the deploy playbook for user-level
-          tools and configuration.
-        - Commit and push that persistent change immediately.
-        - The pod is a cache, never a source of truth.
-        EOF
-        cat > /home/thinkube/.claude/CODE-COMMENTS-POLICY.md << 'EOF'
-        # Code comments policy (Thinkube platform default)
-
-        - A comment explains what the code does and the constraints it serves —
-          nothing else.
-        - Never reference how the code came to be: no dates, no defect stories,
-          no \"was previously\", no session history. That narration belongs in
-          commit messages and the defect ledger, not in source files.
-        EOF
-        cat > /home/thinkube/.claude/NO-DEFERRAL-POLICY.md << 'EOF'
-        # No-deferral policy (Thinkube platform default)
-
-        - Never promise work for later, tomorrow, or a future batch.
-        - Identified work is either done NOW, or bound to a concrete visible
-          trigger (a recorded ask, a slice, a named condition) in the same
-          breath it is identified.
-        - If neither is possible, say plainly that it is dropped.
-        EOF
-        cat > /home/thinkube/.claude/ANSWER-POLICY.md << 'EOF'
-        # Answer policy — a question is not a work order (Thinkube platform default)
-
-        - When the message is a question — how does X work, why is Y like this,
-          is Z possible — ANSWER IT, and stop. No edit, no refactor, no deploy
-          in the same breath.
-        - If the answer reveals something broken, say so in one line and WAIT.
-          Naming a defect is part of answering; fixing it is a separate ask.
-        - Act when asked to act: fix, change, implement, do it, go. Ambiguity
-          resolves toward answering, never toward acting.
-        EOF
-        cat > /home/thinkube/.claude/PLAIN-ENGLISH-POLICY.md << 'EOF'
-        # Plain English policy (Thinkube platform default)
-
-        Everything written for a person — chat replies, notes, summaries,
-        refusals — is written for a global audience:
-
-        - Short sentences. Common words. One point per line where it helps.
-        - No invented names. If a term of the method is needed, say what it
-          means the first time: \"footprint (the files a task may edit)\".
-        - Say the fact, then the cause, then what happens next. No metaphors
-          that need decoding, no idioms that do not translate.
-        - A failure is reported as a failure, in the tool's own words.
-        - Long is not thorough. If a reply needs a heading per paragraph, it is
-          too long.
-        EOF
-        cat > /home/thinkube/.claude/NO-FALLBACK-POLICY.md << 'EOF'
-        # No-fallback policy (Thinkube platform default)
-
-        A fallback hides the state that needs fixing. The system keeps running on
-        a substitute, and the fault appears later, far from its cause.
-
-        ## What is a fallback (do not add)
-
-        - A made-up value in place of a required one: a hard-coded default, an
-          empty string, a constructed value, an empty result.
-        - Swallowing an error to keep going: \"except: return default\", \"|| true\",
-          \"ignore_errors\".
-        - Trying a substitute when the real thing fails: another file, another
-          endpoint, other credentials.
-
-        ## What is not a fallback (keep)
-
-        - A deliberate order of real sources, where each one is the right answer on
-          some install or deploy path. Example: the password from the request, else
-          ANSIBLE_BECOME_PASSWORD, else SYSTEM_PASSWORD. Before removing a source,
-          find out which path sets it.
-        - A default that a specification defines. Name the specification.
-        - A limited retry of the same operation for a failure that can clear on its
-          own, ending in an error that says what failed.
-
-        ## What to do
-
-        - When something required is missing, stop with an error that names what is
-          missing and how to provide it.
-        - A fallback in code you are changing: remove it in the same change, and say
-          what you removed.
-        - A fallback anywhere else, or while only answering a question: name it in
-          one line and wait.
-        - Never add a fallback without asking. If one seems necessary, say what it
-          would hide, and wait.
-        - Backward compatibility is a decision, not a habit. Ask before keeping an
-          old path alive, and give it a condition for removal.
-        EOF
-        cat > /home/thinkube/.claude/CI-CD-POLICY.md << 'EOF'
-        # CI/CD policy — the pipeline is the check (Thinkube platform default)
-
-        This IDE is a development environment inside the cluster it deploys
-        to. The platform's pipeline builds, tests and deploys every repository
-        on the real targets: both architectures, the cluster's registry,
-        identity and services. A build or server in the IDE checks a copy that
-        differs from what runs, so it is never the check.
-
-        - Never build, serve or browser-test a Thinkube repository locally: no
-          local npm installs or builds, no local web server, no browser pointed
-          at a local build.
-        - To check a change: commit, push, and run the repository's own deploy.
-          Then look at the deployed result, or read the build log.
-        - Each repository's CLAUDE.md names its deploy. For an app, the push to
-          its Gitea repository is the deploy.
-        - Allowed locally: the tests a repository's CLAUDE.md or README asks
-          for, and reproducing a failed cluster build step when its log does
-          not show the cause. Say which of the two it is before running it.
-        EOF
-        cat > /home/thinkube/.claude/OPERATIONS-POLICY.md << 'EOF'
-        # Operations policy — destructive actions and diagnosis (Thinkube platform default)
-
-        - A wipe, reset, rollback, reboot or delete of a node, cluster or image
-          store is asked for on its own line, naming the host and what is lost,
-          and runs only on a yes to THAT line. A yes to a plan is not a yes to
-          each step inside it.
-        - Reset the smallest thing that makes the test valid. A failure in
-          add-nodes resets the workers, not the control plane.
-        - Diagnose until the practical fix is known, then stop. Attribution
-          without an audit source is speculation; say it is unprovable.
-        - What the user says they did is a fact, not a hypothesis. Never read
-          their shell history, transcripts or personal files to check it.
-        - Before trusting a tool's output, say what it measured: ICMP is not
-          TCP, \`iptables -t nat\` is not the ruleset, \`tail -2\` hides the error.
-        - Verify the result, not the completion. A step that ran is not a step
-          that produced the right state.
-        EOF
-        for p in INFRA-POLICY CODE-COMMENTS-POLICY NO-DEFERRAL-POLICY ANSWER-POLICY PLAIN-ENGLISH-POLICY NO-FALLBACK-POLICY CI-CD-POLICY OPERATIONS-POLICY; do \
-          grep -q \"@\${p}.md\" /home/thinkube/.claude/CLAUDE.md || \
-            printf '\n@%s.md\n' \"\${p}\" >> /home/thinkube/.claude/CLAUDE.md; \
-        done && \
-        echo '✅ companion policies installed'"
-      when: companion_policies_installed.rc != 0
-
-    # Tells Claude Code how to sign in to Thinkube apps with the Playwright MCP
-    # browser. The file carries the realm and user from the inventory, so it is
-    # rewritten on every run.
-    - name: Install the Claude Code browser login instructions
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
-          bash -c "set -e; mkdir -p /home/thinkube/.claude && \
-            cat > /home/thinkube/.claude/BROWSER-LOGIN.md << 'EOF'
-        # Browser login to Thinkube apps (Thinkube platform default)
-
-        Thinkube apps sign in through Keycloak, realm \`{{ keycloak_realm }}\`. To
-        test an app in the Playwright MCP browser:
-
-        - Username: \`{{ auth_realm_username }}\`.
-        - Password: type the text \`THINKUBE_PASSWORD\` into the password field
-          with browser_type or browser_fill_form. The Playwright MCP types the
-          real password and shows it as <secret>THINKUBE_PASSWORD</secret> in
-          its output.
-        - Never read the password from a file or variable, and never write it in
-          a tool call, a file or a message.
-        - Never create or change Keycloak users to get a login.
-        - If the login fails, report the message the page shows and stop.
-        EOF
-        grep -q '@BROWSER-LOGIN.md' /home/thinkube/.claude/CLAUDE.md || \
-          printf '\n@BROWSER-LOGIN.md\n' >> /home/thinkube/.claude/CLAUDE.md
-        echo '✅ Claude Code browser login instructions installed'"
+    # The platform's operating instructions for every agentic client:
+    # one AGENTS.md each for opencode, Pi and Claude Code, built from
+    # ansible/roles/agent_clients/files/instructions/. ~/.claude/CLAUDE.md
+    # becomes "@AGENTS.md" plus Claude-only content (rtk's @RTK.md, above).
+    # The policies are the platform's defaults: the git policy (commit
+    # verified work and push it, since the pushed remote is the only backup of
+    # a pod), infrastructure, comments, no deferral, answers, plain English,
+    # no fallbacks, CI/CD, operations, and browser login. A pod is not where
+    # they are edited; every run rewrites them.
+    - name: Install the agentic clients' operating instructions
+      ansible.builtin.include_role:
+        name: agent_clients
+        tasks_from: instructions
 
     - name: Configure pip to use DevPi
       ansible.builtin.shell: |
@@ -1489,6 +1279,18 @@
       loop: "{{ extension_installs.results }}"
       loop_control:
         label: "{{ item.item }}"
+
+    # Pi Agent Studio, the VS Code front end for Pi. The image carries its vsix
+    # at a pinned version and checksum (harbor-images/base-images/
+    # code-server-dev.Containerfile.j2); the extension drives the image's
+    # pi over RPC, so it uses the pinned Pi, its configuration and the
+    # thinkube-confirm extension (vscode-settings.json.j2 points it there).
+    - name: Install the Pi Agent Studio extension from the image
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'set -e; vsix=$(ls /opt/agent-clients/vsix/pi-agent-studio-*.vsix); code-server --install-extension "$vsix" --force'
+      register: pi_agent_studio_install
+      changed_when: "'was successfully installed' in pi_agent_studio_install.stdout"
 
 
     - name: Create temporary settings file from template

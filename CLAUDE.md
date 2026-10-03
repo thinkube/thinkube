@@ -182,9 +182,10 @@ Playbooks target host groups from inventory (e.g., `k8s_control_plane`, `baremet
 
 ## Working rules
 
-The same rules every fresh IDE gets as `~/.claude/OPERATIONS-POLICY.md`
-(installed by `code-server/15_configure_environment.yaml`); here so a session
-on the installer host follows them too.
+The same rules every fresh IDE gets in the operations section of its global
+`AGENTS.md` (written by `roles/agent_clients`, from
+`files/instructions/operations-policy.md`); here so a session on the
+installer host follows them too.
 
 - A wipe, reset, rollback, reboot or delete of a node, cluster or image
   store is asked for on its own line, naming the host and what is lost, and
