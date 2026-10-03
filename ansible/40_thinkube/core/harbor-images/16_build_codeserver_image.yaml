@@ -84,9 +84,21 @@
         src: "{{ local_base_images_dir }}/code-server-dev.Containerfile.j2"
         dest: "{{ temp_containerfiles_dir.path }}/code-server-dev.Containerfile"
 
+    # The image installs this version, so a redeploy brings code-server up to
+    # date; the build reuses the cached install while the version is unchanged.
+    - name: Look up the latest code-server release
+      ansible.builtin.uri:
+        url: https://api.github.com/repos/coder/code-server/releases/latest
+        return_content: true
+      register: code_server_release
+      retries: 3
+      delay: 5
+      until: code_server_release.status == 200
+
     - name: Build code-server-dev image
       ansible.builtin.shell: |
         podman build --network pasta:-4 --tls-verify=true \
+                     --build-arg CODE_SERVER_VERSION={{ code_server_release.json.tag_name | regex_replace('^v', '') | quote }} \
                      -t {{ harbor_registry }}/library/code-server-dev:latest \
                      -f {{ temp_containerfiles_dir.path }}/code-server-dev.Containerfile \
                      {{ base_images_dir }}
