@@ -5,8 +5,6 @@
   </picture>
 </p>
 
-<h1 align="center">Thinkube</h1>
-
 <p align="center"><strong>Sovereign AI starts at your desk.</strong><br>
 Your hardware · your models · your data</p>
 
