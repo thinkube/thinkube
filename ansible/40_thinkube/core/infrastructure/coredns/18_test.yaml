@@ -1,0 +1,291 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/coredns/18_test.yaml
+# Description:
+#   Tests CoreDNS: its pods and configuration, the DNS probe on every node,
+#   cluster and external resolution from a pod, forwarding of the platform
+#   domain to BIND9, and resolution of the platform domain on every node.
+#
+#   The address every *.domain name must resolve to is read from BIND9's own
+#   zone (ConfigMap bind9-zones), so the test holds for either overlay:
+#   ZeroTier's static gateway address or Tailscale's operator-assigned one.
+#
+# Requirements:
+#   - dns-server/10_deploy.yaml and coredns/10_deploy.yaml have run
+#   - Thinkube Registry holds library/alpine (the test pod's image)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/coredns/18_test.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain to test
+#   - overlay_provider: zerotier or tailscale
+#   - harbor_registry: registry the test pod's image is pulled from
+- name: Test CoreDNS configuration
+  hosts: k8s_control_plane
+  gather_facts: true
+  vars:
+    dns_test_pod: dns-test
+    dns_test_namespace: default
+    dns_test_image: "{{ harbor_registry }}/library/alpine:latest"
+    external_names:
+      - google.com
+      - acme-v02.api.letsencrypt.org
+      - github.com
+    platform_names:
+      - auth
+      - registry
+      - git
+      - control
+      - argocd
+      - workflows
+      - notebooks
+      - ide
+      - docs
+
+  pre_tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - overlay_provider is defined
+          - harbor_registry is defined
+        fail_msg: "Required inventory variables are not defined"
+
+    - name: Verify ZeroTier-only variables are defined
+      ansible.builtin.assert:
+        that:
+          - overlay_subnet_prefix is defined
+        fail_msg: "ZeroTier-mode variable overlay_subnet_prefix is not defined"
+      when: overlay_provider == 'zerotier'
+
+    - name: Read kube-dns ClusterIP
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc kube-dns -n kube-system -o jsonpath={.spec.clusterIP}
+      register: kube_dns_svc
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Read BIND9 zones
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get configmap bind9-zones -n dns-system -o json
+      register: bind9_zones
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Set the wildcard address BIND9 serves for the domain
+      ansible.builtin.set_fact:
+        kube_dns_ip: "{{ kube_dns_svc.stdout }}"
+        expected_wildcard_ip: >-
+          {{ ((bind9_zones.stdout | from_json).data['db.' + domain_name] | default(''))
+             | regex_search('^\*\s+IN\s+A\s+(\S+)', '\1', multiline=True) | default([''], true) | first }}
+
+    - name: Fail if the kube-dns address or the zone's wildcard address is missing
+      ansible.builtin.fail:
+        msg: |
+          kube-dns ClusterIP='{{ kube_dns_ip }}'; wildcard A record in
+          bind9-zones db.{{ domain_name }}='{{ expected_wildcard_ip }}'.
+          Both must exist: run dns-server/10_deploy.yaml and coredns/10_deploy.yaml.
+      when: kube_dns_ip | length == 0 or expected_wildcard_ip | length == 0
+
+  tasks:
+    # CoreDNS pods and configuration
+    - name: Check CoreDNS pods are running
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get pods -n kube-system -l k8s-app=kube-dns -o json
+      register: coredns_pods
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Validate CoreDNS pods are running
+      ansible.builtin.assert:
+        that:
+          - (coredns_pods.stdout | from_json)['items'] | length > 0
+          - (coredns_pods.stdout | from_json)['items'] | map(attribute='status.phase') | reject('equalto', 'Running') | list | length == 0
+        fail_msg: "CoreDNS pods are not all running"
+
+    - name: Retrieve CoreDNS ConfigMap
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get configmap coredns -n kube-system -o yaml
+      register: coredns_configmap
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Validate CoreDNS configuration contains expected settings
+      ansible.builtin.assert:
+        that:
+          - "'forward . ' in coredns_configmap.stdout"
+          - "'class error' in coredns_configmap.stdout"
+        fail_msg: "CoreDNS ConfigMap does not forward to BIND9 or does not log failed answers only"
+
+    # DNS probe: running on every node and started with all its addresses
+    - name: Read DNS probe DaemonSet
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get daemonset dns-probe -n kube-system -o json
+      register: dns_probe_ds
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Count cluster nodes
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get nodes -o name
+      register: cluster_nodes
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Validate DNS probe runs on every node
+      ansible.builtin.assert:
+        that:
+          - (dns_probe_ds.stdout | from_json)['status']['desiredNumberScheduled'] == (cluster_nodes.stdout_lines | length)
+          - (dns_probe_ds.stdout | from_json)['status']['numberReady'] == (cluster_nodes.stdout_lines | length)
+        fail_msg: >
+          DNS probe is not ready on every node:
+          {{ (dns_probe_ds.stdout | from_json)['status']['numberReady'] }} ready of
+          {{ cluster_nodes.stdout_lines | length }} nodes
+
+    - name: Read DNS probe logs
+      ansible.builtin.command: >
+        {{ kubectl_bin }} logs -n kube-system -l app.kubernetes.io/name=dns-probe --prefix --tail=-1
+      register: dns_probe_logs
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Validate every DNS probe pod started
+      ansible.builtin.assert:
+        that:
+          - (dns_probe_logs.stdout_lines | select('search', 'dns-probe started') | list | length) == (cluster_nodes.stdout_lines | length)
+        fail_msg: "Not every DNS probe pod logged its start line:\n{{ dns_probe_logs.stdout }}"
+
+    - name: Display DNS probe failures logged so far
+      ansible.builtin.debug:
+        msg: "{{ dns_probe_logs.stdout_lines | select('search', 'result=fail') | list }}"
+
+    # Resolution from a pod
+    - name: Start DNS test pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pod {{ dns_test_pod }} -n {{ dns_test_namespace }} --ignore-not-found --wait=true
+        {{ kubectl_bin }} run {{ dns_test_pod }} -n {{ dns_test_namespace }} --image={{ dns_test_image }} --restart=Never -- sleep 600
+        {{ kubectl_bin }} wait --for=condition=Ready pod/{{ dns_test_pod }} -n {{ dns_test_namespace }} --timeout=120s
+      changed_when: true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Read the test pod's resolver configuration
+      ansible.builtin.command: >
+        {{ kubectl_bin }} exec {{ dns_test_pod }} -n {{ dns_test_namespace }} -- cat /etc/resolv.conf
+      register: dns_config
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Test Kubernetes internal service resolution
+      ansible.builtin.command: >
+        {{ kubectl_bin }} exec {{ dns_test_pod }} -n {{ dns_test_namespace }} --
+        nslookup kubernetes.default.svc.cluster.local
+      register: k8s_service_test
+      changed_when: false
+      failed_when: k8s_service_test.rc != 0 or 'Name:' not in k8s_service_test.stdout
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # External names must reach the internet, not the platform wildcard; the
+    # search list must not turn them into names under the platform domain.
+    - name: Test external domain resolution
+      ansible.builtin.command: >
+        {{ kubectl_bin }} exec {{ dns_test_pod }} -n {{ dns_test_namespace }} --
+        nslookup {{ item }}
+      register: external_domain_test
+      changed_when: false
+      failed_when: >-
+        external_domain_test.rc != 0
+        or 'Name:' not in external_domain_test.stdout
+        or expected_wildcard_ip in external_domain_test.stdout
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ external_names + (external_names | map('regex_replace', '$', '.') | list) }}"
+
+    - name: Test platform domain forwarding through kube-dns to BIND9
+      ansible.builtin.command: >
+        {{ kubectl_bin }} exec {{ dns_test_pod }} -n {{ dns_test_namespace }} --
+        nslookup test.{{ domain_name }} {{ kube_dns_ip }}
+      register: kube_dns_forward_test
+      changed_when: false
+      failed_when: kube_dns_forward_test.rc != 0 or expected_wildcard_ip not in kube_dns_forward_test.stdout
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Test platform service names resolve to the wildcard address
+      ansible.builtin.command: >
+        {{ kubectl_bin }} exec {{ dns_test_pod }} -n {{ dns_test_namespace }} --
+        nslookup {{ item }}.{{ domain_name }}
+      register: service_subdomain_test
+      changed_when: false
+      failed_when: service_subdomain_test.rc != 0 or expected_wildcard_ip not in service_subdomain_test.stdout
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ platform_names }}"
+
+    - name: Remove DNS test pod
+      ansible.builtin.command: >
+        {{ kubectl_bin }} delete pod {{ dns_test_pod }} -n {{ dns_test_namespace }} --ignore-not-found --wait=false
+      changed_when: true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # Resolution on every node, through the node's own resolver
+    - name: Test platform domain resolution on every node
+      ansible.builtin.command: getent hosts test.{{ domain_name }}
+      register: node_dns_test
+      changed_when: false
+      failed_when: node_dns_test.rc != 0 or expected_wildcard_ip not in node_dns_test.stdout
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['k8s'] }}"
+
+    - name: Check for conflicting DNS configuration files
+      ansible.builtin.stat:
+        path: /etc/systemd/resolved.conf.d/dns.conf
+      register: conflicting_dns_file
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['k8s'] }}"
+
+    - name: Display warning for conflicting DNS configuration files
+      ansible.builtin.debug:
+        msg: |
+          ⚠️ WARNING: /etc/systemd/resolved.conf.d/dns.conf exists on {{ item.item }}
+          and may override the DNS routing in 10-thinkube.conf. Run:
+          ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/coredns/15_configure_node_dns.yaml
+      when: item.stat.exists | default(false)
+      loop: "{{ conflicting_dns_file.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+                     DNS TEST RESULTS
+          ============================================
+          Overlay: {{ overlay_provider }}
+          kube-dns: {{ kube_dns_ip }}
+          *.{{ domain_name }} (from BIND9's zone): {{ expected_wildcard_ip }}
+
+          ✓ CoreDNS pods running; forwards to BIND9; logs failed answers only
+          ✓ DNS probe running and started on {{ cluster_nodes.stdout_lines | length }} nodes
+          ✓ kubernetes.default.svc.cluster.local resolves in a pod
+          ✓ {{ external_names | join(', ') }} resolve to external addresses, with and without a trailing dot
+          ✓ test.{{ domain_name }} forwards through kube-dns to BIND9
+          ✓ {{ platform_names | length }} platform names resolve to {{ expected_wildcard_ip }}
+          ✓ test.{{ domain_name }} resolves on {{ groups['k8s'] | length }} nodes
+
+          Test pod resolver configuration:
+          {{ dns_config.stdout }}

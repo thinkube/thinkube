@@ -1,0 +1,395 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/qdrant/10_deploy.yaml
+# Description:
+#   Deploy Qdrant vector database; the dashboard requires a Keycloak login at the gateway
+#
+# Requirements:
+#   - Kubernetes (kubeadm) must be installed
+#   - Keycloak instance running (CORE-006)
+#   - TLS certificates available (CORE-004)
+#   - ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/qdrant/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - qdrant_dashboard_hostname: Hostname for Qdrant dashboard
+#   - qdrant_hostname: Hostname for Qdrant API
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to Helm binary
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_hostname: Hostname for Keycloak
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username for Keycloak
+#   - primary_ingress_class: Primary ingress class name
+#   - primary_gateway_ip: Primary ingress IP address
+#
+# Dependencies:
+#   - CORE-004: SSL/TLS Certificates must be configured
+#   - CORE-006: Keycloak must be deployed
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy Qdrant with a Keycloak login on the dashboard
+  hosts: k8s_control_plane
+  gather_facts: true
+  
+  vars:
+    # Common settings - specific to this deployment
+    k8s_namespace: "{{ qdrant_namespace }}"
+    qdrant_dashboard_host: "{{ qdrant_dashboard_hostname }}"
+
+    # TLS settings
+    tls_secret_name: "qdrant-tls-secret"
+
+    # Keycloak client for the dashboard login at the gateway
+    qdrant_dashboard_client_id: "qdrant-dashboard"
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env','ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  tasks:
+    ###########################################################################
+    # Step 1: Create Namespace and TLS Secret
+    ###########################################################################
+    - name: Ensure application namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ k8s_namespace }}"
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Qdrant namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ tls_secret_name }}"
+            namespace: "{{ k8s_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###########################################################################
+    # Step 2: Deploy Qdrant with an API key
+    ###########################################################################
+    # Every API call must carry this key in the "api-key" header. It is
+    # created once and kept in the qdrant-auth Secret across redeploys.
+    - name: Read the Qdrant API key Secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: qdrant-auth
+        namespace: "{{ k8s_namespace }}"
+      register: qdrant_auth_secret
+
+    - name: Create the Qdrant API key Secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: qdrant-auth
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          stringData:
+            api-key: "{{ lookup('ansible.builtin.password', '/dev/null', length=48, chars=['ascii_letters', 'digits']) }}"
+      when: qdrant_auth_secret.resources | length == 0
+
+    - name: Read the Qdrant API key
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: qdrant-auth
+        namespace: "{{ k8s_namespace }}"
+      register: qdrant_auth_secret
+
+    - name: Set the Qdrant API key fact
+      ansible.builtin.set_fact:
+        qdrant_api_key: "{{ qdrant_auth_secret.resources[0].data['api-key'] | b64decode }}"
+
+    - name: Add Qdrant Helm repository
+      kubernetes.core.helm_repository:
+        binary_path: "{{ helm_bin }}"
+        name: qdrant
+        repo_url: "https://qdrant.to/helm"
+        state: present
+
+    - name: Update Helm repos for Qdrant
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+      changed_when: false
+
+    - name: Deploy Qdrant (with CORS enabled)
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        kubeconfig: "{{ kubeconfig }}"
+        name: "qdrant"
+        chart_ref: "qdrant/qdrant"
+        release_namespace: "{{ k8s_namespace }}"
+        create_namespace: false
+        reset_values: true
+        force: true
+        update_repo_cache: true
+        values:
+          priorityClassName: thinkube-workload
+          image:
+            repository: "{{ harbor_registry }}/{{ library_project | default('library') }}/qdrant"
+            tag: "v1.18.0"
+            pullPolicy: IfNotPresent
+          persistence:
+            enabled: true
+            storageClass: ""
+            accessModes:
+              - ReadWriteOnce
+            size: 150Gi
+          replicaCount: 1
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          service:
+            grpc:
+              enabled: true
+              port: 6334
+          cors:
+            enabled: true
+            allowedOrigins:
+              - "https://{{ qdrant_dashboard_host }}"
+          apiKey:
+            valueFrom:
+              secretKeyRef:
+                name: qdrant-auth
+                key: api-key
+      register: qdrant_helm_result
+      retries: 5
+      delay: 10
+      until: qdrant_helm_result is not failed
+
+    ###########################################################################
+    # Step 3: Create Qdrant dashboard HTTPRoute
+    ###########################################################################
+    - name: Create or update Qdrant HTTP Dashboard HTTPRoute
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: qdrant-dashboard-route
+            namespace: "{{ k8s_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name | default('thinkube-gateway') }}"
+                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+                sectionName: https
+            hostnames:
+              - "{{ qdrant_dashboard_host }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: qdrant
+                    port: 6333
+
+    ###########################################################################
+    # Step 4: Create a root-redirect Ingress (redirect "/" to "/dashboard")
+    ###########################################################################
+    - name: Create Qdrant root redirect HTTPRoute
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: qdrant-root-redirect
+            namespace: "{{ k8s_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name | default('thinkube-gateway') }}"
+                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+                sectionName: https
+            hostnames:
+              - "{{ qdrant_dashboard_host }}"
+            rules:
+              - matches:
+                  - path:
+                      type: Exact
+                      value: /
+                filters:
+                  - type: RequestRedirect
+                    requestRedirect:
+                      path:
+                        type: ReplaceFullPath
+                        replaceFullPath: /dashboard
+                      statusCode: 301
+
+    # --- Keycloak login for the dashboard ---
+    # The gateway handles the login itself. An oauth2-proxy route for
+    # /oauth2 on this host would take the gateway's /oauth2/callback, so any
+    # oauth2-proxy route, release and session store is removed.
+    - name: Remove the oauth2-proxy route, release and session store
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete httproute oauth2-proxy-ingress -n {{ k8s_namespace }} --ignore-not-found
+        {{ kubectl_bin }} delete deployment,service ephemeral-valkey -n {{ k8s_namespace }} --ignore-not-found
+        if {{ helm_bin }} status oauth2-proxy -n {{ k8s_namespace }} >/dev/null 2>&1; then
+          {{ helm_bin }} uninstall oauth2-proxy -n {{ k8s_namespace }}
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: oauth2_proxy_removal
+      changed_when: "'deleted' in oauth2_proxy_removal.stdout or 'uninstalled' in oauth2_proxy_removal.stdout"
+
+    - name: Create or update the Keycloak client for the dashboard
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ qdrant_dashboard_client_id }}"
+        keycloak_client_body:
+          clientId: "{{ qdrant_dashboard_client_id }}"
+          enabled: true
+          protocol: openid-connect
+          publicClient: false
+          standardFlowEnabled: true
+          redirectUris:
+            - "https://{{ qdrant_dashboard_host }}/oauth2/callback"
+          webOrigins:
+            - "https://{{ qdrant_dashboard_host }}"
+          baseUrl: "https://{{ qdrant_dashboard_host }}"
+          attributes:
+            post.logout.redirect.uris: "+"
+
+    # Both routes on the dashboard host, so "/" also asks for the login
+    # before it redirects to /dashboard.
+    - name: Require a Keycloak login on the dashboard routes
+      ansible.builtin.include_role:
+        name: gateway_oidc
+      vars:
+        gateway_oidc_namespace: "{{ k8s_namespace }}"
+        gateway_oidc_route_names: ["qdrant-dashboard-route", "qdrant-root-redirect"]
+        gateway_oidc_hostname: "{{ qdrant_dashboard_host }}"
+        gateway_oidc_client_id: "{{ qdrant_dashboard_client_id }}"
+        gateway_oidc_client_secret: "{{ keycloak_client_secret }}"
+    # --- end Keycloak login for the dashboard ---
+                            
+    ###########################################################################
+    # Step 5: Create Qdrant API HTTPRoute (API key required)
+    ###########################################################################
+    - name: Create or update Qdrant API HTTPRoute
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: qdrant-api-route
+            namespace: "{{ k8s_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name | default('thinkube-gateway') }}"
+                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+                sectionName: https
+            hostnames:
+              - "{{ qdrant_hostname }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: qdrant
+                    port: 6333
+
+    ###########################################################################
+    # Step 6: Debug task to check resources
+    ###########################################################################
+    - name: List all HTTPRoutes in namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: HTTPRoute
+        api_version: gateway.networking.k8s.io/v1
+        namespace: "{{ k8s_namespace }}"
+      register: httproutes
+
+    - name: Debug HTTPRoutes
+      ansible.builtin.debug:
+        msg: "HTTPRoutes in namespace: {{ httproutes.resources | map(attribute='metadata.name') | list }}"
+        
+    ###########################################################################
+    # Step 7: Test Qdrant API endpoint
+    ###########################################################################
+    - name: Wait for Qdrant API to be ready (60 seconds timeout)
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_hostname }}/collections"
+        method: GET
+        validate_certs: false
+        headers:
+          Content-Type: "application/json"
+          api-key: "{{ qdrant_api_key }}"
+        status_code: 200
+      register: qdrant_api_ready
+      until: qdrant_api_ready.status == 200
+      retries: 12  # 12 retries x 5s delay = 60s total waiting time
+      delay: 5
+
+    - name: Check that the API refuses a request without the key
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_hostname }}/collections"
+        method: GET
+        status_code: 401
+      
+    - name: Test Qdrant API endpoint (collection creation)
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_hostname }}/collections/test_collection"
+        method: PUT
+        validate_certs: false
+        headers:
+          Content-Type: "application/json"
+          api-key: "{{ qdrant_api_key }}"
+        body_format: json
+        body:
+          vectors:
+            size: 4
+            distance: "Cosine"
+        status_code: [200, 201, 409]  # 409 if collection already exists
+      
+    - name: Display test results
+      ansible.builtin.debug:
+        msg: 
+          - "Qdrant setup complete and API test successful!"
+          - "API endpoint: https://{{ qdrant_hostname }}"
+          - "Dashboard URL: https://{{ qdrant_dashboard_host }}"
+        verbosity: 0

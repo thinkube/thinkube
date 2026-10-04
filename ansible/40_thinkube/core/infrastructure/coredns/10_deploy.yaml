@@ -1,0 +1,336 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/coredns/10_deploy.yaml
+# Description:
+#   Configures CoreDNS as the primary DNS server for the cluster.
+#   Provides Kubernetes internal DNS (cluster.local) and forwards all
+#   external queries to BIND9, which handles *.domain resolution.
+#
+# Requirements:
+#   - Kubernetes (kubeadm) must be installed and running
+#   - Cilium load balancer must be enabled (k8s enable load-balancer)
+#   - dns-server/10_deploy.yaml must have run first (BIND9)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/coredns/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for all services
+#   - overlay_subnet_prefix: Prefix for ZeroTier network
+#   - primary_gateway_ip_octet: Last octet for primary ingress IP
+#   (secondary_ingress_ip_octet removed — kn subdomain eliminated)
+#   - k8s_workers: Group containing worker nodes
+#
+# Dependencies:
+#   - Core infrastructure components should be deployed
+#   - The Cilium load balancer must be enabled before deploying CoreDNS
+#
+# 🤖 [AI-assisted]
+
+- name: Configure CoreDNS for Kubernetes DNS and External Domain Resolution
+  hosts: k8s_control_plane
+  gather_facts: true
+  become: false
+  vars:
+    system_ca_path: /etc/ssl/certs/ca-certificates.crt
+    cert_namespace: kube-system
+    cert_dir: /etc/kubernetes/pki
+    ca_cert: "{{ cert_dir }}/ca.crt"
+    ca_key: "{{ cert_dir }}/ca.key"
+    knative_enabled: false  # Explicitly set to false for CoreDNS setup
+    # The probe runs before Thinkube Registry exists, so it pulls the pinned
+    # Alpine release the registry itself mirrors.
+    dns_probe_image: "mirror.gcr.io/library/alpine:3.22.4"
+    dns_probe_interval_seconds: 5
+    # Subnet prefix is only meaningful in ZeroTier mode (Cilium L2 LB picks
+    # IPs from the overlay subnet). In Tailscale mode the operator assigns
+    # IPs and coredns_external_ip is discovered from Service status below,
+    # so we don't construct primary_gateway_ip from a prefix here.
+    subnet_prefix: "{{ overlay_subnet_prefix if overlay_provider == 'zerotier' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    primary_gateway_ip: "{{ subnet_prefix }}{{ primary_gateway_ip_octet }}"
+
+  pre_tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - network_mode is defined
+          - overlay_provider is defined
+          - groups['k8s_workers'] is defined
+        fail_msg: "Required inventory variables are not defined"
+
+    - name: Verify ZeroTier-specific variables are defined (ZeroTier mode only)
+      ansible.builtin.assert:
+        that:
+          - overlay_subnet_prefix is defined
+          - primary_gateway_ip_octet is defined
+          - dns_external_ip_octet is defined
+          - lb_ip_start_octet is defined
+          - lb_ip_end_octet is defined
+        fail_msg: "ZeroTier-mode inventory variables are missing"
+      when: overlay_provider == 'zerotier'
+
+    # Discover the IP that bind9-external is reachable on. ZeroTier mode:
+    # the static value Cilium L2 LB advertises. Tailscale mode: the
+    # operator-assigned tailnet IP. Either way it must already be in
+    # Service status by now (dns-server runs before this playbook).
+    #
+    # `ingress[*].ip` (not `[0].ip`) because the Tailscale operator
+    # writes the hostname entry first and the IP entry second, so
+    # `[0].ip` would be empty.
+    - name: Read coredns_external_ip from bind9-external Service status
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc bind9-external -n dns-system
+        -o jsonpath={.status.loadBalancer.ingress[*].ip}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: bind9_lookup
+      changed_when: false
+
+    - name: Fail if bind9-external has no LoadBalancer IP yet
+      ansible.builtin.fail:
+        msg: |
+          bind9-external Service in namespace dns-system has no IP in
+          status.loadBalancer.ingress[]. The dns-server playbook must
+          run successfully before this one.
+      when: bind9_lookup.stdout | length == 0
+
+    - name: Set coredns_external_ip from discovered Service IP
+      ansible.builtin.set_fact:
+        coredns_external_ip: "{{ bind9_lookup.stdout }}"
+
+  tasks:
+    # kubeadm installs CoreDNS; verify it is running
+    - name: Verify CoreDNS deployment exists and is ready
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system rollout status deployment/coredns --timeout=120s
+      register: coredns_status
+      changed_when: false
+      failed_when: coredns_status.rc != 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Pin CoreDNS to control plane node
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system patch deployment coredns
+        --type=merge
+        -p '{"spec":{"template":{"spec":{"nodeSelector":{"node-role.kubernetes.io/control-plane":""}}}}}'
+      register: coredns_pin
+      changed_when: "'patched' in coredns_pin.stdout"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Set CoreDNS priority class
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system patch deployment coredns
+        --type=merge
+        -p '{"spec":{"template":{"spec":{"priorityClassName":"thinkube-critical"}}}}'
+      register: coredns_priority
+      changed_when: "'patched' in coredns_priority.stdout"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Wait for CoreDNS rollout after pinning
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system rollout status deployment/coredns --timeout=120s
+      when: coredns_pin.changed
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # CoreDNS upstream is set in the Corefile ConfigMap (applied
+    # below). The Corefile template points the forward plugin at the
+    # BIND9 IP.
+
+    # Create CoreDNS configuration
+    - name: Create temporary CoreDNS Corefile content
+      ansible.builtin.template:
+        src: "templates/Corefile.j2"
+        dest: "{{ ansible_facts.user_dir }}/coredns-corefile-content.txt"
+        mode: '0644'
+      register: coredns_content_file
+
+    - name: Create CoreDNS ConfigMap YAML
+      ansible.builtin.shell: |
+        cat > {{ ansible_facts.user_dir }}/coredns-config.yaml <<EOF
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: coredns
+          namespace: kube-system
+          labels:
+            app.kubernetes.io/name: coredns
+            k8s-app: kube-dns
+        data:
+          Corefile: |
+        $(cat {{ ansible_facts.user_dir }}/coredns-corefile-content.txt | sed 's/^/        /')
+        EOF
+      register: create_configmap_yaml
+      changed_when: true
+
+    - name: Update CoreDNS ConfigMap using kubectl
+      ansible.builtin.command: >
+        {{ kubectl_bin }} apply --validate=false -f {{ ansible_facts.user_dir }}/coredns-config.yaml
+      register: coredns_update
+      changed_when: '"configmap/coredns configured" in coredns_update.stdout or "configmap/coredns created" in coredns_update.stdout'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Restart CoreDNS pods
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system delete pods -l k8s-app=kube-dns
+      when: coredns_update.changed
+      register: restart_dns
+      changed_when: restart_dns.rc == 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Wait for CoreDNS pods to be ready
+      ansible.builtin.command: >
+        {{ kubectl_bin }} -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-dns --timeout=300s
+      when: coredns_update.changed
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # Note: External DNS is now handled by a separate BIND9 deployment
+    # CoreDNS only handles Kubernetes internal DNS (cluster.local)
+
+    # Configure system certificates
+    - name: Ensure ca-certificates package is installed
+      ansible.builtin.apt:
+        name: ca-certificates
+        state: present
+      become: true
+
+    - name: Update system CA certificates
+      ansible.builtin.command: update-ca-certificates
+      become: true
+      register: ca_update
+      changed_when: ca_update.rc == 0
+
+    - name: Create ConfigMap with system certificates
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} create configmap system-certificates \
+        --from-file=ca-certificates.crt={{ system_ca_path }} \
+        -n {{ cert_namespace }} --dry-run=client -o yaml | \
+        {{ kubectl_bin }} apply -f -
+      register: cert_config
+      changed_when: cert_config.rc == 0
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # Configure worker nodes to use CoreDNS external service
+    # All sub-tasks need become: true because they write to /etc/systemd/...
+    # on the delegated worker nodes.
+    - name: Configure worker nodes to use CoreDNS for domain resolution
+      become: true
+      block:
+        - name: Create systemd-resolved conf directory
+          ansible.builtin.file:
+            path: /etc/systemd/resolved.conf.d
+            state: directory
+            mode: '0755'
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['k8s_workers'] }}"
+
+        - name: Configure systemd-resolved to forward domain to CoreDNS
+          ansible.builtin.copy:
+            dest: /etc/systemd/resolved.conf.d/coredns-external.conf
+            content: |
+              [Resolve]
+              DNS={{ coredns_external_ip }}
+              Domains=~{{ domain_name }}
+            mode: '0644'
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['k8s_workers'] }}"
+          register: resolved_config
+
+        - name: Restart systemd-resolved service
+          ansible.builtin.systemd:
+            name: systemd-resolved
+            state: restarted
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['k8s_workers'] }}"
+          when: resolved_config.changed
+
+    - name: Restart CoreDNS to apply final configuration
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pods -n kube-system -l k8s-app=kube-dns
+        {{ kubectl_bin }} wait --for=condition=Ready pods -l k8s-app=kube-dns -n kube-system --timeout=60s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    # DNS probe on every node: resolves over the pod resolver, kube-dns and
+    # both BIND9 addresses, and logs each failure with its time and path.
+    - name: Read kube-dns ClusterIP
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc kube-dns -n kube-system -o jsonpath={.spec.clusterIP}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: kube_dns_svc
+      changed_when: false
+
+    - name: Read bind9-internal ClusterIP
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc bind9-internal -n dns-system -o jsonpath={.spec.clusterIP}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: bind9_internal_svc
+      changed_when: false
+
+    - name: Fail if a DNS Service address is missing
+      ansible.builtin.fail:
+        msg: |
+          The DNS probe needs the ClusterIP of kube-dns (kube-system) and of
+          bind9-internal (dns-system). Found kube-dns='{{ kube_dns_svc.stdout }}',
+          bind9-internal='{{ bind9_internal_svc.stdout }}'. The dns-server
+          playbook must run successfully before this one.
+      when: kube_dns_svc.stdout | length == 0 or bind9_internal_svc.stdout | length == 0
+
+    - name: Set DNS probe addresses
+      ansible.builtin.set_fact:
+        kube_dns_cluster_ip: "{{ kube_dns_svc.stdout }}"
+        bind9_internal_cluster_ip: "{{ bind9_internal_svc.stdout }}"
+
+    - name: Render DNS probe manifests
+      ansible.builtin.template:
+        src: "templates/dns-probe.yaml.j2"
+        dest: "{{ ansible_facts.user_dir }}/dns-probe.yaml"
+        mode: '0644'
+
+    - name: Apply DNS probe
+      ansible.builtin.command: >
+        {{ kubectl_bin }} apply -f {{ ansible_facts.user_dir }}/dns-probe.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: dns_probe_apply
+      changed_when: "'configured' in dns_probe_apply.stdout or 'created' in dns_probe_apply.stdout"
+
+    - name: Wait for the DNS probe on every node
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status daemonset/dns-probe -n kube-system --timeout=180s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    - name: Display summary message
+      ansible.builtin.debug:
+        msg: |
+          CoreDNS is now configured for Kubernetes internal DNS:
+          
+          1. Internal Kubernetes DNS (cluster.local) on ClusterIP
+          2. Service discovery for pods and services
+          3. Configured with upstream DNS servers: 8.8.8.8, 8.8.4.4
+
+          Note: External DNS for {{ domain_name }} is handled by a separate
+          BIND9 deployment. Run the dns-server playbook to deploy it.
+
+          CoreDNS ClusterIP: {{ kube_dns_cluster_ip }}
+          This handles only Kubernetes-internal DNS resolution.
+
+          DNS probe: a pod on every node logs each failed lookup.
+          kubectl logs -n kube-system -l app.kubernetes.io/name=dns-probe --prefix

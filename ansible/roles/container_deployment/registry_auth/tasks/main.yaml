@@ -1,0 +1,87 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Registry credentials for image builds and pod pulls, and the ServiceAccount
+# the build pods run as.
+
+- name: Create temp directory for Docker config
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: ansible_docker_
+  register: docker_temp_dir
+
+- name: Create Docker config.json for Harbor registry authentication
+  ansible.builtin.copy:
+    dest: "{{ docker_temp_dir.path }}/config.json"
+    content: |
+      {
+        "auths": {
+          "{{ container_registry }}": {
+            "auth": "{{ (harbor_robot_user + ':' + harbor_robot_token) | b64encode }}"
+          }
+        }
+      }
+    mode: '0600'
+
+- name: Read Docker config from remote host
+  ansible.builtin.slurp:
+    src: "{{ docker_temp_dir.path }}/config.json"
+  register: docker_config_content
+
+- name: Create the registry credentials Secret for image builds
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig | default(omit) }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ docker_config_secret_name }}"
+        namespace: "{{ argo_namespace }}"
+      type: Opaque
+      data:
+        config.json: "{{ docker_config_content.content }}"
+
+- name: Create Docker pull secret for app in the app namespace
+  ansible.builtin.copy:
+    dest: "{{ docker_temp_dir.path }}/config.app.json"
+    content: |
+      {
+        "auths": {
+          "{{ container_registry }}": {
+            "auth": "{{ (harbor_robot_user + ':' + harbor_robot_token) | b64encode }}"
+          }
+        }
+      }
+    mode: '0600'
+
+- name: Read app Docker config from remote host
+  ansible.builtin.slurp:
+    src: "{{ docker_temp_dir.path }}/config.app.json"
+  register: app_docker_config_content
+
+- name: Create pull secret in app namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig | default(omit) }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: app-pull-secret
+        namespace: "{{ app_namespace }}"
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: "{{ app_docker_config_content.content }}"
+
+- name: Remove temporary Docker config directory
+  ansible.builtin.file:
+    path: "{{ docker_temp_dir.path }}"
+    state: absent
+
+- name: Apply the image-builder ServiceAccount and RBAC
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig | default(omit) }}"
+    state: present
+    src: "{{ local_repo_path }}/k8s/image-builder-setup.yaml"

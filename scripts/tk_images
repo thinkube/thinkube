@@ -1,0 +1,472 @@
+#!/bin/bash
+
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Build and mirror container images for all cluster architectures.
+# Run from code-server terminal after adding new nodes.
+#
+# Usage:
+#   tk_images rebuild [--uncordon node1,node2]
+#   tk_images mirror       # Only mirror public images (13)
+#   tk_images build-base   # Only build base images (14)
+#   tk_images build-jupyter # Only build Jupyter image (15)
+#   tk_images uncordon node1,node2  # Just uncordon nodes
+#
+# The playbooks are idempotent and skip already-built images.
+
+set -e
+
+# readlink -f resolves the symlink (e.g. /usr/local/bin/tk_images) back to the
+# real script so SCRIPT_DIR/THINKUBE_DIR point at the repo, not /usr/local/bin.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+THINKUBE_DIR="$(dirname "$SCRIPT_DIR")"
+TK_ANSIBLE="$SCRIPT_DIR/tk_ansible"
+# Absolute so tk_images works from any CWD (not just the repo root) — tk_ansible
+# does not cd into the repo, so a relative path here breaks when run elsewhere.
+HARBOR_DIR="$THINKUBE_DIR/ansible/40_thinkube/core/harbor-images"
+BUILD_TOKEN="$HOME/.image_build_completed_platforms"
+INVENTORY_DIR="/home/thinkube/.ansible/inventory"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+usage() {
+    echo "Usage: tk_images <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  rebuild [--uncordon node1,node2]  Run all image steps (mirror + build + jupyter)"
+    echo "  mirror                            Mirror public images to Harbor"
+    echo "  build-base                        Build base container images"
+    echo "  build-jupyter                     Build Jupyter image"
+    echo "  venvs                             Build custom venvs for architectures they miss"
+    echo "  uncordon node1,node2              Uncordon specified nodes"
+    echo "  status                            Show build status and cordoned nodes"
+    echo ""
+    echo "Examples:"
+    echo "  tk_images rebuild --uncordon vilanova1,vilanova2"
+    echo "  tk_images build-base   # retry just the base images after a failure"
+    echo "  tk_images status"
+    exit 1
+}
+
+get_kubectl() {
+    if command -v kubectl &> /dev/null; then
+        echo "kubectl"
+    elif command -v k8s &> /dev/null; then
+        echo "k8s kubectl"
+    else
+        echo "kubectl"
+    fi
+}
+
+KUBECTL=$(get_kubectl)
+
+# The architectures the cluster runs now, as "linux/amd64,linux/arm64". The
+# playbooks read container_build_platforms from the inventory, which the
+# installer wrote for the control plane alone and add-nodes updates only when
+# it completes; a node added after a failed run is unknown to it. The live
+# node list is the fact the images must match, so it is passed to every
+# playbook. Empty when kubectl cannot answer; the inventory value is used then.
+cluster_platforms() {
+    local archs platforms=""
+    archs=$($KUBECTL get nodes -o jsonpath='{range .items[*]}{.status.nodeInfo.architecture}{"\n"}{end}' 2>/dev/null | sort -u)
+    for arch in $archs; do
+        case "$arch" in
+            amd64|x86_64) arch="amd64" ;;
+            arm64|aarch64) arch="arm64" ;;
+        esac
+        platforms="${platforms:+$platforms,}linux/${arch}"
+    done
+    echo "$platforms"
+}
+CLUSTER_PLATFORMS=$(cluster_platforms)
+
+run_playbook() {
+    local playbook="$1"
+    local description="$2"
+    local -a extra=()
+    if [ -n "$CLUSTER_PLATFORMS" ]; then
+        extra=(-e "container_build_platforms=$CLUSTER_PLATFORMS")
+        echo -e "${CYAN}Cluster architectures: $CLUSTER_PLATFORMS${NC}"
+    else
+        echo -e "${YELLOW}Could not list the cluster nodes; using container_build_platforms from the inventory${NC}"
+    fi
+    echo ""
+    echo -e "${CYAN}════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}  $description${NC}"
+    echo -e "${CYAN}════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    if "$TK_ANSIBLE" "$HARBOR_DIR/$playbook" "${extra[@]}"; then
+        echo ""
+        echo -e "${GREEN}✓ $description — completed${NC}"
+        return 0
+    else
+        echo ""
+        echo -e "${RED}✗ $description — FAILED${NC}"
+        echo -e "${YELLOW}  Fix the issue and retry with: tk_images $(echo "$description" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')${NC}"
+        return 1
+    fi
+}
+
+update_build_token() {
+    local platforms
+    platforms=$(cluster_platforms)
+    echo "$platforms" > "$BUILD_TOKEN"
+    echo -e "${GREEN}✓ Build token updated: $platforms${NC}"
+}
+
+restart_crashlooping_pods() {
+    # After mirroring images, any DaemonSet pods that pulled wrong-arch
+    # images before the mirror completed need to be force-repulled.
+    # Simply deleting pods isn't enough — containerd caches the wrong-arch
+    # image and IfNotPresent reuses it. We find the owning DaemonSets,
+    # temporarily patch them to imagePullPolicy: Always, wait for the
+    # rollout, then restore IfNotPresent.
+    local nodes_csv="$1"
+    if [ -z "$nodes_csv" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo -e "${CYAN}Checking for crash-looping pods on target nodes...${NC}"
+
+    # Collect unique DaemonSets that own crash-looping pods on target nodes
+    IFS=',' read -ra nodes <<< "$nodes_csv"
+    local daemonsets_to_fix=""
+
+    for node in "${nodes[@]}"; do
+        node=$(echo "$node" | xargs)
+        local ds_list
+        ds_list=$($KUBECTL get pods --all-namespaces --field-selector spec.nodeName="$node" \
+            -o json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+seen = set()
+for pod in data.get('items', []):
+    ns = pod['metadata']['namespace']
+    name = pod['metadata']['name']
+    for cs in pod.get('status', {}).get('containerStatuses', []):
+        waiting = cs.get('state', {}).get('waiting', {})
+        restarts = cs.get('restartCount', 0)
+        if waiting.get('reason') == 'CrashLoopBackOff' or restarts > 10:
+            image = cs.get('image', '')
+            if 'registry.' in image:
+                # Find owning DaemonSet
+                for ref in pod.get('metadata', {}).get('ownerReferences', []):
+                    if ref.get('kind') == 'DaemonSet':
+                        key = f\"{ns}/{ref['name']}\"
+                        if key not in seen:
+                            seen.add(key)
+                            print(key)
+                break
+" 2>/dev/null)
+
+        if [ -n "$ds_list" ]; then
+            daemonsets_to_fix="$daemonsets_to_fix $ds_list"
+        else
+            echo -e "${GREEN}  $node: no crash-looping pods found${NC}"
+        fi
+    done
+
+    # Deduplicate. `|| true` is load-bearing: with no crash-looping pods
+    # (the healthy case) grep matches nothing and exits 1, which under
+    # `set -e` would silently kill the whole script right here — before
+    # the uncordon ever runs.
+    daemonsets_to_fix=$(echo "$daemonsets_to_fix" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+
+    if [ -z "$daemonsets_to_fix" ]; then
+        return 0
+    fi
+
+    # Patch each DaemonSet to Always, wait for rollout, then restore IfNotPresent
+    while IFS= read -r ds_ref; do
+        local ds_ns="${ds_ref%%/*}"
+        local ds_name="${ds_ref##*/}"
+        echo -e "${YELLOW}  Patching $ds_ref imagePullPolicy → Always (force re-pull)${NC}"
+
+        # Get container count
+        local container_count
+        container_count=$($KUBECTL get daemonset -n "$ds_ns" "$ds_name" \
+            -o jsonpath='{.spec.template.spec.containers}' 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "1")
+
+        # Build patch for all containers
+        local patch="["
+        for i in $(seq 0 $((container_count - 1))); do
+            [ "$i" -gt 0 ] && patch="$patch,"
+            patch="$patch{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/$i/imagePullPolicy\",\"value\":\"Always\"}"
+        done
+        patch="$patch]"
+
+        $KUBECTL patch daemonset -n "$ds_ns" "$ds_name" --type='json' -p="$patch" || true
+
+        echo -e "${CYAN}  Waiting for rollout of $ds_ref...${NC}"
+        $KUBECTL rollout status daemonset -n "$ds_ns" "$ds_name" --timeout=120s 2>/dev/null \
+            || echo -e "${YELLOW}  rollout of $ds_ref did not complete within 120s${NC}"
+
+        # Restore IfNotPresent
+        local restore_patch="["
+        for i in $(seq 0 $((container_count - 1))); do
+            [ "$i" -gt 0 ] && restore_patch="$restore_patch,"
+            restore_patch="$restore_patch{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/$i/imagePullPolicy\",\"value\":\"IfNotPresent\"}"
+        done
+        restore_patch="$restore_patch]"
+
+        $KUBECTL patch daemonset -n "$ds_ns" "$ds_name" --type='json' -p="$restore_patch" || true
+        $KUBECTL rollout status daemonset -n "$ds_ns" "$ds_name" --timeout=120s 2>/dev/null \
+            || echo -e "${YELLOW}  rollout of $ds_ref did not complete within 120s${NC}"
+
+        echo -e "${CYAN}  $ds_ref re-pulled and restored to IfNotPresent${NC}"
+    done <<< "$daemonsets_to_fix"
+
+    # A re-pull that fetched the same wrong-architecture image leaves the pod
+    # crash-looping exactly as before, so the pods are checked, not the patch.
+    echo -e "${CYAN}Checking the pods after the re-pull...${NC}"
+    local still=""
+    for node in "${nodes[@]}"; do
+        node=$(echo "$node" | xargs)
+        local bad
+        bad=$($KUBECTL get pods --all-namespaces --field-selector spec.nodeName="$node" \
+            -o json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for pod in data.get('items', []):
+    for cs in pod.get('status', {}).get('containerStatuses', []):
+        waiting = cs.get('state', {}).get('waiting', {})
+        if waiting.get('reason') == 'CrashLoopBackOff':
+            msg = cs.get('lastState', {}).get('terminated', {}).get('message', '') or waiting.get('message', '')
+            print(f\"{pod['metadata']['namespace']}/{pod['metadata']['name']} ({cs['name']}: {msg.strip()[:80] or 'CrashLoopBackOff'})\")
+            break
+" 2>/dev/null)
+        if [ -n "$bad" ]; then
+            echo -e "${RED}  ✗ $node still has crash-looping pods:${NC}"
+            echo "$bad" | sed 's/^/      /'
+            still="$still $node"
+        else
+            echo -e "${GREEN}  ✓ $node: no crash-looping pods${NC}"
+        fi
+    done
+    if [ -n "$still" ]; then
+        echo -e "${RED}  The re-pull did not fix them. Check the image has a manifest for the node's architecture:${NC}"
+        echo -e "${RED}    crane manifest registry.<domain>/library/<image>:<tag> | grep architecture${NC}"
+        return 1
+    fi
+    return 0
+}
+
+# Custom venvs are built for the architectures the cluster has when each is
+# built. Once the images exist and the nodes are schedulable, thinkube-control
+# builds every custom venv that is missing one of the cluster's architectures;
+# venvs already built for it are left alone.
+build_venvs_for_architectures() {
+    if [ -z "$THINKUBE_API_TOKEN" ]; then
+        echo -e "${RED}THINKUBE_API_TOKEN is not set; a new code-server terminal loads it${NC}"
+        return 1
+    fi
+    local domain
+    domain=$(python3 -c "import yaml; print(yaml.safe_load(open('${INVENTORY_DIR}/inventory.yaml'))['all']['vars']['domain_name'])") || return 1
+    local arch answer
+    for arch in $($KUBECTL get nodes -o jsonpath='{range .items[*]}{.metadata.labels.kubernetes\.io/arch}{"\n"}{end}' | sort -u); do
+        if ! answer=$(curl -sS --fail-with-body -X POST \
+                -H "Authorization: Bearer $THINKUBE_API_TOKEN" -H "Content-Type: application/json" \
+                -d "{\"architecture\": \"$arch\"}" \
+                "https://control.${domain}/api/v1/jupyter-venvs/build-for-architecture"); then
+            echo -e "${RED}Custom venv build for $arch refused: $answer${NC}"
+            return 1
+        fi
+        echo -e "${CYAN}Custom venvs for $arch: $answer${NC}"
+    done
+    echo -e "${YELLOW}Venv builds run in thinkube-control; the Kernels page shows each one's status.${NC}"
+}
+
+# Sets UNCORDON_FAILED=1 if any node could not be verified uncordoned.
+UNCORDON_FAILED=0
+uncordon_nodes() {
+    local nodes_csv="$1"
+    if [ -z "$nodes_csv" ]; then
+        echo -e "${YELLOW}No nodes specified to uncordon${NC}"
+        return 0
+    fi
+    IFS=',' read -ra nodes <<< "$nodes_csv"
+    for node in "${nodes[@]}"; do
+        node=$(echo "$node" | xargs)
+        local ok=0
+        for attempt in 1 2 3; do
+            if $KUBECTL uncordon "$node"; then
+                # Trust but verify: confirm the node is actually schedulable.
+                local unsched
+                unsched=$($KUBECTL get node "$node" -o jsonpath='{.spec.unschedulable}' 2>/dev/null || echo "unknown")
+                if [ "$unsched" != "true" ] && [ "$unsched" != "unknown" ]; then
+                    ok=1
+                    break
+                fi
+            fi
+            echo -e "${YELLOW}  uncordon attempt $attempt/3 for $node failed — retrying in 10s${NC}"
+            sleep 10
+        done
+        if [ "$ok" -eq 1 ]; then
+            echo -e "${GREEN}✓ $node uncordoned — verified schedulable${NC}"
+        else
+            echo -e "${RED}✗ Failed to uncordon $node after 3 attempts${NC}"
+            UNCORDON_FAILED=1
+        fi
+    done
+}
+
+show_status() {
+    echo -e "${CYAN}Build token:${NC}"
+    if [ -f "$BUILD_TOKEN" ]; then
+        echo "  $(cat "$BUILD_TOKEN")"
+    else
+        echo "  (not set)"
+    fi
+    echo ""
+    echo -e "${CYAN}Cordoned nodes:${NC}"
+    local cordoned
+    cordoned=$($KUBECTL get nodes -o json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for node in data['items']:
+    spec = node.get('spec', {})
+    if spec.get('unschedulable'):
+        name = node['metadata']['name']
+        arch = node['status']['nodeInfo']['architecture']
+        print(f'  {name} ({arch})')
+" 2>/dev/null)
+    if [ -n "$cordoned" ]; then
+        echo "$cordoned"
+    else
+        echo "  (none)"
+    fi
+    echo ""
+    echo -e "${CYAN}Cluster architectures:${NC}"
+    $KUBECTL get nodes -o jsonpath='{range .items[*]}  {.metadata.name}: {.status.nodeInfo.architecture}{"\n"}{end}' 2>/dev/null
+}
+
+# Parse arguments
+COMMAND="${1:-}"
+shift 2>/dev/null || true
+
+UNCORDON_NODES=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --uncordon)
+            # Fail loudly if no node list follows — `shift 2` with a
+            # missing value would kill the script silently under set -e.
+            if [ -z "${2:-}" ]; then
+                echo -e "${RED}--uncordon requires a node list (e.g. --uncordon node1,node2)${NC}"
+                usage
+            fi
+            UNCORDON_NODES="$2"
+            shift 2
+            ;;
+        *)
+            UNCORDON_NODES="$1"
+            shift
+            ;;
+    esac
+done
+
+case "$COMMAND" in
+    rebuild)
+        echo -e "${CYAN}Starting full image rebuild pipeline${NC}"
+        echo ""
+
+        FAILED=0
+        run_playbook "13_mirror_public_images.yaml" "Mirror public images" || FAILED=1
+
+        if [ $FAILED -eq 0 ]; then
+            run_playbook "14_build_base_images.yaml" "Build base images" || FAILED=1
+        fi
+
+        if [ $FAILED -eq 0 ]; then
+            run_playbook "15_build_jupyter_images.yaml" "Build Jupyter image" || FAILED=1
+        fi
+
+        if [ $FAILED -eq 0 ]; then
+            echo ""
+            update_build_token
+            PODS_FAILED=0
+            if [ -n "$UNCORDON_NODES" ]; then
+                # Restart any pods that cached wrong-arch images before mirroring
+                restart_crashlooping_pods "$UNCORDON_NODES" || PODS_FAILED=1
+                echo ""
+                if [ "$PODS_FAILED" -eq 0 ]; then
+                    uncordon_nodes "$UNCORDON_NODES"
+                else
+                    echo -e "${RED}Nodes left cordoned: pods on them still crash-loop after the re-pull.${NC}"
+                    UNCORDON_FAILED=1
+                fi
+            fi
+            VENV_FAILED=0
+            if [ "$UNCORDON_FAILED" -eq 0 ]; then
+                echo ""
+                build_venvs_for_architectures || VENV_FAILED=1
+            fi
+            echo ""
+            if [ "$PODS_FAILED" -ne 0 ]; then
+                echo -e "${RED}════════════════════════════════════════════════════════${NC}"
+                echo -e "${RED}  Images built, but pods on $UNCORDON_NODES still crash-loop.${NC}"
+                echo -e "${RED}  Nodes are STILL CORDONED. Fix the images, then: tk_images rebuild --uncordon $UNCORDON_NODES${NC}"
+                echo -e "${RED}════════════════════════════════════════════════════════${NC}"
+                exit 1
+            fi
+            echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
+            echo -e "${GREEN}  All images built successfully!${NC}"
+            if [ -n "$UNCORDON_NODES" ] && [ "$UNCORDON_FAILED" -eq 0 ]; then
+                echo -e "${GREEN}  Nodes uncordoned (verified): $UNCORDON_NODES${NC}"
+            elif [ -n "$UNCORDON_NODES" ]; then
+                echo -e "${RED}  WARNING: some nodes are STILL CORDONED.${NC}"
+                echo -e "${RED}  Uncordon manually: tk_images uncordon $UNCORDON_NODES${NC}"
+            else
+                echo -e "${YELLOW}  Remember to uncordon nodes: tk_images uncordon node1,node2${NC}"
+            fi
+            echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
+            if [ "$VENV_FAILED" -ne 0 ]; then
+                echo -e "${RED}  Custom venvs were not started for the new architectures; see the message above.${NC}"
+            fi
+            if [ "$UNCORDON_FAILED" -ne 0 ] || [ "$VENV_FAILED" -ne 0 ]; then
+                exit 1
+            fi
+        else
+            echo ""
+            echo -e "${RED}════════════════════════════════════════════════════════${NC}"
+            echo -e "${RED}  Image rebuild failed. Fix the issue and retry.${NC}"
+            echo -e "${RED}  Nodes remain cordoned until you uncordon them.${NC}"
+            echo -e "${RED}════════════════════════════════════════════════════════${NC}"
+            exit 1
+        fi
+        ;;
+
+    mirror)
+        run_playbook "13_mirror_public_images.yaml" "Mirror public images"
+        ;;
+
+    build-base)
+        run_playbook "14_build_base_images.yaml" "Build base images"
+        ;;
+
+    build-jupyter)
+        run_playbook "15_build_jupyter_images.yaml" "Build Jupyter image"
+        ;;
+
+    venvs)
+        build_venvs_for_architectures
+        ;;
+
+    uncordon)
+        uncordon_nodes "$UNCORDON_NODES"
+        ;;
+
+    status)
+        show_status
+        ;;
+
+    *)
+        usage
+        ;;
+esac

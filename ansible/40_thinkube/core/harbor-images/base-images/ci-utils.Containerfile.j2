@@ -1,0 +1,54 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Lightweight CI/CD utilities image with curl and common tools
+FROM library/alpine:latest
+
+# Install commonly needed CI/CD tools
+RUN apk add --no-cache \
+    # Essential tools
+    curl \
+    wget \
+    git \
+    bash \
+    # JSON/YAML processing
+    jq \
+    yq \
+    # Text processing (grep, sed, awk are in busybox)
+    # Network tools
+    openssh-client \
+    ca-certificates \
+    # Build essentials
+    make \
+    # Archive tools (tar, gzip in busybox)
+    unzip && \
+    # Install crane for container registry manifest manipulation.
+    # Download to a file before extracting so a transient github.com
+    # response (rate limit / 5xx / empty body) fails the build with a
+    # clear error instead of piping garbage to tar.
+    ARCH=$(uname -m) && \
+    case "$ARCH" in aarch64) CRANE_ARCH=arm64 ;; *) CRANE_ARCH=x86_64 ;; esac && \
+    curl -fsSL --retry 5 --retry-delay 5 \
+      -o /tmp/crane.tgz \
+      "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_${CRANE_ARCH}.tar.gz" && \
+    tar -xzf /tmp/crane.tgz -C /usr/local/bin crane && \
+    rm -f /tmp/crane.tgz && \
+    chmod +x /usr/local/bin/crane
+
+# Add a non-root user for security
+RUN adduser -D -s /bin/bash ci-user
+
+# Set bash as default shell
+SHELL ["/bin/bash", "-c"]
+
+# Create workspace directory
+WORKDIR /workspace
+
+# Default to non-root user
+USER ci-user
+
+# Health check command
+HEALTHCHECK NONE
+
+# Default command
+CMD ["/bin/bash"]

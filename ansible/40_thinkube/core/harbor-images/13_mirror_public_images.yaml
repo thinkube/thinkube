@@ -1,0 +1,196 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/13_mirror_public_images.yaml
+# Description:
+#   This playbook mirrors essential container images from public registries to
+#   the local Harbor instance to avoid Docker Hub rate limits. The image list
+#   is fetched from thinkube-metadata on GitHub.
+#
+# Requirements:
+#   - Harbor registry must be installed and accessible
+#   - Connection to public container registries
+#   - Podman or Docker must be installed on the control node
+#   - HARBOR_ROBOT_TOKEN environment variable must be set
+#
+# Usage:
+#   cd ~/thinkube
+#
+#   Mirror all images from thinkube-metadata:
+#     ./scripts/tk_ansible ansible/40_thinkube/core/harbor-images/13_mirror_public_images.yaml
+#
+#   Mirror a single image (override mirror_images via -e):
+#     ./scripts/tk_ansible ansible/40_thinkube/core/harbor-images/13_mirror_public_images.yaml \
+#       -e '{"mirror_images": [{"source": "docker.io/ollama/ollama:0.21.1", "destination": "registry.cmxela.com/library/ollama:latest", "architectures": ["amd64", "arm64"]}]}'
+#
+# Variables from inventory:
+#   - harbor_registry: Registry domain
+#   - harbor_project: Project namespace for mirrored images
+#   - kubeconfig: Path to Kubernetes configuration file
+
+- name: Mirror Public Container Images to Harbor Registry
+  hosts: k8s_control_plane
+  gather_facts: true
+  vars:
+    env_file_path: "{{ ansible_facts.env.HOME }}/.env"
+    harbor_robot_user: "robot$thinkube"
+    library_project: "library"
+    metadata_url: "https://raw.githubusercontent.com/thinkube/thinkube-metadata/{{ thinkube_ref }}/mirror_images.json"
+
+  pre_tasks:
+    - name: Get robot token from env file
+      ansible.builtin.shell: |
+        grep HARBOR_ROBOT_TOKEN {{ ansible_facts.env.HOME }}/.env | cut -d= -f2
+      register: robot_token_cmd
+      changed_when: false
+      failed_when: robot_token_cmd.rc != 0
+
+    - name: Set robot token fact
+      ansible.builtin.set_fact:
+        harbor_robot_token: "{{ robot_token_cmd.stdout | trim }}"
+
+    - name: Verify Harbor robot token is available
+      ansible.builtin.assert:
+        that:
+          - harbor_robot_token | length > 0
+        fail_msg: "HARBOR_ROBOT_TOKEN not found in {{ ansible_facts.env.HOME }}/.env"
+        success_msg: "Harbor robot token is available"
+
+    - name: Get admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+        harbor_admin_user: "admin"
+
+    - name: Parse build platforms into architecture list
+      ansible.builtin.set_fact:
+        build_architectures: "{{ (container_build_platforms | default('linux/' + ('arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64'))).split(',') | map('trim') | map('replace', 'linux/', '') | list }}"
+
+    # ========================================================================
+    # FETCH IMAGE LIST FROM THINKUBE-METADATA
+    # ========================================================================
+
+    - name: Fetch mirror image catalog from GitHub
+      ansible.builtin.uri:
+        url: "{{ metadata_url }}"
+        return_content: true
+        timeout: 30
+      register: metadata_response
+      retries: 5
+      delay: 10
+      until: metadata_response.status == 200
+
+    - name: Parse image catalog
+      ansible.builtin.set_fact:
+        mirror_catalog: "{{ (metadata_response.content | from_json).images }}"
+
+    # Build mirror_images, filtering out entries whose declared
+    # architectures don't overlap what this cluster actually runs. Keeps
+    # us from pulling/pushing huge arm64 images (e.g. tensorrt-llm-spark)
+    # on an amd64-only cluster, where they could never be scheduled.
+    # When an entry's architecture list intersects build_architectures
+    # only partially, narrow it to the intersection so the per-arch
+    # mirror loop only does the work that's actually needed.
+    - name: Build mirror_images list with full destination paths
+      ansible.builtin.set_fact:
+        mirror_images: >-
+          {{
+            mirror_images | default([]) + (
+              [{
+                'source': item.source,
+                'destination': harbor_registry ~ '/' ~ library_project ~ '/' ~ item.destination_name,
+                'description': item.description | default(''),
+                'architectures': effective_archs,
+              }] if effective_archs | length > 0 else []
+            )
+          }}
+      vars:
+        effective_archs: "{{ (item.architectures | default(build_architectures)) | intersect(build_architectures) | list }}"
+      loop: "{{ mirror_catalog }}"
+      loop_control:
+        label: "{{ item.source }}"
+
+    - name: Display skipped images (architecture not present in cluster)
+      ansible.builtin.debug:
+        msg: >-
+          Skipping {{ item.source }} → {{ item.destination_name }}
+          (declared architectures {{ item.architectures }}; cluster runs {{ build_architectures }})
+      loop: "{{ mirror_catalog }}"
+      loop_control:
+        label: "{{ item.source }}"
+      when:
+        - item.architectures is defined
+        - (item.architectures | intersect(build_architectures) | list | length) == 0
+
+    - name: Display image list info
+      ansible.builtin.debug:
+        msg: "Mirroring {{ mirror_images | length }} images (architectures: {{ build_architectures }})"
+
+  tasks:
+    - name: Check if crane is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/crane
+      register: crane_bin
+
+    - name: Install crane binary
+      ansible.builtin.shell: |
+        curl -sL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'x86_64' }}.tar.gz | tar xz -C /usr/local/bin crane
+        chmod +x /usr/local/bin/crane
+      become: true
+      when: not crane_bin.stat.exists
+
+    - name: Create library project in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects"
+        method: POST
+        headers:
+          Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          project_name: "{{ library_project }}"
+          public: true
+          metadata:
+            public: "true"
+            description: "Public library images mirrored from Docker Hub and other registries"
+        validate_certs: true
+        status_code: [201, 409]
+
+    - name: Loop through images and mirror them to Harbor
+      include_tasks: "{{ playbook_dir }}/../../../roles/container_deployment/image_mirror/tasks/main.yaml"
+      vars:
+        source_image: "{{ item.source }}"
+        destination_image: "{{ item.destination }}"
+        harbor_api_user: "{{ harbor_admin_user }}"
+        harbor_api_password: "{{ admin_password }}"
+        harbor_push_user: "{{ harbor_robot_user }}"
+        harbor_push_password: "{{ harbor_robot_token }}"
+        required_architectures: "{{ item.architectures | default(build_architectures) }}"
+      loop: "{{ mirror_images }}"
+      loop_control:
+        label: "{{ item.description if item.description is defined else item.destination }}"
+      tags:
+        - mirror
+
+    - name: Create image manifest for thinkube-control discovery
+      include_role:
+        name: container_deployment/image_manifest
+      vars:
+        manifest_images: "{{ mirror_images }}"
+        manifest_category: "system"
+        manifest_source: "mirrored"
+        manifest_namespace: "registry"
+      tags:
+        - manifest
+
+    - name: Display results
+      ansible.builtin.debug:
+        msg:
+          - "Image mirroring complete"
+          - "----------------------------------------"
+          - "Total images mirrored: {{ mirror_images | length }}"
+          - "Source: thinkube-metadata (GitHub)"
+          - "Library project: {{ library_project }}"
+          - "Mirror tool: podman pull/push + crane manifest (multi-arch)"
+          - "Image manifest created for thinkube-control discovery"
+          - "----------------------------------------"

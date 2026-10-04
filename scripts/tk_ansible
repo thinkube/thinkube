@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Simplified Ansible runner for code-server environment
+# Always runs in cluster network - no network detection needed
+# Usage: tk_ansible ansible/path/to/playbook.yaml [ansible-args]
+
+set -e  # Exit on error
+
+# readlink -f resolves the /usr/local/bin symlink to the real script in the repo.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+THINKUBE_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Inventory location (shared between code-server and thinkube-control)
+INVENTORY_DIR="/home/thinkube/.ansible/inventory"
+
+# Check if playbook argument is provided
+if [ -z "$1" ]; then
+  echo "ERROR: No playbook specified"
+  echo "Usage: $0 ansible/path/to/playbook.yaml [additional options]"
+  exit 1
+fi
+
+PLAYBOOK="$1"
+shift  # Remove first argument
+
+# Source environment variables and export them for Ansible
+if [ -f "$HOME/.env" ]; then
+  echo "Loading environment variables from $HOME/.env"
+  set -a  # automatically export all variables
+  source "$HOME/.env"
+  set +a  # stop auto-exporting
+else
+  echo "ERROR: $HOME/.env file not found!"
+  exit 1
+fi
+
+# Ansible and its collections live in the virtual environment
+if [ ! -f "$HOME/.venv/bin/activate" ]; then
+  echo "ERROR: No Python virtual environment at $HOME/.venv"
+  echo "It holds Ansible and its collections; the code-server deploy creates it."
+  exit 1
+fi
+echo "Activating Python virtual environment from $HOME/.venv"
+source "$HOME/.venv/bin/activate"
+
+# Set ANSIBLE_BECOME_PASSWORD from environment
+if [ -z "$ANSIBLE_BECOME_PASSWORD" ]; then
+  echo "ERROR: ANSIBLE_BECOME_PASSWORD not set in .env file"
+  exit 1
+fi
+
+# The system user signs in over SSH and runs sudo with the same password
+export ANSIBLE_SSH_PASS="$ANSIBLE_BECOME_PASSWORD"
+
+# Password SSH needs sshpass, which the code-server image provides
+if ! command -v sshpass &> /dev/null; then
+  echo "ERROR: sshpass is not installed."
+  echo "It belongs in the code-server image: harbor-images/base-images/code-server-dev.Containerfile.j2"
+  exit 1
+fi
+
+# Get the system username from inventory
+if ! SYSTEM_USERNAME=$(python3 -c "import yaml; inv=yaml.safe_load(open('${INVENTORY_DIR}/inventory.yaml')); print(inv['all']['vars']['system_username'])"); then
+  echo "ERROR: Cannot read all.vars.system_username from ${INVENTORY_DIR}/inventory.yaml"
+  exit 1
+fi
+if [ -z "$SYSTEM_USERNAME" ]; then
+  echo "ERROR: all.vars.system_username is empty in ${INVENTORY_DIR}/inventory.yaml"
+  exit 1
+fi
+
+# Common Ansible settings
+export ANSIBLE_HOST_KEY_CHECKING=False
+
+# Create a temporary vars file for authentication
+TEMP_VARS="/tmp/ansible-vars-$$.yml"
+cat > "$TEMP_VARS" << 'EOF'
+---
+ansible_become_pass: "${ANSIBLE_BECOME_PASSWORD}"
+ansible_ssh_pass: "${ANSIBLE_SSH_PASS}"
+ansible_user: "${SYSTEM_USERNAME}"
+EOF
+
+# Replace placeholders with actual values
+sed -i "s|\${ANSIBLE_BECOME_PASSWORD}|$ANSIBLE_BECOME_PASSWORD|g" "$TEMP_VARS"
+sed -i "s|\${ANSIBLE_SSH_PASS}|$ANSIBLE_SSH_PASS|g" "$TEMP_VARS"
+sed -i "s|\${SYSTEM_USERNAME}|$SYSTEM_USERNAME|g" "$TEMP_VARS"
+
+# Execute playbook with extra vars
+echo "Running playbook: $PLAYBOOK"
+ansible-playbook -i "${INVENTORY_DIR}/inventory.yaml" "$PLAYBOOK" \
+  -e "@$TEMP_VARS" \
+  "$@"
+RESULT=$?
+
+# Clean up temporary files
+rm -f "$TEMP_VARS"
+
+exit $RESULT

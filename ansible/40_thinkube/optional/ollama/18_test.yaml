@@ -1,0 +1,141 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/ollama/18_test.yaml
+# Description:
+#   Test Ollama deployment - validates all components are running correctly
+#
+# Requirements:
+#   - Ollama must be deployed (00_install.yaml)
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/ollama/18_test.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubectl configuration
+#   - ollama_namespace: Namespace for Ollama
+
+- name: Test Ollama deployment
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    k8s_namespace: "{{ ollama_namespace | default('ollama') }}"
+    ollama_host: "{{ ollama_hostname | default('ollama.' + domain_name) }}"
+
+  tasks:
+    ###########################################################################
+    # Test 1: Namespace exists
+    ###########################################################################
+    - name: "TEST 1: Verify Ollama namespace exists"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Namespace
+        name: "{{ k8s_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: "TEST 1: Result"
+      ansible.builtin.debug:
+        msg: "✓ Namespace '{{ k8s_namespace }}' exists"
+
+    ###########################################################################
+    # Test 2: Deployment exists (replicas: 0, gateway-managed)
+    ###########################################################################
+    - name: "TEST 2: Verify Ollama Deployment exists"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Deployment
+        name: ollama
+        namespace: "{{ k8s_namespace }}"
+      register: deploy_check
+      failed_when: deploy_check.resources | length == 0
+
+    - name: "TEST 2: Result"
+      ansible.builtin.debug:
+        msg: "✓ Deployment 'ollama' exists (replicas: {{ deploy_check.resources[0].spec.replicas }}, gateway-managed)"
+
+    ###########################################################################
+    # Test 3: Service exists
+    ###########################################################################
+    - name: "TEST 3: Verify Ollama Service exists"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Service
+        name: ollama
+        namespace: "{{ k8s_namespace }}"
+      register: svc_check
+      failed_when: svc_check.resources | length == 0
+
+    - name: "TEST 3: Result"
+      ansible.builtin.debug:
+        msg: "✓ Service 'ollama' exists"
+
+    ###########################################################################
+    # Test 4: JuiceFS PVC is bound
+    ###########################################################################
+    - name: "TEST 4: Verify MLflow JuiceFS PVC is bound"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: PersistentVolumeClaim
+        name: ollama-mlflow-pvc
+        namespace: "{{ k8s_namespace }}"
+      register: mlflow_pvc_check
+      failed_when: >-
+        mlflow_pvc_check.resources | length == 0 or
+        mlflow_pvc_check.resources[0].status.phase != 'Bound'
+
+    - name: "TEST 4: Result"
+      ansible.builtin.debug:
+        msg: "✓ PVC 'ollama-mlflow-pvc' is bound (JuiceFS — single volume for MLflow + Ollama blobs)"
+
+    ###########################################################################
+    # Test 5: HTTPRoute is configured
+    ###########################################################################
+    - name: "TEST 5: Verify Ollama HTTPRoute exists"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        name: ollama-route
+        namespace: "{{ k8s_namespace }}"
+      register: httproute_check
+      failed_when: httproute_check.resources | length == 0
+
+    - name: "TEST 5: Result"
+      ansible.builtin.debug:
+        msg: "✓ HTTPRoute 'ollama-route' exists (host: {{ ollama_host }})"
+
+    ###########################################################################
+    # Test 6: Service discovery ConfigMap exists
+    ###########################################################################
+    - name: "TEST 6: Verify service discovery ConfigMap"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: "{{ k8s_namespace }}"
+      register: configmap_check
+      failed_when: configmap_check.resources | length == 0
+
+    - name: "TEST 6: Result"
+      ansible.builtin.debug:
+        msg: "✓ Service discovery ConfigMap exists"
+
+    ###########################################################################
+    # Summary
+    ###########################################################################
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "=========================================================="
+          - "All Ollama tests passed!"
+          - "=========================================================="
+          - "Namespace: {{ k8s_namespace }}"
+          - "Deployment: ollama (replicas: 0, gateway-managed)"
+          - "Service: ollama.{{ k8s_namespace }}.svc.cluster.local:11434"
+          - "External: https://{{ ollama_host }}"
+          - "=========================================================="

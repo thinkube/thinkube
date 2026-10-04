@@ -1,0 +1,749 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/11_deploy_webhook_adapter.yaml
+# Description:
+#   Deploy Harbor webhook adapter for instant image updates via direct Git updates
+#   This eliminates the 2-minute polling delay for a true "local development" experience
+#   
+#   Bootstrap capability: Can deploy before thinkube-control exists.
+#
+# Requirements:
+#   - ArgoCD deployed
+#   - Harbor registry deployed and accessible
+#   - Python base image available in Harbor
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/11_deploy_webhook_adapter.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain name for all services
+#   - harbor_registry: Harbor registry hostname
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to Kubernetes configuration file
+#
+# Dependencies:
+#   - CORE-009: ArgoCD deployed
+#
+# Post-deployment:
+#   - Webhook adapter processes Harbor PUSH_ARTIFACT events and updates Git repos
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy Harbor Webhook Adapter
+  hosts: k8s_control_plane
+  gather_facts: true
+  
+  vars:
+    adapter_namespace: "{{ argocd_namespace }}"
+    adapter_name: "harbor-webhook-adapter"
+    
+  tasks:
+    - name: Get sync webhook secret if it exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ adapter_namespace }}"
+        name: "sync-webhook-secret"
+      register: sync_secret_check
+
+    - name: Set sync webhook secret
+      ansible.builtin.set_fact:
+        sync_webhook_secret: "{{ sync_secret_check.resources[0].data.webhook_secret | b64decode if sync_secret_check.resources else '' }}"
+
+    - name: Delete existing webhook adapter ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: ConfigMap
+        name: "{{ adapter_name }}-script"
+        namespace: "{{ adapter_namespace }}"
+      failed_when: false
+
+    - name: Create webhook adapter ConfigMap with Python script
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ adapter_name }}-script"
+            namespace: "{{ adapter_namespace }}"
+            labels:
+              version: "0.1.0"  # Support both ci-cd-pipeline and build-and-push templates
+          data:
+            adapter.py: |
+              #!/usr/bin/env python3
+              import os
+              import sys
+              import json
+              import logging
+              import requests
+              import subprocess
+              import tempfile
+              import base64
+              import hmac
+              import hashlib
+              import time
+              import threading
+              from http.server import HTTPServer, BaseHTTPRequestHandler
+              from urllib.parse import urlparse
+              from datetime import datetime
+              
+              logging.basicConfig(level=logging.INFO)
+              logger = logging.getLogger(__name__)
+              
+              HARBOR_URL = os.environ.get('HARBOR_URL', 'https://registry.{{ domain_name }}')
+              HARBOR_USER = os.environ.get('HARBOR_USER', 'admin')
+              HARBOR_PASSWORD = os.environ.get('HARBOR_PASSWORD', '')
+              GITEA_URL = os.environ.get('GITEA_URL', 'https://git.{{ domain_name }}')
+              GITEA_USER = os.environ.get('GITEA_USER', 'admin')
+              GITEA_PASSWORD = os.environ.get('GITEA_PASSWORD', '')
+              PORT = int(os.environ.get('PORT', '8080'))
+              SYNC_WEBHOOK_URL = os.environ.get('SYNC_WEBHOOK_URL', '')
+              SYNC_WEBHOOK_SECRET = os.environ.get('SYNC_WEBHOOK_SECRET', '')
+
+              def get_app_metadata_from_workflow(workflow_uid):
+                  """Get app metadata from Argo Workflow labels using the workflow UID (tag)"""
+                  try:
+                      # Use Kubernetes API to find workflow by UID
+                      import urllib3
+                      urllib3.disable_warnings()
+                      
+                      # Read service account token
+                      token_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+                      if not os.path.exists(token_path):
+                          raise Exception("Service account token not found")
+                          
+                      with open(token_path, 'r') as f:
+                          token = f.read()
+                      
+                      headers = {'Authorization': f'Bearer {token}'}
+                      
+                      # Query all Argo workflows and filter by UID
+                      # Note: fieldSelector doesn't support metadata.uid for CRDs
+                      url = f'https://kubernetes.default.svc/apis/argoproj.io/v1alpha1/namespaces/argo/workflows'
+                      response = requests.get(url, headers=headers, verify=False, timeout=5)
+                      
+                      if response.status_code == 200:
+                          workflows = response.json().get('items', [])
+                          # Find workflow by UID
+                          matching_workflow = None
+                          for wf in workflows:
+                              if wf.get('metadata', {}).get('uid') == workflow_uid:
+                                  matching_workflow = wf
+                                  break
+                          
+                          if matching_workflow:
+                              labels = matching_workflow.get('metadata', {}).get('labels', {})
+                              app_name = labels.get('thinkube.io/app-name')
+                              namespace = labels.get('thinkube.io/namespace')
+                              
+                              # For thinkube-control and other system apps, namespace might be empty
+                              # Use the app namespace if not specified
+                              if app_name:
+                                  if not namespace:
+                                      namespace = app_name  # Default to app name as namespace
+                                  logger.info(f"Found workflow for app '{app_name}' in namespace '{namespace}'")
+                                  return app_name, namespace
+                              else:
+                                  logger.warning(f"Workflow {workflow_uid} missing app-name label")
+                                  return None, None
+                          else:
+                              logger.warning(f"No workflow found with UID {workflow_uid}")
+                              return None, None
+                      else:
+                          logger.error(f"Failed to query workflows: {response.status_code}")
+                          return None, None
+                          
+                  except Exception as e:
+                      logger.error(f"Failed to get workflow metadata: {e}")
+                      return None, None
+              
+              
+              def check_harbor_image(project, repo, tag):
+                  """Check if an image exists in Harbor registry"""
+                  try:
+                      url = f"{HARBOR_URL}/api/v2.0/projects/{project}/repositories/{repo}/artifacts/{tag}"
+                      response = requests.get(url, auth=(HARBOR_USER, HARBOR_PASSWORD), verify=False, timeout=10)
+                      return response.status_code == 200
+                  except Exception as e:
+                      logger.error(f"Failed to check Harbor image {project}/{repo}:{tag}: {e}")
+                      return False
+              
+              def trigger_argocd_sync(app_name):
+                  """Trigger ArgoCD sync via sync webhook"""
+                  if not SYNC_WEBHOOK_URL:
+                      logger.info("Sync webhook URL not configured, skipping sync trigger")
+                      return True
+                  
+                  try:
+                      payload = {"application": app_name}
+                      payload_json = json.dumps(payload)
+                      headers = {"Content-Type": "application/json"}
+                      
+                      # Add HMAC signature if secret is configured
+                      if SYNC_WEBHOOK_SECRET:
+                          signature = hmac.new(
+                              SYNC_WEBHOOK_SECRET.encode('utf-8'),
+                              payload_json.encode('utf-8'),
+                              hashlib.sha256
+                          ).hexdigest()
+                          headers["X-Webhook-Signature"] = signature
+                      
+                      response = requests.post(
+                          SYNC_WEBHOOK_URL,
+                          data=payload_json,
+                          headers=headers,
+                          timeout=30
+                      )
+                      
+                      if response.status_code == 200:
+                          logger.info(f"Successfully triggered sync for {app_name}")
+                          return True
+                      else:
+                          logger.error(f"Failed to trigger sync for {app_name}: {response.status_code} - {response.text}")
+                          return False
+                          
+                  except Exception as e:
+                      logger.error(f"Error triggering sync: {e}")
+                      return False
+              
+              def update_git_with_images(app_name, tag, containers):
+                  """Update git repository with new image tags"""
+                  try:
+                      # Create temporary directory for git operations
+                      with tempfile.TemporaryDirectory() as temp_dir:
+                          repo_url = f"{GITEA_URL}/thinkube-deployments/{app_name}.git"
+                          repo_dir = os.path.join(temp_dir, app_name)
+
+                          # Clone repository
+                          clone_cmd = [
+                              'git', 'clone', '--depth', '1', '--branch', 'main',
+                              repo_url.replace('https://', f'https://{GITEA_USER}:{GITEA_PASSWORD}@'),
+                              repo_dir
+                          ]
+                          result = subprocess.run(clone_cmd, capture_output=True, text=True, timeout=30)
+                          if result.returncode != 0:
+                              logger.error(f"Git clone failed: {result.stderr}")
+                              return False
+
+                          # Update .argocd-source file
+                          argocd_file = os.path.join(repo_dir, 'k8s', f'.argocd-source-{app_name}.yaml')
+
+                          # Create/update the ArgoCD source file with new image tags
+                          image_list = []
+                          for container in containers:
+                              image_list.append(f'{{ harbor_registry }}/thinkube/{app_name}-{container["name"]}:{tag}')
+
+                          # Write updated content
+                          os.makedirs(os.path.dirname(argocd_file), exist_ok=True)
+                          with open(argocd_file, 'w') as f:
+                              # Write YAML manually to ensure correct format
+                              f.write('kustomize:\n')
+                              f.write('  images:\n')
+                              for image in image_list:
+                                  f.write(f'  - {image}\n')
+
+                          # Configure git user
+                          subprocess.run(['git', 'config', 'user.name', 'harbor-webhook-adapter'],
+                                       cwd=repo_dir, timeout=10)
+                          subprocess.run(['git', 'config', 'user.email', 'webhook@thinkube.com'],
+                                       cwd=repo_dir, timeout=10)
+
+                          # Commit changes
+                          subprocess.run(['git', 'add', '.'], cwd=repo_dir, timeout=10)
+                          commit_msg = f"build: automatic update of {app_name} to {tag}"
+                          commit_result = subprocess.run(['git', 'commit', '-m', commit_msg],
+                                                       cwd=repo_dir, capture_output=True, text=True, timeout=10)
+
+                          if commit_result.returncode != 0:
+                              if "nothing to commit" in commit_result.stdout:
+                                  logger.info(f"No changes to commit for {app_name}:{tag}")
+                                  return True
+                              else:
+                                  logger.error(f"Git commit failed: {commit_result.stderr}")
+                                  return False
+
+                          # Push changes
+                          push_result = subprocess.run(['git', 'push'], cwd=repo_dir,
+                                                     capture_output=True, text=True, timeout=30)
+                          if push_result.returncode != 0:
+                              logger.error(f"Git push failed: {push_result.stderr}")
+                              return False
+
+                          logger.info(f"Successfully updated git for {app_name} with tag {tag}")
+
+                          # Trigger ArgoCD sync after Git update
+                          if trigger_argocd_sync(app_name):
+                              logger.info(f"Successfully triggered ArgoCD sync for {app_name}")
+                          else:
+                              logger.warning(f"Failed to trigger ArgoCD sync for {app_name}, but Git update succeeded")
+
+                          return True
+
+                  except Exception as e:
+                      logger.error(f"Failed to update git: {e}")
+                      return False
+              
+              def process_webhook_async(webhook_data):
+                  """Process webhook in background thread"""
+                  try:
+                      logger.info(f"Background processing started for webhook: {webhook_data.get('type', 'unknown')}")
+                      
+                      # Process only PUSH_ARTIFACT events
+                      if webhook_data.get('type') == 'PUSH_ARTIFACT':
+                          event_data = webhook_data.get('event_data', {})
+                          repository = event_data.get('repository', {})
+                          resources = event_data.get('resources', [])
+                          
+                          if repository and resources:
+                              repo_name = repository.get('repo_full_name', '')
+                              # Builds push their layer cache to <image>/cache, one
+                              # event per layer; those are never deployable images.
+                              if repo_name.endswith('/cache'):
+                                  return
+                              logger.info(f"Webhook for repo {repo_name} with {len(resources)} resources")
+                              
+                              # Initialize variables
+                              app_name = None
+                              namespace = None
+                              workflow_uid = None
+                              
+                              # Find the workflow UID from the resources (it's the tag)
+                              for resource in resources:
+                                  tag = resource.get('tag', '')
+                                  if tag and tag != 'latest':  # The tag is the workflow UID
+                                      workflow_uid = tag
+                                      break
+                              
+                              if not workflow_uid:
+                                  logger.warning("No workflow UID found in webhook resources")
+                                  return
+                              
+                              # Get app metadata from the workflow
+                              app_name, namespace = get_app_metadata_from_workflow(workflow_uid)
+                              
+                              if not app_name or not namespace:
+                                  logger.error(f"Failed to find workflow metadata for UID: {workflow_uid}")
+                                  return
+                              
+                              # Get container information from the workflow template
+                              # The workflow knows which containers it's building
+                              containers = []
+                              
+                              # Read service account token
+                              token_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+                              with open(token_path, 'r') as f:
+                                  token = f.read()
+                              
+                              headers = {'Authorization': f'Bearer {token}'}
+                              
+                              # Get the WorkflowTemplate to see which containers it builds
+                              wft_url = f'https://kubernetes.default.svc/apis/argoproj.io/v1alpha1/namespaces/argo/workflowtemplates/{app_name}-build'
+                              wft_response = requests.get(wft_url, headers=headers, verify=False, timeout=5)
+                              
+                              if wft_response.status_code != 200:
+                                  logger.error(f"Failed to get WorkflowTemplate: {wft_response.status_code}")
+                                  return
+                              
+                              wft_data = wft_response.json()
+                              spec = wft_data.get('spec', {})
+                              templates = spec.get('templates', [])
+                              
+                              # Find build tasks to identify unique containers.
+                              # Multi-arch builds have multiple tasks (build-inference-amd64,
+                              # build-inference-arm64) sharing the same container_name param.
+                              seen_containers = set()
+                              for template in templates:
+                                  if template.get('name') in ['ci-cd-pipeline', 'build-and-push']:
+                                      dag = template.get('dag', {})
+                                      tasks = dag.get('tasks', [])
+                                      for task in tasks:
+                                          task_name = task.get('name', '')
+                                          if task_name.startswith('build-') and task_name not in ['build-pipeline', 'build-and-push']:
+                                              task_args = {a['name']: a['value'] for a in task.get('arguments', {}).get('parameters', [])}
+                                              container_name = task_args.get('container_name') or task_name.replace('build-', '')
+                                              if container_name not in seen_containers:
+                                                  seen_containers.add(container_name)
+                                                  containers.append({'name': container_name})
+
+                              if not containers:
+                                  logger.error(f"No container build tasks found in WorkflowTemplate for {app_name}")
+                                  return
+
+                              logger.info(f"Found {len(containers)} containers from WorkflowTemplate: {[c['name'] for c in containers]}")
+
+                              for resource in resources:
+                                  tag = resource.get('tag', '')
+                                  if tag and tag != 'latest':  # Ignore latest tags
+                                      logger.info(f"Received webhook for {app_name} - {repo_name}:{tag}")
+
+                                      # Smart Detection: Check if all container images exist in Harbor
+                                      try:
+                                          # Check each container image
+                                          image_status = {}
+                                          for container in containers:
+                                              container_name = container['name']
+                                              exists = check_harbor_image('thinkube', f'{app_name}-{container_name}', tag)
+                                              image_status[container_name] = exists
+
+                                          all_images_exist = all(image_status.values())
+                                          logger.info(f"Image check for {app_name}:{tag} - {image_status}")
+
+                                          if all_images_exist:
+                                              logger.info(f"All {len(containers)} images found for {app_name}:{tag}")
+
+                                              # Update git repository with image tags
+                                              if update_git_with_images(app_name, tag, containers):
+                                                  logger.info(f"Successfully updated git for {app_name}:{tag}")
+                                              else:
+                                                  logger.error(f"Failed to update git for {app_name}:{tag}")
+                                          else:
+                                              missing_containers = [name for name, exists in image_status.items() if not exists]
+                                              logger.info(f"Waiting for images: {missing_containers}")
+
+                                      except Exception as e:
+                                          logger.error(f"Failed to process webhook for {app_name}:{tag}: {e}")
+                      
+                      logger.info("Background processing completed")
+                      
+                  except Exception as e:
+                      logger.error(f"Error in background webhook processing: {e}")
+                      import traceback
+                      logger.error(traceback.format_exc())
+              
+              class WebhookHandler(BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      # Health check endpoint
+                      if self.path == '/' or self.path == '/health':
+                          self.send_response(200)
+                          self.send_header('Content-type', 'application/json')
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"status": "ok"}).encode())
+                      else:
+                          self.send_response(404)
+                          self.end_headers()
+                  
+                  def do_POST(self):
+                      if self.path != '/webhook':
+                          self.send_response(404)
+                          self.end_headers()
+                          return
+                      
+                      try:
+                          content_length = int(self.headers['Content-Length'])
+                          post_data = self.rfile.read(content_length)
+                          webhook_data = json.loads(post_data)
+                          
+                          # Log the webhook for debugging
+                          logger.info(f"Received webhook: {webhook_data.get('type', 'unknown')}")
+                          
+                          # Start processing in background thread
+                          thread = threading.Thread(target=process_webhook_async, args=(webhook_data,))
+                          thread.daemon = True  # Don't wait for thread to complete on shutdown
+                          thread.start()
+                          
+                          # Immediately respond to Harbor
+                          self.send_response(200)
+                          self.send_header('Content-type', 'application/json')
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"status": "accepted"}).encode())
+                          
+                      except Exception as e:
+                          logger.error(f"Error receiving webhook: {e}")
+                          self.send_response(500)
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"error": str(e)}).encode())
+                  
+                  def log_message(self, format, *args):
+                      # Suppress default access logs
+                      pass
+              
+              if __name__ == '__main__':
+                  try:
+                      logger.info(f"Starting webhook adapter on port {PORT}")
+                      logger.info(f"Harbor URL: {HARBOR_URL}")
+                      logger.info(f"Gitea URL: {GITEA_URL}")
+                      # Add debug logging
+                      logger.info(f"Creating HTTP server on 0.0.0.0:{PORT}")
+                      httpd = HTTPServer(('0.0.0.0', PORT), WebhookHandler)
+                      logger.info("HTTP server created successfully, starting to serve...")
+                      httpd.serve_forever()
+                  except Exception as e:
+                      logger.error(f"Failed to start webhook adapter: {e}")
+                      import traceback
+                      logger.error(traceback.format_exc())
+                      sys.exit(1)
+
+    - name: Create ServiceAccount for webhook adapter
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "{{ adapter_name }}"
+            namespace: "{{ adapter_namespace }}"
+
+    - name: Create ClusterRole for webhook adapter
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: "{{ adapter_name }}-configmap-reader"
+          rules:
+          - apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "list"]
+          - apiGroups: ["argoproj.io"]
+            resources: ["workflows", "workflowtemplates"]
+            verbs: ["get", "list"]
+
+    - name: Create ClusterRoleBinding
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: "{{ adapter_name }}-configmap-reader"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: "{{ adapter_name }}-configmap-reader"
+          subjects:
+          - kind: ServiceAccount
+            name: "{{ adapter_name }}"
+            namespace: "{{ adapter_namespace }}"
+
+    - name: Deploy webhook adapter
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ adapter_name }}"
+            namespace: "{{ adapter_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: "{{ adapter_name }}"
+            template:
+              metadata:
+                labels:
+                  app: "{{ adapter_name }}"
+              spec:
+                serviceAccountName: "{{ adapter_name }}"
+                containers:
+                - name: adapter
+                  image: "{{ harbor_registry }}/library/python:3.12-alpine"
+                  command: ["/bin/sh", "-c"]
+                  args: ["apk add --no-cache git && pip install --no-cache-dir requests pyyaml && python -u /app/adapter.py"]
+                  env:
+                  - name: HARBOR_URL
+                    value: "https://registry.{{ domain_name }}"
+                  - name: HARBOR_USER
+                    value: "admin"
+                  - name: HARBOR_PASSWORD
+                    value: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+                  - name: GITEA_URL
+                    value: "https://git.{{ domain_name }}"
+                  - name: GITEA_USER
+                    value: "{{ admin_username }}"
+                  - name: GITEA_PASSWORD
+                    value: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+                  - name: PORT
+                    value: "8080"
+                  - name: SYNC_WEBHOOK_URL
+                    value: "http://argocd-sync-webhook.{{ adapter_namespace }}.svc.cluster.local/sync"
+                  - name: SYNC_WEBHOOK_SECRET
+                    value: "{{ sync_webhook_secret | default('') }}"
+                  ports:
+                  - containerPort: 8080
+                    name: http
+                  resources:
+                    requests:
+                      cpu: 50m
+                      memory: 64Mi
+                    limits:
+                      cpu: 100m
+                      memory: 128Mi
+                  livenessProbe:
+                    httpGet:
+                      path: /
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 30
+                  readinessProbe:
+                    httpGet:
+                      path: /
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 10
+                  volumeMounts:
+                  - name: script
+                    mountPath: /app
+                volumes:
+                - name: script
+                  configMap:
+                    name: "{{ adapter_name }}-script"
+
+    - name: Create Service for webhook adapter
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ adapter_name }}"
+            namespace: "{{ adapter_namespace }}"
+          spec:
+            selector:
+              app: "{{ adapter_name }}"
+            ports:
+            - port: 80
+              targetPort: 8080
+              name: http
+
+    - name: Create HTTPRoute for webhook adapter
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: "{{ adapter_name }}"
+            namespace: "{{ adapter_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
+              - "{{ adapter_name }}.{{ domain_name }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: "{{ adapter_name }}"
+                    port: 80
+
+    - name: Wait for deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ adapter_namespace }}"
+        name: "{{ adapter_name }}"
+        wait: true
+        wait_condition:
+          type: Progressing
+          status: "True"
+        wait_timeout: 300
+
+    - name: Restart webhook adapter pods
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ adapter_name }}"
+            namespace: "{{ adapter_namespace }}"
+          spec:
+            template:
+              metadata:
+                annotations:
+                  restartedAt: "{{ ansible_facts.date_time.iso8601 }}"
+
+    - name: Get admin password from environment
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+      when: admin_password is not defined
+      delegate_to: localhost
+    
+    - name: Debug admin credentials
+      ansible.builtin.debug:
+        msg: 
+          - "Using admin username: {{ admin_username }}"
+          - "Using admin password: {{ admin_password | length }} characters"
+          - "Harbor URL: https://{{ harbor_registry }}/api/v2.0/projects/{{ harbor_project }}/webhook/policies"
+
+    - name: Configure Harbor webhook for thinkube project
+      when: not (skip_webhook_config | default(false))
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects/{{ harbor_project }}/webhook/policies"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "ArgoCD Git Updater"
+          description: "Update Git repository on image push"
+          enabled: true
+          targets:
+            - type: "http"
+              address: "https://{{ adapter_name }}.{{ domain_name }}/webhook"
+              skip_cert_verify: true
+          event_types:
+            - "PUSH_ARTIFACT"
+      register: webhook_create
+      failed_when: webhook_create.status not in [201, 409]
+      changed_when: webhook_create.status == 201
+
+    - name: Check if webhook already exists
+      ansible.builtin.debug:
+        msg: "Harbor webhook already configured"
+      when: 
+        - not (skip_webhook_config | default(false))
+        - webhook_create.status == 409
+
+    - name: Verify webhook secret consistency
+      ansible.builtin.debug:
+        msg: |
+          Webhook adapter using secret: {{ sync_webhook_secret | default('NOT SET') }}
+          Secret length: {{ sync_webhook_secret | length if sync_webhook_secret else 0 }} characters
+      when: sync_webhook_secret is defined
+
+    - name: Display webhook adapter status
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Harbor Webhook Adapter Deployed Successfully
+          ════════════════════════════════════════════════════════
+          
+          Adapter URL: https://{{ adapter_name }}.{{ domain_name }}/webhook
+          Sync Webhook Secret: {{ 'Configured (' + (sync_webhook_secret | length | string) + ' chars)' if sync_webhook_secret else 'Not configured' }}
+          
+          The CI/CD pipeline is now optimized for instant deployment:
+          1. Push code → Build (~1 min)
+          2. Harbor webhook → Git update (instant)
+          3. Git commit → ArgoCD webhook (instant)
+          4. ArgoCD deploys (30 sec)
+          
+          Total time: ~1.5 minutes (from push to deployment)
+          
+          This provides a near-local development experience!
+          ════════════════════════════════════════════════════════

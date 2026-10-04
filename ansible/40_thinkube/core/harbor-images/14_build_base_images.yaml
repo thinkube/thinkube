@@ -1,0 +1,833 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/harbor/14_build_base_images.yaml
+# Description:
+#   Build and push optimized base images to Harbor library project.
+#   Multi-arch: each architecture builds natively on a node of that architecture.
+#   No QEMU emulation — when container_build_platforms has multiple architectures,
+#   builds are delegated to matching nodes via delegate_to.
+#
+# Requirements:
+#   - Harbor registry deployed and accessible
+#   - Podman installed on all build nodes
+#   - Harbor admin credentials
+#   - Base images mirrored to Harbor (13_mirror_public_images.yaml must run first)
+#   - For multi-arch: build nodes of each architecture reachable via Ansible
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/harbor/14_build_base_images.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Harbor registry hostname
+#   - container_build_platforms: e.g., "linux/arm64" or "linux/amd64,linux/arm64"
+#
+# 🤖 [AI-assisted]
+
+- name: Build and Push Base Images to Harbor
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    local_base_images_dir: "{{ playbook_dir }}/base-images"
+    base_images_dir: "/tmp/harbor-base-images"
+    remote_containerfiles_dir: "/tmp/harbor-containerfiles"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    # vLLM version installed by vllm-base. It names the tk-vllm-wheels release
+    # (arm64) and the PyPI version (amd64), and it starts the image tag.
+    vllm_version: "0.23.0"
+    # File name of the arm64 wheel in the tk-vllm-wheels release v{{ vllm_version }}.
+    vllm_arm64_wheel: "vllm-0.23.1.dev0+g0fc695fc6.d20260617-cp312-cp312-linux_aarch64.whl"
+    vllm_base_tag: "{{ vllm_version }}-cuda13.0-py3.12"
+
+  pre_tasks:
+    # Build nodes' systemd-resolved is configured below to forward
+    # *.{{ domain_name }} queries to BIND9. The IP we point them at must be
+    # whatever bind9-external is currently reachable on — Cilium L2 LB
+    # claimed value (ZeroTier) or Tailscale Operator-assigned tailnet IP.
+    # `ingress[*].ip` (not `[0].ip`) because the Tailscale operator
+    # writes a hostname entry before the IP entry; `[0].ip` would
+    # therefore be empty.
+    - name: Read bind9-external IP from Service status
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc bind9-external -n dns-system
+        -o jsonpath={.status.loadBalancer.ingress[*].ip}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: bind9_lookup
+      changed_when: false
+      tags: [always]
+
+    - name: Fail if bind9-external has no LoadBalancer IP yet
+      ansible.builtin.fail:
+        msg: |
+          bind9-external Service in namespace dns-system has no IP in
+          status.loadBalancer.ingress[]. The dns-server playbook must
+          run successfully before this one.
+      when: bind9_lookup.stdout | length == 0
+      tags: [always]
+
+    - name: Set bind9_advertised_ip from the discovered IP
+      ansible.builtin.set_fact:
+        bind9_advertised_ip: "{{ bind9_lookup.stdout }}"
+      tags: [always]
+
+  tasks:
+    # ========================================================================
+    # SETUP: Determine architectures and build nodes
+    # ========================================================================
+
+    - name: Parse build platforms into architecture list
+      ansible.builtin.set_fact:
+        build_architectures: "{{ (container_build_platforms | default('linux/' + ('arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64'))).split(',') | map('trim') | map('replace', 'linux/', '') | list }}"
+      tags: [always]
+
+    # Prefer the orchestrator (control plane) as the build node when its
+    # architecture matches the target — building locally avoids an SSH hop
+    # and a build-context sync. Only fall back to picking a worker from
+    # the architecture's inventory group when the orchestrator can't serve
+    # this arch (e.g. amd64 control plane + arm64 worker, building arm64).
+    - name: Map each architecture to a build node from inventory
+      ansible.builtin.set_fact:
+        arch_build_nodes: >-
+          {{
+            arch_build_nodes | default({}) | combine({
+              item: (
+                [inventory_hostname]
+                if _orch_arch == item
+                else ((groups.get('x86_64' if item == 'amd64' else item, [])
+                       | intersect(groups.get('k8s_cluster', [])))
+                      or [inventory_hostname])
+              )[0]
+            })
+          }}
+      vars:
+        _orch_arch: >-
+          {{ 'amd64' if ansible_facts['architecture'] == 'x86_64'
+             else ('arm64' if ansible_facts['architecture'] == 'aarch64'
+                   else ansible_facts['architecture']) }}
+      loop: "{{ build_architectures }}"
+      tags: [always]
+
+    - name: Set multi-arch flag
+      ansible.builtin.set_fact:
+        is_multi_arch: "{{ build_architectures | length > 1 }}"
+      tags: [always]
+
+    - name: Display build configuration
+      ansible.builtin.debug:
+        msg: >-
+          Architectures: {{ build_architectures | join(', ') }}.
+          Multi-arch: {{ is_multi_arch }}.
+          Build nodes: {{ arch_build_nodes }}
+      tags: [always]
+
+    # ========================================================================
+    # SETUP: Harbor projects and build context
+    # ========================================================================
+
+    - name: Ensure library project exists in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects"
+        method: POST
+        headers:
+          Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
+        body_format: json
+        body:
+          project_name: "library"
+          public: true
+          metadata:
+            public: "true"
+        validate_certs: true
+        status_code: [201, 409]
+      tags: [always]
+
+    - name: Ensure thinkube project exists in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/api/v2.0/projects"
+        method: POST
+        headers:
+          Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
+        body_format: json
+        body:
+          project_name: "thinkube"
+          public: true
+          metadata:
+            public: "true"
+        validate_certs: true
+        status_code: [201, 409]
+      tags: [always]
+
+    - name: Create build context directory
+      ansible.builtin.file:
+        path: "{{ base_images_dir }}"
+        state: directory
+        mode: '0755'
+      tags: [always]
+
+    - name: Create Containerfiles directory
+      ansible.builtin.file:
+        path: "{{ remote_containerfiles_dir }}"
+        state: directory
+        mode: '0755'
+      tags: [always]
+
+    # ========================================================================
+    # TEMPLATE: Render all Containerfiles
+    # ========================================================================
+
+    - name: Template Python base Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/python-base.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/python-base.Containerfile"
+      tags: [python-base]
+
+    - name: Template Node.js 18 base Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/node-base.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/node-base.Containerfile"
+      tags: [node-base]
+
+    - name: Template Node.js 22 base Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/node-base-22.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/node-base-22.Containerfile"
+      tags: [node-base]
+
+    - name: Template test-runner Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/test-runner.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/test-runner.Containerfile"
+      tags: [test-runner]
+
+    - name: Template ci-utils Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/ci-utils.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/ci-utils.Containerfile"
+      tags: [ci-utils]
+
+    - name: Template tk-service-discovery Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/tk-service-discovery.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/tk-service-discovery.Containerfile"
+      tags: [tk-service-discovery]
+
+    - name: Template AI inference base Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/ai-inference-base.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/ai-inference-base.Containerfile"
+      tags: [ai-inference-base]
+
+    - name: Template vLLM base Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/vllm-base.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/vllm-base.Containerfile"
+      tags: [vllm-base]
+
+    - name: Template TensorRT-LLM base Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/tensorrt-llm-base.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/tensorrt-llm-base.Containerfile"
+      tags: [tensorrt-llm-base]
+
+    - name: Template MLflow Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/mlflow.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/mlflow.Containerfile"
+      tags: [mlflow]
+
+    - name: Template model-mirror Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/model-mirror.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/model-mirror.Containerfile"
+      tags: [model-mirror]
+
+    - name: Template Valkey Containerfile
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/valkey.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/valkey.Containerfile"
+      tags: [valkey]
+
+    - name: Copy Valkey entrypoint script to build context
+      ansible.builtin.copy:
+        src: "{{ local_base_images_dir }}/docker-entrypoint.sh"
+        dest: "{{ base_images_dir }}/docker-entrypoint.sh"
+        mode: '0755'
+      tags: [valkey]
+
+    - name: Clone tk-package-version repository
+      ansible.builtin.git:
+        repo: "https://github.com/thinkube/tk-package-version.git"
+        dest: "{{ base_images_dir }}/tk-package-version"
+        version: "{{ thinkube_ref }}"
+        force: yes
+      tags: [tk-package-version]
+
+    - name: Copy tk-package-version Containerfile to containerfiles dir
+      ansible.builtin.copy:
+        src: "{{ base_images_dir }}/tk-package-version/Containerfile"
+        dest: "{{ remote_containerfiles_dir }}/Containerfile"
+        remote_src: true
+      tags: [tk-package-version]
+
+    # ========================================================================
+    # PREPARE: Ensure podman and Harbor login on all build nodes
+    # ========================================================================
+
+    - name: Ensure podman and pasta installed on all build nodes
+      ansible.builtin.apt:
+        name: [podman, passt]
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+      become: true
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      tags: [always]
+
+    - name: Configure podman registries on all build nodes
+      block:
+        - name: Ensure containers config directory exists on build nodes
+          ansible.builtin.file:
+            path: /etc/containers
+            state: directory
+            mode: '0755'
+          become: true
+          delegate_to: "{{ item.value }}"
+          loop: "{{ arch_build_nodes | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value }})"
+
+        - name: Write registries.conf on build nodes
+          ansible.builtin.copy:
+            dest: /etc/containers/registries.conf
+            content: |
+              unqualified-search-registries = ["{{ harbor_registry }}"]
+
+              [[registry]]
+              location = "{{ harbor_registry }}"
+              insecure = false
+
+              [[registry]]
+              location = "docker.io"
+
+              [[registry]]
+              location = "quay.io"
+
+              [[registry]]
+              location = "ghcr.io"
+            mode: '0644'
+          become: true
+          delegate_to: "{{ item.value }}"
+          loop: "{{ arch_build_nodes | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value }})"
+      when: is_multi_arch
+      tags: [always]
+
+    - name: Ensure build nodes can resolve {{ domain_name }} via CoreDNS
+      block:
+        - name: Create systemd-resolved conf directory on build nodes
+          ansible.builtin.file:
+            path: /etc/systemd/resolved.conf.d
+            state: directory
+            mode: '0755'
+          become: true
+          delegate_to: "{{ item.value }}"
+          loop: "{{ arch_build_nodes | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value }})"
+
+        - name: Configure DNS forwarding for {{ domain_name }} on build nodes
+          ansible.builtin.copy:
+            dest: /etc/systemd/resolved.conf.d/coredns-external.conf
+            content: |
+              [Resolve]
+              DNS={{ bind9_advertised_ip }}
+              Domains=~{{ domain_name }}
+            mode: '0644'
+          become: true
+          delegate_to: "{{ item.value }}"
+          loop: "{{ arch_build_nodes | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value }})"
+          register: _resolved_config
+
+        - name: Restart systemd-resolved on build nodes
+          ansible.builtin.systemd:
+            name: systemd-resolved
+            state: restarted
+          become: true
+          delegate_to: "{{ item.value }}"
+          loop: "{{ arch_build_nodes | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value }})"
+          when: _resolved_config.changed
+      when: is_multi_arch
+      tags: [always]
+
+    - name: Login to Harbor on all build nodes
+      ansible.builtin.shell: |
+        echo {{ admin_password }} | podman login {{ harbor_registry }} -u admin --password-stdin --tls-verify=true
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      changed_when: false
+      tags: [always]
+
+    # ========================================================================
+    # DISTRIBUTE: Copy build context and Containerfiles to remote build nodes
+    # ========================================================================
+
+    - name: Create directories on remote build nodes
+      ansible.builtin.file:
+        path: "{{ item[1] }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ item[0].value }}"
+      loop: "{{ arch_build_nodes | dict2items | product([base_images_dir, remote_containerfiles_dir]) | list }}"
+      loop_control:
+        label: "{{ item[0].key }}: {{ item[1] }}"
+      when: is_multi_arch and item[0].value != inventory_hostname
+      tags: [always]
+
+    - name: Sync build context to remote build nodes
+      ansible.builtin.shell: |
+        tar -czf - -C {{ base_images_dir }} . | \
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          {{ item.value }} 'tar -xzf - -C {{ base_images_dir }}'
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      when: is_multi_arch and item.value != inventory_hostname
+      changed_when: true
+      tags: [always]
+
+    - name: Sync Containerfiles to remote build nodes
+      ansible.builtin.shell: |
+        tar -czf - -C {{ remote_containerfiles_dir }} . | \
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          {{ item.value }} 'tar -xzf - -C {{ remote_containerfiles_dir }}'
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      when: is_multi_arch and item.value != inventory_hostname
+      changed_when: true
+      tags: [always]
+
+    # ========================================================================
+    # BUILD: Each image using native per-node builds
+    # ========================================================================
+
+    # Workaround for podman cache bug: https://github.com/containers/podman/issues/21310
+    - name: Remove old Python base image on all build nodes
+      ansible.builtin.shell: |
+        podman rmi -f {{ harbor_registry }}/library/python-base:3.12-slim || true
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      changed_when: false
+      tags: [python-base]
+
+    - name: Build python-base
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [python-base]
+      vars:
+        image_name: "{{ harbor_registry }}/library/python-base"
+        image_tags: ["3.12-slim"]
+        containerfile: "python-base.Containerfile"
+        build_context: "{{ base_images_dir }}"
+        no_cache: true
+      tags: [python-base]
+
+    - name: Build node-base 18
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [node-base]
+      vars:
+        image_name: "{{ harbor_registry }}/library/node-base"
+        image_tags: ["18-alpine"]
+        containerfile: "node-base.Containerfile"
+        build_context: "{{ base_images_dir }}"
+      tags: [node-base]
+
+    - name: Build node-base 22
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [node-base]
+      vars:
+        image_name: "{{ harbor_registry }}/library/node-base"
+        image_tags: ["22-alpine", "latest"]
+        containerfile: "node-base-22.Containerfile"
+        build_context: "{{ base_images_dir }}"
+      tags: [node-base]
+
+    - name: Build test-runner
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [test-runner]
+      vars:
+        image_name: "{{ harbor_registry }}/library/test-runner"
+        image_tags: ["latest"]
+        containerfile: "test-runner.Containerfile"
+        build_context: "{{ base_images_dir }}"
+      tags: [test-runner]
+
+    - name: Build ci-utils
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [ci-utils]
+      vars:
+        image_name: "{{ harbor_registry }}/library/ci-utils"
+        image_tags: ["latest", "alpine"]
+        containerfile: "ci-utils.Containerfile"
+        build_context: "{{ base_images_dir }}"
+      tags: [ci-utils]
+
+    - name: Build tk-service-discovery
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [tk-service-discovery]
+      vars:
+        image_name: "{{ harbor_registry }}/library/tk-service-discovery"
+        image_tags: ["latest"]
+        containerfile: "tk-service-discovery.Containerfile"
+        build_context: "{{ base_images_dir }}"
+      tags: [tk-service-discovery]
+
+    - name: Build ai-inference-base
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [ai-inference-base]
+      vars:
+        image_name: "{{ harbor_registry }}/library/ai-inference-base"
+        image_tags: ["cuda13.0-torch2.9-py3.12"]
+        containerfile: "ai-inference-base.Containerfile"
+        build_context: "{{ base_images_dir }}"
+      tags: [ai-inference-base]
+
+    - name: Build vllm-base
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [vllm-base]
+      vars:
+        image_name: "{{ harbor_registry }}/library/vllm-base"
+        image_tags: ["{{ vllm_base_tag }}"]
+        containerfile: "vllm-base.Containerfile"
+        build_context: "{{ base_images_dir }}"
+      tags: [vllm-base]
+
+    # TensorRT-LLM uses different base images per architecture
+    - name: Determine TensorRT-LLM base image per architecture
+      ansible.builtin.set_fact:
+        tensorrt_base_for_arch: "{{ tensorrt_base_for_arch | default({}) | combine({item: (harbor_registry + '/library/tensorrt-llm-spark:1.3.0rc13') if item == 'arm64' else (harbor_registry + '/library/tensorrt-llm:1.3.0rc13')}) }}"
+      loop: "{{ build_architectures }}"
+      tags: [tensorrt-llm-base]
+
+    - name: "tensorrt-llm-base — build per-arch"
+      ansible.builtin.shell: |
+        podman build --platform linux/{{ item.key }} \
+                     --network pasta:-4 \
+                     --tls-verify=true \
+                     --build-arg BASE_IMAGE={{ tensorrt_base_for_arch[item.key] }} \
+                     -t {{ harbor_registry }}/library/tensorrt-llm-base:1.3.0rc13-{{ item.key }} \
+                     -f {{ remote_containerfiles_dir }}/tensorrt-llm-base.Containerfile \
+                     {{ base_images_dir }}
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} on {{ item.value }}"
+      register: tensorrt_build
+      changed_when: true
+      tags: [tensorrt-llm-base]
+
+    - name: "tensorrt-llm-base — push per-arch"
+      ansible.builtin.shell: |
+        podman push --tls-verify=true --creds=admin:{{ admin_password }} {{ harbor_registry }}/library/tensorrt-llm-base:1.3.0rc13-{{ item.key }}
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} on {{ item.value }}"
+      changed_when: true
+      retries: 2
+      delay: 10
+      tags: [tensorrt-llm-base]
+
+    - name: "tensorrt-llm-base — render manifest script"
+      ansible.builtin.template:
+        src: templates/create_manifest_list.sh.j2
+        dest: /tmp/tensorrt-llm-base-manifest.sh
+        mode: '0755'
+      vars:
+        image_name: "{{ harbor_registry }}/library/tensorrt-llm-base"
+        image_tags: ['1.3.0rc13', 'latest']
+      tags: [tensorrt-llm-base]
+
+    - name: "tensorrt-llm-base — create manifest list"
+      ansible.builtin.command: /tmp/tensorrt-llm-base-manifest.sh
+      changed_when: true
+      tags: [tensorrt-llm-base]
+
+    ###################################################################
+    # text-embeddings-base (TEI + Python/Gradio dependencies)
+    ###################################################################
+    - name: Template text-embeddings-base Containerfile on all build nodes
+      ansible.builtin.template:
+        src: "{{ local_base_images_dir }}/text-embeddings-base.Containerfile.j2"
+        dest: "{{ remote_containerfiles_dir }}/text-embeddings-base.Containerfile"
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} on {{ item.value }}"
+      tags: [text-embeddings-base]
+
+    - name: Determine TEI base image per architecture
+      ansible.builtin.set_fact:
+        tei_base_for_arch: "{{ tei_base_for_arch | default({}) | combine({item: (harbor_registry + '/library/text-embeddings-inference:121-latest') if item == 'arm64' else (harbor_registry + '/library/text-embeddings-inference:86-latest')}) }}"
+      loop: "{{ build_architectures }}"
+      tags: [text-embeddings-base]
+
+    - name: "text-embeddings-base — build per-arch"
+      ansible.builtin.shell: |
+        podman build --platform linux/{{ item.key }} \
+                     --network pasta:-4 \
+                     --tls-verify=true \
+                     --build-arg BASE_IMAGE={{ tei_base_for_arch[item.key] }} \
+                     -t {{ harbor_registry }}/library/text-embeddings-base:latest-{{ item.key }} \
+                     -f {{ remote_containerfiles_dir }}/text-embeddings-base.Containerfile \
+                     {{ base_images_dir }}
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} on {{ item.value }}"
+      register: tei_build
+      changed_when: true
+      tags: [text-embeddings-base]
+
+    - name: "text-embeddings-base — push per-arch"
+      ansible.builtin.shell: |
+        podman push --tls-verify=true --creds=admin:{{ admin_password }} {{ harbor_registry }}/library/text-embeddings-base:latest-{{ item.key }}
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} on {{ item.value }}"
+      changed_when: true
+      retries: 2
+      delay: 10
+      tags: [text-embeddings-base]
+
+    - name: "text-embeddings-base — render manifest script"
+      ansible.builtin.template:
+        src: templates/create_manifest_list.sh.j2
+        dest: /tmp/text-embeddings-base-manifest.sh
+        mode: '0755'
+      vars:
+        image_name: "{{ harbor_registry }}/library/text-embeddings-base"
+        image_tags: ['latest']
+      tags: [text-embeddings-base]
+
+    - name: "text-embeddings-base — create manifest list"
+      ansible.builtin.command: /tmp/text-embeddings-base-manifest.sh
+      changed_when: true
+      tags: [text-embeddings-base]
+
+    - name: Build mlflow-custom
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [mlflow]
+      vars:
+        image_name: "{{ harbor_registry }}/library/mlflow-custom"
+        image_tags: ["latest"]
+        containerfile: "mlflow.Containerfile"
+        build_context: "{{ base_images_dir }}"
+      tags: [mlflow]
+
+    - name: Build model-mirror
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [model-mirror]
+      vars:
+        image_name: "{{ harbor_registry }}/library/model-mirror"
+        image_tags: ["latest"]
+        containerfile: "model-mirror.Containerfile"
+        build_context: "{{ base_images_dir }}"
+      tags: [model-mirror]
+
+    - name: Build valkey
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [valkey]
+      vars:
+        image_name: "{{ harbor_registry }}/library/valkey"
+        image_tags: ["8.1.0", "latest"]
+        containerfile: "valkey.Containerfile"
+        build_context: "{{ base_images_dir }}"
+      tags: [valkey]
+
+    - name: Build tk-package-version
+      ansible.builtin.include_tasks:
+        file: _build_native_image.yaml
+        apply:
+          tags: [tk-package-version]
+      vars:
+        image_name: "{{ harbor_registry }}/library/tk-package-version"
+        image_tags: ["latest"]
+        containerfile: "Containerfile"
+        build_context: "{{ base_images_dir }}/tk-package-version"
+      tags: [tk-package-version]
+
+    # ========================================================================
+    # CLEANUP
+    # ========================================================================
+
+    - name: Clean up Containerfiles directory
+      ansible.builtin.file:
+        path: "{{ remote_containerfiles_dir }}"
+        state: absent
+
+    - name: Clean up Containerfiles on remote build nodes
+      ansible.builtin.file:
+        path: "{{ remote_containerfiles_dir }}"
+        state: absent
+      delegate_to: "{{ item.value }}"
+      loop: "{{ arch_build_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value }})"
+      when: is_multi_arch and item.value != inventory_hostname
+
+    # ========================================================================
+    # MANIFEST
+    # ========================================================================
+
+    - name: Create manifest for custom built images
+      include_role:
+        name: container_deployment/image_manifest
+      vars:
+        manifest_images:
+          - destination: "{{ harbor_registry }}/library/python-base:3.12-slim"
+            source: "custom-build"
+            description: "Python 3.12 base with FastAPI, SQLAlchemy, MLflow, and testing tools"
+            metadata:
+              base_image: "python:3.12-slim"
+              packages: "fastapi sqlalchemy mlflow pytest"
+          - destination: "{{ harbor_registry }}/library/node-base:18-alpine"
+            source: "custom-build"
+            description: "Node.js 18 Alpine with common development dependencies"
+            metadata:
+              base_image: "node:18-alpine"
+          - destination: "{{ harbor_registry }}/library/node-base:22-alpine"
+            source: "custom-build"
+            description: "Node.js 22 LTS Alpine with common development dependencies"
+            metadata:
+              base_image: "node:22-alpine"
+          - destination: "{{ harbor_registry }}/library/node-base:latest"
+            source: "custom-build"
+            description: "Node.js base latest (22-alpine)"
+          - destination: "{{ harbor_registry }}/library/test-runner:latest"
+            source: "custom-build"
+            description: "Test runner with pytest, jest, and testing utilities"
+          - destination: "{{ harbor_registry }}/library/ci-utils:latest"
+            source: "custom-build"
+            description: "CI/CD utilities image with curl, jq, git, and common tools"
+          - destination: "{{ harbor_registry }}/library/ci-utils:alpine"
+            source: "custom-build"
+            description: "CI/CD utilities Alpine variant"
+          - destination: "{{ harbor_registry }}/library/tk-service-discovery:latest"
+            source: "custom-build"
+            description: "Service discovery init container with kubectl, jq, and yq"
+            metadata:
+              base_image: "alpine:3.19"
+              tools: "kubectl jq yq bash"
+          - destination: "{{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.9-py3.12"
+            source: "custom-build"
+            description: "AI inference base with CUDA 13.0, PyTorch 2.9, Python 3.12"
+          - destination: "{{ harbor_registry }}/library/vllm-base:{{ vllm_base_tag }}"
+            source: "custom-build"
+            description: "vLLM {{ vllm_version }} inference base with CUDA 13.0, PyTorch 2.11, Python 3.12"
+            metadata:
+              base_image: "cuda:13.0.0-devel-ubuntu24.04"
+              packages: "vllm torch transformers gradio fastapi"
+          - destination: "{{ harbor_registry }}/library/tensorrt-llm-base:1.3.0rc13"
+            source: "custom-build"
+            description: "TensorRT-LLM base with FA2, trtllm-serve (arm64: Spark SDK, amd64: standard)"
+            metadata:
+              packages: "tensorrt_llm openai gradio"
+          - destination: "{{ harbor_registry }}/library/mlflow-custom:latest"
+            source: "custom-build"
+            description: "MLflow with OIDC auth, PostgreSQL and S3 support"
+            metadata:
+              base_image: "python:3.12-slim"
+              packages: "mlflow mlflow-oidc-auth psycopg2-binary boto3 PyJWT"
+          - destination: "{{ harbor_registry }}/library/model-mirror:latest"
+            source: "custom-build"
+            description: "Model mirror image for HuggingFace to MLflow mirroring"
+            metadata:
+              base_image: "python:3.12-slim"
+              packages: "huggingface_hub mlflow"
+          - destination: "{{ harbor_registry }}/library/valkey:8.1.0"
+            source: "github.com/valkey-io/valkey-container"
+            description: "Valkey 8.1.0 Alpine - Redis OSS alternative"
+            metadata:
+              base_image: "alpine"
+              version: "8.1.0"
+          - destination: "{{ harbor_registry }}/library/valkey:latest"
+            source: "github.com/valkey-io/valkey-container"
+            description: "Valkey latest - Redis OSS alternative"
+          - destination: "{{ harbor_registry }}/library/tk-package-version:latest"
+            source: "github.com/thinkube/tk-package-version"
+            description: "MCP server for checking package versions across multiple registries"
+            metadata:
+              language: "rust"
+              type: "mcp-server"
+        manifest_category: "system"
+        manifest_source: "built"
+        manifest_namespace: "registry"
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          Base Images build finished
+          ════════════════════════════════════════════════════════
+
+          {{ image_build_report | default([]) | join('\n') }}
+
+          Architectures: {{ build_architectures | join(', ') }}
+          Multi-arch: {{ is_multi_arch }}
+          Build nodes: {{ arch_build_nodes }}
+
+          Python base: {{ harbor_registry }}/library/python-base:3.12-slim
+          Node.js 18 base: {{ harbor_registry }}/library/node-base:18-alpine
+          Node.js 22 base: {{ harbor_registry }}/library/node-base:22-alpine
+          Test runner: {{ harbor_registry }}/library/test-runner:latest
+          CI utils: {{ harbor_registry }}/library/ci-utils:latest
+          Service discovery: {{ harbor_registry }}/library/tk-service-discovery:latest
+          AI inference base: {{ harbor_registry }}/library/ai-inference-base:cuda13.0-torch2.9-py3.12
+          vLLM base: {{ harbor_registry }}/library/vllm-base:{{ vllm_base_tag }}
+          TensorRT-LLM base: {{ harbor_registry }}/library/tensorrt-llm-base:1.3.0rc13
+          MLflow custom: {{ harbor_registry }}/library/mlflow-custom:latest
+          Model mirror: {{ harbor_registry }}/library/model-mirror:latest
+          Valkey: {{ harbor_registry }}/library/valkey:8.1.0
+          tk-package-version: {{ harbor_registry }}/library/tk-package-version:latest
+          TEI: mirrored via 13_mirror_public_images.yaml
+
+          ════════════════════════════════════════════════════════

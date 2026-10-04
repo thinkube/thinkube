@@ -1,0 +1,1385 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/code-server/15_configure_environment.yaml
+# Description:
+#   Configure code-server environment after deployment using kubectl exec
+#   This runs IN the actual container, so all changes persist
+#
+# Requirements:
+#   - code-server must be deployed (10_deploy.yaml)
+#   - Pod must be running and ready
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/code-server/15_configure_environment.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Configure code-server environment
+  hosts: k8s_control_plane
+  gather_facts: true
+  
+  vars:
+    code_server_namespace: "code-server"
+    claude_code_version: "2.1.288"
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    code_source_path: "{{ shared_code_path }}"
+    # Where the installer keeps the secrets it was given, on this host.
+    env_file_path: "{{ ansible_facts.env.HOME }}/.env"
+    # The Keycloak password of the admin user, resolved the same way
+    # keycloak/10_deploy.yaml resolves it when it sets that password: from
+    # ADMIN_PASSWORD when the environment carries one, and otherwise from
+    # ANSIBLE_BECOME_PASSWORD, which is what an installer run provides. Read
+    # bare, this is empty during an install and the play stops on a password
+    # Keycloak was never given.
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+  pre_tasks:
+    # Who is at the keyboard, learned from the token when nothing else says.
+    - name: Set github_token from environment
+      ansible.builtin.set_fact:
+        github_token: "{{ github_token | default(lookup('env', 'GITHUB_TOKEN'), true) }}"
+
+    - name: Resolve the GitHub username from the token
+      ansible.builtin.include_role:
+        name: common/github_username
+
+    # Commits made in code-server carry the name and email of the person who
+    # installed Thinkube, given on the installer's configuration screen.
+    - name: Stop when the git author name is not set
+      ansible.builtin.assert:
+        that:
+          - git_author_name is defined and (git_author_name | string | trim | length > 0)
+        fail_msg: >-
+          git_author_name is not set. Set git_author_name in the inventory
+          (all.vars in inventory.yaml) to the full name that code-server
+          uses as the author of git commits.
+        quiet: true
+
+    - name: Stop when the git author email is not set
+      ansible.builtin.assert:
+        that:
+          - git_author_email is defined and (git_author_email | string | trim | length > 0)
+        fail_msg: >-
+          git_author_email is not set. Set git_author_email in the inventory
+          (all.vars in inventory.yaml) to the email that code-server uses
+          as the author of git commits.
+        quiet: true
+
+  tasks:
+    # Same retry as 13_clone_repositories: the pod may not exist yet when this
+    # runs (see the comment there). `{.items[0]...}` errors on an empty list,
+    # `{.items[*]...}` returns empty and lets the retry work.
+    - name: Wait for a running code-server pod and take its name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
+          -l app=code-server \
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[*].metadata.name}' | awk '{print $1}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: pod_name
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: pod_name.stdout != ""
+
+
+    - name: Wait for pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        name: "{{ pod_name.stdout }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+
+    # NOTE: Node.js 20.x and code symlink are now installed in the Docker image
+    # No need to install them here
+
+    - name: Get Argo Workflows service account token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: argo
+        name: argo-workflows-server-sa-token
+      register: argo_sa_secret
+      failed_when: argo_sa_secret.resources | length == 0
+
+    - name: Set Argo token fact
+      ansible.builtin.set_fact:
+        argo_service_account_token: "{{ argo_sa_secret.resources[0].data.token | b64decode }}"
+
+    - name: Create .env file in shared-code for Ansible execution
+      ansible.builtin.copy:
+        dest: "{{ shared_code_path }}/.env"
+        content: |
+          # Ansible credentials for playbook execution from code-server
+          # Created by 15_configure_environment.yaml
+          ANSIBLE_BECOME_PASSWORD={{ lookup('env', 'ANSIBLE_BECOME_PASSWORD') }}
+          ADMIN_PASSWORD={{ admin_password }}
+          GITHUB_TOKEN={{ lookup('env', 'GITHUB_TOKEN') }}
+          GITHUB_USERNAME={{ github_username }}
+        mode: '0600'
+
+    # The Playwright MCP server reads this dotenv file (--secrets, set in
+    # thinkube-control/13_configure_code_server.yaml). When a browser tool is
+    # given the text THINKUBE_PASSWORD, the server types the real password, and
+    # it replaces the password with <secret>THINKUBE_PASSWORD</secret> in every
+    # result, so the password never reaches the agent's context.
+    - name: Stop when the admin password is not set
+      ansible.builtin.assert:
+        that:
+          - admin_password | length > 0
+        fail_msg: >-
+          Neither ADMIN_PASSWORD nor ANSIBLE_BECOME_PASSWORD is set in the
+          environment. One of them is the Keycloak password of
+          {{ auth_realm_username }}; export it before running this playbook
+          (tk_ansible loads it from ~/.env).
+        quiet: true
+
+    - name: Create the Playwright MCP configuration directory
+      ansible.builtin.file:
+        path: "{{ shared_code_path }}/.config/playwright-mcp"
+        state: directory
+        mode: '0700'
+
+    - name: Write the Playwright MCP secrets file
+      ansible.builtin.copy:
+        dest: "{{ shared_code_path }}/.config/playwright-mcp/secrets.env"
+        content: |
+          THINKUBE_PASSWORD={{ admin_password }}
+        mode: '0600'
+
+    ###################################################################
+    # Create environment setup scripts (cross-shell compatible)
+    # NOTE: Stored in ~/.thinkube_shared_shell (same location as aliases/functions from playbook 14)
+    # Contains ONLY environment variables - aliases managed by playbook 14's JSON system
+    ###################################################################
+    - name: Create Bash/Zsh environment setup script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'mkdir -p /home/thinkube/.thinkube_shared_shell && cat > /home/thinkube/.thinkube_shared_shell/env_setup.sh << "EOF"
+        #!/bin/bash
+        # Thinkube Environment Variables (Bash/Zsh compatible)
+        # Created by 15_configure_environment.yaml
+        # NOTE: Aliases are managed by the JSON system in playbook 14
+        # NOTE: Service endpoints (Argo, DevPI, ArgoCD, etc.) come from ~/.config/thinkube/service-env.sh
+
+        # Kubernetes
+        export KUBECONFIG=/home/thinkube/.kube/config
+
+        # Argo Workflows - Service account token (secret, not in ConfigMaps)
+        export ARGO_TOKEN={{ argo_service_account_token }}
+
+        # Ansible
+        export ANSIBLE_CONFIG=/home/thinkube/.ansible.cfg
+
+        # Python virtualenv
+        if [ -f /home/thinkube/.venv/bin/activate ]; then
+            source /home/thinkube/.venv/bin/activate
+        fi
+
+        # npm global packages
+        export PATH="/home/thinkube/.npm-global/bin:$PATH"
+
+        # Rust toolchain (rustup/cargo/rustc)
+        if [ -d /home/thinkube/.cargo/bin ]; then
+            export PATH="/home/thinkube/.cargo/bin:$PATH"
+        fi
+
+        # rtk (Rust Token Killer) is a proxy — invoke it explicitly, e.g. `rtk git status`.
+        # It has no transparent interactive-shell hook; the binary is on PATH via cargo above.
+        EOF
+        chmod +x /home/thinkube/.thinkube_shared_shell/env_setup.sh
+        echo "✅ Bash/Zsh environment setup created"'
+
+    - name: Create Fish environment setup script
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.thinkube_shared_shell/env_setup.fish << "EOF"
+        # Thinkube Environment Variables (Fish compatible)
+        # Created by 15_configure_environment.yaml
+        # NOTE: Aliases are managed by the JSON system in playbook 14
+        # NOTE: Service endpoints (Argo, DevPI, ArgoCD, etc.) come from ~/.config/thinkube/service-env.sh
+
+        # Kubernetes
+        set -gx KUBECONFIG /home/thinkube/.kube/config
+
+        # Argo Workflows - Service account token (secret, not in ConfigMaps)
+        set -gx ARGO_TOKEN {{ argo_service_account_token }}
+
+        # Ansible
+        set -gx ANSIBLE_CONFIG /home/thinkube/.ansible.cfg
+
+        # Python virtualenv
+        if test -f /home/thinkube/.venv/bin/activate.fish
+            source /home/thinkube/.venv/bin/activate.fish
+        end
+
+        # npm global packages
+        set -gx PATH /home/thinkube/.npm-global/bin $PATH
+
+        # Rust toolchain (rustup/cargo/rustc)
+        if test -d /home/thinkube/.cargo/bin
+            set -gx PATH /home/thinkube/.cargo/bin $PATH
+        end
+
+        # rtk (Rust Token Killer) is a proxy — invoke it explicitly, e.g. `rtk git status`.
+        # It has no transparent interactive-shell hook; the binary is on PATH via cargo above.
+        EOF
+        chmod +x /home/thinkube/.thinkube_shared_shell/env_setup.fish
+        echo "✅ Fish environment setup created"'
+
+    ###################################################################
+    # Append environment sourcing to existing shell configs
+    # NOTE: Shell configs are created by playbook 14 (14_configure_shell.yaml)
+    # We only add environment variable sourcing, not overwriting anything
+    ###################################################################
+    - name: Check if Bash has environment sourcing
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          grep -q "THINKUBE ENV SETUP" /home/thinkube/.bashrc
+      register: bash_env_configured
+      failed_when: false
+      changed_when: false
+
+    - name: Append environment sourcing to Bash config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat >> /home/thinkube/.bashrc << "EOF"
+
+        # BEGIN THINKUBE ENV SETUP
+        # Source Thinkube environment variables
+        if [ -f ~/.thinkube_shared_shell/env_setup.sh ]; then
+            source ~/.thinkube_shared_shell/env_setup.sh
+        fi
+
+        # Source service environment variables from deployed services
+        if [ -f ~/.config/thinkube/service-env-cs.sh ]; then
+            source ~/.config/thinkube/service-env-cs.sh
+        fi
+        # END THINKUBE ENV SETUP
+        EOF'
+      when: bash_env_configured.rc != 0
+
+    - name: Check if Zsh has environment sourcing
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          grep -q "THINKUBE ENV SETUP" /home/thinkube/.zshrc
+      register: zsh_env_configured
+      failed_when: false
+      changed_when: false
+
+    - name: Append environment sourcing to Zsh config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat >> /home/thinkube/.zshrc << "EOF"
+
+        # BEGIN THINKUBE ENV SETUP
+        # Source Thinkube environment variables
+        if [ -f ~/.thinkube_shared_shell/env_setup.sh ]; then
+            source ~/.thinkube_shared_shell/env_setup.sh
+        fi
+
+        # Source service environment variables from deployed services
+        if [ -f ~/.config/thinkube/service-env-cs.sh ]; then
+            source ~/.config/thinkube/service-env-cs.sh
+        fi
+        # END THINKUBE ENV SETUP
+        EOF'
+      when: zsh_env_configured.rc != 0
+
+    - name: Check if Fish has environment sourcing
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          grep -q "THINKUBE ENV SETUP" /home/thinkube/.config/fish/config.fish
+      register: fish_env_configured
+      failed_when: false
+      changed_when: false
+
+    - name: Append environment sourcing to Fish config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat >> /home/thinkube/.config/fish/config.fish << "EOF"
+
+        # BEGIN THINKUBE ENV SETUP
+        # Source Thinkube environment variables
+        if test -f ~/.thinkube_shared_shell/env_setup.fish
+            source ~/.thinkube_shared_shell/env_setup.fish
+        end
+
+        # Source service environment variables from deployed services
+        if test -f ~/.config/thinkube/service-env-cs.sh
+            bass source ~/.config/thinkube/service-env-cs.sh
+        end
+        # END THINKUBE ENV SETUP
+        EOF'
+      when: fish_env_configured.rc != 0
+
+    ###################################################################
+    # Create .bash_profile and .profile to source .bashrc
+    # NOTE: Bash login shells read .bash_profile, not .bashrc
+    # Code-server terminals start as login shells
+    ###################################################################
+    - name: Create .bash_profile to source .bashrc
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.bash_profile << "EOF"
+        # Source .bashrc for login shells
+        if [ -f ~/.bashrc ]; then
+            source ~/.bashrc
+        fi
+        EOF'
+
+    - name: Create .profile to source .bashrc
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.profile << "EOF"
+        # Source .bashrc for login shells
+        if [ -f ~/.bashrc ]; then
+            source ~/.bashrc
+        fi
+        EOF'
+
+    - name: Configure npm for global installations
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            mkdir -p /home/thinkube/.npm-global
+            npm config set prefix '/home/thinkube/.npm-global'
+          "
+
+    # Pinned: the installer takes the version to install. The image sets
+    # DISABLE_AUTOUPDATER=1, so the version stays until this pin changes.
+    - name: Install Claude Code {{ claude_code_version }} via native installer
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -l -c "curl -fsSL https://claude.ai/install.sh | bash -s {{ claude_code_version }} && claude --version | grep -q '^{{ claude_code_version }} '"
+
+    - name: Install Playwright MCP server globally
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            npm install -g @playwright/mcp
+            echo '✅ Playwright MCP server installed'
+          "
+
+    # Create Python virtualenv at /home/thinkube/.venv to match ansible controller environment
+    # This ensures inventory Python interpreter paths work for both environments
+    - name: Create Python virtualenv
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "python3 -m venv /home/thinkube/.venv"
+
+    - name: Install Python platform tools and service SDKs
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "source /home/thinkube/.venv/bin/activate && \
+            pip3 install --no-cache-dir \
+            --extra-index-url https://pypi.org/simple \
+            ansible \
+            ansible-core \
+            copier \
+            kubernetes==36.0.3 \
+            ansible-lint \
+            mlflow \
+            opensearch-py \
+            weaviate-client \
+            langfuse \
+            argilla \
+            clickhouse-connect \
+            devpi-client \
+            cvat-cli \
+            requests \
+            psycopg2-binary \
+            boto3 \
+            redis \
+            qdrant-client \
+            nats-py \
+            chromadb \
+            lfx \
+            maturin \
+            && echo '✅ Python packages installed'"
+
+    # uv, the Rust toolchain, rtk and the tk_* commands are built into the
+    # code-server-dev image (harbor-images/base-images/code-server-dev
+    # .Containerfile.j2), under /opt and /usr/local where the shared-code
+    # home mount does not hide them. They used to be installed here, into the
+    # running pod, and the parts outside the home were lost whenever the pod
+    # was recreated. This checks the running image is one that has them, and
+    # says what to do when it is not, rather than silently reinstalling.
+    - name: Check the running image provides the developer toolchain
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "command -v uv >/dev/null && \
+            test -x /opt/cargo/bin/cargo && \
+            /usr/local/bin/rtk gain >/dev/null 2>&1 && \
+            test -L /usr/local/bin/tk_images && \
+            /usr/local/bin/opencode --version >/dev/null && \
+            /usr/local/bin/pi --version >/dev/null"
+      register: image_toolchain
+      failed_when: false
+      changed_when: false
+
+    - name: Stop when the running code-server image predates the built-in toolchain
+      ansible.builtin.assert:
+        that: image_toolchain.rc == 0
+        fail_msg: >-
+          The running code-server pod lacks uv, cargo, rtk, the tk_* commands
+          or the agentic clients (opencode, pi).
+          They are part of the code-server-dev image; rebuild and redeploy it
+          with code-server/20_redeploy.yaml before running this playbook.
+        quiet: true
+
+    # Automatic token savings: register rtk's PreToolUse hook in Claude Code so an
+    # agent's Bash commands are transparently rewritten to run through rtk (`rtk hook
+    # claude`). Idempotent — the guard greps for the hook already present in
+    # ~/.claude/settings.json, so a re-run is a no-op. `rtk init -g --auto-patch` also
+    # writes ~/.claude/RTK.md and adds an @RTK.md reference to ~/.claude/CLAUDE.md.
+    - name: Check if the rtk Claude Code hook is registered
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "grep -q 'rtk hook claude' /home/thinkube/.claude/settings.json"
+      register: rtk_hook_registered
+      failed_when: false
+      changed_when: false
+
+    - name: Register the rtk auto-rewrite hook for Claude Code (global)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -lc "rtk init -g --auto-patch && echo '✅ rtk Claude Code hook registered'"
+      when: rtk_hook_registered.rc != 0
+
+    # Pre-approves the Thinkube MCP servers, the playbook runner and read-only
+    # shell commands in ~/.claude/settings.json, and describes this cluster to
+    # the auto-mode classifier so it does not block routine platform work.
+    # Rules are added to the user's allow list, never removed; autoMode is
+    # owned by this task and replaced on every run. The file is created by the
+    # rtk task above; its absence is an error.
+    - name: Pre-approve Thinkube tools for Claude Code (global)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -i -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          python3 -c '
+        import json, sys
+        path = "/home/thinkube/.claude/settings.json"
+        managed = json.load(sys.stdin)
+        with open(path) as f:
+            settings = json.load(f)
+        before = json.dumps(settings, sort_keys=True)
+        allow = settings.setdefault("permissions", {}).setdefault("allow", [])
+        allow.extend(rule for rule in managed["allow"] if rule not in allow)
+        settings["autoMode"] = managed["autoMode"]
+        if json.dumps(settings, sort_keys=True) != before:
+            with open(path, "w") as f:
+                json.dump(settings, f, indent=2)
+                f.write("\n")
+            print("changed")
+        '
+      args:
+        stdin: "{{ claude_code_managed_permissions | to_json }}"
+      register: claude_permissions_result
+      changed_when: "'changed' in claude_permissions_result.stdout"
+      vars:
+        claude_code_managed_permissions:
+          allow:
+            - "mcp__thinkube-control"
+            - "mcp__thinkube-tandem"
+            - "mcp__tk-package-version"
+            - "Edit(//home/thinkube/thinkube-platform/**)"
+            - "Read(//home/thinkube/**)"
+            - "Bash(./scripts/tk_ansible *)"
+            - "Bash(rtk proxy *)"
+            - "Bash(git *)"
+            - "Bash(rtk git *)"
+            - "Bash(ls *)"
+            - "Bash(cat *)"
+            - "Bash(head *)"
+            - "Bash(tail *)"
+            - "Bash(grep *)"
+            - "Bash(find *)"
+            - "Bash(sed -n *)"
+            - "Bash(kubectl get *)"
+            - "Bash(kubectl describe *)"
+            - "Bash(kubectl logs *)"
+            - "Bash(helm list *)"
+            - "Bash(helm status *)"
+            - "Bash(helm get *)"
+            - "Bash(ansible-playbook --syntax-check *)"
+          autoMode:
+            environment:
+              - "$defaults"
+              - "This workspace is a code-server pod on the user's own private Thinkube Kubernetes cluster. The user owns every host, namespace and registry in it."
+              - "Running Ansible playbooks with ./scripts/tk_ansible from /home/thinkube/thinkube-platform/core/thinkube, and kubectl or helm against this cluster, is normal development work here."
+              - "Committing and pushing to the user's own repositories under /home/thinkube/thinkube-platform is required by the user's git policy."
+            allow:
+              - "$defaults"
+              - "Running any playbook with ./scripts/tk_ansible from /home/thinkube/thinkube-platform/core/thinkube."
+              - "Calling any tool of the thinkube-control, thinkube-tandem or tk-package-version MCP servers."
+              - "Scoped git add, commit and push (not force-push) in repositories under /home/thinkube/thinkube-platform."
+
+    # The platform's operating instructions for every agentic client:
+    # one AGENTS.md each for opencode, Pi and Claude Code, built from
+    # ansible/roles/agent_clients/files/instructions/. ~/.claude/CLAUDE.md
+    # becomes "@AGENTS.md" plus Claude-only content (rtk's @RTK.md, above).
+    # The policies are the platform's defaults: the git policy (commit
+    # verified work and push it, since the pushed remote is the only backup of
+    # a pod), infrastructure, comments, no deferral, answers, plain English,
+    # no fallbacks, CI/CD, operations, and browser login. A pod is not where
+    # they are edited; every run rewrites them.
+    - name: Install the agentic clients' operating instructions
+      ansible.builtin.include_role:
+        name: agent_clients
+        tasks_from: instructions
+
+    - name: Configure pip to use DevPi
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/.config/pip && \
+            cat > /home/thinkube/.config/pip/pip.conf << 'EOF'
+        [global]
+        index-url = https://{{ devpi_api_hostname }}/root/{{ devpi_index_name }}/+simple/
+        trusted-host = {{ devpi_api_hostname | regex_replace('^https?://', '') }}
+        EOF
+        echo '✅ pip configured to use DevPi'"
+
+    # uv has NO `trusted-host` key (that is pip's spelling) — writing it makes uv
+    # REJECT the whole config file, so every `uv tool install` / `uv pip` on a
+    # deployed instance failed with "unknown field `trusted-host`". uv's schema:
+    # a top-level [[index]] (applies to uv tool/add AND the uv-pip interface)
+    # and `allow-insecure-host` (the trusted-host equivalent) at top level.
+    # DevPi is listed WITHOUT `default = true`: uv searches it first and falls
+    # back to PyPI — the same mirror-first-with-fallback intent as pip's
+    # index-url + extra-index-url pair (devpi/15_configure_cli.yaml), and it
+    # keeps installs working when the mirror is degraded (observed 2026-08-04:
+    # root/pypi 404/504 on packages it should proxy).
+    - name: Configure uv to use DevPi
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/.config/uv && \
+            cat > /home/thinkube/.config/uv/uv.toml << 'EOF'
+        allow-insecure-host = [\"{{ devpi_api_hostname | regex_replace('^https?://', '') }}\"]
+
+        [[index]]
+        url = \"https://{{ devpi_api_hostname }}/root/{{ devpi_index_name }}/+simple/\"
+        EOF
+        echo '✅ uv configured to use DevPi'"
+
+    # graphify (github.com/Graphify-Labs/graphify): tree-sitter AST → queryable
+    # knowledge graph of a repo, fully local for code (no LLM calls, no vector
+    # store). The tandem extension's contextualize round uses it HOST-SIDE as a
+    # deterministic starting map (`graphify query`), fail-soft when absent. The
+    # PyPI package is `graphifyy` (double y — the single-y name is unrelated);
+    # the CLI is `graphify`. PINNED: bump deliberately, it is a fast-moving
+    # project. Runs AFTER the uv DevPi config so it resolves through the mirror
+    # (root/{{ devpi_index_name }} inherits root/pypi). uv installs the bin
+    # straight into ~/.local/bin, which is the image's process PATH.
+    - name: Check if graphify is installed at the pinned version
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "/home/thinkube/.local/bin/graphify --version 2>/dev/null | grep -q '0.9.32'"
+      register: graphify_installed
+      failed_when: false
+      changed_when: false
+
+    # UV_NO_CONFIG: install straight from PyPI, ignoring the DevPi uv.toml —
+    # same mirror-independence as the claude/rtk/npm install tasks above. uv
+    # HARD-FAILS on an erroring index instead of falling through (observed
+    # 2026-08-04: devpi proxy 504s made every config-routed install fail), and
+    # a pinned bootstrap tool must not depend on mirror health.
+    - name: Install graphify (pinned, direct from PyPI)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "UV_NO_CONFIG=1 uv tool install --force graphifyy==0.9.32 && \
+            /home/thinkube/.local/bin/graphify --version && \
+            echo '✅ graphify installed'"
+      when: graphify_installed.rc != 0
+
+    - name: Remove legacy pip.conf if it exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "rm -f /home/thinkube/.pip/pip.conf && echo '✅ Legacy pip.conf removed'"
+
+    - name: Create Ansible configuration content
+      ansible.builtin.set_fact:
+        ansible_cfg_content: |
+          [defaults]
+          host_key_checking = False
+          inventory = /home/thinkube/.ansible/inventory/inventory.yaml
+          remote_user = {{ system_username }}
+          private_key_file = ~/.ssh/thinkube_cluster_key
+          interpreter_python = auto_silent
+          roles_path = /home/thinkube/thinkube-platform/core/thinkube/ansible/roles
+          inject_facts_as_vars = False
+
+          [ssh_connection]
+          ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no
+          
+    - name: Create temporary Ansible configuration file
+      ansible.builtin.copy:
+        content: "{{ ansible_cfg_content }}"
+        dest: /tmp/ansible-cfg-{{ ansible_facts.date_time.epoch }}
+        mode: '0644'
+      register: temp_ansible_cfg
+
+    - name: Copy Ansible configuration to pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ temp_ansible_cfg.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.ansible.cfg
+
+    - name: Clean up temporary Ansible config
+      ansible.builtin.file:
+        path: "{{ temp_ansible_cfg.dest }}"
+        state: absent
+
+    - name: Check if inventory already exists in pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          test -f /home/thinkube/.ansible/inventory/inventory.yaml && echo "exists" || echo "missing"
+      register: inventory_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create inventory directory on host if inventory missing
+      ansible.builtin.file:
+        path: "{{ shared_code_path }}/.ansible/inventory"
+        state: directory
+        mode: '0755'
+      when: inventory_check.stdout == "missing"
+
+    - name: Copy entire inventory directory to shared location if missing
+      ansible.builtin.copy:
+        src: "{{ inventory_dir }}/"
+        dest: "{{ shared_code_path }}/.ansible/inventory/"
+        mode: '0644'
+        directory_mode: '0755'
+      when: inventory_check.stdout == "missing"
+
+    # The shared inventory outlives a reinstall, so the copy above does not
+    # run again and would keep the credentials of the previous install. The
+    # credentials the installer writes are therefore mirrored from the
+    # installer's inventory on every run: set when the installer defines
+    # them, removed when it does not. Every other value in the shared
+    # inventory (nodes added later, rewritten addresses) is kept.
+    - name: Check the installer inventory has an all.vars mapping
+      ansible.builtin.assert:
+        that:
+          - (lookup('ansible.builtin.file', inventory_file) | from_yaml).all.vars is mapping
+        fail_msg: "{{ inventory_file }} has no all.vars mapping; the installer writes its credentials there."
+        quiet: true
+
+    - name: Read credentials from the installer inventory
+      ansible.builtin.set_fact:
+        installer_inventory_vars: "{{ (lookup('ansible.builtin.file', inventory_file) | from_yaml).all.vars }}"
+
+    - name: Mirror installer credentials into the shared inventory
+      ansible.builtin.shell: |
+        python3 - "{{ shared_code_path }}/.ansible/inventory/inventory.yaml" <<'EOF'
+        import json
+        import os
+        import sys
+        import yaml
+
+        path = sys.argv[1]
+        keys = json.loads(os.environ["CREDENTIAL_KEYS"])
+        source = json.loads(os.environ["INSTALLER_CREDENTIALS"])
+        with open(path) as f:
+            inventory = yaml.safe_load(f)
+        target = inventory["all"]["vars"]
+        changed = []
+        for key in keys:
+            if key not in source:
+                if key in target:
+                    del target[key]
+                    changed.append(key)
+            elif target.get(key) != source[key]:
+                target[key] = source[key]
+                changed.append(key)
+        if changed:
+            with open(path, "w") as f:
+                yaml.dump(inventory, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=4096)
+        print("changed: " + ", ".join(changed) if changed else "unchanged")
+        EOF
+      environment:
+        CREDENTIAL_KEYS: "{{ installer_credential_keys | to_json }}"
+        INSTALLER_CREDENTIALS: >-
+          {{ installer_inventory_vars | dict2items
+             | selectattr('key', 'in', installer_credential_keys)
+             | items2dict | to_json }}
+      vars:
+        installer_credential_keys:
+          - cloudflare_api_token
+          - github_token
+          - zerotier_network_id
+          - zerotier_api_token
+          - tailscale_auth_key
+          - tailscale_api_token
+          - tailscale_oauth_client_id
+          - tailscale_oauth_client_secret
+      register: _credential_sync
+      changed_when: _credential_sync.stdout != "unchanged"
+
+    # The helper that resolves a node's current address from the cluster.
+    # Lives in the shared home so code-server, thinkube-control and any
+    # other runner of the shared inventory see the same file.
+    - name: Create shared .local/bin
+      ansible.builtin.file:
+        path: "{{ shared_code_path }}/.local/bin"
+        state: directory
+        mode: '0755'
+      tags: [node_ip_inventory]
+
+    - name: Install thinkube-node-ip helper
+      ansible.builtin.copy:
+        src: thinkube-node-ip
+        dest: "{{ shared_code_path }}/.local/bin/thinkube-node-ip"
+        mode: '0755'
+      tags: [node_ip_inventory]
+
+    # Idempotent rewrite of the shared inventory's node addresses: every
+    # cluster node's ansible_host/lan_ip becomes a run-time lookup against
+    # the cluster (thinkube-node-ip), with the stored address kept as the
+    # fallback for when the cluster cannot answer. Addresses on this
+    # platform are DHCP-assigned and move; the cluster's InternalIP (kept
+    # current by node-ip sync) is the only copy that is always right.
+    # ZeroTier ansible_host values are overlay addresses, which are static,
+    # and stay as they are. Python interpreters are left as the installer
+    # wrote them.
+    - name: Create inventory rewrite script
+      ansible.builtin.copy:
+        dest: /tmp/update_shared_inventory.py
+        mode: '0755'
+        content: |
+          {% raw %}
+          #!/usr/bin/env python3
+          import sys
+          import yaml
+
+          HELPER = "/home/{user}/.local/bin/thinkube-node-ip"
+          NODE_GROUPS = ("k8s_control_plane", "k8s_workers")
+
+          def walk_hosts(node, out, in_node_group=False):
+              """Collect host name -> host dict for hosts under the node groups."""
+              if not isinstance(node, dict):
+                  return
+              for name, body in (node.get("hosts") or {}).items():
+                  if in_node_group and isinstance(body, dict):
+                      out.setdefault(name, body)
+                  elif in_node_group and body is None:
+                      out.setdefault(name, None)
+              for gname, gbody in (node.get("children") or {}).items():
+                  walk_hosts(gbody, out, in_node_group or gname in NODE_GROUPS)
+
+          def find_host_defs(node, name, found):
+              """Every dict that defines host `name` (with vars), anywhere in the tree."""
+              if not isinstance(node, dict):
+                  return
+              body = (node.get("hosts") or {}).get(name)
+              if isinstance(body, dict):
+                  found.append(body)
+              for gbody in (node.get("children") or {}).values():
+                  find_host_defs(gbody, name, found)
+
+          def lookup_expr(user, host, fallback):
+              return '{{ lookup("pipe", "%s %s %s") }}' % (HELPER.format(user=user), host, fallback)
+
+          def is_dynamic(value):
+              return isinstance(value, str) and "thinkube-node-ip" in value
+
+          def update_inventory(inventory_path, system_username):
+              with open(inventory_path) as f:
+                  inventory = yaml.safe_load(f)
+              root = inventory.get("all", {})
+
+              node_hosts = {}
+              walk_hosts(root, node_hosts, False)
+              changed = []
+              for name in node_hosts:
+                  defs = []
+                  find_host_defs(root, name, defs)
+                  for body in defs:
+                      if body.get("ansible_connection") == "local":
+                          continue
+                      lan_ip = body.get("lan_ip")
+                      if not lan_ip or is_dynamic(lan_ip):
+                          continue
+                      if body.get("ansible_host") == lan_ip:
+                          body["ansible_host"] = lookup_expr(system_username, name, lan_ip)
+                      body["lan_ip"] = lookup_expr(system_username, name, lan_ip)
+                      changed.append(name)
+
+              with open(inventory_path, "w") as f:
+                  yaml.dump(inventory, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=4096)
+              print("Inventory updated; cluster-resolved addresses for: %s" % (", ".join(changed) or "none (already dynamic)"))
+
+          if __name__ == "__main__":
+              if len(sys.argv) != 3:
+                  print("Usage: update_shared_inventory.py <inventory_path> <system_username>")
+                  sys.exit(1)
+              update_inventory(sys.argv[1], sys.argv[2])
+          {% endraw %}
+      tags: [node_ip_inventory]
+
+    - name: Rewrite shared inventory (cluster-resolved addresses)
+      ansible.builtin.command:
+        cmd: python3 /tmp/update_shared_inventory.py "{{ shared_code_path }}/.ansible/inventory/inventory.yaml" "{{ system_username }}"
+      register: _inventory_rewrite
+      changed_when: "'already dynamic' not in _inventory_rewrite.stdout"
+      tags: [node_ip_inventory]
+
+    - name: Remove temporary inventory rewrite script
+      ansible.builtin.file:
+        path: /tmp/update_shared_inventory.py
+        state: absent
+      tags: [node_ip_inventory]
+
+    # NOTE: Repository cloning (platform repos, Tandem board, user templates)
+    # moved to 13_clone_repositories.yaml. It runs `git reset --hard` on existing
+    # repos, so it must NOT run on a config re-run of this playbook — that would
+    # wipe uncommitted work in the cloned repos.
+
+    # The tk_ansible / tk_ssh / tk_images / tk_clone_dev links in /usr/local/bin
+    # are created by the code-server-dev image (see the toolchain check above).
+    # They were made here with `kubectl exec ... ln -sf` into the container
+    # filesystem and vanished every time the pod was recreated.
+
+    - name: Build hostAliases list for cluster nodes
+      ansible.builtin.set_fact:
+        cluster_host_aliases: "{{ cluster_host_aliases | default([]) + [{'ip': hostvars[item]['ansible_host'], 'hostnames': [item]}] }}"
+      loop: "{{ groups['baremetal'] }}"
+      when: hostvars[item]['ansible_host'] is defined
+
+    - name: Get current hostAliases from code-server deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Deployment
+        namespace: "{{ code_server_namespace }}"
+        name: code-server
+      register: cs_deployment
+
+    - name: Build comparable host strings from current and desired aliases
+      ansible.builtin.set_fact:
+        current_hosts: "{{ cs_deployment.resources[0].spec.template.spec.hostAliases | default([]) | map(attribute='ip') | sort | list }}"
+        desired_hosts: "{{ cluster_host_aliases | map(attribute='ip') | sort | list }}"
+        current_hostnames: "{{ cs_deployment.resources[0].spec.template.spec.hostAliases | default([]) | map(attribute='hostnames') | flatten | sort | list }}"
+        desired_hostnames: "{{ cluster_host_aliases | map(attribute='hostnames') | flatten | sort | list }}"
+
+    - name: Determine if hostAliases need updating
+      ansible.builtin.set_fact:
+        hostalias_changed: "{{ current_hosts != desired_hosts or current_hostnames != desired_hostnames }}"
+
+    - name: Patch code-server deployment with hostAliases (only if changed)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: patched
+        kind: Deployment
+        namespace: "{{ code_server_namespace }}"
+        name: code-server
+        definition:
+          spec:
+            template:
+              spec:
+                hostAliases: "{{ cluster_host_aliases }}"
+      when: hostalias_changed | bool
+
+    # The hostAliases patch mutates the deployment spec. With
+    # strategy.type: Recreate the old pod is deleted and a new pod is
+    # scheduled with a different name, so the cached pod_name fact is
+    # now stale. Wait for the rollout and re-fetch the pod name before
+    # any further kubectl exec calls.
+    - name: Wait for code-server rollout after hostAliases patch
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status deployment/code-server
+        -n {{ code_server_namespace }} --timeout=300s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+      when: hostalias_changed | bool
+
+    - name: Re-fetch code-server pod name after hostAliases patch
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
+          -l app=code-server \
+          -o jsonpath='{.items[0].metadata.name}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: new_pod_name
+      failed_when: new_pod_name.stdout == ""
+      changed_when: false
+      when: hostalias_changed | bool
+
+    - name: Update pod_name if it was re-fetched
+      ansible.builtin.set_fact:
+        pod_name: "{{ new_pod_name }}"
+      when: hostalias_changed | bool
+
+    # Create symlinks for GitHub SSH keys on control plane
+    # This allows git config to work both in pod and when SSHing to control plane
+    - name: Check if GitHub SSH key exists and is a file (not symlink)
+      ansible.builtin.stat:
+        path: "/home/{{ system_username }}/.ssh/{{ item }}"
+      loop:
+        - github_ed25519
+        - github_ed25519.pub
+      register: github_key_stat
+
+    - name: Remove existing GitHub SSH keys if they are files (not symlinks)
+      ansible.builtin.file:
+        path: "/home/{{ system_username }}/.ssh/{{ item.item }}"
+        state: absent
+      loop: "{{ github_key_stat.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists and not item.stat.islnk
+
+    - name: Create symlinks for GitHub SSH keys
+      ansible.builtin.file:
+        src: "/home/{{ system_username }}/shared-code/.ssh/{{ item }}"
+        dest: "/home/{{ system_username }}/.ssh/{{ item }}"
+        state: link
+      loop:
+        - github_ed25519
+        - github_ed25519.pub
+
+    - name: Configure git SSH for all cloned repositories
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            set -e
+            echo '===== Configuring git SSH for cloned repositories ====='
+            for repo_dir in /home/thinkube/thinkube-platform/*/* /home/thinkube/user-templates/*; do
+              if [ -d \"\$repo_dir/.git\" ]; then
+                repo_name=\$(basename \$repo_dir)
+                echo \"Configuring git SSH for \$repo_name...\"
+                cd \"\$repo_dir\"
+                git config core.sshCommand 'ssh -F /home/thinkube/.ssh/config -i /home/thinkube/.ssh/github_ed25519'
+                echo \"  ✓ SSH configured for \$repo_name\"
+              fi
+            done
+            echo '✅ Git SSH configuration complete for all repositories'
+          "
+
+    ###################################################################
+    # Configure CLI Tools for Development
+    ###################################################################
+
+    - name: Configure kubectl (copy kubeconfig to persistent storage)
+      ansible.builtin.shell: |
+        # Create .kube directory on host in shared-code (persists across pod restarts)
+        mkdir -p {{ shared_code_path }}/.kube
+        # Copy kubeconfig from control plane and modify API server address for in-cluster access
+        sed 's|https://127.0.0.1:6443|https://kubernetes.default.svc.cluster.local:443|g' {{ kubeconfig }} > {{ shared_code_path }}/.kube/config
+        chmod 600 {{ shared_code_path }}/.kube/config
+        echo '✅ kubectl configured (persists in {{ shared_code_path }}/.kube/config)'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+
+    - name: Configure GitHub CLI (gh auth)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            echo '{{ github_token }}' | gh auth login --with-token
+            gh auth status
+            echo '✅ GitHub CLI authenticated'
+          "
+      when: github_token is defined and github_token | length > 0
+
+    - name: Get ArgoCD token from .env
+      ansible.builtin.shell: grep ARGOCD_DEPLOYMENT_SECRET {{ ansible_facts.env.HOME }}/.env | cut -d= -f2 | tr -d '"'
+      register: argocd_token_result
+      changed_when: false
+
+    - name: Create ArgoCD config from template
+      ansible.builtin.template:
+        src: templates/argocd_config.j2
+        dest: /tmp/argocd-config
+        mode: '0600'
+      vars:
+        argocd_deployment_token: "{{ argocd_token_result.stdout }}"
+
+    - name: Copy ArgoCD config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- mkdir -p /home/thinkube/.config/argocd
+        {{ kubectl_bin }} cp /tmp/argocd-config {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.config/argocd/config
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- chmod 600 /home/thinkube/.config/argocd/config
+        rm -f /tmp/argocd-config
+        echo '✅ ArgoCD CLI configured'
+
+    - name: Create Argo Workflows config from template
+      ansible.builtin.template:
+        src: templates/argo_config.j2
+        dest: /tmp/argo-config
+        mode: '0600'
+      vars:
+        argo_grpc_domain: "grpc-argo.{{ domain_name }}"
+
+    - name: Copy Argo config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- mkdir -p /home/thinkube/.config/argo
+        {{ kubectl_bin }} cp /tmp/argo-config {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.config/argo/config
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- chmod 600 /home/thinkube/.config/argo/config
+        rm -f /tmp/argo-config
+        echo '✅ Argo Workflows CLI configured'
+
+    - name: Get Gitea admin token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: gitea
+        name: gitea-admin-token
+      register: gitea_token_secret
+      failed_when: gitea_token_secret.resources | length == 0
+
+    - name: Configure Tea (Gitea CLI)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "
+            tea login add \
+              --name {{ gitea_hostname }} \
+              --url https://{{ gitea_hostname }} \
+              --token '{{ gitea_token_secret.resources[0].data.token | b64decode }}' \
+              --insecure
+            echo '✅ Tea (Gitea CLI) configured'
+          "
+
+    - name: Read Harbor robot token from .env
+      ansible.builtin.shell: grep HARBOR_ROBOT_TOKEN {{ ansible_facts.env.HOME }}/.env | cut -d= -f2 | tr -d '"'
+      register: harbor_token_result
+      changed_when: false
+
+    - name: Create Harbor auth base64 string
+      ansible.builtin.shell: echo -n 'robot${{ harbor_robot_name }}:{{ harbor_token_result.stdout }}' | base64 -w0
+      register: harbor_auth_result
+      changed_when: false
+
+    - name: Create Docker config from template
+      ansible.builtin.template:
+        src: templates/docker-config.json.j2
+        dest: /tmp/docker-config.json
+        mode: '0600'
+      vars:
+        harbor_auth_b64: "{{ harbor_auth_result.stdout }}"
+
+    - name: Copy Docker config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- mkdir -p /home/thinkube/.docker
+        {{ kubectl_bin }} cp /tmp/docker-config.json {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/.docker/config.json
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- chmod 600 /home/thinkube/.docker/config.json
+        rm -f /tmp/docker-config.json
+        echo '✅ Harbor/Docker credentials configured'
+
+    # Each value is passed as its own argument, with no shell in between,
+    # so names with apostrophes, quotes or accents reach git unchanged.
+    - name: Configure git user settings
+      ansible.builtin.command:
+        argv:
+          - "{{ kubectl_bin }}"
+          - exec
+          - -n
+          - "{{ code_server_namespace }}"
+          - "{{ pod_name.stdout }}"
+          - --
+          - git
+          - config
+          - --global
+          - "{{ item.key }}"
+          - "{{ item.value }}"
+      loop:
+        - { key: user.name, value: "{{ git_author_name }}" }
+        - { key: user.email, value: "{{ git_author_email }}" }
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Configure service environment variables from deployed services
+      include_role:
+        name: code_server_env_update
+
+    - name: Create CLI tools test script from template
+      ansible.builtin.template:
+        src: templates/test-cli-tools.sh.j2
+        dest: /tmp/test-cli-tools-{{ ansible_facts.date_time.epoch }}.sh
+        mode: '0755'
+      register: test_script
+
+    - name: Copy test script to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ test_script.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/test-cli-tools.sh \
+          -c code-server
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          chmod +x /home/thinkube/test-cli-tools.sh
+
+    - name: Clean up temporary test script
+      ansible.builtin.file:
+        path: "{{ test_script.dest }}"
+        state: absent
+
+    - name: Create Fish CLI tools test script from template
+      ansible.builtin.template:
+        src: templates/test-cli-tools.fish.j2
+        dest: /tmp/test-cli-tools-{{ ansible_facts.date_time.epoch }}.fish
+        mode: '0755'
+      register: test_script_fish
+
+    - name: Copy Fish test script to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ test_script_fish.dest }} \
+          {{ code_server_namespace }}/{{ pod_name.stdout }}:/home/thinkube/test-cli-tools.fish \
+          -c code-server
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          chmod +x /home/thinkube/test-cli-tools.fish
+
+    - name: Clean up temporary Fish test script
+      ansible.builtin.file:
+        path: "{{ test_script_fish.dest }}"
+        state: absent
+
+    - name: Create VS Code workspace settings content
+      ansible.builtin.set_fact:
+        vscode_workspace_settings: |
+          {
+            "files.exclude": {
+              "**/.cache": true,
+              "**/.config": true,
+              "**/.local": true,
+              "**/.npm": true,
+              "**/.npm-global": true,
+              "**/.vscode-server": true,
+              "**/.ansible": true,
+              "**/.venv": true,
+              "**/.ansible.cfg": true,
+              "**/.ssh": true,
+              "**/.gitconfig": true,
+              "**/.npmrc": true,
+              "**/.profile": true,
+              "**/.bashrc": true,
+              "**/.bash_history": true,
+              "**/.claude.json": true,
+              "**/claude.json": true,
+              "**/ansible/.ansible": true,
+              "**/tmp": true,
+              "**/node_modules": true,
+              "**/create-gitea-repo.sh": true,
+              "**/setup-gitea-workflow.sh": true,
+              "**/.git": false,
+              "**/.gitignore": false
+            },
+            "explorer.excludeGitIgnore": false,
+            "search.exclude": {
+              "**/.cache": true,
+              "**/.config": true,
+              "**/.local": true,
+              "**/.npm": true,
+              "**/.npm-global": true,
+              "**/.vscode-server": true,
+              "**/.venv": true,
+              "**/node_modules": true,
+              "**/tmp": true,
+              "**/.bash_history": true
+            }
+          }
+          
+    - name: Create .vscode directory
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c "mkdir -p /home/thinkube/.vscode"
+          
+    - name: Copy VS Code workspace settings
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c 'cat > /home/thinkube/.vscode/settings.json << "EOF"
+          {{ vscode_workspace_settings }}
+          EOF'
+
+    - name: Create apps, components and user-templates directories for workspace
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - apps
+        - components
+        - user-templates
+
+    - name: Create Thinkube workspace file
+      ansible.builtin.template:
+        src: thinkube.code-workspace.j2
+        dest: "{{ code_source_path }}/thinkube.code-workspace"
+        mode: '0644'
+
+    - name: Ensure VS Code extensions directory exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          mkdir -p /home/thinkube/.local/share/code-server/extensions
+
+    # Every Thinkube extension installs the same way: a fresh clone of its
+    # repository builds a vsix, and code-server's extension manager installs
+    # it, so the manager records the version and the Extensions panel offers
+    # the reload. scripts/deploy.sh is the same file in every repository;
+    # files/extension-deploy.sh is the master, and a repository whose copy
+    # differs is not installed.
+    - name: Read the master extension deploy script
+      ansible.builtin.set_fact:
+        # sha256sum of the file itself: the file lookup would drop its last
+        # newline and never match the copy in a repository.
+        extension_deploy_sha: "{{ lookup('pipe', 'sha256sum ' ~ playbook_dir ~ '/files/extension-deploy.sh').split()[0] }}"
+        extension_repos:
+          - thinkube-theme
+          - thinkube-notebook-view
+          - thinkube-tandem-chat
+          - thinkube-cicd-monitor
+          - thinkube-tandem
+        extension_branch: "{{ thinkube_ref }}"
+
+    - name: Build and install the Thinkube extensions
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -c '
+          set -e
+          BUILD=/tmp/tk-extension-build/{{ item }}
+          rm -rf "$BUILD"
+          mkdir -p /tmp/tk-extension-build
+          git clone --quiet --depth 1 --branch {{ extension_branch }} \
+            https://github.com/thinkube/{{ item }}.git "$BUILD"
+          cd "$BUILD"
+          if [ "$(sha256sum scripts/deploy.sh | cut -d" " -f1)" != "{{ extension_deploy_sha }}" ]; then
+            echo "{{ item }}: scripts/deploy.sh differs from the master copy; not installed"
+            exit 1
+          fi
+          scripts/deploy.sh --no-bump
+          rm -rf "$BUILD"
+          '
+      loop: "{{ extension_repos }}"
+      register: extension_installs
+
+    - name: Display the extension installations
+      ansible.builtin.debug:
+        var: item.stdout_lines
+      loop: "{{ extension_installs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Create temporary settings file from template
+      ansible.builtin.template:
+        src: templates/vscode-settings.json.j2
+        dest: /tmp/vscode-settings-{{ ansible_facts.date_time.epoch }}.json
+        mode: '0644'
+      register: temp_settings_file
+
+    - name: Ensure VS Code user settings directory exists on host with correct permissions
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/.local/share/code-server/User"
+        state: directory
+        mode: '0755'
+
+    - name: Check if existing settings file exists on host
+      ansible.builtin.stat:
+        path: "{{ code_source_path }}/.local/share/code-server/User/settings.json"
+      register: existing_settings_file
+
+    - name: Read existing settings if present
+      ansible.builtin.slurp:
+        src: "{{ code_source_path }}/.local/share/code-server/User/settings.json"
+      register: existing_settings
+      when: existing_settings_file.stat.exists
+
+    - name: Parse existing settings
+      ansible.builtin.set_fact:
+        existing_vscode_settings: "{{ existing_settings.content | b64decode | from_json }}"
+      when: existing_settings_file.stat.exists
+
+    - name: Read template settings file
+      ansible.builtin.slurp:
+        src: "{{ temp_settings_file.dest }}"
+      register: template_settings_content
+
+    - name: Parse template settings
+      ansible.builtin.set_fact:
+        template_vscode_settings: "{{ template_settings_content.content | b64decode | from_json }}"
+
+    # Three layers: the defaults are the user's to change (a colour or icon
+    # theme picked in the editor stays), the existing settings keep what the
+    # user and other playbooks wrote (apiToken, ...), and the template is
+    # applied on every run.
+    - name: Merge defaults, existing settings and the template
+      ansible.builtin.set_fact:
+        merged_vscode_settings: "{{ vscode_default_settings | combine(existing_vscode_settings | default({}), recursive=True) | combine(template_vscode_settings, recursive=True) }}"
+      vars:
+        vscode_default_settings:
+          workbench.colorTheme: "Thinkube Light"
+          workbench.productIconTheme: "thinkube-icons"
+
+    - name: Write merged settings to temporary file
+      ansible.builtin.copy:
+        content: "{{ merged_vscode_settings | to_nice_json(indent=4) }}"
+        dest: /tmp/vscode-settings-merged-{{ ansible_facts.date_time.epoch }}.json
+        mode: '0644'
+      register: merged_settings_file
+
+    - name: Get current code-server pod name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
+          -l app=code-server \
+          -o jsonpath='{.items[0].metadata.name}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: current_pod_name
+      changed_when: false
+
+    - name: Copy merged settings file to pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} cp {{ merged_settings_file.dest }} \
+          {{ code_server_namespace }}/{{ current_pod_name.stdout }}:/home/thinkube/.local/share/code-server/User/settings.json \
+          -c code-server
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: extension_config
+
+    - name: Clean up temporary template file
+      ansible.builtin.file:
+        path: "{{ temp_settings_file.dest }}"
+        state: absent
+
+    - name: Clean up temporary merged file
+      ansible.builtin.file:
+        path: "{{ merged_settings_file.dest }}"
+        state: absent
+      
+    - name: Display extension configuration output
+      ansible.builtin.debug:
+        var: extension_config.stdout_lines
+      when: extension_config is defined
+
+    - name: Display setup summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ Code-server environment configured successfully"
+          - "✅ Cross-shell environment (Bash, Zsh, Fish) configured"
+          - "✅ Node.js and npm installed"
+          - "✅ Claude Code installed and available"
+          - "✅ Python and Ansible installed"
+          - "✅ Repository cloned (if SSH key available)"
+          - "✅ VS Code extensions installed (if repositories available)"
+          - "✅ VS Code workspace configured with clean file explorer"
+          - "✅ Nerd Fonts injected (Fira Code, JetBrains Mono)"
+          - ""
+          - "The 'claude' command should now work in any new terminal session"
+          - ""
+          - "Extensions installed:"
+          - "  - thinkube-tandem (via symlink from platform repo)"
+          - "  - thinkube-cicd-monitor (via symlink from platform repo)"
+          - "  - Hooks are configured for Ansible playbook review"
+          - ""
+          - "Test CLI tools:"
+          - "  - Bash: ./test-cli-tools.sh"
+          - "  - Fish: fish test-cli-tools.fish"
+          - ""
+          - "💡 Reload browser to see Nerd Font icons in terminal"

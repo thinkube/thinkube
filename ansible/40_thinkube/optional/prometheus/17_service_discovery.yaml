@@ -1,0 +1,113 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/prometheus/17_service_discovery.yaml
+# Description:
+#   Configure service discovery for Prometheus by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - Prometheus must be deployed
+#   - kubectl access to the Kubernetes (kubeadm) cluster
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/prometheus/17_service_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#
+# 🤖 AI-assisted
+
+- name: Configure Prometheus service discovery
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    component_version: "{{ lookup('file', playbook_dir + '/VERSION') }}"
+    prometheus_namespace: "monitoring"
+    prometheus_hostname: "prometheus.{{ domain_name }}"
+    alertmanager_hostname: "alertmanager.{{ domain_name }}"
+
+  tasks:
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: "{{ prometheus_namespace }}"
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "prometheus"
+              thinkube.io/component-version: "{{ component_version }}"
+          data:
+            service.yaml: |
+              service:
+                name: prometheus
+                display_name: "Prometheus"
+                description: "Metrics collection and monitoring system"
+                type: optional
+                category: monitoring
+                icon: /icons/tk_observability.svg
+                component_version: "{{ component_version }}"
+
+                endpoints:
+                  - name: prometheus
+                    type: http
+                    url: "https://{{ prometheus_hostname }}"
+                    health_url: "http://prometheus-k8s.{{ prometheus_namespace }}.svc.cluster.local:9090/-/healthy"
+                    description: "Prometheus server"
+                    primary: true
+                  - name: alertmanager
+                    type: http
+                    url: "https://{{ alertmanager_hostname }}"
+                    health_url: "http://alertmanager-main.{{ prometheus_namespace }}.svc.cluster.local:9093/-/healthy"
+                    description: "Alert routing and management"
+
+                dependencies:
+                  - perses
+
+                scaling:
+                  resource_type: statefulset
+                  resource_name: prometheus-k8s
+                  namespace: "{{ prometheus_namespace }}"
+                  min_replicas: 1
+                  can_disable: true
+
+                metadata:
+                  authentication: none
+                  persistence: true
+                  license: "Apache-2.0"
+
+                environment_variables:
+                  - name: PROMETHEUS_URL
+                    value: "https://{{ prometheus_hostname }}"
+                  - name: ALERTMANAGER_URL
+                    value: "https://{{ alertmanager_hostname }}"
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ prometheus_namespace }}"
+        name: thinkube-service-config
+      register: configmap_check
+
+    - name: Display service discovery status
+      ansible.builtin.debug:
+        msg: |
+          Service discovery configured for Prometheus
+
+          Service registered with:
+          - Name: prometheus
+          - Category: monitoring
+          - Prometheus endpoint: https://{{ prometheus_hostname }}
+          - Alertmanager endpoint: https://{{ alertmanager_hostname }}

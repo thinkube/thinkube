@@ -1,0 +1,116 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# 11_setup_tailscale.yaml - Verify Tailscale tailnet membership on overlay nodes
+#
+# Purpose:
+#   Sanity-check that every node in `overlay_nodes` has Tailscale installed
+#   and joined the tailnet. Runs after 06_install_tailscale.yaml and before
+#   the Kubernetes install in 40_thinkube/, so a misconfigured node fails
+#   here rather than later.
+#
+#   The previous version of this playbook configured a subnet-route
+#   workaround so the Cilium load balancer's L2 announcements could be
+#   reached over Tailscale's L3 mesh (the control plane advertised a /27
+#   subnet, the Tailscale API auto-approved it, and IP forwarding was
+#   enabled). That whole pattern made the control plane a single point of
+#   failure for all service traffic. It has been replaced by the Tailscale
+#   Kubernetes Operator (40_thinkube/core/infrastructure/tailscale-operator)
+#   which exposes Services on the tailnet directly via per-Service or
+#   shared-Gateway tailnet devices.
+#
+# Requirements:
+#   - Tailscale already installed and connected via 06_install_tailscale.yaml
+#
+# Variables:
+#   - overlay_provider: must be 'tailscale' (no-op otherwise)
+#
+# Run with:
+#   ./scripts/run_ansible.sh ansible/30_networking/11_setup_tailscale.yaml
+
+- name: Verify Tailscale tailnet membership on overlay nodes
+  hosts: overlay_nodes
+  gather_facts: false
+  become: false
+  serial: 1
+
+  tasks:
+    - name: Skip when overlay provider is not Tailscale
+      ansible.builtin.meta: end_play
+      when: overlay_provider != 'tailscale'
+
+    - name: Check that the tailscale CLI is installed
+      ansible.builtin.command: which tailscale
+      register: tailscale_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if Tailscale is not installed
+      ansible.builtin.fail:
+        msg: |
+          Tailscale is not installed on {{ inventory_hostname }}.
+          Run 06_install_tailscale.yaml first, or use the overlay setup step
+          in the installer.
+      when: tailscale_installed.rc != 0
+
+    - name: Read Tailscale status JSON
+      ansible.builtin.command: tailscale status --json
+      register: tailscale_status_raw
+      changed_when: false
+      failed_when: tailscale_status_raw.rc != 0
+
+    - name: Parse Tailscale device info
+      ansible.builtin.set_fact:
+        tailscale_status: "{{ tailscale_status_raw.stdout | from_json }}"
+
+    - name: Fail if not connected to tailnet
+      ansible.builtin.fail:
+        msg: |
+          Node {{ inventory_hostname }} is not in the Running BackendState
+          on the tailnet (current: {{ tailscale_status.BackendState }}).
+          Run 06_install_tailscale.yaml or rejoin manually with `tailscale up`.
+      when: tailscale_status.BackendState != 'Running'
+
+    - name: Display per-node tailnet membership
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          ✅ Tailscale verified for {{ inventory_hostname }}
+          ════════════════════════════════════════════════════════
+
+          Device ID:  {{ tailscale_status.Self.ID }}
+          Tailnet IP: {{ tailscale_status.Self.TailscaleIPs[0] }}
+          DNS Name:   {{ tailscale_status.Self.DNSName }}
+
+          ════════════════════════════════════════════════════════
+
+- name: Tailscale verification summary
+  hosts: overlay_nodes[0]
+  gather_facts: false
+
+  tasks:
+    - name: Skip summary when overlay provider is not Tailscale
+      ansible.builtin.meta: end_play
+      when: overlay_provider != 'tailscale'
+
+    - name: Display Tailscale verification summary
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════════════════════
+          ✅ All overlay nodes verified on the tailnet
+          ════════════════════════════════════════════════════════════════════════
+
+          Verified Nodes: {{ groups['overlay_nodes'] | length }}
+
+          {% for node in groups['overlay_nodes'] %}
+          - {{ node }}: Connected
+          {% endfor %}
+
+          Service exposure on the tailnet is handled by the Tailscale
+          Kubernetes Operator (deployed by
+          40_thinkube/core/infrastructure/tailscale-operator/10_deploy.yaml).
+
+          ════════════════════════════════════════════════════════════════════════

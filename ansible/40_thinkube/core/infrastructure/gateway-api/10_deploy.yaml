@@ -1,0 +1,644 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/gateway-api/10_deploy.yaml
+# Description:
+#   Deploys Envoy Gateway as the Gateway API controller for the cluster.
+#   Envoy Gateway fully supports HTTPRoute, TLSRoute, GRPCRoute, and TCPRoute.
+#   Creates two Gateways:
+#     - thinkube-gateway: HTTP/HTTPS/TLS-passthrough + all TCP services
+#     - thinkube-kn-gateway: HTTPS for Knative (*.kn.<domain>)
+#
+#   Images are pre-pulled via podman and imported into containerd to avoid
+#   Docker Hub dependency at deploy time (same approach as dns-server).
+#
+# Requirements:
+#   - Thinkube Kubernetes Cluster (kubeadm) installed with Cilium CNI
+#   - Cilium L2 LoadBalancer pool configured (ZeroTier mode — done by
+#     10_install_k8s.yaml via CiliumLoadBalancerIPPool + L2AnnouncementPolicy)
+#   - acme-certificates deployed (wildcard cert in default namespace)
+#   - podman installed (handled by this playbook)
+#
+# Usage:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/gateway-api/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name, argocd_hostname
+#   - primary_gateway_ip_octet
+#   - network_mode, network_cidr, overlay_subnet_prefix
+#   - kubectl_bin, helm_bin, kubeconfig
+#   - overlay_provider: 'zerotier' or 'tailscale'
+#   - gateway_hostname (Tailscale only): tailnet hostname for the
+#     shared cluster Gateway. The installer resolves this at the
+#     configuration page (defaults to "<cluster_name>-gw" if the user
+#     leaves it blank), so it's always populated by the time we get here.
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy Envoy Gateway for Gateway API
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+  vars:
+    # primary_gateway_ip is only meaningful in ZeroTier mode (Cilium L2 LB
+    # pins the Service to this address). In Tailscale mode the Tailscale
+    # Operator picks the Service's tailnet IP at runtime, so we read it
+    # back from Gateway status below instead of comparing to a known value.
+    subnet_prefix: "{{ overlay_subnet_prefix if overlay_provider == 'zerotier' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    primary_gateway_ip: "{{ subnet_prefix }}{{ primary_gateway_ip_octet }}"
+
+    eg_version: "v1.8.0"
+    eg_namespace: "envoy-gateway-system"
+    gateway_namespace: "gateway-system"
+    gateway_name: "thinkube-gateway"
+
+    # Envoy proxy image bundled with Envoy Gateway v1.8 — see compat
+    # matrix at https://gateway.envoyproxy.io/news/releases/matrix/
+    eg_images:
+      - name: "docker.io/envoyproxy/gateway:{{ eg_version }}"
+        file: "/tmp/envoyproxy-gateway-{{ eg_version }}.tar"
+      - name: "docker.io/envoyproxy/envoy:distroless-v1.38.0"
+        file: "/tmp/envoyproxy-envoy-distroless-v1.38.0.tar"
+      - name: "docker.io/envoyproxy/ratelimit:c8765e89"
+        file: "/tmp/envoyproxy-ratelimit-c8765e89.tar"
+
+    # Standard containerd paths under kubeadm
+    containerd_sock: "/run/containerd/containerd.sock"
+    ctr_bin: "/usr/bin/ctr"
+
+    tcp_services:
+      - name: postgres
+        port: 5432
+        backend_namespace: postgres
+        backend_service: postgresql-official
+        backend_port: 5432
+      - name: gitea-ssh
+        port: 2222
+        backend_namespace: gitea
+        backend_service: gitea
+        backend_port: 22
+      - name: nats
+        port: 4222
+        backend_namespace: nats
+        backend_service: nats
+        backend_port: 4222
+      - name: valkey
+        port: 6379
+        backend_namespace: valkey
+        backend_service: valkey
+        backend_port: 6379
+      - name: clickhouse
+        port: 9000
+        backend_namespace: clickhouse
+        backend_service: clickhouse-clickhouse
+        backend_port: 9000
+
+  tasks:
+    ###########################################################################
+    # Step 1: Pull Envoy Gateway images with podman, import into containerd
+    # Same pattern as dns-server (BIND9): podman pull → tar → ctr import
+    ###########################################################################
+    - name: Install podman
+      ansible.builtin.apt:
+        name: podman
+        state: present
+        update_cache: false
+      become: true
+
+    - name: Check which Envoy Gateway images are already in containerd
+      ansible.builtin.shell: |
+        sudo {{ ctr_bin }} --address {{ containerd_sock }} --namespace k8s.io images ls \
+          --format '{{ "{{" }}.Name{{ "}}" }}' 2>/dev/null | grep "{{ item.name.split(':')[0] }}" | grep "{{ item.name.split(':')[1] }}" || echo ""
+      loop: "{{ eg_images }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: containerd_image_checks
+      changed_when: false
+      failed_when: false
+
+    - name: Pull missing Envoy Gateway images with podman
+      ansible.builtin.shell: |
+        podman pull {{ item.item.name }}
+      loop: "{{ containerd_image_checks.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout == ""
+      changed_when: true
+      failed_when: false
+
+    - name: Save pulled images to tar files
+      ansible.builtin.shell: |
+        podman save -o {{ item.item.file }} {{ item.item.name }}
+      loop: "{{ containerd_image_checks.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout == ""
+      changed_when: true
+
+    - name: Import images into containerd
+      ansible.builtin.shell: |
+        sudo {{ ctr_bin }} --address {{ containerd_sock }} --namespace k8s.io images import {{ item.item.file }}
+      loop: "{{ containerd_image_checks.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout == ""
+      become: true
+      changed_when: true
+
+    - name: Clean up image tar files
+      ansible.builtin.file:
+        path: "{{ item.item.file }}"
+        state: absent
+      loop: "{{ containerd_image_checks.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout == ""
+
+    ###########################################################################
+    # Step 2: Install experimental Gateway API CRDs (TCPRoute, UDPRoute)
+    # Envoy Gateway v1.8 requires Gateway API v1.5.1 (per the EG
+    # compatibility matrix). TCPRoute is in the experimental channel —
+    # we install the experimental-install.yaml bundle which contains
+    # standard + experimental CRDs.
+    ###########################################################################
+    - name: Check if TCPRoute CRD exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get crd tcproutes.gateway.networking.k8s.io 2>/dev/null && echo "exists" || echo "absent"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: tcproute_crd_check
+      changed_when: false
+      failed_when: false
+
+    # Server-side apply required: Gateway API v1.5.1 CRDs exceed the
+    # 256KB annotation limit for client-side kubectl apply.
+    - name: Install experimental Gateway API CRDs (v1.5.1, required by EG 1.8)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: tcproute_crd_check.stdout == "absent"
+      changed_when: true
+
+    - name: Wait for TCPRoute CRD to be established
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} wait --for=condition=Established crd/tcproutes.gateway.networking.k8s.io --timeout=60s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    ###########################################################################
+    # Step 3: Download and install Envoy Gateway via Helm
+    ###########################################################################
+    - name: Check if Envoy Gateway is already installed
+      ansible.builtin.shell: |
+        {{ helm_bin }} list -n {{ eg_namespace }} --kubeconfig {{ kubeconfig }} 2>/dev/null | grep -q "^eg" && echo "installed" || echo "absent"
+      register: eg_helm_check
+      changed_when: false
+      failed_when: false
+
+    # Retried so a transient registry failure costs a retry on the download
+    # rather than failing the step. This runs before Harbor exists, so the
+    # chart can only come from upstream.
+    - name: Download Envoy Gateway Helm chart (retries on transient network errors)
+      ansible.builtin.shell: |
+        {{ helm_bin }} pull oci://docker.io/envoyproxy/gateway-helm \
+          --version {{ eg_version }} \
+          --destination /tmp/
+      register: helm_pull
+      retries: 5
+      delay: 30
+      until: helm_pull.rc == 0
+      changed_when: helm_pull.rc == 0
+
+    - name: Create Envoy Gateway namespace and apply resource policies
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ eg_namespace }}"
+        tier: "critical"
+
+    - name: Install or upgrade Envoy Gateway via Helm
+      ansible.builtin.shell: |
+        {{ helm_bin }} upgrade --install eg /tmp/gateway-helm-{{ eg_version }}.tgz \
+          --namespace {{ eg_namespace }} \
+          --set deployment.envoyGateway.imagePullPolicy=IfNotPresent \
+          --set deployment.envoyGateway.pod.priorityClassName=thinkube-critical \
+          --set config.envoyGateway.extensionApis.enableBackend=true \
+          --kubeconfig {{ kubeconfig }}
+      register: eg_install
+      changed_when: true
+
+    - name: Clean up Helm chart file
+      ansible.builtin.file:
+        path: "/tmp/gateway-helm-{{ eg_version }}.tgz"
+        state: absent
+      when: eg_helm_check.stdout == "absent"
+
+    - name: Wait for Envoy Gateway controller to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status deployment/envoy-gateway \
+          -n {{ eg_namespace }} --timeout=120s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    ###########################################################################
+    # Step 4: Create EnvoyProxy resource
+    ###########################################################################
+    # In Tailscale mode the operator exposes the Envoy Gateway Service on
+    # the tailnet. We use `spec.loadBalancerClass: tailscale` (NOT the
+    # `tailscale.com/expose` annotation): the LoadBalancerClass path is
+    # the only one where the operator writes the assigned tailnet IP back
+    # into Service.status.loadBalancer.ingress, which is what Envoy
+    # Gateway watches to mark the Gateway "Programmed". The hostname
+    # annotation pins the device's tailnet name to gateway_hostname.
+    - name: Build EnvoyProxy provider.kubernetes spec
+      ansible.builtin.set_fact:
+        envoy_proxy_kubernetes: >-
+          {{ {} if overlay_provider != 'tailscale' else {
+               'envoyService': {
+                 'loadBalancerClass': 'tailscale',
+                 'annotations': {
+                   'tailscale.com/hostname': gateway_hostname,
+                 },
+               },
+             } }}
+
+    - name: Create EnvoyProxy resource for Thinkube
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        apply: true
+        server_side_apply:
+          force_conflicts: true
+          field_manager: ansible
+        definition:
+          apiVersion: gateway.envoyproxy.io/v1alpha1
+          kind: EnvoyProxy
+          metadata:
+            name: thinkube-proxy
+            namespace: "{{ eg_namespace }}"
+          spec:
+            provider:
+              type: Kubernetes
+              kubernetes: "{{ envoy_proxy_kubernetes }}"
+
+    # Service.spec.loadBalancerClass is immutable, so an existing Envoy
+    # Gateway Service from a prior deploy that lacked it (or had the
+    # wrong class) cannot be updated in place. Delete it here so Envoy
+    # Gateway recreates it from the EnvoyProxy spec above. No-op when
+    # the Service is already correct or absent.
+    - name: Reconcile Envoy Gateway Service if loadBalancerClass mismatch
+      when: overlay_provider == 'tailscale'
+      block:
+        - name: Read current loadBalancerClass on Envoy Gateway Service
+          ansible.builtin.shell: |
+            {{ kubectl_bin }} get svc -n {{ eg_namespace }} \
+              -l gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }} \
+              -o jsonpath='{.items[0].spec.loadBalancerClass}' 2>/dev/null || true
+          environment:
+            KUBECONFIG: "{{ kubeconfig }}"
+          register: existing_lb_class
+          changed_when: false
+          failed_when: false
+
+        - name: Delete stale Envoy Gateway Service so it recreates with loadBalancerClass
+          ansible.builtin.shell: |
+            {{ kubectl_bin }} delete svc -n {{ eg_namespace }} \
+              -l gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }}
+          environment:
+            KUBECONFIG: "{{ kubeconfig }}"
+          when:
+            - existing_lb_class.stdout is defined
+            - existing_lb_class.stdout != ''
+            - existing_lb_class.stdout != 'tailscale'
+          changed_when: true
+
+    ###########################################################################
+    # Step 5: Create GatewayClass pointing to Envoy Gateway
+    ###########################################################################
+    - name: Create GatewayClass for Envoy Gateway
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: eg
+          spec:
+            controllerName: gateway.envoyproxy.io/gatewayclass-controller
+            parametersRef:
+              group: gateway.envoyproxy.io
+              kind: EnvoyProxy
+              name: thinkube-proxy
+              namespace: "{{ eg_namespace }}"
+
+    - name: Wait for GatewayClass eg to be accepted
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get gatewayclass eg \
+          -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gatewayclass_status
+      until: gatewayclass_status.stdout == "True"
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    ###########################################################################
+    # Step 6: Create gateway-system namespace and copy TLS certificates
+    ###########################################################################
+    - name: Create gateway-system namespace and apply resource policies
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ gateway_namespace }}"
+        tier: "critical"
+
+    - name: Get wildcard certificate from default namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name | replace('.', '-') }}-tls -n default -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wildcard_cert_raw
+      failed_when: wildcard_cert_raw.rc != 0
+      changed_when: false
+
+    - name: Parse wildcard certificate
+      ansible.builtin.set_fact:
+        wildcard_cert_data: "{{ wildcard_cert_raw.stdout | from_json }}"
+
+    - name: Create TLS secret for main gateway
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: gateway-tls-secret
+            namespace: "{{ gateway_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert_data.data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert_data.data['tls.key'] }}"
+
+    ###########################################################################
+    # Step 7: Create main Gateway (HTTP + HTTPS + TLS passthrough + TCP ports)
+    ###########################################################################
+    - name: Build base Gateway spec (listeners only)
+      ansible.builtin.set_fact:
+        gateway_spec:
+          gatewayClassName: eg
+          listeners:
+            - name: http
+              protocol: HTTP
+              port: 80
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: https
+              protocol: HTTPS
+              port: 443
+              hostname: "*.{{ domain_name }}"
+              tls:
+                mode: Terminate
+                certificateRefs:
+                  - kind: Secret
+                    name: gateway-tls-secret
+                    namespace: "{{ gateway_namespace }}"
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: postgres
+              protocol: TCP
+              port: 5432
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: gitea-ssh
+              protocol: TCP
+              port: 2222
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: nats
+              protocol: TCP
+              port: 4222
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: valkey
+              protocol: TCP
+              port: 6379
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: clickhouse
+              protocol: TCP
+              port: 9000
+              allowedRoutes:
+                namespaces:
+                  from: All
+
+    # In ZeroTier mode the user assigns a fixed overlay IP to the Gateway and
+    # Cilium's L2 LB announces it. In Tailscale mode the Tailscale operator
+    # provisions a tailnet IP for the Service, so we omit addresses entirely
+    # and let the Service stay LoadBalancer-pending until the operator
+    # populates Service.status.loadBalancer.ingress.
+    - name: Add explicit address for ZeroTier mode
+      ansible.builtin.set_fact:
+        gateway_spec: >-
+          {{ gateway_spec | combine({
+               'addresses': [{'type': 'IPAddress', 'value': primary_gateway_ip}],
+             }) }}
+      when: overlay_provider == 'zerotier'
+
+    - name: Create main Gateway (thinkube-gateway)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: "{{ gateway_name }}"
+            namespace: "{{ gateway_namespace }}"
+          spec: "{{ gateway_spec }}"
+
+    # Some backends (CVAT) log a user in from these headers. Only the gateway
+    # login and oauth2-proxy may set them, so the gateway removes any copy a
+    # client sends, before any other filter runs.
+    - name: Remove user identity headers sent by clients
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.envoyproxy.io/v1alpha1
+          kind: ClientTrafficPolicy
+          metadata:
+            name: strip-identity-headers
+            namespace: "{{ gateway_namespace }}"
+          spec:
+            targetRefs:
+              - group: gateway.networking.k8s.io
+                kind: Gateway
+                name: "{{ gateway_name }}"
+                sectionName: https
+            headers:
+              earlyRequestHeaders:
+                remove:
+                  - X-Auth-Request-User
+                  - X-Auth-Request-Email
+                  - X-Auth-Request-Preferred-Username
+                  - X-Auth-Request-Groups
+                  - X-Auth-Request-Access-Token
+                  - X-Forwarded-User
+                  - X-Forwarded-Email
+                  - X-Forwarded-Preferred-Username
+                  - X-Forwarded-Groups
+                  - X-Forwarded-Access-Token
+
+    ###########################################################################
+    # Step 8: HTTP → HTTPS redirect route
+    ###########################################################################
+    - name: Create HTTP to HTTPS redirect route
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: http-to-https-redirect
+            namespace: "{{ gateway_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: http
+            rules:
+              - filters:
+                  - type: RequestRedirect
+                    requestRedirect:
+                      scheme: https
+                      statusCode: 301
+
+    ###########################################################################
+    # Step 9: Ensure backend namespaces exist and create ReferenceGrants
+    ###########################################################################
+    - name: Ensure backend namespaces exist for TCP services
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item.backend_namespace }}"
+      loop: "{{ tcp_services }}"
+      loop_control:
+        label: "{{ item.backend_namespace }}"
+
+    - name: Create ReferenceGrants for TCP service backends
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1beta1
+          kind: ReferenceGrant
+          metadata:
+            name: allow-gateway-tcp
+            namespace: "{{ item.backend_namespace }}"
+          spec:
+            from:
+              - group: gateway.networking.k8s.io
+                kind: TCPRoute
+                namespace: "{{ gateway_namespace }}"
+            to:
+              - group: ""
+                kind: Service
+      loop: "{{ tcp_services }}"
+      loop_control:
+        label: "{{ item.backend_namespace }}"
+
+    ###########################################################################
+    # Step 10: Create TCPRoutes (referencing thinkube-gateway)
+    ###########################################################################
+    # The TCPRoute CRD requires backendRefs[].port to be an integer.
+    # Going through kubernetes.core.k8s with `port: "{{ x | int }}"` was
+    # still producing a string in the request body (the module's
+    # serializer doesn't preserve the int type through the templated
+    # dict). Rendering the YAML as plain text and piping it to
+    # `kubectl apply -f -` avoids the issue entirely — kubectl parses
+    # the unquoted scalar `{{ item.backend_port }}` as an integer.
+    - name: Create TCPRoutes for each TCP service
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: gateway.networking.k8s.io/v1alpha2
+        kind: TCPRoute
+        metadata:
+          name: {{ item.name }}
+          namespace: {{ gateway_namespace }}
+        spec:
+          parentRefs:
+            - name: {{ gateway_name }}
+              namespace: {{ gateway_namespace }}
+              sectionName: {{ item.name }}
+          rules:
+            - backendRefs:
+                - name: {{ item.backend_service }}
+                  namespace: {{ item.backend_namespace }}
+                  port: {{ item.backend_port }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: tcproute_apply
+      changed_when: "'created' in tcproute_apply.stdout or 'configured' in tcproute_apply.stdout"
+      loop: "{{ tcp_services }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    ###########################################################################
+    # Step 11: Wait for Gateways to receive IP addresses
+    ###########################################################################
+    # ZeroTier mode pre-pins primary_gateway_ip via Cilium L2 LB, so we
+    # wait for the Gateway to come up with that exact address. Tailscale
+    # mode lets the operator pick from 100.64.0.0/10 — wait for any IP.
+    # Filter by `type=="IPAddress"` so we don't pick up the Hostname
+    # entry (Tailscale Operator emits both, ordering not guaranteed).
+    - name: Wait for main Gateway to have IP assigned
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get gateway {{ gateway_name }} -n {{ gateway_namespace }} \
+          -o jsonpath='{.status.addresses[?(@.type=="IPAddress")].value}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: primary_gw_ip
+      until: >-
+        (overlay_provider == 'zerotier' and primary_gw_ip.stdout == primary_gateway_ip)
+        or (overlay_provider == 'tailscale' and primary_gw_ip.stdout | length > 0)
+      retries: 40
+      delay: 10
+      changed_when: false
+
+    ###########################################################################
+    # Step 12: Display summary
+    ###########################################################################
+    - name: Display Gateway deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Envoy Gateway {{ eg_version }} deployed successfully"
+          - ""
+          - "Main Gateway ({{ gateway_name }}): {{ primary_gw_ip.stdout }}"
+          - "  - HTTP  (80)   → HTTPS redirect"
+          - "  - HTTPS (443)  → TLS termination (*.{{ domain_name }})"
+          - "  - TCP   (5432) → PostgreSQL"
+          - "  - TCP   (2222) → Gitea SSH"
+          - "  - TCP   (4222) → NATS"
+          - "  - TCP   (6379) → Valkey"
+          - "  - TCP   (9000) → ClickHouse"
+          - ""
+          - "Knative services use DomainMapping through the main gateway"

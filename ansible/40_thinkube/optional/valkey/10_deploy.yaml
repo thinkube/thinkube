@@ -1,0 +1,307 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/valkey/10_deploy.yaml
+# Description:
+#   Deploy Valkey (Redis-compatible) for infrastructure use in Kubernetes with external access
+#
+# This playbook:
+#   1. Creates valkey namespace
+#   2. Creates persistent storage for Valkey data
+#   3. Deploys Valkey 8.1 with persistence enabled
+#   4. Creates ClusterIP and headless services
+#   5. Configures external access via TCP passthrough (port 6379)
+#
+# Requirements:
+#   - Kubernetes (kubeadm) must be installed and running
+#   - NGINX Ingress Controller with TCP passthrough support
+#   - Wildcard TLS certificate in default namespace
+#   - Valkey custom image must be available in Harbor (built by Harbor base images playbook)
+#   - HARBOR_ROBOT_TOKEN environment variable in ~/.env file
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/valkey/10_deploy.yaml
+#
+# Variables from inventory:
+#   - harbor_registry: Harbor registry domain
+#   - kubeconfig: Path to kubeconfig file
+#   - domain_name: Base domain (e.g., thinkube.com)
+#   - ingress_namespace: Namespace for ingress controller
+#   - primary_ingress_service: Ingress controller service name
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 AI-assisted
+
+- name: Deploy Valkey (Redis-compatible)
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    valkey_namespace: "valkey"
+    valkey_deployment_name: "valkey"
+    valkey_service_name: "valkey"
+    valkey_headless_service_name: "valkey-headless"
+    valkey_image: "{{ harbor_registry }}/library/valkey:7.2-alpine"
+    valkey_port: 6379
+    valkey_storage_class: "k8s-hostpath"
+    valkey_persistence_size: "5Gi"
+    valkey_hostname: "valkey.{{ domain_name }}"
+    valkey_tls_secret_name: "{{ valkey_namespace }}-tls-secret"
+    # Password from environment (same as admin password)
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+
+  tasks:
+    - name: Verify the admin password is provided
+      ansible.builtin.assert:
+        that:
+          - admin_password != ""
+        fail_msg: "ADMIN_PASSWORD is not set: it is the Valkey password; set it in ~/.env or in the environment that runs this playbook."
+
+    - name: Load Harbor robot token from .env file
+      ansible.builtin.shell: |
+        if [ -f "{{ ansible_facts.env.HOME }}/.env" ]; then
+          source {{ ansible_facts.env.HOME }}/.env
+          echo $HARBOR_ROBOT_TOKEN
+        else
+          echo ""
+        fi
+      args:
+        executable: /bin/bash
+      register: robot_token_result
+      changed_when: false
+
+    - name: Set Harbor credentials facts
+      ansible.builtin.set_fact:
+        harbor_robot_user: "robot${{ harbor_robot_name }}"
+        harbor_robot_token: "{{ robot_token_result.stdout.strip() }}"
+
+    - name: Verify Harbor robot token is available
+      ansible.builtin.fail:
+        msg: "HARBOR_ROBOT_TOKEN not found in {{ ansible_facts.env.HOME }}/.env. Please ensure Harbor is configured."
+      when: harbor_robot_token == ""
+
+    - name: Create namespace for Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ valkey_namespace }}"
+        kind: Namespace
+        state: present
+
+    - name: Create Harbor registry pull secret in Valkey namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: harbor-registry-secret
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: "{{ {'auths': {harbor_registry: {'username': harbor_robot_user, 'password': harbor_robot_token, 'auth': (harbor_robot_user + ':' + harbor_robot_token) | b64encode}}} | to_json | b64encode }}"
+
+    - name: Create Valkey password secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: valkey-auth
+          type: Opaque
+          stringData:
+            password: "{{ admin_password }}"
+
+    - name: Create PVC for Valkey data
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: valkey-data
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: "{{ valkey_storage_class }}"
+            resources:
+              requests:
+                storage: "{{ valkey_persistence_size }}"
+
+    - name: Deploy Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ valkey_deployment_name }}"
+            labels:
+              app: "{{ valkey_deployment_name }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: "{{ valkey_deployment_name }}"
+            template:
+              metadata:
+                labels:
+                  app: "{{ valkey_deployment_name }}"
+              spec:
+                priorityClassName: thinkube-workload
+                imagePullSecrets:
+                - name: harbor-registry-secret
+                containers:
+                - name: valkey
+                  image: "{{ valkey_image }}"
+                  imagePullPolicy: Always
+                  command: ["valkey-server"]
+                  args:
+                    - "--save"
+                    - "900 1"
+                    - "--appendonly"
+                    - "yes"
+                    - "--protected-mode"
+                    - "no"
+                    - "--requirepass"
+                    - "$(VALKEY_PASSWORD)"
+                    - "--maxmemory-policy"
+                    - "noeviction"
+                  env:
+                    - name: VALKEY_PASSWORD
+                      valueFrom:
+                        secretKeyRef:
+                          name: valkey-auth
+                          key: password
+                  ports:
+                  - containerPort: "{{ valkey_port }}"
+                    name: valkey
+                  resources:
+                    limits:
+                      memory: "256Mi"
+                      cpu: "200m"
+                    requests:
+                      memory: "128Mi"
+                      cpu: "100m"
+                  volumeMounts:
+                    - name: data
+                      mountPath: /data
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: valkey-data
+
+    - name: Create ClusterIP service for Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ valkey_service_name }}"
+            labels:
+              app: "{{ valkey_deployment_name }}"
+          spec:
+            type: ClusterIP
+            selector:
+              app: "{{ valkey_deployment_name }}"
+            ports:
+              - name: valkey
+                port: "{{ valkey_port }}"
+                targetPort: "{{ valkey_port }}"
+
+    - name: Create headless service for Valkey
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: "{{ valkey_namespace }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ valkey_headless_service_name }}"
+            labels:
+              app: "{{ valkey_deployment_name }}"
+          spec:
+            clusterIP: None
+            selector:
+              app: "{{ valkey_deployment_name }}"
+            ports:
+              - name: valkey
+                port: "{{ valkey_port }}"
+                targetPort: "{{ valkey_port }}"
+
+    ###########################################################################
+    # Configure external access via Ingress
+    ###########################################################################
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Valkey namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ valkey_tls_secret_name }}"
+            namespace: "{{ valkey_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    # Clients reach this service through the TCPRoute gateway-api/10_deploy.yaml
+    # creates in the gateway's namespace. A route may send traffic to a Service
+    # in another namespace only when that namespace grants it, and the grant
+    # lives in this namespace, which a rollback can delete; the deploy creates
+    # it with the namespace.
+    - name: Allow the gateway's TCP routes to reach the Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1beta1
+          kind: ReferenceGrant
+          metadata:
+            name: allow-gateway-tcp
+            namespace: "{{ valkey_namespace }}"
+          spec:
+            from:
+              - group: gateway.networking.k8s.io
+                kind: TCPRoute
+                namespace: "{{ gateway_namespace }}"
+            to:
+              - group: ""
+                kind: Service
+
+    - name: Final Valkey info
+      ansible.builtin.debug:
+        msg:
+          - "Valkey (Redis-compatible) deployed successfully."
+          - "Namespace: {{ valkey_namespace }}"
+          - "Image: {{ valkey_image }}"
+          - "External URL: {{ valkey_hostname }}:{{ valkey_port }}"
+          - "Service: {{ valkey_service_name }}.{{ valkey_namespace }}.svc.cluster.local:{{ valkey_port }}"
+          - "Headless service: {{ valkey_headless_service_name }}.{{ valkey_namespace }}.svc.cluster.local:{{ valkey_port }}"
+          - "Persistence: {{ valkey_persistence_size }} on {{ valkey_storage_class }}"
+          - "Features: AOF persistence enabled, save snapshots every 900s if 1+ key changed"
+          - "TCP passthrough configured on port {{ valkey_port }}"

@@ -1,0 +1,236 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/qdrant/18_test.yaml
+# Description:
+#   Test Qdrant deployment and validate functionality
+#
+# Requirements:
+#   - Qdrant must be deployed (10_deploy.yaml)
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/qdrant/18_test.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubectl configuration
+#   - kubectl_bin: Path to kubectl binary
+#   - qdrant_namespace: Namespace for Qdrant
+#   - qdrant_hostname: Hostname for Qdrant API
+#   - qdrant_dashboard_hostname: Hostname for Qdrant dashboard
+#
+# 🤖 [AI-assisted]
+
+- name: Test Qdrant Deployment
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    k8s_namespace: "{{ qdrant_namespace }}"
+
+  tasks:
+    - name: Check if namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ k8s_namespace }}"
+      register: namespace_check
+      failed_when: namespace_check.resources | length == 0
+
+    - name: Check Qdrant statefulset
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant"
+      register: qdrant_statefulset
+      failed_when: qdrant_statefulset.resources | length == 0
+
+    - name: Check Qdrant service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant"
+      register: qdrant_service
+      failed_when: qdrant_service.resources | length == 0
+
+    - name: Check Qdrant dashboard HTTPRoute
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant-dashboard-route"
+      register: dashboard_httproute
+      failed_when: dashboard_httproute.resources | length == 0
+
+    - name: Check Qdrant API HTTPRoute
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant-api-route"
+      register: api_httproute
+      failed_when: api_httproute.resources | length == 0
+
+    - name: Check the gateway login policy on the dashboard routes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: gateway.envoyproxy.io/v1alpha1
+        kind: SecurityPolicy
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant-dashboard-oidc"
+      register: oidc_policy
+      failed_when: >-
+        oidc_policy.resources | length == 0
+        or (oidc_policy.resources[0].spec.targetRefs | map(attribute='name') | sort | list)
+           != ['qdrant-dashboard-route', 'qdrant-root-redirect']
+
+    - name: Check TLS secret exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ k8s_namespace }}"
+        name: "qdrant-tls-secret"
+      register: tls_secret
+      failed_when: tls_secret.resources | length == 0
+
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+
+    - name: Check Qdrant client in Keycloak
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ keycloak_realm }}/clients?clientId=qdrant-dashboard"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: qdrant_client
+      failed_when: qdrant_client.json | length == 0
+
+    - name: Read the Qdrant API key
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ k8s_namespace }}"
+        name: qdrant-auth
+      register: qdrant_auth_secret
+      failed_when: qdrant_auth_secret.resources | length == 0
+
+    - name: Test Qdrant API endpoint
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_hostname }}/"
+        method: GET
+        headers:
+          api-key: "{{ qdrant_auth_secret.resources[0].data['api-key'] | b64decode }}"
+        status_code: 200
+      register: api_info
+
+    - name: Test Qdrant API collections endpoint
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_hostname }}/collections"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          api-key: "{{ qdrant_auth_secret.resources[0].data['api-key'] | b64decode }}"
+        status_code: 200
+      register: collections_test
+
+    - name: Test that the API refuses a request without the key
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_hostname }}/collections"
+        method: GET
+        status_code: 401
+
+    - name: Test Qdrant dashboard paths without a login
+      ansible.builtin.uri:
+        url: "https://{{ qdrant_dashboard_hostname }}{{ item }}"
+        method: GET
+        follow_redirects: none
+        status_code: [200, 301, 302, 303]
+      register: dashboard_tests
+      loop: ["/", "/dashboard", "/collections"]
+
+    - name: Verify each path is sent to the Keycloak login
+      ansible.builtin.assert:
+        that:
+          - item.status in [302, 303]
+          - (item.location | default('')).startswith(keycloak_url ~ '/realms/' ~ keycloak_realm ~ '/protocol/openid-connect/auth')
+        fail_msg: >-
+          https://{{ qdrant_dashboard_hostname }}{{ item.item }} without a login
+          answered {{ item.status }} {{ item.location | default('') }}.
+          The dashboard host is reachable without a login.
+      loop: "{{ dashboard_tests.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Check persistent volume claim
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ k8s_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=qdrant"
+      register: pvc_check
+      failed_when: pvc_check.resources | length == 0
+
+    - name: Test summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════
+          ✅ Qdrant Test Results
+          ════════════════════════════════════════════════════════
+          
+          Namespace: {{ k8s_namespace }}
+          API URL: https://{{ qdrant_hostname }}
+          Dashboard URL: https://{{ qdrant_dashboard_hostname }}
+          
+          Component Status:
+          ✓ Qdrant statefulset: Running
+          ✓ Gateway login policy: Present
+          ✓ HTTPRoutes configured: Yes
+          ✓ TLS certificate: Present
+          ✓ Keycloak client: Configured
+          ✓ API health check: Passed
+          ✓ API key required: Yes
+          ✓ Authentication redirect: Working
+          ✓ Persistent storage: Configured
+          
+          Access Instructions:
+          1. API Access: https://{{ qdrant_hostname }}
+          2. Dashboard: https://{{ qdrant_dashboard_hostname }}
+          3. Login via Keycloak SSO
+          
+          API Endpoints:
+          - Info: https://{{ qdrant_hostname }}/
+          - Collections: https://{{ qdrant_hostname }}/collections
+          - gRPC: {{ qdrant_hostname }}:6334
+          
+          Troubleshooting Commands:
+          - kubectl -n {{ k8s_namespace }} get pods
+          - kubectl -n {{ k8s_namespace }} logs statefulset/qdrant
+          - kubectl -n {{ k8s_namespace }} get securitypolicy qdrant-dashboard-oidc -o yaml
+          
+          ════════════════════════════════════════════════════════

@@ -1,0 +1,1204 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/10_deploy.yaml
+# Description:
+#   Deploy the Thinkube Control Hub using Argo Workflows and ArgoCD with Keycloak integration
+#
+# Requirements:
+#   - Kubernetes (kubeadm) cluster with Argo Workflows and ArgoCD installed
+#   - Keycloak instance for authentication
+#   - Environment variable: ADMIN_PASSWORD
+#   - GitHub token configured in inventory or environment
+#   - TLS certificates available at configured paths
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/thinkube-control/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Domain for Kubernetes services
+#   - admin_username: Admin username for service access
+#   - admin_password: Admin password (from environment ADMIN_PASSWORD)
+#   - primary_gateway_ip: Main ingress IP address
+#   - kubeconfig: Path to kubeconfig file
+#   - github_token: GitHub API token
+#
+# Dependencies:
+#   - CORE-004: SSL/TLS Certificates must be configured
+#   - CORE-006: Keycloak must be deployed
+#   - CORE-010: Argo Workflows must be deployed
+#   - CORE-011: ArgoCD must be deployed
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy Control Hub using Argo Workflows and ArgoCD with Keycloak integration
+  hosts: k8s_control_plane
+  gather_facts: true
+  vars_files:
+    - vars/model_aliases.yaml
+  
+  vars:
+    # Namespace configuration
+    k8s_namespace: "{{ thinkube_control_namespace }}"
+    
+    # Domain configuration - using inventory variables
+    control_host: "control.{{ domain_name }}"
+    cookie_domain: ".{{ domain_name }}"
+    
+    # Git configuration
+    git_user_name: "Control Hub Automation"
+    git_user_email: "thinkube@thinkube.com"
+    
+    # TLS settings
+    tls_secret_name: "control-tls-secret"
+
+    # Keycloak client settings
+    keycloak_app_client_id: "thinkube-control"
+    keycloak_user_to_grant_access: "{{ auth_realm_username }}"
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+    # GitHub configuration
+    github_repo_name: "thinkube-control"
+    template_url: "git@github.com:thinkube/{{ github_repo_name }}.git"
+    # MAJOR.MINOR of the platform release, read from the repository's VERSION file.
+    thinkube_platform_version: "{{ (lookup('ansible.builtin.file', playbook_dir ~ '/../../../../VERSION') | trim).split('.')[0:2] | join('.') }}"
+    github_api_url: "https://api.github.com"
+    
+    # Path inside the code-server pod (needed by common/github_ssh_keys)
+    pod_code_path: "/home/coder"
+    
+    # Environment file location
+    env_file_path: "{{ ansible_facts.env.HOME }}/.env"
+    
+    # Kubernetes/Deployment configuration
+    argocd_namespace: "argocd"
+    argo_workflows_namespace: "argo"
+    app_namespace: "{{ k8s_namespace }}"
+    app_name: "thinkube-control"
+    container_registry: "registry.{{ domain_name }}"
+    backend_image_repo: "{{ container_registry }}/thinkube/thinkube-control-backend"
+    frontend_image_repo: "{{ container_registry }}/thinkube/thinkube-control-frontend"
+    image_tag: "{{ ansible_facts.date_time.iso8601_basic_short }}"
+    
+    # ArgoCD configuration
+    argocd_server: "argocd.{{ domain_name }}:443"
+    
+    # Image builds: registry credentials and the build pods' ServiceAccount
+    docker_config_secret_name: "docker-config"
+    image_builder_sa_name: "image-builder"
+    
+    # Added for compatibility
+    image_repo: "{{ frontend_image_repo }}"
+    
+    # GitHub integration settings
+    use_github: true
+    app_dashboard_host: "{{ control_host }}"
+    
+    # Multi-node specific settings
+    check_interval: 5
+    
+    # Shared code directory (accessible from code-server and jupyterhub)
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    code_source_path: "{{ shared_code_path }}"
+    
+
+  pre_tasks:
+    # Load environment variables from .env file first
+    - name: Load environment variables from .env file
+      ansible.builtin.include_role:
+        name: common/environment
+
+    # Set GitHub variables from environment if not in inventory
+    - name: Set github_token from environment
+      ansible.builtin.set_fact:
+        github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+      when: github_token is not defined or github_token == ""
+
+    # Set HuggingFace token from environment if not in inventory
+    - name: Set hf_token from environment
+      ansible.builtin.set_fact:
+        hf_token: "{{ lookup('env', 'HF_TOKEN') }}"
+      when: hf_token is not defined or hf_token == ""
+
+    # Set admin_password from environment variables
+    - name: Set admin_password from ADMIN_PASSWORD or ANSIBLE_BECOME_PASSWORD
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+      when: admin_password is not defined or admin_password == ""
+
+    # Get the actual node name - Kubernetes might use FQDN or short hostname
+    - name: Get actual Kubernetes node name
+      ansible.builtin.shell: |
+        # Get node name that contains our inventory hostname
+        {{ kubectl_bin }} get nodes -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep "^{{ inventory_hostname }}" | head -1
+      register: k8s_node_result
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      
+    - name: Set master_node_name fact
+      ansible.builtin.set_fact:
+        master_node_name: "{{ k8s_node_result.stdout }}"
+        
+    - name: Debug node name
+      ansible.builtin.debug:
+        msg: "Kubernetes node name: {{ master_node_name }}"
+    
+    - name: Get master node IP from inventory
+      ansible.builtin.set_fact:
+        master_node_ip: "{{ hostvars[inventory_hostname]['ansible_host'] }}"
+      when: hostvars[inventory_hostname]['ansible_host'] is defined
+    
+    - name: Debug master node IP
+      ansible.builtin.debug:
+        msg: "Master node IP: {{ master_node_ip | default('not found') }}"
+    
+    - name: Verify required variables
+      ansible.builtin.fail:
+        msg: "{{ item }} is not defined. Please set it in inventory."
+      when: vars[item] is not defined or vars[item] == ""
+      loop:
+        - domain_name
+        - admin_username
+        - kubeconfig
+        - github_token
+        - github_username
+        - hf_token
+
+    # Store the inventory github_token before it gets overwritten
+    - name: Store inventory github_token
+      ansible.builtin.set_fact:
+        inventory_github_token: "{{ github_token }}"
+      when: github_token is defined
+
+    # Store the inventory hf_token before it gets overwritten
+    - name: Store inventory hf_token
+      ansible.builtin.set_fact:
+        inventory_hf_token: "{{ hf_token }}"
+      when: hf_token is defined
+
+    - name: Install migration tools and common dependencies in shared venv for template deployments
+      ansible.builtin.pip:
+        name:
+          # Database and migration tools
+          - alembic==1.13.1
+          - sqlalchemy==2.0.23
+          - psycopg2-binary==2.9.9
+          # Common web framework dependencies for template apps
+          - fastapi==0.109.2
+          - uvicorn==0.27.1
+          - pydantic==2.5.3
+          - pydantic-settings==2.1.0
+          # Authentication and security
+          - python-jose[cryptography]==3.3.0
+          - cryptography==42.0.2
+          # HTTP client and utilities
+          - httpx==0.26.0
+          - python-multipart==0.0.7
+          - websockets==12.0
+          # Kubernetes integration common in templates
+          - kubernetes==36.0.3
+        state: present
+        virtualenv: ~/.venv
+      tags: [migration-tools]
+        
+    # Restore github_token from inventory if it was overwritten
+    - name: Use inventory github_token if environment doesn't have one
+      ansible.builtin.set_fact:
+        github_token: "{{ inventory_github_token }}"
+      when:
+        - inventory_github_token is defined
+        - github_token is not defined or github_token == ""
+
+    # Restore hf_token from inventory if it was overwritten
+    - name: Use inventory hf_token if environment doesn't have one
+      ansible.builtin.set_fact:
+        hf_token: "{{ inventory_hf_token }}"
+      when:
+        - inventory_hf_token is defined
+        - hf_token is not defined or hf_token == ""
+
+    # Ensure CODE_SOURCE_PATH is set since code-server is not yet migrated
+    - name: Check if CODE_SOURCE_PATH is in .env
+      ansible.builtin.shell: grep -E '^CODE_SOURCE_PATH=' {{ ansible_facts.env.HOME }}/.env || true
+      register: code_path_check
+      changed_when: false
+      
+    - name: Add CODE_SOURCE_PATH to .env if missing
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_facts.env.HOME }}/.env"
+        line: "CODE_SOURCE_PATH={{ shared_code_path }}"
+        create: false
+      when: code_path_check.stdout == ""
+      
+    - name: Ensure shared-code directory exists
+      ansible.builtin.file:
+        path: "{{ shared_code_path }}"
+        state: directory
+        mode: '0775'
+      
+    # Set code_source_path and update local_repo_path
+    - name: Set code paths for repository
+      ansible.builtin.set_fact:
+        code_source_path: "{{ shared_code_path }}"
+        host_code_path: "{{ shared_code_path }}"
+        local_repo_path: "{{ shared_code_path }}/{{ github_repo_name }}"
+
+    - name: Ensure application namespace exists and apply resource policies
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ k8s_namespace }}"
+        tier: "platform"
+
+    # Create RBAC for backend to create Jobs (for model detection)
+    - name: Create Role for Job management
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: job-manager
+            namespace: "{{ k8s_namespace }}"
+          rules:
+          - apiGroups: ["batch"]
+            resources: ["jobs", "jobs/status"]
+            verbs: ["create", "get", "list", "watch", "delete"]
+          - apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["get", "list"]
+          - apiGroups: [""]
+            resources: ["pods/log"]
+            verbs: ["get"]
+
+    - name: Create RoleBinding for backend service account
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: backend-job-manager
+            namespace: "{{ k8s_namespace }}"
+          subjects:
+          - kind: ServiceAccount
+            name: "{{ k8s_namespace }}"
+            namespace: "{{ k8s_namespace }}"
+          roleRef:
+            kind: Role
+            name: job-manager
+            apiGroup: rbac.authorization.k8s.io
+
+    # Create app metadata ConfigMap for webhook adapter
+    # 🤖 This is critical for webhook adapter to identify the app correctly
+    - name: Create app metadata ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ github_repo_name }}-metadata"
+            namespace: "{{ k8s_namespace }}"
+            labels:
+              app.kubernetes.io/name: "{{ github_repo_name }}"
+              app.kubernetes.io/managed-by: thinkube-control
+          data:
+            app_name: "{{ github_repo_name }}"
+            containers: |
+              [{"name": "backend", "build": ".", "port": 8000, "size": "medium", "health": "/health"},
+               {"name": "frontend", "build": "./frontend", "port": 3000, "size": "medium", "health": "/"}]
+
+    # Copy wildcard certificate from default namespace
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to control namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ tls_secret_name }}"
+            namespace: "{{ k8s_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Create GitHub token secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "github-token"
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          stringData:
+            token: "{{ github_token }}"
+
+    - name: Create HuggingFace token secret in argo namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "huggingface-token"
+            namespace: "argo"
+          type: Opaque
+          stringData:
+            token: "{{ hf_token }}"
+
+    - name: Get MLflow OAuth2 client secret from mlflow namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: mlflow
+        name: oauth2-proxy-secret
+      register: mlflow_oauth_secret
+
+    - name: Create MLflow authentication config secret in argo namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "mlflow-auth-config"
+            namespace: "argo"
+          type: Opaque
+          stringData:
+            keycloak-token-url: "{{ keycloak_url }}/realms/{{ auth_realm_username }}/protocol/openid-connect/token"
+            client-id: "mlflow"
+            client-secret: "{{ mlflow_oauth_secret.resources[0].data['client-secret'] | b64decode }}"
+            username: "{{ auth_realm_username }}"
+            password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    - name: Create MLflow authentication config secret in thinkube-control namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "mlflow-auth-config"
+            namespace: "thinkube-control"
+          type: Opaque
+          stringData:
+            keycloak-token-url: "{{ keycloak_url }}/realms/{{ auth_realm_username }}/protocol/openid-connect/token"
+            client-id: "mlflow"
+            client-secret: "{{ mlflow_oauth_secret.resources[0].data['client-secret'] | b64decode }}"
+            username: "{{ auth_realm_username }}"
+            password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    - name: Create service account in argo namespace for model download workflows
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "thinkube-control"
+            namespace: "argo"
+
+    - name: Create PostgreSQL secret for backend
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "postgresql-official"
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          stringData:
+            postgres-password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+    - name: Create Ansible credentials secret for backend
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "ansible-credentials"
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          stringData:
+            become-password: "{{ lookup('env', 'ANSIBLE_BECOME_PASSWORD') }}"
+            
+    - name: Create admin credentials secret for backend
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "admin-credentials"
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          stringData:
+            admin-username: "{{ admin_username }}"
+            admin-password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+
+    - name: Read JupyterHub service token from hub secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: jupyterhub
+        name: hub
+      register: hub_secret
+      failed_when: false
+
+    - name: Copy JupyterHub service token to thinkube-control namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: jupyterhub-service-token
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          data:
+            token: "{{ hub_secret.resources[0].data['hub.services.thinkube-control.apiToken'] }}"
+      when:
+        - hub_secret.resources | default([]) | length > 0
+        - "'hub.services.thinkube-control.apiToken' in hub_secret.resources[0].data"
+
+    # Drop and recreate databases for clean slate (split to avoid transaction block)
+    - name: Drop thinkube_control database if exists
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d postgres -c "DROP DATABASE IF EXISTS thinkube_control;"
+      register: drop_control_db
+      changed_when: drop_control_db.rc == 0
+
+    - name: Create thinkube_control database
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d postgres -c "CREATE DATABASE thinkube_control OWNER {{ admin_username }};"
+      register: create_control_db
+      changed_when: create_control_db.rc == 0
+
+    - name: Drop thinkube_control_test database if exists
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d postgres -c "DROP DATABASE IF EXISTS thinkube_control_test;"
+      register: drop_test_db
+      changed_when: drop_test_db.rc == 0
+
+    - name: Create thinkube_control_test database
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d postgres -c "CREATE DATABASE thinkube_control_test OWNER {{ admin_username }};"
+      register: create_test_db
+      changed_when: create_test_db.rc == 0
+
+  roles:
+    # GitHub and repository setup
+    - common/github_ssh_keys
+
+    # Use the updated repo role with Copier support
+    - role: container_deployment/repo
+      vars:
+        copier_extra_data:
+          model_aliases: "{{ thinkube_model_alias_map }}"
+        gitea_repo_name: "{{ app_name }}"
+        author_name: "{{ git_user_name }}"
+        author_email: "{{ git_user_email }}"
+
+  tasks:
+    # Copy deploy key to template directory for development workflow
+    # This handles both local and remote deployment scenarios
+    - name: Check if template directory exists (indicates development environment)
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../../thinkube-control"
+      register: template_dir_check
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_python_interpreter: "{{ lookup('env', 'HOME') }}/.venv/bin/python3"
+
+    - name: Setup deploy key in template directory for development
+      when: template_dir_check.stat.exists
+      block:
+        - name: Ensure template SSH directory exists
+          ansible.builtin.file:
+            path: "{{ playbook_dir }}/../../../thinkube-control/.ssh/{{ github_repo_name }}"
+            state: directory
+            mode: '0700'
+          delegate_to: localhost
+          become: false
+          vars:
+            ansible_python_interpreter: "{{ lookup('env', 'HOME') }}/.venv/bin/python3"
+
+        # When deployment machine != management machine, fetch from remote
+        - name: Fetch deploy key from control plane to management machine
+          ansible.builtin.fetch:
+            src: "{{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}/id_ed25519"
+            dest: "{{ playbook_dir }}/../../../thinkube-control/.ssh/{{ github_repo_name }}/id_ed25519"
+            flat: yes
+            mode: '0600'
+          when: inventory_hostname != 'localhost' and ansible_connection != 'local'
+
+        # When deployment machine == management machine, copy locally
+        - name: Copy deploy key locally on same machine
+          ansible.builtin.copy:
+            src: "{{ host_code_path | default(code_source_path) }}/.ssh/{{ github_repo_name }}/id_ed25519"
+            dest: "{{ playbook_dir }}/../../../thinkube-control/.ssh/{{ github_repo_name }}/id_ed25519"
+            mode: '0600'
+            remote_src: yes
+          when: inventory_hostname == 'localhost' or ansible_connection == 'local'
+
+        - name: Configure git in template directory to use deploy key
+          ansible.builtin.shell: |
+            cd {{ playbook_dir }}/../../../thinkube-control
+            git config core.sshCommand "ssh -i .ssh/{{ github_repo_name }}/id_ed25519 -o IdentitiesOnly=yes"
+          delegate_to: localhost
+          become: false
+          changed_when: false
+          vars:
+            ansible_python_interpreter: "{{ lookup('env', 'HOME') }}/.venv/bin/python3"
+
+
+    # Verify shared inventory exists (created by code-server deployment)
+    # Shared location: /home/thinkube/.ansible/inventory/ (accessible to both code-server and thinkube-control)
+    - name: Verify inventory exists at shared location
+      ansible.builtin.stat:
+        path: "{{ shared_code_path }}/.ansible/inventory/inventory.yaml"
+      register: inventory_check
+      failed_when: not inventory_check.stat.exists
+
+    # Setup Docker and container build components
+    - name: Include registry credentials and build ServiceAccount setup
+      ansible.builtin.include_role:
+        name: container_deployment/registry_auth
+    
+    # Copy Gitea token to Argo namespace for workflow access
+    - name: Get Gitea admin token from gitea namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: gitea
+        name: gitea-admin-token
+      register: gitea_token_secret
+      
+    - name: Copy Gitea token to Argo namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: gitea-admin-token
+            namespace: "{{ argo_workflows_namespace }}"
+          type: Opaque
+          data:
+            token: "{{ gitea_token_secret.resources[0].data.token }}"
+      when: gitea_token_secret.resources | length > 0
+    
+    # Create Gitea repository first (without pushing)
+    - name: Create Gitea repository
+      ansible.builtin.include_tasks: tasks/create_gitea_repo.yaml
+      vars:
+        gitea_org: "thinkube-deployments"
+        gitea_repo_name: "{{ app_name }}"
+        gitea_repo_description: "Thinkube Control deployment manifests"
+        gitea_hostname: "git.{{ domain_name }}"
+    
+    # Create ArgoCD application early (before webhook configuration)
+    # This ensures the app exists when webhook adapter tries to sync it
+    - name: Create ArgoCD application placeholder
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: "{{ app_name }}"
+            namespace: "{{ argocd_namespace }}"
+          spec:
+            project: default
+            source:
+              repoURL: "https://git.{{ domain_name }}/thinkube-deployments/{{ app_name }}.git"
+              targetRevision: HEAD
+              path: "k8s"
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: "{{ app_namespace }}"
+            syncPolicy:
+              syncOptions:
+              - CreateNamespace=true
+    
+    # Deploy the CI/CD WorkflowTemplate before configuring webhook
+    - name: Deploy CI/CD WorkflowTemplate for webhook triggers
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        src: "{{ local_repo_path }}/k8s/build-workflow.yaml"
+    
+    # Configure webhook before pushing (so it triggers on first push)
+    - name: Configure Gitea webhook for CI/CD
+      ansible.builtin.include_role:
+        name: gitea/configure_webhook
+      vars:
+        gitea_org: "thinkube-deployments"
+        gitea_repo_name: "thinkube-control"
+        gitea_token: "{{ gitea_token_secret.resources[0].data.token | b64decode }}"
+    
+    # Setup git hooks for automatic template processing
+    - name: Setup git hooks in local repository
+      ansible.builtin.include_tasks: tasks/setup_git_hooks.yaml
+    
+    # Before the push: the backend will not start without the key.
+    - name: Ensure the Secrets store encryption key
+      ansible.builtin.include_tasks: tasks/ensure_encryption_key.yaml
+
+    # Create MCP default API token BEFORE pushing (needed when pods start)
+    - name: Generate MCP default API token
+      ansible.builtin.set_fact:
+        mcp_default_api_token: "tk_{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Create MCP default API token secret in thinkube-control
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "mcp-default-token"
+            namespace: "thinkube-control"
+          type: Opaque
+          stringData:
+            token: "{{ mcp_default_api_token }}"
+
+    # Now push to Gitea - this will trigger the webhook!
+    - name: Push to Gitea repository (triggers webhook)
+      ansible.builtin.include_tasks: tasks/push_to_gitea.yaml
+      vars:
+        gitea_org: "thinkube-deployments"
+        gitea_repo_name: "{{ app_name }}"
+        gitea_hostname: "git.{{ domain_name }}"
+        gitea_token: "{{ gitea_token_secret.resources[0].data.token | b64decode }}"
+    
+    # Also run the git_push role to set up development scripts
+    - name: Setup development scripts and documentation
+      ansible.builtin.include_role:
+        name: container_deployment/git_push
+        tasks_from: setup_dev_scripts
+      vars:
+        gitea_org: "thinkube-deployments"
+        gitea_repo_name: "{{ app_name }}"
+      when: false  # Skip for now, as role doesn't have this task file yet
+
+- name: Continue deployment with Keycloak and remaining services
+  hosts: k8s_control_plane
+  gather_facts: false
+  vars:
+    # Inherit all variables from the first play
+    k8s_namespace: "{{ thinkube_control_namespace }}"
+    control_host: "control.{{ domain_name }}"
+    cookie_domain: ".{{ domain_name }}"
+    git_user_name: "Control Hub Automation"
+    git_user_email: "thinkube@thinkube.com"
+    tls_secret_name: "control-tls-secret"
+    keycloak_app_client_id: "thinkube-control"
+    keycloak_user_to_grant_access: "{{ auth_realm_username }}"
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    keycloak_validate_certs: false
+    github_repo_name: "thinkube-control"
+    template_url: "git@github.com:thinkube/{{ github_repo_name }}.git"
+    github_api_url: "https://api.github.com"
+    pod_code_path: "/home/coder"
+    env_file_path: "{{ ansible_facts.env.HOME }}/.env"
+    argocd_namespace: "argocd"
+    argo_workflows_namespace: "argo"
+    app_namespace: "{{ k8s_namespace }}"
+    app_name: "thinkube-control"
+    container_registry: "registry.{{ domain_name }}"
+    backend_image_repo: "{{ container_registry }}/thinkube/thinkube-control-backend"
+    frontend_image_repo: "{{ container_registry }}/thinkube/thinkube-control-frontend"
+    image_tag: "{{ ansible_facts.date_time.iso8601_basic_short }}"
+    argocd_server: "argocd.{{ domain_name }}:443"
+    docker_config_secret_name: "docker-config"
+    image_builder_sa_name: "image-builder"
+    image_repo: "{{ frontend_image_repo }}"
+    use_github: true
+    app_dashboard_host: "{{ control_host }}"
+    master_node_name: "{{ hostvars[groups['k8s_control_plane'][0]]['master_node_name'] }}"
+    master_node_ip: "{{ hostvars[groups['k8s_control_plane'][0]]['master_node_ip'] }}"
+    check_interval: 5
+    thinkube_control_source: "{{ playbook_dir }}/../../../thinkube-control"
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    code_source_path: "{{ shared_code_path }}"
+    local_repo_path: "{{ shared_code_path }}/{{ github_repo_name }}"
+    
+  roles:
+    # Set up Keycloak client
+    - role: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ keycloak_app_client_id }}"
+        keycloak_client_body:
+          clientId: "{{ keycloak_app_client_id }}"
+          enabled: true
+          rootUrl: "https://{{ control_host }}"
+          baseUrl: "https://{{ control_host }}"
+          redirectUris:
+            - "https://{{ control_host }}/*"
+          webOrigins:
+            - "https://{{ control_host }}"
+          directAccessGrantsEnabled: false
+          standardFlowEnabled: true
+          implicitFlowEnabled: false
+          publicClient: true
+          protocol: "openid-connect"
+    
+    # Set up a basic role for dashboard access
+    - role: keycloak/keycloak_realm_role
+      vars:
+        keycloak_role_name: "control-user"
+        keycloak_role_description: "Access to the control hub"
+    
+    # Assign the role to the user
+    - role: keycloak/keycloak_user
+      vars:
+        keycloak_user_name: "{{ keycloak_user_to_grant_access }}"
+        keycloak_realm_role_name: "control-user"
+        keycloak_realm_role_description: "Access to the control hub"
+    
+  tasks:
+    # Note: Initial workflow removed - webhook will handle image builds
+    # Webhook adapter will update Git when images are ready
+
+    # Get Harbor robot token from the shared secret created by Harbor deployment
+    - name: Get Harbor robot credentials from kube-system secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: harbor-robot-credentials
+        namespace: kube-system
+      register: harbor_robot_secret
+      failed_when: harbor_robot_secret.resources | length == 0
+
+    - name: Set Harbor robot credentials from secret
+      ansible.builtin.set_fact:
+        harbor_robot_user: "{{ harbor_robot_secret.resources[0].data['robot-user'] | b64decode }}"
+        harbor_robot_token: "{{ harbor_robot_secret.resources[0].data['robot-token'] | b64decode }}"
+
+    - name: Debug Harbor credentials
+      ansible.builtin.debug:
+        msg:
+          - "Harbor robot user: {{ harbor_robot_user }}"
+          - "Harbor robot token length: {{ harbor_robot_token | length }}"
+      when: harbor_robot_token is defined
+        
+    - name: Create Harbor credentials secret for backend
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "harbor-credentials"
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          stringData:
+            harbor-robot-token: "{{ harbor_robot_token }}"
+            
+    - name: Create ArgoCD credentials secret for backend
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "argocd-credentials"
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          stringData:
+            argocd-password: "{{ argocd_password }}"
+            argocd-deployment-secret: "{{ argocd_token }}"
+
+    # Verify images exist before creating ArgoCD app
+    - name: Verify backend image exists
+      ansible.builtin.uri:
+        url: "https://{{ container_registry }}/api/v2.0/projects/thinkube/repositories/control-backend/artifacts"
+        method: GET
+        user: "{{ harbor_robot_user }}"
+        password: "{{ harbor_robot_token }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: backend_images
+      failed_when: backend_images.json | length == 0
+
+    - name: Verify frontend image exists
+      ansible.builtin.uri:
+        url: "https://{{ container_registry }}/api/v2.0/projects/thinkube/repositories/control-frontend/artifacts"
+        method: GET
+        user: "{{ harbor_robot_user }}"
+        password: "{{ harbor_robot_token }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: frontend_images
+      failed_when: frontend_images.json | length == 0
+
+    # Configure ArgoCD repository access (app already exists)
+    - name: Configure ArgoCD repository access
+      ansible.builtin.include_role:
+        name: container_deployment/argocd
+      vars:
+        argocd_repo_url: "https://git.{{ domain_name }}/thinkube-deployments/{{ app_name }}.git"
+        gitea_hostname: "git.{{ domain_name }}"
+        gitea_org: "thinkube-deployments"
+        gitea_repo_name: "{{ app_name }}"
+        use_github: false
+    
+    # Wait for ArgoCD application to be Healthy. The repo-server rollout
+    # is now properly awaited upstream (in the argocd role), so 15×5s of
+    # retry budget is comfortable for the application reconcile + first
+    # sync. If this still times out, something is genuinely wrong (e.g.
+    # SSH keys broken, repo unreachable) — fail loud here rather than
+    # cascade into a misleading downstream error like "deployment X
+    # invalid" or "no resources found in namespace".
+    - name: Wait for ArgoCD application deployment
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: argocd
+        name: "{{ app_name }}"
+      register: argocd_app
+      until:
+        - argocd_app.resources | length > 0
+        - argocd_app.resources[0].status.health.status | default("Unknown") == "Healthy"
+        - argocd_app.resources[0].status.resources | default([]) | length > 0
+      retries: 15
+      delay: 5
+
+    - name: Show ArgoCD application status
+      ansible.builtin.debug:
+        msg: |
+          ArgoCD Application Status:
+          - Sync: {{ argocd_app.resources[0].status.sync.status | default('Unknown') }}
+          - Health: {{ argocd_app.resources[0].status.health.status | default('Unknown') }}
+          - Resources: {{ argocd_app.resources[0].status.resources | default([]) | length }}
+      when: argocd_app.resources | length > 0
+
+    # Wait for the CI/CD chain to complete: build -> Harbor push ->
+    # webhook adapter updates git -> ArgoCD sync -> deployment created.
+    # On a fresh install this takes ~2-3 minutes. kubectl rollout status
+    # fails immediately if the deployment does not exist yet, so we must
+    # wait for it to appear first.
+    - name: Wait for backend deployment to be created by ArgoCD
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+        name: "thinkube-control-backend"
+      register: backend_deploy
+      until: backend_deploy.resources | length > 0
+      retries: 60
+      delay: 5
+
+    - name: Wait for backend deployment rollout
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status deployment/thinkube-control-backend
+        -n {{ k8s_namespace }} --timeout=300s
+      changed_when: false
+
+    - name: Wait for frontend deployment to be created by ArgoCD
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+        name: "thinkube-control-frontend"
+      register: frontend_deploy
+      until: frontend_deploy.resources | length > 0
+      retries: 60
+      delay: 5
+
+    - name: Wait for frontend deployment rollout
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status deployment/thinkube-control-frontend
+        -n {{ k8s_namespace }} --timeout=300s
+      changed_when: false
+      
+    # Set default Git configuration values
+    - name: Set default Git configuration values if not provided
+      ansible.builtin.set_fact:
+        git_user_name: "{{ git_user_name | default('Ansible Automation') }}"
+        git_user_email: "{{ git_user_email | default('devops@example.com') }}"
+      when: code_source_path is defined and code_source_path != ""
+
+    # Configure Git in the repository
+    - name: Configure Git user name and email in repository
+      ansible.builtin.shell: |
+        cd {{ local_repo_path }}
+        git config user.name "{{ git_user_name }}"
+        git config user.email "{{ git_user_email }}"
+        git config pull.rebase true
+        if [[ "{{ local_repo_path }}" == "{{ code_source_path }}/"* ]]; then
+          git config core.sshCommand "ssh -i /home/coder/.ssh/{{ github_repo_name }}/id_ed25519 -o StrictHostKeyChecking=no"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: local_repo_path is defined and local_repo_path != ""
+
+    # Note: Pre-push hooks removed - using Gitea Actions for CI/CD instead
+        
+    # Copy Keycloak client secret to Kubernetes
+    - name: Create Keycloak client secret in Kubernetes
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "thinkube-control-keycloak"
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          stringData:
+            client_id: "{{ keycloak_app_client_id }}"
+            client_secret: "{{ keycloak_client_secret }}"
+            realm: "thinkube"
+      when: keycloak_client_secret is defined
+
+    - name: Wait for backend deployment to exist
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace }}"
+        name: "thinkube-control-backend"
+        wait: true
+        wait_condition:
+          type: Progressing
+          status: "True"
+        wait_timeout: 300
+        
+    - name: Wait for backend pods to be ready and running
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ k8s_namespace }}"
+        label_selectors:
+          - "app=thinkube-control-backend"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+      register: backend_pods
+      
+    - name: Give backend time to initialize database tables
+      ansible.builtin.pause:
+        seconds: 10
+      when: backend_pods.resources | length > 0
+
+    # Insert MCP default token into database (tables now exist after deployment)
+    - name: Get MCP default token from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ k8s_namespace }}"
+        name: "mcp-default-token"
+      register: mcp_token_secret
+
+    - name: Extract token and hash
+      ansible.builtin.set_fact:
+        mcp_default_api_token: "{{ mcp_token_secret.resources[0].data.token | b64decode }}"
+
+    - name: Hash the API token for database storage
+      ansible.builtin.set_fact:
+        mcp_default_api_token_hash: "{{ mcp_default_api_token | hash('sha256') }}"
+
+    - name: Generate ID for API token database entry
+      ansible.builtin.set_fact:
+        mcp_default_api_token_id: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') | replace('/', '_') | replace('+', '-') }}"
+
+    - name: Check if MCP default token already exists in database
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d thinkube_control -t -c "
+          SELECT COUNT(*) FROM api_tokens WHERE name = 'MCP Default';
+          "
+      register: mcp_token_check
+
+    - name: Create MCP default API token in database
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d thinkube_control -c "
+          INSERT INTO api_tokens (id, name, token_hash, user_id, username, is_active, scopes, created_at)
+          VALUES (
+            '{{ mcp_default_api_token_id }}',
+            'MCP Default',
+            '{{ mcp_default_api_token_hash }}',
+            '{{ auth_realm_username }}',
+            '{{ auth_realm_username }}',
+            true,
+            '[\"read\", \"write\"]'::jsonb,
+            NOW()
+          );
+          "
+      when: mcp_token_check.stdout | trim | int == 0
+
+    # Reconcile model mirror jobs from MLflow registry
+    # After a full deploy the model_mirror_jobs table is empty, but MLflow
+    # still has all registered models. Re-populate from the MLflow DB so the
+    # UI shows the correct download status.
+    # On first install MLflow may not exist yet — check before querying.
+    - name: Check if MLflow database exists
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'mlflow';"
+      register: mlflow_db_exists
+      ignore_errors: true
+
+    - name: Get registered model IDs from MLflow
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d mlflow -tAc "
+          SELECT p.value
+          FROM registered_models rm
+          JOIN model_versions mv ON rm.name = mv.name
+          JOIN runs r ON mv.run_id = r.run_uuid
+          JOIN params p ON r.run_uuid = p.run_uuid AND p.key = 'model_id'
+          GROUP BY p.value;
+          "
+      register: mlflow_model_ids
+      when: mlflow_db_exists.stdout | default('') | trim == '1'
+      ignore_errors: true
+
+    - name: Reconcile model mirror jobs from MLflow registry
+      kubernetes.core.k8s_exec:
+        kubeconfig: "{{ kubeconfig }}"
+        namespace: postgres
+        pod: postgresql-official-0
+        container: postgres
+        command: |
+          psql -U {{ admin_username }} -d thinkube_control -c "
+          INSERT INTO model_mirror_jobs (id, model_id, status, workflow_name, created_at, updated_at)
+          VALUES (gen_random_uuid(), '{{ item }}', 'succeeded', 'reconciled-from-mlflow', NOW(), NOW())
+          ON CONFLICT (model_id) DO NOTHING;
+          "
+      loop: "{{ mlflow_model_ids.stdout_lines | default([]) | select | list }}"
+      when:
+        - mlflow_model_ids is defined
+        - mlflow_model_ids.stdout_lines is defined
+        - mlflow_model_ids.stdout_lines | select | list | length > 0
+      register: reconcile_models
+      changed_when: "'INSERT 0 1' in (reconcile_models.stdout | default(''))"
+
+    # Display setup summary
+    - name: Display setup summary
+      ansible.builtin.debug:
+        msg: |
+          
+          ════════════════════════════════════════════════════════
+          ✅ Control Hub Deployment Completed
+          ════════════════════════════════════════════════════════
+          
+          Control URL: https://{{ control_host }}
+          Backend image: {{ backend_image_repo }}:{{ image_tag }}
+          Frontend image: {{ frontend_image_repo }}:{{ image_tag }}
+          GitHub repository: {{ template_url }}
+          
+          Authentication:
+          - Keycloak: https://auth.{{ domain_name }}/realms/thinkube
+          - Client ID: {{ keycloak_app_client_id }}
+          - User with access: {{ keycloak_user_to_grant_access }}
+          
+          CI/CD:
+          - Webhook configured for automatic builds on push
+          - Push to Gitea repository will trigger Argo Workflows
+          
+          Architecture:
+          - Frontend: Vue.js with DaisyUI
+          - Backend: FastAPI with Keycloak integration
+          - Build: Argo Workflows with Buildah
+          - Deployment: ArgoCD
+          - Authentication: OAuth2 Proxy and Keycloak
+          - Session storage: Redis
+          
+          Repository location: {{ local_repo_path | default('TBD') }}
+          
+          ════════════════════════════════════════════════════════

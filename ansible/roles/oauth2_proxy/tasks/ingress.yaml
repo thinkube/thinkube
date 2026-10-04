@@ -1,0 +1,51 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# roles/oauth2_proxy/tasks/ingress.yaml
+---
+# Create OAuth2 Proxy HTTPRoute (Gateway API)
+# The oauth2-proxy /oauth2/* paths need their own route so the callback works.
+
+- name: Debug HTTPRoute settings
+  debug:
+    msg:
+      - "HTTPRoute name: {{ oauth2_proxy_ingress_name }}"
+      - "Namespace: {{ oauth2_proxy_namespace }}"
+      - "Host: {{ oauth2_proxy_ingress_host }}"
+      - "Path: {{ oauth2_proxy_ingress_path }}"
+      - "Gateway: {{ gateway_name | default('thinkube-gateway') }}"
+  when: oauth2_proxy_debug | bool
+
+- name: Create OAuth2 Proxy HTTPRoute
+  # Rendered via heredoc + kubectl apply because kubernetes.core.k8s
+  # serializes backendRefs[].port as a string, which the API rejects.
+  ansible.builtin.shell:
+    cmd: |
+      cat <<'EOF' | {{ kubectl_bin }} --kubeconfig={{ oauth2_proxy_kubeconfig | default(kubeconfig) }} apply -f -
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: HTTPRoute
+      metadata:
+        name: {{ oauth2_proxy_ingress_name }}
+        namespace: {{ oauth2_proxy_namespace }}
+      spec:
+        parentRefs:
+          - name: {{ gateway_name | default('thinkube-gateway') }}
+            namespace: {{ gateway_namespace | default('gateway-system') }}
+            sectionName: https
+        hostnames:
+          - {{ oauth2_proxy_ingress_host }}
+        rules:
+          - matches:
+              - path:
+                  type: {{ oauth2_proxy_ingress_path_type }}
+                  value: {{ oauth2_proxy_ingress_path }}
+            backendRefs:
+              - name: {{ oauth2_proxy_name }}
+                port: {{ oauth2_proxy_service_port }}
+      EOF
+  changed_when: true
+
+- name: Debug OAuth2 Proxy HTTPRoute creation
+  debug:
+    msg: "Created OAuth2 Proxy HTTPRoute '{{ oauth2_proxy_ingress_name }}' for host '{{ oauth2_proxy_ingress_host }}'"
+  when: oauth2_proxy_debug | bool

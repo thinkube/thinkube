@@ -1,0 +1,350 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/ollama/10_deploy.yaml
+# Description:
+#   Deploy Ollama inference server as a Deployment with replicas: 0
+#   Pods are created at runtime by the LLM Gateway targeting specific nodes/GPUs
+#   Mounts JuiceFS MLflow volume for accessing fine-tuned GGUF models
+#
+# Requirements:
+#   - Kubernetes (kubeadm) must be installed
+#   - Harbor must have Ollama image mirrored
+#   - GPU node available
+#   - JupyterHub deployed (creates the shared jupyterhub-mlflow-root PV)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/ollama/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - ollama_namespace: Namespace for Ollama (default: ollama)
+#   - ollama_hostname: Hostname for Ollama API
+#   - kubeconfig: Path to kubeconfig file
+#   - harbor_registry: Harbor registry URL
+#   - primary_ingress_class: Primary ingress class name
+#
+# Note: Deployed with replicas: 0. The LLM Gateway creates pods targeting specific nodes/GPUs.
+#
+
+- name: Deploy Ollama with JuiceFS MLflow access (replicas 0, gateway-managed)
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    k8s_namespace: "{{ ollama_namespace | default('ollama') }}"
+    ollama_host: "{{ ollama_hostname | default('ollama.' + domain_name) }}"
+    tls_secret_name: "ollama-tls-secret"
+
+  tasks:
+    ###########################################################################
+    # Step 1: Create Namespace and TLS Secret
+    ###########################################################################
+    - name: Ensure Ollama namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ k8s_namespace }}"
+            labels:
+              thinkube.io/component: "ollama"
+              thinkube.io/type: "optional"
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to Ollama namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ tls_secret_name }}"
+            namespace: "{{ k8s_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###########################################################################
+    # Step 2: Create PV and PVC for JuiceFS MLflow access
+    ###########################################################################
+    # Ollama uses a SINGLE JuiceFS volume for both MLflow model artifacts and
+    # its own model blob storage (OLLAMA_MODELS=/mlflow-models/.ollama/models).
+    # This allows ollama create to hard-link GGUFs from MLflow instead of
+    # copying them, eliminating model duplication.
+    #
+    # Path mapping:
+    #   JupyterHub:  /home/thinkube/thinkube/mlflow/
+    #   Ollama:      /mlflow-models/
+    #   Ollama blobs: /mlflow-models/.ollama/models/
+    #
+    - name: Create static PV for MLflow access (mounts same JuiceFS volume)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: ollama-mlflow-root
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 1Ti
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-mlflow-secret
+                namespace: juicefs
+              volumeAttributes:
+                juicefs/mount-cpu-limit: ""
+                juicefs/mount-cpu-request: ""
+                juicefs/mount-memory-limit: ""
+                juicefs/mount-memory-request: ""
+              volumeHandle: ollama-mlflow-root
+            persistentVolumeReclaimPolicy: Retain
+            volumeMode: Filesystem
+
+    # A Retain PV keeps a stale claimRef after its PVC is deleted (e.g.
+    # namespace recreation). Clear it so the PVC can rebind.
+    - name: Check PV phase
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolume
+        name: ollama-mlflow-root
+      register: pv_info
+
+    - name: Clear stale claimRef on PV if Released
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: ollama-mlflow-root
+          spec:
+            claimRef: null
+      when:
+        - pv_info.resources | length > 0
+        - pv_info.resources[0].status.phase == 'Released'
+
+    - name: Create PVC for JuiceFS MLflow access (bound to static PV)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: ollama-mlflow-pvc
+            namespace: "{{ k8s_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: ollama-mlflow-root
+            storageClassName: ""  # Empty string = use static binding
+            resources:
+              requests:
+                storage: 1Ti
+
+    ###########################################################################
+    # Step 3: Remove old StatefulSet and DaemonSet (migrated to Deployment)
+    ###########################################################################
+    - name: Remove old Ollama StatefulSet if present
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: StatefulSet
+        name: ollama
+        namespace: "{{ k8s_namespace }}"
+      ignore_errors: true
+
+    - name: Remove old Ollama DaemonSet if present
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        kind: DaemonSet
+        name: ollama
+        namespace: "{{ k8s_namespace }}"
+      ignore_errors: true
+
+    ###########################################################################
+    # Step 4: Deploy Ollama Deployment with replicas: 0
+    # Pods are created at runtime by the LLM Gateway, which sets nodeSelector
+    # and GPU resource requests per pod based on user selection.
+    ###########################################################################
+    - name: Deploy Ollama Deployment (replicas 0)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ollama
+            namespace: "{{ k8s_namespace }}"
+            labels:
+              app: ollama
+              app.kubernetes.io/name: ollama
+              app.kubernetes.io/component: inference
+              thinkube.io/component: ollama
+          spec:
+            replicas: 0
+            selector:
+              matchLabels:
+                app: ollama
+            template:
+              metadata:
+                labels:
+                  app: ollama
+                  app.kubernetes.io/name: ollama
+              spec:
+                priorityClassName: thinkube-workload
+                containers:
+                  - name: ollama
+                    image: "{{ harbor_registry }}/{{ library_project | default('library') }}/ollama:latest"
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 11434
+                        name: http
+                        protocol: TCP
+                    env:
+                      - name: OLLAMA_MODELS
+                        value: /mlflow-models/.ollama/models
+                      - name: OLLAMA_HOST
+                        value: "0.0.0.0:11434"
+                      - name: OLLAMA_KEEP_ALIVE
+                        value: "-1"
+                    resources:
+                      requests:
+                        cpu: "2"
+                        memory: "8Gi"
+                      limits:
+                        cpu: "8"
+                        memory: "128Gi"
+                    volumeMounts:
+                      - name: mlflow-models
+                        mountPath: /mlflow-models
+                    readinessProbe:
+                      httpGet:
+                        path: /
+                        port: 11434
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                    livenessProbe:
+                      httpGet:
+                        path: /
+                        port: 11434
+                      initialDelaySeconds: 60
+                      periodSeconds: 30
+                volumes:
+                  - name: mlflow-models
+                    persistentVolumeClaim:
+                      claimName: ollama-mlflow-pvc
+
+    ###########################################################################
+    # Step 5: Create Ollama Service
+    ###########################################################################
+    - name: Create Ollama Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ollama
+            namespace: "{{ k8s_namespace }}"
+            labels:
+              app: ollama
+              app.kubernetes.io/name: ollama
+          spec:
+            type: ClusterIP
+            selector:
+              app: ollama
+            ports:
+              - port: 11434
+                targetPort: 11434
+                protocol: TCP
+                name: http
+
+    ###########################################################################
+    # Step 6: Create Ollama HTTPRoute
+    ###########################################################################
+    - name: Create Ollama HTTPRoute
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: ollama-route
+            namespace: "{{ k8s_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name | default('thinkube-gateway') }}"
+                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+                sectionName: https
+            hostnames:
+              - "{{ ollama_host }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: ollama
+                    port: 11434
+                timeouts:
+                  request: "3600s"
+
+    ###########################################################################
+    # Step 7: Verify Deployment exists (replicas: 0, no pods expected)
+    ###########################################################################
+    - name: Verify Ollama Deployment exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Deployment
+        name: ollama
+        namespace: "{{ k8s_namespace }}"
+      register: ollama_deploy
+      failed_when: ollama_deploy.resources | length == 0
+
+    ###########################################################################
+    # Step 8: Display deployment summary
+    ###########################################################################
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Ollama deployed successfully (replicas: 0, gateway-managed)!"
+          - "=========================================================="
+          - "Namespace: {{ k8s_namespace }}"
+          - "Service: ollama.{{ k8s_namespace }}.svc.cluster.local:11434"
+          - "External URL: https://{{ ollama_host }}"
+          - "Replicas: 0 (LLM Gateway creates pods on demand)"
+          - "=========================================================="
+          - "Storage: Single JuiceFS volume (hard-link enabled)"
+          - "  - /mlflow-models: MLflow artifacts + Ollama blobs"
+          - "  - OLLAMA_MODELS=/mlflow-models/.ollama/models"
+          - "  - ollama create hard-links GGUFs (zero duplication)"
+          - "=========================================================="

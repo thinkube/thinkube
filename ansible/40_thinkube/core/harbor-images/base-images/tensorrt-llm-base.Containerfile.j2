@@ -1,0 +1,37 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# TensorRT-LLM base image with trtllm-serve, FlashAttention2, and MXFP4 support
+# Architecture-aware: uses DGX Spark image on arm64, standard release on amd64
+ARG BASE_IMAGE={{ harbor_registry }}/library/tensorrt-llm-spark:1.3.0rc13
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+
+# Add dependencies for Thinkube LLM serving templates
+# Force upgrade openai-harmony to 0.0.8+ (spark container has 0.0.4 pinned by tensorrt_llm)
+# We need 0.0.8 for the strict parameter in parse_messages_from_completion_tokens
+RUN pip install --no-cache-dir --force-reinstall \
+    openai-harmony>=0.0.8 && \
+    pip install --no-cache-dir \
+    gradio>=4.42.0 \
+    mlflow~=3.6.0 \
+    httpx>=0.27.0
+
+# Pre-download tiktoken encoding files for openai-harmony (offline support)
+# Required because HF_HUB_OFFLINE=1 blocks runtime downloads
+RUN mkdir -p /app/tiktoken_encodings && \
+    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        -o /app/tiktoken_encodings/o200k_base.tiktoken \
+        "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
+ENV TIKTOKEN_ENCODINGS_BASE=/app/tiktoken_encodings
+
+# Create icons directory for Thinkube branding
+RUN mkdir -p /app/icons
+
+# Base images by architecture (TensorRT-LLM 1.3.0rc13):
+#   arm64: tensorrt-llm-spark (DGX Spark, Blackwell sm_121a, NVFP4/MXFP4)
+#   amd64: tensorrt-llm standard release
+# Both include: TensorRT-LLM with trtllm-serve, FlashAttention2, PyTorch, CUDA
+#
+# This layer adds: Gradio, MLflow client, httpx, openai-harmony, tiktoken encodings

@@ -1,0 +1,68 @@
+{#
+  The part of ~/.config/opencode/opencode.json Thinkube manages. tasks/clients.yaml
+  merges it into the file: these keys are replaced, the user's other keys and
+  their own providers, MCP servers and permission rules are kept.
+
+  share "disabled" keeps sessions off opencode.ai; autoupdate false stops the
+  update check. enabled_providers allows the gateway, and Anthropic for a user
+  who adds their own API key (/connect); no other provider, keyless or not.
+  Permission rules match tool names <server>_<tool>; the last matching rule
+  wins, so each server's "ask" comes before its read-only "allow" rules.
+#}
+{% set default_alias = thinkube_model_aliases | list | first %}
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "thinkube": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Thinkube LLM gateway",
+      "options": {
+        "baseURL": {{ agent_gateway_url | to_json }},
+        "apiKey": "{env:THINKUBE_API_TOKEN}"
+      },
+      "models": {
+{% for alias, m in thinkube_model_aliases.items() %}
+        {{ alias | to_json }}: {
+          "name": {{ m.name | to_json }},
+          "tool_call": true,
+          "reasoning": true,
+{% if m.vision | default(false) %}
+          "attachment": true,
+          "modalities": { "input": ["text", "image"], "output": ["text"] },
+{% endif %}
+          "limit": { "context": {{ m.context_window }}, "output": {{ m.max_output }} }
+        }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+      }
+    }
+  },
+  "model": {{ ('thinkube/' ~ default_alias) | to_json }},
+  "small_model": {{ ('thinkube/' ~ default_alias) | to_json }},
+  "enabled_providers": ["thinkube", "anthropic"],
+  "share": "disabled",
+  "autoupdate": false,
+  "mcp": {
+{% for s in agent_mcp_servers %}
+    {{ s.name | to_json }}: {% if s.transport == 'http' %}{
+      "type": "remote",
+      "url": {{ s.url | to_json }},
+      "oauth": false,
+      "headers": {{ ({'Authorization': 'Bearer {env:' ~ s.bearer_token_env ~ '}'} if s.bearer_token_env is defined else {}) | to_json }},
+      "enabled": true
+    }{% else %}{
+      "type": "local",
+      "command": {{ ([s.command] + s.args) | to_json }},
+      "enabled": true
+    }{% endif %}{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  },
+  "permission": {
+{% for s in agent_mcp_servers %}
+    {{ (s.name ~ '_*') | to_json }}: {{ ('allow' if s.read_only_tools == ['*'] else 'ask') | to_json }}{% for p in s.read_only_tools if p != '*' %},
+    {{ (s.name ~ '_' ~ p) | to_json }}: "allow"{% endfor %}{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  }
+}

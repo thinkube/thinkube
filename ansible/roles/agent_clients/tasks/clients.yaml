@@ -1,0 +1,205 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Configures opencode, Pi and Claude Code from vars/main.yaml (the MCP
+# servers) and thinkube_model_aliases (the gateway's models). Each client's
+# files are merged: the keys Thinkube manages are replaced, the user's own are
+# kept.
+#
+# Inputs:
+#   thinkube_model_aliases  40_thinkube/core/thinkube-control/vars/model_aliases.yaml
+#   agent_bearer_tokens     {env var name: token}, the value of every
+#                           bearer_token_env; Claude Code is given the value,
+#                           the other clients read the variable at run time
+#   agent_code_server_pod   name of a running code-server pod (Claude CLI)
+
+- name: Check the inputs of the client configuration
+  ansible.builtin.assert:
+    that:
+      - thinkube_model_aliases is mapping
+      - thinkube_model_aliases | length > 0
+      - agent_bearer_tokens is mapping
+      - agent_code_server_pod | length > 0
+      - agent_mcp_servers | selectattr('bearer_token_env', 'defined') | map(attribute='bearer_token_env') | difference(agent_bearer_tokens.keys() | list) | length == 0
+    fail_msg: "thinkube_model_aliases, agent_bearer_tokens (one token per bearer_token_env) and agent_code_server_pod are required"
+    quiet: true
+
+# opencode -------------------------------------------------------------------
+
+- name: Render opencode's managed configuration
+  ansible.builtin.set_fact:
+    agent_opencode: "{{ lookup('template', 'opencode-managed.json.j2') | from_json }}"
+
+- name: Update opencode.json
+  ansible.builtin.include_tasks: json_file.yaml
+  vars:
+    json_file: "{{ agent_opencode_dir }}/opencode.json"
+    json_changes:
+      merge:
+        - ["{{ agent_opencode | dict2items | rejectattr('key', 'in', ['provider', 'mcp', 'permission']) | items2dict }}"]
+        - ["provider", "{{ agent_opencode.provider }}"]
+        - ["mcp", "{{ agent_opencode.mcp }}"]
+        - ["permission", "{{ agent_opencode.permission }}"]
+
+# opencode installs @opencode-ai/plugin into each configuration directory at
+# start unless the directory already has it installed and locked. The image
+# carries it at opencode's version in /opt/agent-clients; linking that tree
+# here means opencode finds it and never fetches it.
+- name: Link the image's opencode plugin package into ~/.config/opencode
+  ansible.builtin.file:
+    src: "/opt/agent-clients/{{ item }}"
+    dest: "{{ agent_home_host_path }}/{{ agent_opencode_dir }}/{{ item }}"
+    state: link
+    force: true
+    follow: false
+  become: true
+  become_user: "{{ system_username }}"
+  loop:
+    - package.json
+    - package-lock.json
+    - node_modules
+
+- name: Ensure opencode's plugin directory exists
+  ansible.builtin.file:
+    path: "{{ agent_home_host_path }}/{{ agent_opencode_dir }}/plugin"
+    state: directory
+    mode: '0755'
+  become: true
+  become_user: "{{ system_username }}"
+
+- name: Write the opencode plugin that keeps Playwright screenshots as images
+  ansible.builtin.copy:
+    src: opencode/thinkube-screenshot.ts
+    dest: "{{ agent_home_host_path }}/{{ agent_opencode_dir }}/plugin/thinkube-screenshot.ts"
+    mode: '0644'
+  become: true
+  become_user: "{{ system_username }}"
+
+# Pi --------------------------------------------------------------------------
+
+- name: Update Pi's models.json (the gateway provider)
+  ansible.builtin.include_tasks: json_file.yaml
+  vars:
+    json_file: "{{ agent_pi_dir }}/models.json"
+    json_changes:
+      merge:
+        - ["providers", {thinkube: "{{ lookup('template', 'pi-models-managed.json.j2') | from_json }}"}]
+
+- name: Update Pi's mcp.json
+  ansible.builtin.include_tasks: json_file.yaml
+  vars:
+    json_file: "{{ agent_pi_dir }}/mcp.json"
+    json_changes:
+      merge:
+        - ["mcpServers", "{{ lookup('template', 'pi-mcp-managed.json.j2') | from_json }}"]
+
+- name: Update Pi's settings.json
+  ansible.builtin.include_tasks: json_file.yaml
+  vars:
+    json_file: "{{ agent_pi_dir }}/settings.json"
+    json_changes:
+      merge:
+        - ["{{ lookup('template', 'pi-settings-managed.json.j2') | from_json }}"]
+
+- name: Ensure Pi's extensions directory exists
+  ansible.builtin.file:
+    path: "{{ agent_home_host_path }}/{{ agent_pi_dir }}/extensions"
+    state: directory
+    mode: '0755'
+  become: true
+  become_user: "{{ system_username }}"
+
+- name: Write the Pi extension that confirms Thinkube tools that change state
+  ansible.builtin.template:
+    src: thinkube-confirm.ts.j2
+    dest: "{{ agent_home_host_path }}/{{ agent_pi_dir }}/extensions/thinkube-confirm.ts"
+    mode: '0644'
+  become: true
+  become_user: "{{ system_username }}"
+
+- name: Write the Pi extension that keeps Playwright screenshots as images
+  ansible.builtin.copy:
+    src: pi/thinkube-screenshot.ts
+    dest: "{{ agent_home_host_path }}/{{ agent_pi_dir }}/extensions/thinkube-screenshot.ts"
+    mode: '0644'
+  become: true
+  become_user: "{{ system_username }}"
+
+# The links point into the image, so they dangle on the node and resolve in
+# the pod.
+- name: Link Pi's example extensions from the Pi package
+  ansible.builtin.file:
+    src: "{{ agent_pi_package_dir }}/examples/extensions/{{ item }}"
+    dest: "{{ agent_home_host_path }}/{{ agent_pi_dir }}/extensions/{{ item }}"
+    state: link
+    force: true
+    follow: false
+  loop: "{{ agent_pi_example_extensions }}"
+  become: true
+  become_user: "{{ system_username }}"
+
+- name: Ensure Pi's agents directory exists
+  ansible.builtin.file:
+    path: "{{ agent_home_host_path }}/{{ agent_pi_dir }}/agents"
+    state: directory
+    mode: '0755'
+  become: true
+  become_user: "{{ system_username }}"
+
+- name: Write the agents of the subagent tool
+  ansible.builtin.copy:
+    src: "pi-agents/{{ item }}"
+    dest: "{{ agent_home_host_path }}/{{ agent_pi_dir }}/agents/{{ item }}"
+    mode: '0644'
+  loop: "{{ agent_pi_subagents | map('regex_replace', '$', '.md') | list + ['LICENSE'] }}"
+  become: true
+  become_user: "{{ system_username }}"
+
+# VS Code's chat (thinkube-tandem-chat: the Tandem sessions) ------------------
+
+- name: Update VS Code's chat settings
+  ansible.builtin.include_tasks: json_file.yaml
+  vars:
+    json_file: "{{ agent_vscode_user_dir }}/settings.json"
+    json_changes:
+      merge:
+        - ["{{ agent_vscode_settings }}"]
+
+- name: Check for VS Code's language model groups
+  ansible.builtin.stat:
+    path: "{{ agent_home_host_path }}/{{ agent_vscode_user_dir }}/chatLanguageModels.json"
+  register: agent_vscode_models_stat
+
+- name: Read VS Code's language model groups
+  ansible.builtin.slurp:
+    src: "{{ agent_home_host_path }}/{{ agent_vscode_user_dir }}/chatLanguageModels.json"
+  register: agent_vscode_models_raw
+  when: agent_vscode_models_stat.stat.exists
+
+- name: Write the placeholder model group, keeping the user's groups
+  ansible.builtin.copy:
+    content: "{{ (agent_vscode_groups | rejectattr('name', 'equalto', agent_vscode_placeholder_model.name) | list + [agent_vscode_placeholder_model]) | to_nice_json }}\n"
+    dest: "{{ agent_home_host_path }}/{{ agent_vscode_user_dir }}/chatLanguageModels.json"
+    mode: '0644'
+  become: true
+  become_user: "{{ system_username }}"
+  vars:
+    agent_vscode_groups: "{{ (agent_vscode_models_raw.content | b64decode | from_json) if agent_vscode_models_stat.stat.exists else [] }}"
+
+# Claude Code -----------------------------------------------------------------
+
+# One registration at user scope serves every directory. claude mcp add-json
+# refuses a name that exists, so each server is removed first and added again.
+- name: Register the MCP servers with Claude Code (user scope)
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} exec -n code-server {{ agent_code_server_pod }} -- \
+      bash -l -c 'claude mcp remove "$1" -s user >/dev/null 2>&1; claude mcp add-json -s user "$1" "$2"' \
+      _ {{ item.name | quote }} {{ agent_claude_server | to_json | quote }}
+  vars:
+    agent_claude_server: "{{ {'type': 'http', 'url': item.url, 'headers': ({'Authorization': 'Bearer ' ~ agent_bearer_tokens[item.bearer_token_env]} if item.bearer_token_env is defined else {})}
+                             if item.transport == 'http' else {'type': 'stdio', 'command': item.command, 'args': item.args} }}"
+  loop: "{{ agent_mcp_servers }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: "{{ item.bearer_token_env is defined }}"

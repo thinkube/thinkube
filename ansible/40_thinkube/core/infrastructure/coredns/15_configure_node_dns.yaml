@@ -1,0 +1,232 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/coredns/15_configure_node_dns.yaml
+# Description:
+#   Configure all nodes to use BIND9 for DNS resolution
+#   This should be run AFTER the BIND9 DNS server is deployed
+#
+# Requirements:
+#   - BIND9 DNS server must be deployed (dns-server/10_deploy.yaml). The
+#     bind9-external Service must already have a LoadBalancer ingress IP —
+#     either statically allocated by Cilium L2 LB (ZeroTier mode) or
+#     dynamically by the Tailscale Operator (Tailscale mode). The IP is
+#     discovered from Service status in pre_tasks.
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/coredns/15_configure_node_dns.yaml
+
+- name: Configure DNS on all nodes to use BIND9 DNS server
+  hosts: all
+  gather_facts: true
+  become: false
+
+  pre_tasks:
+    # The address every node will be told to use for DNS is the IP that
+    # bind9-external is actually reachable on — the value Cilium L2 LB
+    # claimed in ZeroTier mode, or the tailnet IP the Tailscale Operator
+    # assigned in Tailscale mode. Read it from Service status so we
+    # don't drift from whatever the cluster actually has. Delegated to
+    # the control plane because most nodes don't have kubectl.
+    # `ingress[*].ip` (not `[0].ip`) because the Tailscale operator
+    # writes a hostname entry before the IP entry; `[0].ip` would
+    # therefore be empty.
+    - name: Read bind9-external IP from Service status
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc bind9-external -n dns-system
+        -o jsonpath={.status.loadBalancer.ingress[*].ip}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: bind9_lookup
+      changed_when: false
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      run_once: true
+
+    - name: Fail if bind9-external has no LoadBalancer IP yet
+      ansible.builtin.fail:
+        msg: |
+          bind9-external Service in namespace dns-system has no IP in
+          status.loadBalancer.ingress[]. The dns-server playbook must
+          run successfully before this one.
+      when: bind9_lookup.stdout | length == 0
+      run_once: true
+
+    - name: Set coredns_external_ip from the discovered IP
+      ansible.builtin.set_fact:
+        coredns_external_ip: "{{ bind9_lookup.stdout }}"
+
+  tasks:
+    # Create systemd-resolved directory for drop-in configs
+    - name: Create systemd-resolved directory
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      become: true
+
+    # Remove any conflicting DNS configuration files first
+    - name: Remove conflicting DNS configuration files
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d/dns.conf
+        state: absent
+      become: true
+      notify: restart systemd-resolved
+      
+    # Configure Kubernetes nodes
+    - name: Configure systemd-resolved for Kubernetes nodes
+      ansible.builtin.copy:
+        content: |
+          # DNS configuration for Kubernetes nodes
+          [Resolve]
+          # Primary DNS: BIND9 for network and domain resolution
+          DNS={{ coredns_external_ip }}
+          Domains={% if overlay_provider | default('') == 'tailscale' %}~{{ domain_name }}{% endif %}
+
+          DNSStubListener=yes
+        dest: /etc/systemd/resolved.conf.d/10-thinkube.conf
+        owner: root
+        group: root
+        mode: '0644'
+      become: true
+      when: inventory_hostname in groups['k8s']
+      notify: restart systemd-resolved
+        
+    # Configure non-Kubernetes nodes (management controllers, etc)
+    - name: Remove conflicting DNS configuration for non-Kubernetes nodes
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d/dns.conf
+        state: absent
+      become: true
+      when: "inventory_hostname not in groups['k8s']"
+      notify: restart systemd-resolved
+
+    - name: Configure systemd-resolved for non-Kubernetes nodes
+      ansible.builtin.copy:
+        content: |
+          # DNS configuration for non-Kubernetes nodes
+          [Resolve]
+          # Primary DNS: BIND9 for network and domain resolution
+          DNS={{ coredns_external_ip }}
+          Domains={% if overlay_provider | default('') == 'tailscale' %}~{{ domain_name }}{% endif %}
+
+          DNSStubListener=yes
+        dest: /etc/systemd/resolved.conf.d/10-thinkube.conf
+        owner: root
+        group: root
+        mode: '0644'
+      become: true
+      when: "inventory_hostname not in groups['k8s']"
+      notify: restart systemd-resolved
+      
+    # Ensure systemd-resolved is enabled to start on boot
+    - name: Enable systemd-resolved to start on boot
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      become: true
+      
+    # Create a systemd service to ensure DNS is configured after network is up
+    - name: Create DNS configuration verification service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Verify DNS Configuration after network is online
+          After=network-online.target systemd-resolved.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStartPre=/bin/sleep 5
+          ExecStart=/bin/systemctl restart systemd-resolved
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/dns-config-verify.service
+        owner: root
+        group: root
+        mode: '0644'
+      become: true
+      notify: enable dns verify service
+      
+  handlers:
+    - name: restart systemd-resolved
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+        daemon_reload: true
+      become: true
+
+    - name: enable dns verify service
+      ansible.builtin.systemd:
+        name: dns-config-verify
+        enabled: yes
+        daemon_reload: yes
+      become: true
+        
+  post_tasks:
+    # Test DNS resolution to verify configuration
+    - name: Test DNS resolution for internal cluster domain
+      ansible.builtin.command: nslookup kubernetes.default.svc.cluster.local
+      register: internal_dns_test
+      changed_when: false
+      failed_when: false
+      when: inventory_hostname in groups['k8s']
+      
+    - name: Test DNS resolution for external domain
+      ansible.builtin.command: nslookup {{ item }}
+      with_items:
+        - "keycloak.{{ domain_name }}"
+        - "acme-v02.api.letsencrypt.org"
+        - "github.com"
+      register: external_dns_test  
+      changed_when: false
+      failed_when: false
+      
+    - name: Test DNS resolution with trailing dot (FQDN)
+      ansible.builtin.command: nslookup {{ item }}.
+      with_items:
+        - "acme-v02.api.letsencrypt.org"
+        - "github.com"
+      register: fqdn_dns_test
+      changed_when: false
+      failed_when: false
+      
+    - name: Show DNS test results
+      ansible.builtin.debug:
+        msg: |
+          Node: {{ inventory_hostname }}
+          
+          {% if inventory_hostname in groups['k8s'] %}
+          Internal DNS (cluster.local): {{ 'SUCCESS' if internal_dns_test.rc == 0 else 'FAILED' }}
+          {% endif %}
+          
+          External DNS Resolution:
+          {% for result in external_dns_test.results %}
+          - {{ result.item }}: {{ 'SUCCESS' if result.rc == 0 else 'FAILED' }}
+          {% endfor %}
+          
+          FQDN Resolution (with trailing dot):
+          {% for result in fqdn_dns_test.results %}
+          - {{ result.item }}: {{ 'SUCCESS' if result.rc == 0 else 'FAILED' }}
+          {% endfor %}
+          
+          EXTERNAL RESOLUTION VALIDATION: 
+          {% set has_domain_issue = false %}
+          {% for result in external_dns_test.results %}
+          {% if result.stdout is defined and "thinkube.com" in result.stdout and not result.item.endswith(domain_name) %}
+          {% set has_domain_issue = true %}
+          {% endif %}
+          {% endfor %}
+          
+          {% if has_domain_issue %}
+          ❌ FAILED - External domains are resolving to internal IPs
+          {% else %}
+          ✅ PASSED - External domains resolve correctly
+          {% endif %}

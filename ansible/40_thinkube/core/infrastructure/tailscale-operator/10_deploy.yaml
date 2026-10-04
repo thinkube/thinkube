@@ -1,0 +1,190 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/tailscale-operator/10_deploy.yaml
+# Description:
+#   Installs the Tailscale Kubernetes Operator into the cluster so Services
+#   annotated with tailscale.com/expose become tailnet devices reachable
+#   from any device on the tailnet. Replaces the brittle subnet-route
+#   workaround (advertised by the control plane) with a per-Service or
+#   shared-Gateway tailnet device managed by the operator.
+#
+#   This playbook is a no-op when overlay_provider != 'tailscale'.
+#
+# Requirements:
+#   - Kubernetes (kubeadm) installed and running
+#   - helm + kubectl binaries installed (helm_bin, kubectl_bin from inventory)
+#   - The user has created an OAuth client at Tailscale Admin → Trust
+#     credentials with scopes Devices/Core (R+W) and Keys/Auth Keys (R+W),
+#     tagged tag:k8s-operator. The installer adds the matching tagOwners
+#     to the tailnet policy file via the Tailscale ACL API before this
+#     playbook runs.
+#
+# Position in chain:
+#   Must come after k8s/10_install_k8s.yaml (needs a working cluster) and
+#   before gateway-api/10_deploy.yaml in Tailscale mode (the Gateway
+#   Service gets annotated for the operator to expose).
+#
+# Variables from inventory:
+#   - overlay_provider: 'tailscale' or 'zerotier' (skip if not tailscale)
+#   - tailscale_oauth_client_id, tailscale_oauth_client_secret
+#   - kubectl_bin, helm_bin, kubeconfig
+#
+# Usage:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/tailscale-operator/10_deploy.yaml
+
+- name: Install Tailscale Kubernetes Operator
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+
+  vars:
+    operator_release: "tailscale-operator"
+    operator_repo_name: "tailscale"
+    operator_repo_url: "https://pkgs.tailscale.com/helmcharts"
+    operator_deployment: "operator"
+
+  tasks:
+    - name: Skip when overlay provider is not Tailscale
+      ansible.builtin.meta: end_play
+      when: overlay_provider != 'tailscale'
+
+    - name: Verify required Tailscale OAuth credentials are present
+      ansible.builtin.assert:
+        that:
+          - tailscale_oauth_client_id is defined
+          - tailscale_oauth_client_id | length > 0
+          - tailscale_oauth_client_secret is defined
+          - tailscale_oauth_client_secret | length > 0
+        fail_msg: >-
+          tailscale_oauth_client_id and tailscale_oauth_client_secret are
+          required to install the Tailscale Operator. Generate an OAuth
+          client at Tailscale Admin → Trust credentials → +Credential →
+          OAuth (Devices/Core R+W, Keys/Auth Keys R+W, tag k8s-operator)
+          and re-run the configuration step in the installer.
+
+    - name: Remove stale Tailscale devices from previous installs
+      ansible.builtin.uri:
+        url: "https://api.tailscale.com/api/v2/tailnet/-/devices"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ tailscale_api_token }}"
+        return_content: yes
+      register: ts_devices
+      when: tailscale_api_token is defined and tailscale_api_token | length > 0
+
+    - name: Delete stale operator-managed Tailscale devices
+      ansible.builtin.uri:
+        url: "https://api.tailscale.com/api/v2/device/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ tailscale_api_token }}"
+        status_code: [200]
+      loop: >-
+        {{ (ts_devices.json.devices | default([]))
+           | selectattr('hostname', 'match', '^(' + cluster_name + '-|tailscale-operator)')
+           | list }}
+      loop_control:
+        label: "{{ item.hostname }} ({{ item.addresses[0] | default('?') }})"
+      when:
+        - tailscale_api_token is defined and tailscale_api_token | length > 0
+        - ts_devices.json.devices | default([]) | length > 0
+
+    - name: Add the Tailscale Helm repository
+      ansible.builtin.command: >
+        {{ helm_bin }} repo add {{ operator_repo_name }} {{ operator_repo_url }}
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+      failed_when:
+        - helm_repo_add.rc != 0
+        - "'already exists' not in helm_repo_add.stderr"
+
+    - name: Refresh the Helm repository index
+      ansible.builtin.command: "{{ helm_bin }} repo update {{ operator_repo_name }}"
+      changed_when: false
+
+    - name: Create Tailscale Operator namespace and apply resource policies
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ tailscale_namespace }}"
+        tier: "critical"
+
+    # Fetched before the install so a transient upstream failure costs a retry
+    # on the download rather than on the cluster operation. This step runs
+    # before Harbor exists, so the chart can only come from upstream. The
+    # version is deliberately not pinned, so the directory is emptied first and
+    # whatever tarball the pull produced is found rather than named.
+    - name: Empty the directory for the pre-fetched Tailscale Operator chart
+      ansible.builtin.file:
+        path: /tmp/tailscale-operator-chart
+        state: "{{ item }}"
+        mode: '0755'
+      loop:
+        - absent
+        - directory
+
+    - name: Pre-fetch Tailscale Operator chart tarball (retries on transient network errors)
+      ansible.builtin.command: >-
+        {{ helm_bin }} pull {{ operator_repo_name }}/tailscale-operator
+        --destination /tmp/tailscale-operator-chart
+      register: ts_operator_chart_pull
+      retries: 5
+      delay: 30
+      until: ts_operator_chart_pull.rc == 0
+      changed_when: ts_operator_chart_pull.rc == 0
+
+    - name: Find the pre-fetched Tailscale Operator chart
+      ansible.builtin.find:
+        paths: /tmp/tailscale-operator-chart
+        patterns: "tailscale-operator-*.tgz"
+      register: ts_operator_chart
+
+    - name: Stop when the pre-fetched Tailscale Operator chart is not exactly one file
+      ansible.builtin.assert:
+        that: ts_operator_chart.files | length == 1
+        fail_msg: >-
+          Expected one tailscale-operator-*.tgz in /tmp/tailscale-operator-chart,
+          found {{ ts_operator_chart.files | length }}.
+        quiet: true
+
+    - name: Install or upgrade the Tailscale Operator
+      ansible.builtin.command: >
+        {{ helm_bin }} upgrade --install {{ operator_release }}
+        {{ ts_operator_chart.files[0].path }}
+        --namespace={{ tailscale_namespace }}
+        --set-string oauth.clientId={{ tailscale_oauth_client_id }}
+        --set-string oauth.clientSecret={{ tailscale_oauth_client_secret }}
+        --wait
+        --kubeconfig {{ kubeconfig }}
+      register: helm_install
+      changed_when: true
+
+    - name: Wait for the operator deployment to become available
+      ansible.builtin.command: >
+        {{ kubectl_bin }} rollout status deployment/{{ operator_deployment }}
+        -n {{ tailscale_namespace }} --timeout=180s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    - name: Display install summary
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════
+          ✅ Tailscale Kubernetes Operator installed
+          ════════════════════════════════════════════════════════
+
+          Namespace:  {{ tailscale_namespace }}
+          Release:    {{ operator_release }}
+          Deployment: {{ operator_deployment }}
+
+          Annotate any Service of type LoadBalancer with
+            tailscale.com/expose: "true"
+          and an optional
+            tailscale.com/hostname: "<name>"
+          to expose it on the tailnet via this operator.
+
+          ════════════════════════════════════════════════════════

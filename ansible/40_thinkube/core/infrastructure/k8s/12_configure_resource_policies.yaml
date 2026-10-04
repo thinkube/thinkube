@@ -1,0 +1,95 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Configure cluster-wide PriorityClasses for eviction ordering.
+#
+# PriorityClasses (cluster-scoped):
+#   - thinkube-critical (1000000): Gateway, DNS, CoreDNS
+#   - thinkube-platform (100000):  Keycloak, PostgreSQL, Harbor, Gitea, ArgoCD, thinkube-control
+#   - thinkube-workload (10000):   User deployments, optional components (globalDefault)
+#   - thinkube-batch (1000):       Argo workflow tasks, builds, one-off jobs
+#
+# LimitRanges and ResourceQuotas are applied per-namespace by the
+# thinkube_namespace role when each component creates its namespace.
+#
+# Usage:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/k8s/12_configure_resource_policies.yaml
+
+- name: Configure Cluster Resource Policies
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  tasks:
+    - name: Create thinkube-critical PriorityClass
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: scheduling.k8s.io/v1
+          kind: PriorityClass
+          metadata:
+            name: thinkube-critical
+          value: 1000000
+          globalDefault: false
+          preemptionPolicy: PreemptLowerPriority
+          description: >-
+            Critical infrastructure: gateway, DNS, CoreDNS.
+            These pods must survive eviction pressure.
+
+    - name: Create thinkube-platform PriorityClass
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: scheduling.k8s.io/v1
+          kind: PriorityClass
+          metadata:
+            name: thinkube-platform
+          value: 100000
+          globalDefault: false
+          preemptionPolicy: PreemptLowerPriority
+          description: >-
+            Core platform services: Keycloak, PostgreSQL, Harbor, Gitea,
+            ArgoCD, thinkube-control. Evicted after batch and workloads.
+
+    - name: Create thinkube-workload PriorityClass
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: scheduling.k8s.io/v1
+          kind: PriorityClass
+          metadata:
+            name: thinkube-workload
+          value: 10000
+          globalDefault: true
+          preemptionPolicy: PreemptLowerPriority
+          description: >-
+            Default priority for user deployments, optional components,
+            and template-deployed applications.
+
+    - name: Create thinkube-batch PriorityClass
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: scheduling.k8s.io/v1
+          kind: PriorityClass
+          metadata:
+            name: thinkube-batch
+          value: 1000
+          globalDefault: false
+          preemptionPolicy: PreemptLowerPriority
+          description: >-
+            Batch jobs: Argo workflow tasks, image builds, one-off jobs.
+            First to be evicted under memory pressure.
+
+    - name: Display PriorityClass summary
+      ansible.builtin.debug:
+        msg: |
+          PriorityClasses configured:
+            thinkube-critical  (1,000,000) — gateway, DNS, CoreDNS
+            thinkube-platform  (  100,000) — Keycloak, PostgreSQL, Harbor, Gitea, ArgoCD
+            thinkube-workload  (   10,000) — user deployments (globalDefault)
+            thinkube-batch     (    1,000) — Argo tasks, builds

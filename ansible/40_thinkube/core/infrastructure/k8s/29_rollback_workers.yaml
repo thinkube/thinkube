@@ -1,0 +1,275 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/k8s/29_rollback_workers.yaml
+#
+# Rollback playbook for the Thinkube Kubernetes Cluster worker nodes
+# (kubeadm-joined).
+#
+# WARNING: This drains, deletes, and wipes worker nodes. Pods scheduled
+# only on these workers (no PV mirror on the control plane) are lost.
+#
+# Workflow:
+#   1. On the control plane: drain each worker, then `kubectl delete node`.
+#   2. On each worker: `kubeadm reset`, wipe cluster state (packages,
+#      containerd and its image store stay; the install is idempotent), clean up
+#      networking artefacts, optionally reboot.
+#   3. On the control plane: final node count + summary.
+#
+# Usage:
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s/29_rollback_workers.yaml
+#
+# Confirmation is the orchestrator's responsibility (installer wizard,
+# thinkube-control UI, or the operator explicitly invoking the script).
+# This playbook contains no internal safety gates — invocation IS the
+# commitment.
+#
+# 🤖 [AI-assisted]
+
+- name: Drain and remove workers from the cluster
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    kubectl_path: "{{ user_home }}/.local/bin/kubectl"
+    drain_timeout: "300s"
+
+  tasks:
+    - name: Check which workers exist in the cluster
+      ansible.builtin.command: "{{ kubectl_path }} get node {{ item }}"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      loop: "{{ groups['k8s_workers'] }}"
+      register: _worker_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Drain worker nodes
+      ansible.builtin.command: >
+        {{ kubectl_path }} drain {{ item.item }}
+        --ignore-daemonsets --delete-emptydir-data
+        --timeout={{ drain_timeout }} --force
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      loop: "{{ _worker_exists.results }}"
+      when: item.rc == 0
+      register: _drain_result
+      failed_when: false
+      changed_when: _drain_result.rc == 0
+
+    - name: Wait for pods to be evicted
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting for pods to be evicted from workers..."
+      when: _drain_result is changed
+
+    - name: Delete worker nodes from cluster
+      ansible.builtin.command: "{{ kubectl_path }} delete node {{ item.item }}"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      loop: "{{ _worker_exists.results }}"
+      when: item.rc == 0
+      register: _delete_result
+      changed_when: "'deleted' in _delete_result.stdout"
+      failed_when: false
+
+    - name: Display remaining cluster nodes
+      ansible.builtin.command: "{{ kubectl_path }} get nodes"
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      register: _remaining_nodes
+      changed_when: false
+
+    - name: Show remaining nodes
+      ansible.builtin.debug:
+        var: _remaining_nodes.stdout_lines
+
+
+- name: Wipe worker nodes
+  hosts: k8s_workers
+  become: true
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    kubectl_path: "{{ user_home }}/.local/bin/kubectl"
+    helm_path: "{{ user_home }}/.local/bin/helm"
+
+  tasks:
+    # =====================================================================
+    # kubeadm reset — drains the local kubelet state cleanly
+    # =====================================================================
+    - name: Check if kubeadm is installed
+      ansible.builtin.stat:
+        path: /usr/bin/kubeadm
+      register: _kubeadm_binary
+
+    - name: Run kubeadm reset
+      ansible.builtin.command: kubeadm reset --force --cleanup-tmp-dir
+      when: _kubeadm_binary.stat.exists
+      register: _kubeadm_reset
+      failed_when: false
+      changed_when: _kubeadm_reset.rc == 0
+
+    # =====================================================================
+    # Wipe Thinkube-owned state
+    # =====================================================================
+    - name: Unmount any lingering kubelet pod volumes
+      ansible.builtin.shell: |
+        mount | awk '/\/var\/lib\/kubelet\/pods/ {print $3}' | xargs -r -I {} umount -l {} 2>/dev/null || true
+      changed_when: false
+
+    - name: Remove cluster + runtime state directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /etc/cni/net.d
+        - /var/lib/kubelet
+        - /var/openebs
+        - /var/lib/rawfile-localpv
+      failed_when: false
+
+    - name: Remove vanilla kubectl / helm from ~/.local/bin
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ kubectl_path }}"
+        - "{{ helm_path }}"
+
+    # =====================================================================
+    # Node-local API VIP (k8s0 dummy + socket proxy) — see 20_join_workers
+    # =====================================================================
+    - name: Stop and disable API VIP proxy, node-ip sync and link watchdog units
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - k8s-api-proxy.socket
+        - k8s-api-proxy.service
+        - thinkube-node-ip-sync.timer
+        - thinkube-node-ip-sync-watch.service
+        - thinkube-node-ip-sync.service
+        - thinkube-link-watchdog.timer
+        - thinkube-link-watchdog.service
+      failed_when: false
+
+    - name: Remove API VIP proxy, node-ip sync, link watchdog and dummy interface files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/k8s-api-proxy.socket
+        - /etc/systemd/system/k8s-api-proxy.service
+        - /etc/systemd/system/thinkube-node-ip-sync.timer
+        - /etc/systemd/system/thinkube-node-ip-sync-watch.service
+        - /etc/systemd/system/thinkube-node-ip-sync.service
+        - /usr/local/bin/thinkube-node-ip-sync
+        - /etc/systemd/system/thinkube-link-watchdog.timer
+        - /etc/systemd/system/thinkube-link-watchdog.service
+        - /usr/local/bin/thinkube-link-watchdog
+        - /etc/systemd/network/10-k8s-dummy.netdev
+        - /etc/systemd/network/10-k8s-dummy.network
+
+    - name: Reload systemd after unit removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart systemd-networkd after dummy config removal
+      ansible.builtin.systemd:
+        name: systemd-networkd
+        state: restarted
+      failed_when: false
+
+    - name: Delete k8s0 dummy interface
+      ansible.builtin.command: ip link delete k8s0
+      failed_when: false
+      changed_when: true
+
+    - name: Remove Thinkube-owned kernel module and sysctl drop-ins
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/modules-load.d/thinkube-k8s.conf
+        - /etc/sysctl.d/99-thinkube-k8s.conf
+
+    # The apt sources and packages Thinkube added stay: they may be the
+    # user's as much as ours (DGX OS ships docker from docker's own
+    # repository), and the next install is idempotent over them. The
+    # commands below remove them when the user wants that.
+    - name: Say which apt sources and packages were left in place
+      ansible.builtin.debug:
+        msg:
+          - "Left in place: the apt sources and packages Thinkube added."
+          - "To remove the sources and keys:"
+          - "  sudo rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/docker.asc /etc/apt/keyrings/kubernetes-apt-keyring.gpg && sudo apt-get update"
+          - "To remove the packages (containerd.io is also docker's: keep it where docker is installed):"
+          - "  sudo apt-mark unhold kubeadm kubelet kubectl containerd.io && sudo apt-get purge kubeadm kubelet kubectl kubernetes-cni containerd.io"
+
+    # =====================================================================
+    # Cilium network interfaces left behind on the worker
+    # =====================================================================
+    - name: Enumerate Cilium-created interfaces
+      ansible.builtin.shell: |
+        ip -o link show | awk -F': ' '/cilium|lxc/ {print $2}' | sed 's/@.*//' | sort -u
+      register: _cilium_interfaces
+      changed_when: false
+
+    - name: Delete Cilium-created interfaces
+      ansible.builtin.command: "ip link delete {{ item }}"
+      loop: "{{ _cilium_interfaces.stdout_lines | default([]) }}"
+      when: _cilium_interfaces.stdout_lines | length > 0
+      failed_when: false
+      changed_when: true
+
+    # No automatic reboot — if the operator wants a clean kernel state
+    # after rollback, they can reboot the worker manually. Keeping the
+    # playbook side-effect-bounded to "cleanup only" makes it safe to
+    # re-run and avoids surprises in unattended orchestration.
+
+  post_tasks:
+    - name: Display worker cleanup summary
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "Worker {{ inventory_hostname }} wiped"
+          - "==============================================="
+
+
+- name: Final verification on control plane
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    kubectl_path: "{{ user_home }}/.local/bin/kubectl"
+
+  tasks:
+    - name: Count remaining nodes
+      ansible.builtin.shell: |
+        {{ kubectl_path }} get nodes --no-headers | wc -l
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      register: _final_node_count
+      changed_when: false
+
+    - name: Display final cluster status
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "Worker Rollback Summary"
+          - "==============================================="
+          - "Workers wiped:               {{ groups['k8s_workers'] | length }}"
+          - "Remaining nodes in cluster:  {{ _final_node_count.stdout }}"
+          - "==============================================="

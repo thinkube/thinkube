@@ -1,0 +1,554 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/juicefs/10_deploy.yaml
+# Description:
+#   Deploy JuiceFS distributed filesystem providing true ReadWriteMany (RWX) storage
+#   Uses PostgreSQL for metadata and SeaweedFS S3 for data storage
+#
+# Requirements:
+#   - Kubernetes (kubeadm) cluster operational
+#   - PostgreSQL deployed and accessible
+#   - SeaweedFS deployed with S3 API configured
+#   - Helm installed on control plane
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/juicefs/10_deploy.yaml
+#
+# Variables from inventory:
+#   - juicefs_namespace: Namespace for JuiceFS CSI driver
+#   - postgres_hostname: PostgreSQL hostname for metadata storage
+#   - admin_username: PostgreSQL admin username
+#   - admin_password: PostgreSQL admin password (via ADMIN_PASSWORD env var)
+#   - seaweedfs_namespace: SeaweedFS namespace
+#   - domain_name: Base domain for S3 endpoint
+#
+# Dependencies:
+#   - CORE: PostgreSQL (metadata storage)
+#   - CORE: SeaweedFS (S3 object storage)
+#
+# 🤖 [AI-assisted]
+
+- name: Prepare kubelet directories on all nodes
+  hosts: k8s_cluster
+  gather_facts: false
+  tasks:
+    - name: Ensure kubelet plugins_registry directory exists
+      ansible.builtin.file:
+        path: /var/lib/kubelet/plugins_registry
+        state: directory
+        mode: '0755'
+      become: true
+
+- name: Deploy JuiceFS distributed filesystem with RWX support
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Admin password from environment variable
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    # Keycloak client for the dashboard login at the gateway
+    juicefs_dashboard_hostname: "juicefs.{{ domain_name }}"
+    juicefs_dashboard_client_id: "juicefs-dashboard"
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ admin_password }}"
+
+    # JuiceFS configuration
+    juicefs_volume_name: "thinkube-shared"
+    juicefs_storage_class_name: "juicefs-rwx"
+    juicefs_csi_version: "0.30.0"  # Latest stable version
+
+    # PostgreSQL connection (using internal cluster DNS)
+    postgres_internal_host: "postgresql-official.{{ postgres_namespace }}.svc.cluster.local"
+    postgres_port: "5432"
+    postgres_database: "juicefs"
+
+    # SeaweedFS S3 configuration (internal cluster endpoint)
+    s3_endpoint_internal: "http://seaweedfs-filer.{{ seaweedfs_namespace }}.svc.cluster.local:8333"
+    s3_bucket: "juicefs-data"
+
+  pre_tasks:
+    - name: Verify admin password available
+      ansible.builtin.assert:
+        that: admin_password != ''
+        fail_msg: "ADMIN_PASSWORD environment variable must be set"
+        success_msg: "Admin password loaded from environment"
+
+    - name: Check for required variables
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined or item | length == 0
+      loop:
+        - juicefs_namespace
+        - postgres_namespace
+        - admin_username
+        - kubeconfig
+        - kubectl_bin
+        - seaweedfs_namespace
+        - domain_name
+
+  tasks:
+    ###########################################################################
+    # Task 1: Namespace and Prerequisites
+    ###########################################################################
+
+    - name: Ensure JuiceFS namespace exists and apply resource policies
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ juicefs_namespace }}"
+        tier: "platform"
+
+    - name: Verify PostgreSQL is accessible
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/postgresql-official -- \
+          psql -U {{ admin_username }} -d mydatabase -c "SELECT 1" > /dev/null 2>&1 && echo "ok" || echo "failed"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        PGPASSWORD: "{{ admin_password }}"
+      register: postgres_check
+      failed_when: postgres_check.stdout != "ok"
+
+    - name: Verify SeaweedFS S3 is accessible
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret seaweedfs-s3-credentials -n {{ seaweedfs_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: s3_creds_check
+      failed_when: s3_creds_check.rc != 0
+      changed_when: false
+
+    - name: Get S3 credentials from SeaweedFS
+      ansible.builtin.set_fact:
+        s3_access_key: "{{ (s3_creds_check.stdout | from_json).data.access_key | b64decode }}"
+        s3_secret_key: "{{ (s3_creds_check.stdout | from_json).data.secret_key | b64decode }}"
+
+    ###########################################################################
+    # Task 2: Create JuiceFS database in PostgreSQL
+    ###########################################################################
+    - name: Check if JuiceFS database exists in PostgreSQL
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/postgresql-official -- \
+          psql -U {{ admin_username }} -d mydatabase -tAc "SELECT 1 FROM pg_database WHERE datname='{{ postgres_database }}'"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        PGPASSWORD: "{{ admin_password }}"
+      register: db_check
+      changed_when: false
+
+    - name: Create JuiceFS database in PostgreSQL
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/postgresql-official -- \
+          psql -U {{ admin_username }} -d mydatabase -c "CREATE DATABASE {{ postgres_database }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        PGPASSWORD: "{{ admin_password }}"
+      when: db_check.stdout == ""
+      register: db_create
+
+    ###########################################################################
+    # Task 3: Create S3 bucket for JuiceFS
+    ###########################################################################
+    - name: Get SeaweedFS filer pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ seaweedfs_namespace }} \
+          -l app.kubernetes.io/name=seaweedfs,app.kubernetes.io/component=filer \
+          -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: filer_pods
+      changed_when: false
+
+    - name: Create S3 bucket for JuiceFS in SeaweedFS
+      ansible.builtin.shell: |
+        POD_NAME=$(echo '{{ filer_pods.stdout }}' | jq -r '.items[0].metadata.name')
+        {{ kubectl_bin }} exec -n {{ seaweedfs_namespace }} ${POD_NAME} -- \
+          sh -c 's3.bucket.create -name={{ s3_bucket }} | weed shell -master=seaweedfs-master:9333' || true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: bucket_create
+      changed_when: "'created' in bucket_create.stdout"
+
+    ###########################################################################
+    # Task 4: Add JuiceFS Helm repository
+    ###########################################################################
+    - name: Add JuiceFS Helm repository
+      ansible.builtin.shell: |
+        {{ helm_bin }} repo add juicefs https://juicedata.github.io/charts/
+        {{ helm_bin }} repo update
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout or 'Update Complete' in helm_repo_add.stdout"
+
+    # Fetched before the install so a transient upstream failure costs a retry
+    # here rather than the whole deployment: the chart comes from GitHub
+    # releases, which returned 504 mid-install and failed the step three times
+    # inside 44 seconds. Installing from the local copy keeps the retry on the
+    # download, which is the flaky part, not on the cluster operation.
+    - name: Pre-fetch JuiceFS CSI chart tarball (retries on transient network errors)
+      ansible.builtin.command: >-
+        {{ helm_bin }} pull juicefs/juicefs-csi-driver
+        --version {{ juicefs_csi_version }}
+        --destination /tmp
+      register: juicefs_chart_pull
+      retries: 5
+      delay: 30
+      until: juicefs_chart_pull.rc == 0
+      changed_when: juicefs_chart_pull.rc == 0
+
+    ###########################################################################
+    # Task 5: Create JuiceFS configuration secret
+    ###########################################################################
+    - name: Create JuiceFS volume configuration secret
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: juicefs-secret
+          namespace: {{ juicefs_namespace }}
+        type: Opaque
+        stringData:
+          name: "{{ juicefs_volume_name }}"
+          metaurl: "postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable"
+          storage: "s3"
+          bucket: "{{ s3_endpoint_internal }}/{{ s3_bucket }}"
+          access-key: "{{ s3_access_key }}"
+          secret-key: "{{ s3_secret_key }}"
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: secret_result
+      changed_when: "'created' in secret_result.stdout or 'configured' in secret_result.stdout"
+
+    ###########################################################################
+    # Task 6: Deploy JuiceFS CSI Driver
+    ###########################################################################
+    # mountPodPatch sets requests + a CPU limit but deliberately NO memory limit:
+    # the juicefs mount process runs oom_score_adj=-1000 (unkillable) and is alone
+    # in its cgroup, so a hard memory limit turns reclaimable page cache from large
+    # model reads into an unkillable-process OOM loop that floods kern.log and fills
+    # the node disk (SP-tgqg1j_SL-1 / TEP-tgmtd3). Without the limit, that page
+    # cache is reclaimed at node level under real memory pressure.
+    - name: Install/Upgrade JuiceFS CSI driver via Helm using Harbor registry
+      ansible.builtin.shell: |
+        {{ helm_bin }} upgrade --install juicefs-csi-driver \
+          /tmp/juicefs-csi-driver-{{ juicefs_csi_version }}.tgz \
+          --namespace kube-system \
+          --set image.repository={{ harbor_registry }}/library/juicefs-csi-driver \
+          --set image.tag=v{{ juicefs_csi_version }} \
+          --set sidecars.livenessProbeImage.repository={{ harbor_registry }}/library/livenessprobe \
+          --set sidecars.livenessProbeImage.tag=v2.11.0 \
+          --set sidecars.nodeDriverRegistrarImage.repository={{ harbor_registry }}/library/csi-node-driver-registrar \
+          --set sidecars.nodeDriverRegistrarImage.tag=v2.9.0 \
+          --set sidecars.csiProvisionerImage.repository={{ harbor_registry }}/library/csi-provisioner \
+          --set sidecars.csiProvisionerImage.tag=v2.2.2 \
+          --set jfsMountImage.repository={{ harbor_registry }}/library/juicefs-mount \
+          --set jfsMountImage.tag=ce-v1.2.3 \
+          --set storageClasses[0].enabled=false \
+          --set kubeletDir=/var/lib/kubelet \
+          --set controller.priorityClassName=thinkube-platform \
+          --set node.priorityClassName=thinkube-platform \
+          --set-json 'globalConfig.mountPodPatch=[{"resources":{"requests":{"cpu":"100m","memory":"256Mi"},"limits":{"cpu":"1"}}}]'
+      register: helm_install
+      retries: 3
+      delay: 10
+      until: helm_install.rc == 0
+
+    ###########################################################################
+    # Task 7: Wait for CSI driver pods to be ready
+    ###########################################################################
+    - name: Wait for JuiceFS CSI controller to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get statefulset juicefs-csi-controller -n kube-system -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: csi_controller
+      until:
+        - csi_controller.rc == 0
+        - (csi_controller.stdout | from_json).status.readyReplicas is defined
+        - (csi_controller.stdout | from_json).status.readyReplicas == (csi_controller.stdout | from_json).spec.replicas
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: Wait for JuiceFS CSI node pods to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get daemonset juicefs-csi-node -n kube-system -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: csi_node
+      until:
+        - csi_node.rc == 0
+        - (csi_node.stdout | from_json).status.numberReady is defined
+        - (csi_node.stdout | from_json).status.numberReady == (csi_node.stdout | from_json).status.desiredNumberScheduled
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    ###########################################################################
+    # Task 8: Create StorageClass for RWX volumes
+    ###########################################################################
+    - name: Create JuiceFS RWX StorageClass
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata:
+          name: {{ juicefs_storage_class_name }}
+        provisioner: csi.juicefs.com
+        parameters:
+          csi.storage.k8s.io/provisioner-secret-name: juicefs-secret
+          csi.storage.k8s.io/provisioner-secret-namespace: {{ juicefs_namespace }}
+          csi.storage.k8s.io/node-publish-secret-name: juicefs-secret
+          csi.storage.k8s.io/node-publish-secret-namespace: {{ juicefs_namespace }}
+        reclaimPolicy: Retain
+        volumeBindingMode: Immediate
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: storageclass_result
+      changed_when: "'created' in storageclass_result.stdout or 'configured' in storageclass_result.stdout"
+
+    ###########################################################################
+    # Format JuiceFS Metadata Database
+    ###########################################################################
+    - name: Check if JuiceFS volume is already formatted
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run juicefs-format-check --rm -i --restart=Never \
+          --image=juicedata/juicefs-csi-driver:v{{ juicefs_csi_version }} \
+          --namespace={{ juicefs_namespace }} \
+          --command -- /usr/local/bin/juicefs status \
+          postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: format_check
+      failed_when: false
+      changed_when: false
+
+    - name: Clean up S3 storage path if format check failed (orphaned data)
+      ansible.builtin.shell: |
+        echo "fs.rm -rf /buckets/{{ s3_bucket }}/{{ juicefs_volume_name }}" | \
+          {{ kubectl_bin }} exec -i -n seaweedfs seaweedfs-filer-0 -- weed shell
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: format_check.rc != 0
+      failed_when: false
+      changed_when: true
+
+    - name: Format JuiceFS volume if not already formatted
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} run juicefs-format --rm -i --restart=Never \
+          --image=juicedata/juicefs-csi-driver:v{{ juicefs_csi_version }} \
+          --namespace={{ juicefs_namespace }} \
+          --command -- /usr/local/bin/juicefs format \
+          --storage=s3 \
+          --bucket={{ s3_endpoint_internal }}/{{ s3_bucket }} \
+          --access-key={{ s3_access_key }} \
+          --secret-key={{ s3_secret_key }} \
+          postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable \
+          {{ juicefs_volume_name }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: format_check.rc != 0
+      register: format_result
+
+    ###########################################################################
+    # Deploy S3 Gateway
+    ###########################################################################
+    - name: Deploy JuiceFS S3 Gateway
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: juicefs-gateway
+          namespace: {{ juicefs_namespace }}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: juicefs-gateway
+          template:
+            metadata:
+              labels:
+                app: juicefs-gateway
+            spec:
+              # On the control plane, beside Thinkube Storage (SeaweedFS), so
+              # S3 traffic stays on that node instead of crossing to another.
+              nodeSelector:
+                node-role.kubernetes.io/control-plane: ""
+              containers:
+              - name: gateway
+                image: juicedata/juicefs-csi-driver:v0.30.0
+                command:
+                  - sh
+                  - -c
+                  - |
+                    /usr/local/bin/juicefs gateway \
+                      --access-log=/dev/stdout \
+                      postgres://{{ admin_username }}:{{ admin_password }}@{{ postgres_internal_host }}:{{ postgres_port }}/{{ postgres_database }}?sslmode=disable \
+                      0.0.0.0:9000
+                env:
+                  - name: MINIO_ROOT_USER
+                    value: "{{ admin_username }}"
+                  - name: MINIO_ROOT_PASSWORD
+                    value: "{{ admin_password }}"
+                ports:
+                  - containerPort: 9000
+                    protocol: TCP
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gateway_result
+      changed_when: "'created' in gateway_result.stdout or 'configured' in gateway_result.stdout"
+
+    - name: Create S3 Gateway Service
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: juicefs-gateway
+          namespace: {{ juicefs_namespace }}
+        spec:
+          type: ClusterIP
+          selector:
+            app: juicefs-gateway
+          ports:
+            - port: 9000
+              targetPort: 9000
+              protocol: TCP
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gateway_svc_result
+      changed_when: "'created' in gateway_svc_result.stdout or 'configured' in gateway_svc_result.stdout"
+
+    ###########################################################################
+    # Configure dashboard to use English locale
+    ###########################################################################
+    - name: Get current dashboard deployment
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get deployment juicefs-csi-dashboard -n kube-system -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: dashboard_current
+      failed_when: false
+      changed_when: false
+
+    - name: Patch JuiceFS dashboard to use English locale
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch deployment juicefs-csi-dashboard -n kube-system --type='json' -p='[
+          {
+            "op": "add",
+            "path": "/spec/template/spec/containers/0/env/-",
+            "value": {"name": "LANG", "value": "en_US.UTF-8"}
+          }
+        ]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: dashboard_current.rc == 0
+      register: patch_result
+      changed_when: "'patched' in patch_result.stdout"
+      failed_when: patch_result.rc != 0 and 'already exists' not in patch_result.stderr
+
+    - name: Wait for dashboard to restart after locale change
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get deployment juicefs-csi-dashboard -n kube-system -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: dashboard_status
+      until:
+        - dashboard_status.rc == 0
+        - (dashboard_status.stdout | from_json).status.readyReplicas is defined
+        - (dashboard_status.stdout | from_json).status.readyReplicas == (dashboard_status.stdout | from_json).spec.replicas
+      retries: 20
+      delay: 3
+      changed_when: false
+
+    ###########################################################################
+    # Task 10: Create dashboard ingress
+    ###########################################################################
+    - name: Create JuiceFS dashboard HTTPRoute
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: juicefs-dashboard
+          namespace: kube-system
+        spec:
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ juicefs_dashboard_hostname }}"
+          rules:
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: juicefs-csi-dashboard
+                  port: 8088
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: httproute_result
+      changed_when: "'created' in httproute_result.stdout or 'configured' in httproute_result.stdout"
+
+    # --- Keycloak login for the dashboard ---
+    # The dashboard shows pods and volumes from the whole cluster and has no
+    # login of its own, so the gateway requires a Keycloak login.
+    - name: Create or update the Keycloak client for the dashboard
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ juicefs_dashboard_client_id }}"
+        keycloak_client_body:
+          clientId: "{{ juicefs_dashboard_client_id }}"
+          enabled: true
+          protocol: openid-connect
+          publicClient: false
+          standardFlowEnabled: true
+          redirectUris:
+            - "https://{{ juicefs_dashboard_hostname }}/oauth2/callback"
+          webOrigins:
+            - "https://{{ juicefs_dashboard_hostname }}"
+          baseUrl: "https://{{ juicefs_dashboard_hostname }}"
+          attributes:
+            post.logout.redirect.uris: "+"
+
+    - name: Require a Keycloak login on the dashboard route
+      ansible.builtin.include_role:
+        name: gateway_oidc
+      vars:
+        gateway_oidc_namespace: kube-system
+        gateway_oidc_route_names: ["juicefs-dashboard"]
+        gateway_oidc_hostname: "{{ juicefs_dashboard_hostname }}"
+        gateway_oidc_client_id: "{{ juicefs_dashboard_client_id }}"
+        gateway_oidc_client_secret: "{{ keycloak_client_secret }}"
+    # --- end Keycloak login for the dashboard ---
+
+    ###########################################################################
+    # Task 11: Summary
+    ###########################################################################
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "JuiceFS distributed filesystem deployed successfully!"
+          - "=================================================="
+          - "Storage Class: {{ juicefs_storage_class_name }}"
+          - "Access Mode: ReadWriteMany (RWX)"
+          - "Metadata: PostgreSQL ({{ postgres_database }} database)"
+          - "Data Storage: SeaweedFS S3 ({{ s3_bucket }} bucket)"
+          - "Dashboard (Keycloak login): https://{{ juicefs_dashboard_hostname }}"
+          - "=================================================="
+          - "To use JuiceFS in your PVCs:"
+          - "  storageClassName: {{ juicefs_storage_class_name }}"
+          - "  accessModes: [ReadWriteMany]"
+          - "=================================================="

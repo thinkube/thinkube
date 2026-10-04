@@ -1,0 +1,464 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/devpi/10_deploy.yaml
+# Description:
+#   Simple DevPi deployment using podman build and direct kubectl deployment
+#   No Argo Workflows or ArgoCD dependency
+#
+# Requirements:
+#   - Kubernetes (kubeadm) cluster must be running
+#   - Podman installed
+#   - Harbor registry accessible
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/devpi/10_deploy.yaml
+
+- name: Deploy DevPi using simple podman build approach
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: true
+  
+  vars:
+    # Application settings
+    app_name: devpi
+    devpi_namespace: devpi
+    devpi_index_name: stable
+
+    # Image settings - use library (public) project for core services
+    harbor_project: library
+    image_tag: "latest"
+    
+    # Keycloak client for the dashboard login at the gateway
+    devpi_dashboard_client_id: "oauth2-proxy-{{ app_name }}"
+
+    # Keycloak admin credentials
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+    # TLS settings
+    tls_secret_name: "{{ devpi_namespace }}-tls-secret"
+    
+    # Repository paths - local to ansible controller
+    local_repo_path: "/tmp/thinkube-devpi"
+
+  tasks:
+    - name: Get admin credentials
+      ansible.builtin.set_fact:
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    - name: Ensure application namespace exists and apply resource policies
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ devpi_namespace }}"
+        tier: "platform"
+
+    - name: Get wildcard certificate from default namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wildcard_cert_raw
+      changed_when: false
+      failed_when: wildcard_cert_raw.rc != 0
+
+    - name: Parse wildcard certificate JSON
+      ansible.builtin.set_fact:
+        wildcard_cert: "{{ wildcard_cert_raw.stdout | from_json }}"
+
+    - name: Copy wildcard certificate to DevPi namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: {{ tls_secret_name }}
+          namespace: {{ devpi_namespace }}
+        type: kubernetes.io/tls
+        data:
+          tls.crt: {{ wildcard_cert.data['tls.crt'] }}
+          tls.key: {{ wildcard_cert.data['tls.key'] }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: cert_copy_result
+      changed_when: "'created' in cert_copy_result.stdout or 'configured' in cert_copy_result.stdout"
+
+    - name: Get Harbor pull secret from default namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret harbor-pull-secret -n default -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: harbor_pull_secret_raw
+      changed_when: false
+      failed_when: harbor_pull_secret_raw.rc != 0
+
+    - name: Parse Harbor pull secret JSON
+      ansible.builtin.set_fact:
+        harbor_pull_secret: "{{ harbor_pull_secret_raw.stdout | from_json }}"
+
+    - name: Copy Harbor pull secret to DevPi namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: harbor-pull-secret
+          namespace: {{ devpi_namespace }}
+        type: {{ harbor_pull_secret.type }}
+        data: {{ harbor_pull_secret.data | to_json }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: harbor_secret_copy_result
+      changed_when: "'created' in harbor_secret_copy_result.stdout or 'configured' in harbor_secret_copy_result.stdout"
+
+    # Clone public DevPi repository
+    - name: Clone DevPi repository on control plane
+      ansible.builtin.git:
+        repo: "https://github.com/thinkube/thinkube-devpi.git"
+        dest: "/tmp/thinkube-devpi"
+        version: "{{ thinkube_ref }}"
+        force: yes
+
+    - name: Build DevPi image with podman on control plane
+      ansible.builtin.shell: |
+        cd /tmp/thinkube-devpi
+        podman build -f dockerfile/Dockerfile -t {{ harbor_registry }}/library/{{ app_name }}:{{ image_tag }} .
+      register: build_result
+
+    - name: Push image to Harbor from control plane
+      ansible.builtin.shell: |
+        podman push {{ harbor_registry }}/library/{{ app_name }}:{{ image_tag }} --tls-verify=false
+      register: push_result
+
+    - name: Create PVC for DevPi packages
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: devpi-data-pvc
+          namespace: {{ devpi_namespace }}
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 50Gi
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: pvc_result
+      changed_when: "'created' in pvc_result.stdout or 'configured' in pvc_result.stdout"
+
+    # Create deployment manifest from template WITHOUT outside-url for initialization
+    - name: Create DevPi deployment manifest (without outside-url)
+      ansible.builtin.template:
+        src: deployment.yaml.j2
+        dest: "/tmp/devpi-deployment.yaml"
+      vars:
+        devpi_image: "{{ harbor_registry }}/library/{{ app_name }}:{{ image_tag }}"
+        devpi_outside_url_enabled: false
+
+    - name: Apply DevPi deployment (without outside-url)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/devpi-deployment.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: deployment_result
+      changed_when: "'created' in deployment_result.stdout or 'configured' in deployment_result.stdout"
+
+    - name: Create DevPi service
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: {{ app_name }}
+          namespace: {{ devpi_namespace }}
+        spec:
+          selector:
+            app: {{ app_name }}
+          ports:
+          - port: 3141
+            targetPort: 3141
+            protocol: TCP
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: service_result
+      changed_when: "'created' in service_result.stdout or 'configured' in service_result.stdout"
+
+    - name: Create nginx headers ConfigMap for DevPi
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: nginx-headers
+          namespace: {{ devpi_namespace }}
+        data:
+          X-Real-IP: "\$remote_addr"
+          X-Forwarded-For: "\$proxy_add_x_forwarded_for"
+          X-Forwarded-Proto: "\$scheme"
+          X-Forwarded-Host: "\$host"
+          X-Outside-URL: "https://\$host"
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: configmap_result
+      changed_when: "'created' in configmap_result.stdout or 'configured' in configmap_result.stdout"
+
+    - name: Create DevPi HTTP HTTPRoute
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: {{ app_name }}-http-httproute
+          namespace: {{ devpi_namespace }}
+        spec:
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ devpi_dashboard_hostname }}"
+          rules:
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: {{ app_name }}
+                  port: 3141
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: http_httproute_result
+      changed_when: "'created' in http_httproute_result.stdout or 'configured' in http_httproute_result.stdout"
+
+    # --- Keycloak login for the dashboard ---
+    # The gateway handles the login itself. An oauth2-proxy route for
+    # /oauth2 on this host would take the gateway's /oauth2/callback, so any
+    # oauth2-proxy route, release and session store is removed.
+    - name: Remove the oauth2-proxy route, release and session store
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete httproute oauth2-proxy-ingress -n {{ devpi_namespace }} --ignore-not-found
+        {{ kubectl_bin }} delete deployment,service ephemeral-redis -n {{ devpi_namespace }} --ignore-not-found
+        if {{ helm_bin }} status oauth2-proxy -n {{ devpi_namespace }} >/dev/null 2>&1; then
+          {{ helm_bin }} uninstall oauth2-proxy -n {{ devpi_namespace }}
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: oauth2_proxy_removal
+      changed_when: "'deleted' in oauth2_proxy_removal.stdout or 'uninstalled' in oauth2_proxy_removal.stdout"
+
+    - name: Create or update the Keycloak client for the dashboard
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ devpi_dashboard_client_id }}"
+        keycloak_client_body:
+          clientId: "{{ devpi_dashboard_client_id }}"
+          enabled: true
+          protocol: openid-connect
+          publicClient: false
+          standardFlowEnabled: true
+          redirectUris:
+            - "https://{{ devpi_dashboard_hostname }}/oauth2/callback"
+          webOrigins:
+            - "https://{{ devpi_dashboard_hostname }}"
+          baseUrl: "https://{{ devpi_dashboard_hostname }}"
+          attributes:
+            post.logout.redirect.uris: "+"
+
+    - name: Require a Keycloak login on the dashboard route
+      ansible.builtin.include_role:
+        name: gateway_oidc
+      vars:
+        gateway_oidc_namespace: "{{ devpi_namespace }}"
+        gateway_oidc_route_names: ["{{ app_name }}-http-httproute"]
+        gateway_oidc_hostname: "{{ devpi_dashboard_hostname }}"
+        gateway_oidc_client_id: "{{ devpi_dashboard_client_id }}"
+        gateway_oidc_client_secret: "{{ keycloak_client_secret }}"
+    # --- end Keycloak login for the dashboard ---
+
+    - name: Create DevPi API HTTPRoute (no auth required)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: {{ app_name }}-api-httproute
+          namespace: {{ devpi_namespace }}
+        spec:
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ devpi_api_hostname }}"
+          rules:
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: {{ app_name }}
+                  port: 3141
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: api_httproute_result
+      changed_when: "'created' in api_httproute_result.stdout or 'configured' in api_httproute_result.stdout"
+
+    - name: Wait for DevPi deployment to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status deployment/{{ app_name }} -n {{ devpi_namespace }} --timeout=300s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: deployment_wait_result
+      changed_when: false
+
+    - name: Delete existing DevPi initialization Job if present
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete job devpi-init -n {{ devpi_namespace }} --ignore-not-found=true --wait=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: job_delete_result
+      changed_when: "'deleted' in job_delete_result.stdout"
+
+    - name: Create DevPi initialization Job
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f - <<EOF
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: devpi-init
+          namespace: {{ devpi_namespace }}
+        spec:
+          ttlSecondsAfterFinished: 300
+          backoffLimit: 3
+          template:
+            spec:
+              restartPolicy: OnFailure
+              imagePullSecrets:
+              - name: harbor-pull-secret
+              containers:
+              - name: devpi-init
+                image: {{ harbor_registry }}/library/{{ app_name }}:{{ image_tag }}
+                command:
+                - bash
+                - -c
+                - |
+                  set -e
+                  echo "Waiting for DevPi server to be ready..."
+                  until python3 -c "import urllib.request; urllib.request.urlopen('http://devpi.{{ devpi_namespace }}.svc.cluster.local:3141/', timeout=2)" > /dev/null 2>&1; do
+                    echo "Waiting..."
+                    sleep 2
+                  done
+                  echo "DevPi server is ready"
+
+                  # Use devpi-api hostname (no OAuth2) for initialization
+                  export DEVPI_CLIENTDIR=/tmp/devpi-init
+                  rm -rf \$DEVPI_CLIENTDIR
+                  mkdir -p \$DEVPI_CLIENTDIR
+
+                  # Connect via internal service (no outside-url rewriting at this point)
+                  devpi use http://devpi.{{ devpi_namespace }}.svc.cluster.local:3141 --clientdir=\$DEVPI_CLIENTDIR
+
+                  # First login with empty password (default for new devpi)
+                  if devpi login root --password='' --clientdir=\$DEVPI_CLIENTDIR 2>&1; then
+                    echo 'Logged in with empty password - setting new password'
+                    devpi user -m root password='{{ admin_password }}' --clientdir=\$DEVPI_CLIENTDIR
+                    echo 'Root user password set'
+                    # Re-login with new password
+                    devpi login root --password='{{ admin_password }}' --clientdir=\$DEVPI_CLIENTDIR
+                  else
+                    echo 'Empty password login failed - trying with admin password'
+                    # Password already set, login with it
+                    devpi login root --password='{{ admin_password }}' --clientdir=\$DEVPI_CLIENTDIR
+                  fi
+
+                  # The mirror resolves a project directly at the PyPI simple page for it.
+                  # Without this it first downloads the list of every project on
+                  # PyPI, times out, and reports the project as absent.
+                  devpi index root/pypi mirror_no_project_list=True --clientdir=\$DEVPI_CLIENTDIR 2>&1 && echo 'Mirror set to resolve projects directly'
+
+                  # Create index (will fail gracefully if it already exists)
+                  if devpi index -c root/{{ devpi_index_name }} bases=root/pypi volatile=False --clientdir=\$DEVPI_CLIENTDIR 2>&1; then
+                    echo 'Index created'
+                  else
+                    echo 'Index creation attempted (may already exist)'
+                  fi
+
+                  echo 'Initialization complete'
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: init_job_create_result
+      changed_when: "'created' in init_job_create_result.stdout or 'configured' in init_job_create_result.stdout"
+
+    - name: Wait for initialization Job to complete
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} wait --for=condition=Complete job/devpi-init -n {{ devpi_namespace }} --timeout=300s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: init_job_result
+      changed_when: false
+
+    - name: Get initialization Job logs
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} logs -n {{ devpi_namespace }} job/devpi-init"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: init_logs
+      changed_when: false
+
+    - name: Display initialization logs
+      ansible.builtin.debug:
+        var: init_logs.stdout_lines
+
+    # Now redeploy with outside-url enabled for proper operation
+    - name: Create DevPi deployment manifest (with outside-url)
+      ansible.builtin.template:
+        src: deployment.yaml.j2
+        dest: "/tmp/devpi-deployment-final.yaml"
+      vars:
+        devpi_image: "{{ harbor_registry }}/library/{{ app_name }}:{{ image_tag }}"
+        devpi_outside_url_enabled: true
+
+    - name: Apply DevPi deployment (with outside-url)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/devpi-deployment-final.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: deployment_final_result
+      changed_when: "'created' in deployment_final_result.stdout or 'configured' in deployment_final_result.stdout"
+
+    - name: Wait for DevPi deployment to be ready (after outside-url enabled)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status deployment/{{ app_name }} -n {{ devpi_namespace }} --timeout=300s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: deployment_final_wait_result
+      changed_when: false
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "DevPi deployment complete"
+          - "-----------------------------------"
+          - "Web interface (Keycloak protected): https://{{ devpi_dashboard_hostname }}"
+          - "API endpoint (direct access): https://{{ devpi_api_hostname }}"
+          - "Container image: {{ harbor_registry }}/library/{{ app_name }}:{{ image_tag }}"
+          - "-----------------------------------"
+          - "Root user: root"
+          - "Root password: the platform admin password (not printed)"
+          - "Default index: root/{{ devpi_index_name }}"
+          - "-----------------------------------"

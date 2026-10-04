@@ -1,0 +1,76 @@
+---
+# Nothing may precede the `---` above, not even a comment. kubeadm splits
+# this file on `---` textually, so a leading comment block becomes a
+# document of its own and kubeadm rejects the file with "kind and
+# apiVersion is mandatory information that must be specified". Every
+# comment, the licence header included, belongs inside a document.
+#
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Thinkube kubeadm InitConfiguration + ClusterConfiguration + KubeletConfiguration
+# Rendered by 10_install_k8s.yaml on the control plane node.
+# API version v1beta4 (K8s 1.31+).
+#
+# API endpoint architecture: everything baked into the cluster
+# (controlPlaneEndpoint, advertiseAddress, cert SANs, Cilium k8sServiceHost)
+# uses the stable dummy IP (k8s_stable_ip on interface k8s0) so the control
+# plane stays movable across networks. Workers reach the same IP through a
+# node-local socket proxy (see 20_join_workers.yaml). Only kubelet's node-ip
+# is the real LAN IP: Node InternalIP is the target for Cilium's VXLAN
+# node-to-node traffic and for apiserver→kubelet (exec/logs/metrics, :10250),
+# neither of which can ride the 6443 proxy.
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "{{ k8s_stable_ip }}"
+  bindPort: 6443
+nodeRegistration:
+  criSocket: "unix:///run/containerd/containerd.sock"
+  imagePullSerial: true
+  kubeletExtraArgs:
+    - name: "node-ip"
+      value: "{{ lan_ip }}"
+
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: "v{{ kubeadm_k8s_patch }}"
+clusterName: "{{ cluster_name }}"
+controlPlaneEndpoint: "{{ k8s_stable_ip }}:6443"
+networking:
+  podSubnet: "{{ pod_cidr }}"
+  serviceSubnet: "{{ service_cidr }}"
+apiServer:
+  certSANs:
+    - "{{ k8s_stable_ip }}"
+    - "127.0.0.1"
+    - "localhost"
+    - "{{ ansible_facts.hostname }}"
+    - "{{ ansible_facts.fqdn }}"
+
+---
+# KubeletConfiguration — same memory protection values for CP and workers.
+# enforceNodeAllocatable=pods only (system-reserved/kube-reserved inform
+# the scheduler but are not cgroup-enforced).
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+maxPods: 500
+systemReserved:
+  memory: 4Gi
+  cpu: 500m
+kubeReserved:
+  memory: 2Gi
+  cpu: 500m
+evictionHard:
+  memory.available: "2Gi"
+  nodefs.available: "10%"
+evictionSoft:
+  memory.available: "4Gi"
+  nodefs.available: "15%"
+evictionSoftGracePeriod:
+  memory.available: 30s
+  nodefs.available: 1m
+enforceNodeAllocatable:
+  - pods

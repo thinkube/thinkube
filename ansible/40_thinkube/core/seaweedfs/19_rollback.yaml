@@ -1,0 +1,186 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/seaweedfs/19_rollback.yaml
+# Description:
+#   Rollback SeaweedFS deployment, removing all resources
+#
+# Requirements:
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/seaweedfs/19_rollback.yaml
+#
+# Variables from inventory:
+#   - seaweedfs_namespace: SeaweedFS namespace
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Rollback SeaweedFS deployment
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: true
+  
+  vars:
+    seaweedfs_namespace: seaweedfs
+    # Admin password for Keycloak cleanup
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    keycloak_ui_client_id: "oauth2-proxy-seaweedfs"
+
+  tasks:
+    - name: Check if SeaweedFS namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ seaweedfs_namespace }}"
+      register: namespace_check
+      failed_when: false
+
+    - name: Delete the Keycloak client of the SeaweedFS web UI
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_client_delete
+      vars:
+        keycloak_client_id: "{{ keycloak_ui_client_id }}"
+
+    # Delete Argo Workflows resources
+    - name: Delete Argo artifact repository ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: artifact-repositories
+        namespace: argo
+        state: absent
+      failed_when: false
+
+    - name: Delete Argo S3 secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: argo-artifacts-s3
+        namespace: argo
+        state: absent
+      failed_when: false
+
+    # Delete HTTPRoutes first
+    - name: Delete SeaweedFS HTTPRoutes
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        namespace: "{{ seaweedfs_namespace }}"
+        state: absent
+        label_selectors:
+          - "app=seaweedfs"
+      when: namespace_check.resources | length > 0
+      failed_when: false
+
+    - name: Delete all HTTPRoutes in namespace
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete httproute -n {{ seaweedfs_namespace }} --all"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: namespace_check.resources | length > 0
+      failed_when: false
+
+    # Delete SeaweedFS deployments and statefulsets
+    - name: Delete SeaweedFS Filer deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: seaweedfs-filer
+        namespace: "{{ seaweedfs_namespace }}"
+        state: absent
+      when: namespace_check.resources | length > 0
+      failed_when: false
+
+    - name: Delete SeaweedFS StatefulSets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        name: "{{ item }}"
+        namespace: "{{ seaweedfs_namespace }}"
+        state: absent
+      loop:
+        - seaweedfs-master
+        - seaweedfs-volume
+      when: namespace_check.resources | length > 0
+      failed_when: false
+
+    # Delete services
+    - name: Delete all services
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete service -n {{ seaweedfs_namespace }} --all"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: namespace_check.resources | length > 0
+      failed_when: false
+
+    # Delete PVCs
+    - name: Delete all PVCs
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete pvc -n {{ seaweedfs_namespace }} --all"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: namespace_check.resources | length > 0
+      failed_when: false
+
+    # Delete secrets
+    - name: Delete all secrets
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete secret -n {{ seaweedfs_namespace }} --all"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: namespace_check.resources | length > 0
+      failed_when: false
+
+    # Delete configmaps
+    - name: Delete all configmaps
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete configmap -n {{ seaweedfs_namespace }} --all"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: namespace_check.resources | length > 0
+      failed_when: false
+
+    # Delete namespace
+    - name: Delete namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ seaweedfs_namespace }}"
+        state: absent
+      when: namespace_check.resources | length > 0
+      register: delete_namespace
+      failed_when: false
+
+    - name: Wait for namespace to be deleted
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ seaweedfs_namespace }}"
+      register: namespace_deleted
+      until: namespace_deleted.resources | length == 0
+      retries: 30
+      delay: 10
+      when: 
+        - namespace_check.resources | length > 0
+        - delete_namespace is changed
+      failed_when: false
+
+    - name: Display rollback summary
+      ansible.builtin.debug:
+        msg:
+          - "SeaweedFS rollback completed"
+          - "Removed namespace: {{ seaweedfs_namespace }}"
+          - "Removed the Keycloak client of the web UI"
+          - "Removed Argo S3 configuration"

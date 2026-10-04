@@ -1,0 +1,625 @@
+#!/bin/bash
+
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+###############################################################################
+# thinkube-wipe.sh
+#
+# Returns tkamd1 (the Kubernetes control plane) to a state as close to a
+# freshly installed Ubuntu Server as the machine allows, so the Thinkube
+# installer can be run against it from scratch with nothing carried over.
+#
+# Run it ON the machine being wiped. Everything needed to use it is in this
+# file; no other notes are required.
+#
+#
+# WHY "AS CLOSE TO FRESH AS POSSIBLE" IS THE GOAL
+# -----------------------------------------------
+# A reinstall is only a test of the installer if the installer is the only
+# thing that put state on the machine. Every file that survives a wipe is a
+# file the installer is never forced to produce correctly, and a file whose
+# staleness will surface later as a failure that looks like something else.
+#
+# That is not hypothetical. A public key from an install two rebuilds earlier
+# survived in ~/shared-code/.ssh. The installer wrote a fresh private key
+# beside it and never touched the public half, so OpenSSH refused to sign
+# with the pair and every node the control plane tried to reach was rejected
+# with no message. The wipe preserved the directory; the installer only
+# overwrote half of it; nothing compared the two.
+#
+# So the rule this script follows: if the installer creates it, this script
+# destroys it. Only what a fresh Ubuntu Server would have is kept.
+#
+#
+# WHAT IS KEPT, AND WHY
+# ---------------------
+#   Ubuntu itself, its packages from the base install, the kernel, netplan
+#   The 'thinkube' account, its home directory, its sudo rights
+#   sshd, and password login (checked before any key is removed)
+#   The account's group memberships, so sudo works with its password
+#   (checked before the passwordless rule is removed)
+#   The NVIDIA driver: it describes the hardware, not the cluster
+#
+# The home directory is emptied and refilled from /etc/skel, which is what a
+# newly created Ubuntu account contains. It is not deleted, because deleting
+# it on a headless machine buys nothing and risks the account.
+#
+# ~/.ssh and ~/.env are copied to /root/thinkube-wipe-keep/ before removal.
+# Root-owned, outside the home, so a mistake is recoverable without weakening
+# the wipe.
+#
+#
+# WHAT IS DESTROYED
+# -----------------
+#   Kubernetes      kubeadm reset, purge kubeadm/kubelet/kubectl, and
+#                   containerd.io only when no other installed package depends
+#                   on it (on DGX OS docker-ce does, and purging it took docker
+#                   and the DGX OS extras with it); nothing is autoremoved;
+#                   /etc/kubernetes, /var/lib/kubelet, /var/lib/etcd, CNI
+#   Container tools podman, buildah, skopeo, podman-compose, podman-toolbox,
+#                   qemu-user-static, binfmt-support, and their state
+#   Overlay         tailscale logged out of the tailnet, then purged, with
+#                   /var/lib/tailscale removed
+#   Storage         SeaweedFS, JuiceFS, OpenEBS/rawfile, and their data
+#   Thinkube system all thinkube-* units, the k8s0 dummy interface, the
+#                   modules-load / sysctl / resolved drop-ins, the Kubernetes
+#                   and Tailscale apt repositories and keyrings
+#   Home            everything under it, including shared-code, replaced by
+#                   the contents of /etc/skel
+#   Sudo            /etc/sudoers.d/thinkube, the passwordless rule the
+#                   installer's SSH setup writes; sudo asks for the password
+#                   again, as on a fresh machine
+#
+# Logging tailscale out matters. Purging the package alone leaves the node
+# registered, so the next install joins as a duplicate and the tailnet fills
+# with offline ghosts of previous rebuilds.
+#
+#
+# THE WORK GUARD
+# --------------
+# shared-code holds every repository this platform is developed in. Because
+# this script deletes it, it refuses to run while any repository under it has
+# uncommitted changes, commits that are not on a remote, or no remote at all.
+# It names them and exits.
+#
+# --i-have-no-work-to-lose skips the guard. It is the only way to lose work
+# with this script, and it has to be typed.
+#
+#
+# WHERE THIS SCRIPT LIVES
+# -----------------------
+# In the thinkube repository, under scripts/. Install it outside the home
+# before running it, so the copy you run is not among the files it deletes:
+#
+#   sudo install -m 755 ~/shared-code/thinkube-platform/core/thinkube/scripts/thinkube-wipe.sh \
+#        /usr/local/sbin/thinkube-wipe
+#
+#
+# DRIVING THE REINSTALL
+# ---------------------
+# From tkspark, over SSH, in a normal shell. NOT from code-server: that runs
+# on tkamd1 and dies the moment kubelet stops, taking the terminal with it.
+# tkspark needs the installer .deb and a copy of ~/.env.
+#
+# tkamd2 and tkspark clean themselves when re-added: the join playbook resets
+# orphaned local state once the control plane positively reports the node as
+# NotFound. Reboot tkspark before re-adding it — only a reboot clears the
+# pinned BPF maps in /sys/fs/bpf.
+#
+#
+# USAGE
+# -----
+#   ./thinkube-wipe.sh --dry-run                       # print, change nothing
+#   sudo ./thinkube-wipe.sh --yes-wipe-this-machine
+#   sudo ./thinkube-wipe.sh --yes-wipe-this-machine --reboot
+#
+#   --keep-home                 empty only Thinkube's own output, leave the
+#                               rest of the home alone (the old behaviour)
+#   --keep-images               keep the container image stores and runtimes:
+#                               /var/lib/containerd, /var/lib/containers,
+#                               ~/.local/share/containers, and containerd.io,
+#                               podman, buildah, skopeo. Everything else still
+#                               goes. The next install reuses layers instead of
+#                               pulling ~50 public images and rebuilding the
+#                               base images, which is the long middle of a run.
+#                               It is NOT a clean-baseline wipe: the install
+#                               that follows does not prove the image steps work
+#                               from nothing, and a changed Containerfile can
+#                               reuse a cached layer. Use it to iterate on the
+#                               steps after the image builds; wipe without it
+#                               before trusting a run as a clean install. The
+#                               survey says so in a box, so a kept-images run
+#                               cannot be mistaken for a clean one later.
+#   --i-have-no-work-to-lose    skip the uncommitted/unpushed guard
+#
+# AFTER IT FINISHES
+# -----------------
+#   1. sudo reboot            (this machine)
+#   2. reboot tkspark         (before it is re-added)
+#   3. on tkspark: thinkube-installer
+#
+# The script ends with a survey of anything it recognises as non-fresh and
+# could not remove. An empty survey is the pass condition.
+#
+###############################################################################
+set -uo pipefail
+
+WIPE_USER="${SUDO_USER:-thinkube}"
+HOME_DIR="/home/${WIPE_USER}"
+KEEP_DIR="/root/thinkube-wipe-keep"
+DRY=0
+CONFIRMED=0
+DO_REBOOT=0
+KEEP_HOME=0
+SKIP_WORK_GUARD=0
+KEEP_IMAGES=0
+
+for a in "$@"; do
+    case "$a" in
+        --dry-run)                 DRY=1 ;;
+        --yes-wipe-this-machine)   CONFIRMED=1 ;;
+        --reboot)                  DO_REBOOT=1 ;;
+        --keep-home)               KEEP_HOME=1 ;;
+        --keep-images)             KEEP_IMAGES=1 ;;
+        --i-have-no-work-to-lose)  SKIP_WORK_GUARD=1 ;;
+        # Everything from the copyright to the end of the header box, found
+        # rather than counted: a hardcoded last line silently truncates the
+        # help the next time the header grows.
+        -h|--help)                 sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d'; exit 0 ;;
+        *) echo "unknown argument: $a" >&2; exit 2 ;;
+    esac
+done
+
+if [ "$DRY" -eq 0 ] && [ "$CONFIRMED" -eq 0 ]; then
+    echo "Refusing to run without --yes-wipe-this-machine (or --dry-run)." >&2
+    echo "Run '$0 --help' for the full explanation." >&2
+    exit 2
+fi
+if [ "$DRY" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+    echo "Must run as root (use sudo)." >&2
+    exit 2
+fi
+
+run() {
+    if [ "$DRY" -eq 1 ]; then echo "  [dry-run] $*"; else "$@" >/dev/null 2>&1 || true; fi
+}
+say() { echo; echo "── $*"; }
+
+say "Preflight"
+echo "  host:  $(hostname)"
+echo "  user:  ${WIPE_USER}"
+echo "  home:  ${HOME_DIR}  ($([ "$KEEP_HOME" -eq 1 ] && echo "kept, Thinkube output only" || echo "emptied to /etc/skel"))"
+[ "$DRY" -eq 1 ] && echo "  MODE:  DRY RUN — nothing will be changed"
+
+if [ "$(hostname)" != "tkamd1" ]; then
+    echo
+    echo "  WARNING: this script is written for tkamd1, the control plane."
+    echo "  tkamd2 and tkspark clean themselves when re-added by the join"
+    echo "  playbook — they only need a reboot. Continue only if you mean to."
+    if [ "$DRY" -eq 0 ]; then
+        read -r -p "  type the hostname to continue: " ans
+        [ "$ans" = "$(hostname)" ] || { echo "  aborted"; exit 1; }
+    fi
+fi
+
+###############################################################################
+# Password login must work before any key is removed, or a headless machine
+# becomes unreachable the moment this finishes.
+###############################################################################
+say "Checking password login is available"
+if [ "$(id -u)" -ne 0 ]; then
+    echo "  skipped: 'sshd -T' needs root, and this is a dry run as ${WIPE_USER}"
+elif sshd -T 2>/dev/null | grep -qi '^passwordauthentication yes'; then
+    echo "  sshd: passwordauthentication yes"
+else
+    echo "  sshd does NOT accept passwords."
+    echo "  Removing the SSH keys would leave this machine unreachable."
+    echo "  Enable PasswordAuthentication, or run with --keep-home."
+    [ "$KEEP_HOME" -eq 0 ] && exit 1
+fi
+
+###############################################################################
+# Sudo must work with a password before the passwordless rule is removed, or
+# the machine is left without a way to become root.
+###############################################################################
+say "Checking sudo works with a password"
+if ! id -nG "${WIPE_USER}" | tr ' ' '\n' | grep -qx sudo; then
+    echo "  ${WIPE_USER} is not in the sudo group."
+    echo "  Removing /etc/sudoers.d/${WIPE_USER} would leave no way to use sudo."
+    echo "  Add it with: usermod -aG sudo ${WIPE_USER}"
+    [ "$DRY" -eq 0 ] && exit 1
+elif [ "$(id -u)" -ne 0 ]; then
+    echo "  in the sudo group; the password status needs root, and this is a dry run as ${WIPE_USER}"
+elif [ "$(passwd -S "${WIPE_USER}" | awk '{print $2}')" != "P" ]; then
+    echo "  ${WIPE_USER} has no usable password (passwd -S: $(passwd -S "${WIPE_USER}" | awk '{print $2}'))."
+    echo "  Without the passwordless rule, sudo would ask for a password that does not exist."
+    echo "  Set one with: passwd ${WIPE_USER}"
+    [ "$DRY" -eq 0 ] && exit 1
+else
+    echo "  ${WIPE_USER}: in the sudo group, password set"
+fi
+
+###############################################################################
+# Nothing under shared-code may be lost.
+###############################################################################
+if [ "$KEEP_HOME" -eq 0 ] && [ "$SKIP_WORK_GUARD" -eq 0 ]; then
+    say "Checking every repository under shared-code is committed and pushed"
+    unsaved=0
+    while IFS= read -r gitdir; do
+        d=$(dirname "$gitdir")
+        dirty=$(git -C "$d" status --porcelain 2>/dev/null | wc -l)
+        unpushed=$(git -C "$d" log --branches --not --remotes --oneline 2>/dev/null | wc -l)
+        remotes=$(git -C "$d" remote 2>/dev/null | wc -l)
+        if [ "$dirty" -gt 0 ] || [ "$unpushed" -gt 0 ] || [ "$remotes" -eq 0 ]; then
+            printf "  %-58s dirty=%s unpushed=%s remotes=%s\n" \
+                   "${d#"${HOME_DIR}/shared-code/"}" "$dirty" "$unpushed" "$remotes"
+            unsaved=$((unsaved + 1))
+        fi
+    done < <(find "${HOME_DIR}/shared-code" -maxdepth 4 -name .git \
+                  -not -path "*/node_modules/*" 2>/dev/null)
+
+    if [ "$unsaved" -gt 0 ]; then
+        echo
+        echo "  ${unsaved} repositories hold work that only exists on this machine."
+        echo "  This script deletes shared-code. Commit and push them first."
+        echo "  A repository with no remote cannot be pushed anywhere — move it,"
+        echo "  or accept the loss with --i-have-no-work-to-lose."
+        [ "$DRY" -eq 0 ] && exit 1
+        echo "  [dry-run] a real run would stop here"
+    else
+        echo "  clean: every repository is committed and pushed"
+    fi
+fi
+
+###############################################################################
+# Kubernetes layer. Reset first: kubeadm is gone after the purge.
+###############################################################################
+# kubeadm reset removes containers over CRI with no timeout and hangs when a
+# pod is wedged (a kubeadm bug open since 2018). The same sequence as
+# 19_rollback_control.yaml leaves it nothing to talk to: stop kubelet, drop the
+# static pod manifests, kill the control-plane processes, remove every pod and
+# container, restart containerd to clear its CRI state, then reset.
+say "Stopping kubelet and the control-plane static pods"
+run systemctl stop kubelet
+run systemctl disable kubelet
+run rm -f /etc/kubernetes/manifests/kube-apiserver.yaml \
+          /etc/kubernetes/manifests/kube-controller-manager.yaml \
+          /etc/kubernetes/manifests/kube-scheduler.yaml \
+          /etc/kubernetes/manifests/etcd.yaml
+for proc in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+    run pkill -9 -x "$proc"
+done
+if [ "$DRY" -eq 0 ]; then
+    for _ in $(seq 1 15); do
+        ss -ltn 2>/dev/null | grep -q ':6443 ' || break
+        sleep 1
+    done
+fi
+
+CRI="unix:///run/containerd/containerd.sock"
+if command -v crictl >/dev/null 2>&1; then
+    say "Force-stopping pods and containers (crictl)"
+    for id in $(crictl -r "$CRI" pods -q 2>/dev/null); do run crictl -r "$CRI" stopp "$id"; done
+    for id in $(crictl -r "$CRI" ps -aq 2>/dev/null); do run crictl -r "$CRI" stop "$id"; done
+    run crictl -r "$CRI" rmp --all --force
+    run crictl -r "$CRI" rm --all --force
+fi
+if systemctl is-active --quiet containerd 2>/dev/null; then
+    say "Restarting containerd to clear its CRI state"
+    run systemctl restart containerd
+    [ "$DRY" -eq 0 ] && sleep 3
+fi
+
+say "kubeadm reset"
+if command -v kubeadm >/dev/null 2>&1; then
+    run kubeadm reset --force --cri-socket "$CRI"
+else
+    echo "  kubeadm not installed; nothing to reset"
+fi
+
+###############################################################################
+# Leave the tailnet before the client is removed, or the node stays registered
+# and the next install joins as a duplicate.
+###############################################################################
+say "Leaving the Tailscale network"
+if command -v tailscale >/dev/null 2>&1; then
+    run tailscale logout
+    run tailscale down
+else
+    echo "  tailscale not installed"
+fi
+
+say "Purging packages the installer added"
+PURGE_PKGS="kubeadm kubelet kubectl \
+            podman-compose podman-toolbox \
+            qemu-user-static binfmt-support \
+            tailscale tailscale-archive-keyring \
+            sshpass s3cmd apache2-utils"
+# Purging these four takes their image stores with them, so --keep-images keeps
+# the runtimes installed. The installer reinstalls them either way; what is
+# being kept is the layers underneath, not the packages. They are appended
+# rather than filtered out: podman-compose and podman-toolbox contain the word
+# podman, so stripping by name clipped them into '-compose' and '-toolbox'.
+# containerd.io is Docker's containerd package. On DGX OS docker-ce depends on
+# it, and purging it there removed docker and, through autoremove, the DGX OS
+# packages only docker kept installed (nvidia-system-extra, nv-docker-options,
+# rasdaemon, ...). It goes only when nothing else installed depends on it, and
+# nothing is ever autoremoved: the leftovers are small, that damage was not.
+CONTAINERD_USERS=$(apt-cache rdepends --installed --important containerd.io 2>/dev/null \
+    | awk 'f && NF {sub(/^[ |]+/, ""); print} /^Reverse Depends:/ {f=1}' | sort -u | paste -sd' ')
+if [ "$KEEP_IMAGES" -eq 0 ]; then
+    PURGE_PKGS="$PURGE_PKGS podman buildah skopeo"
+    if [ -z "$CONTAINERD_USERS" ]; then
+        PURGE_PKGS="$PURGE_PKGS containerd.io"
+    else
+        echo "  keeping containerd.io: ${CONTAINERD_USERS} depend on it"
+    fi
+else
+    echo "  keeping containerd.io, podman, buildah and skopeo (--keep-images)"
+fi
+run apt-mark unhold ${PURGE_PKGS}
+if [ "$DRY" -eq 1 ]; then
+    echo "  [dry-run] apt-get purge -y ${PURGE_PKGS}"
+else
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y ${PURGE_PKGS} >/dev/null 2>&1 || true
+fi
+
+say "Unmounting leftover kubelet pod volumes"
+if [ "$DRY" -eq 1 ]; then
+    awk '/\/var\/lib\/kubelet/ {print "  [dry-run] umount -l " $2}' /proc/mounts
+else
+    awk '/\/var\/lib\/kubelet/ {print $2}' /proc/mounts | sort -r \
+        | xargs -r umount -l 2>/dev/null || true
+fi
+
+say "Removing cluster and runtime state"
+# /var/lib/containerd and /var/lib/containers are the image stores: containerd's
+# for what Kubernetes runs, podman's for what the image builds produce. Both are
+# content addressed and re-derivable, which is why --keep-images may spare them
+# while every other directory here still goes.
+STATE_DIRS="/etc/kubernetes /etc/cni \
+            /var/lib/kubelet /var/lib/etcd \
+            /var/lib/tailscale /var/lib/cni \
+            /var/openebs /var/lib/rawfile-localpv /var/csi /var/local/openebs \
+            /opt/cni /opt/containerd"
+# A shared containerd keeps /etc/containerd and its store: docker's containers
+# live in that store, and the next install renders config.toml again.
+if [ -n "$CONTAINERD_USERS" ]; then
+    echo "  keeping /etc/containerd and /var/lib/containerd: ${CONTAINERD_USERS} use containerd"
+elif [ "$KEEP_IMAGES" -eq 0 ]; then
+    STATE_DIRS="$STATE_DIRS /etc/containerd /var/lib/containerd /var/lib/containers"
+else
+    STATE_DIRS="$STATE_DIRS /etc/containerd"
+    echo "  keeping /var/lib/containerd and /var/lib/containers (--keep-images)"
+fi
+for d in $STATE_DIRS; do
+    echo "  rm -rf $d"; run rm -rf "$d"
+done
+
+say "Removing SeaweedFS / JuiceFS data and build caches"
+for d in /ssd/object_store /ssd/seaweed-master /storage/filer_store /storage/logs \
+         /var/lib/juicefs /var/jfsCache \
+         /var/lib/jupyterhub-venvs /var/lib/thinkube; do
+    echo "  rm -rf $d"; run rm -rf "$d"
+done
+
+###############################################################################
+# Thinkube-owned system configuration
+###############################################################################
+say "Removing Thinkube systemd units, dummy interface and drop-ins"
+run systemctl disable --now k8s-api-proxy.socket k8s-api-proxy.service \
+    thinkube-node-ip-sync.timer thinkube-node-ip-sync.service \
+    thinkube-node-ip-sync-watch.service \
+    thinkube-link-watchdog.timer thinkube-link-watchdog.service
+run rm -f /etc/systemd/system/k8s-api-proxy.socket \
+          /etc/systemd/system/k8s-api-proxy.service \
+          /etc/systemd/system/thinkube-node-ip-sync.timer \
+          /etc/systemd/system/thinkube-node-ip-sync.service \
+          /etc/systemd/system/thinkube-node-ip-sync-watch.service \
+          /etc/systemd/system/thinkube-link-watchdog.timer \
+          /etc/systemd/system/thinkube-link-watchdog.service \
+          /usr/local/bin/thinkube-node-ip-sync \
+          /usr/local/bin/thinkube-link-watchdog \
+          /etc/systemd/network/10-k8s-dummy.netdev \
+          /etc/systemd/network/10-k8s-dummy.network \
+          /etc/modules-load.d/thinkube-k8s.conf \
+          /etc/sysctl.d/99-thinkube-k8s.conf \
+          /etc/systemd/resolved.conf.d/10-thinkube.conf
+run systemctl daemon-reload
+
+say "Removing the apt repositories and keyrings the installer added"
+run rm -f /etc/apt/sources.list.d/kubernetes.list \
+          /etc/apt/sources.list.d/docker.list \
+          /etc/apt/sources.list.d/tailscale.list \
+          /etc/apt/keyrings/kubernetes-apt-keyring.gpg \
+          /etc/apt/keyrings/tailscale-archive-keyring.gpg \
+          /usr/share/keyrings/tailscale-archive-keyring.gpg
+run apt-get update
+
+say "Resetting UFW to its packaged state"
+run ufw --force disable
+run ufw --force reset
+
+say "Removing the passwordless sudo rule the installer added"
+echo "  rm -f /etc/sudoers.d/${WIPE_USER}"
+run rm -f "/etc/sudoers.d/${WIPE_USER}"
+
+###############################################################################
+# The home directory
+###############################################################################
+if [ "$KEEP_HOME" -eq 1 ]; then
+    say "Removing Thinkube leftovers from ${HOME_DIR} (--keep-home)"
+    for p in "${HOME_DIR}/.kube" \
+             "${HOME_DIR}/.ansible" \
+             "${HOME_DIR}/.ansible_async" \
+             "${HOME_DIR}/.thinkube-installer" \
+             "${HOME_DIR}/.local/bin/kubectl" \
+             "${HOME_DIR}/.local/bin/helm" \
+             "${HOME_DIR}/.ssh/thinkube_cluster_key" \
+             "${HOME_DIR}/.ssh/thinkube_cluster_key.pub" \
+             "${HOME_DIR}/shared-code/.ssh" \
+             "${HOME_DIR}/shared-code/.ansible" \
+             "${HOME_DIR}/shared-code/.kube" \
+             "${HOME_DIR}/shared-code/conformance-results"; do
+        echo "  rm -rf $p"; run rm -rf "$p"
+    done
+    echo "  kept: ~/.env, ~/shared-code and every repository under it"
+else
+    say "Preserving credentials outside the home"
+    echo "  ${KEEP_DIR}/"
+    run mkdir -p "${KEEP_DIR}"
+    run chmod 700 "${KEEP_DIR}"
+    [ -d "${HOME_DIR}/.ssh" ] && run cp -a "${HOME_DIR}/.ssh" "${KEEP_DIR}/ssh"
+    [ -f "${HOME_DIR}/.env" ] && run cp -a "${HOME_DIR}/.env" "${KEEP_DIR}/env"
+
+    say "Emptying ${HOME_DIR} and refilling it from /etc/skel"
+    # Rootless podman keeps its layers under the home, so emptying the home
+    # takes them too. With --keep-images the store is moved out of the way and
+    # put back after the refill, which is the third place images would otherwise
+    # be destroyed, after the package purge and /var/lib.
+    ROOTLESS_STORE="${HOME_DIR}/.local/share/containers"
+    STASHED_STORE="${KEEP_DIR}/rootless-containers"
+    if [ "$DRY" -eq 1 ]; then
+        echo "  [dry-run] rm -rf ${HOME_DIR}/* ${HOME_DIR}/.[!.]*"
+        echo "  [dry-run] cp -a /etc/skel/. ${HOME_DIR}/"
+        [ "$KEEP_IMAGES" -eq 1 ] && [ -d "$ROOTLESS_STORE" ] \
+            && echo "  [dry-run] keep ${ROOTLESS_STORE} across the refill"
+    else
+        if [ "$KEEP_IMAGES" -eq 1 ] && [ -d "$ROOTLESS_STORE" ]; then
+            rm -rf "$STASHED_STORE"
+            mkdir -p "$(dirname "$STASHED_STORE")"
+            mv "$ROOTLESS_STORE" "$STASHED_STORE"
+            echo "  keeping ${ROOTLESS_STORE} (--keep-images)"
+        fi
+        find "${HOME_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        cp -a /etc/skel/. "${HOME_DIR}/" 2>/dev/null || true
+        chown -R "${WIPE_USER}:${WIPE_USER}" "${HOME_DIR}"
+        chmod 750 "${HOME_DIR}"
+        # Put the image store back only AFTER the chown above. Rootless podman
+        # stores a container's uid N as the user's subordinate uid 100000+N-1,
+        # so a recursive chown over the store flattens every layer to uid 1000
+        # — container root — and every cached layer that creates files for
+        # another user is silently broken. That happened on 2026-10-01: the
+        # next `podman build` failed at its first step run as the image's
+        # user, "mkdir: cannot create directory '/home/thinkube'".
+        if [ "$KEEP_IMAGES" -eq 1 ] && [ -d "$STASHED_STORE" ]; then
+            mkdir -p "$(dirname "$ROOTLESS_STORE")"
+            chown "${WIPE_USER}:${WIPE_USER}" "$(dirname "$ROOTLESS_STORE")" "${HOME_DIR}/.local" 2>/dev/null || true
+            mv "$STASHED_STORE" "$ROOTLESS_STORE"
+        fi
+    fi
+    echo "  a copy of the old ~/.ssh and ~/.env is in ${KEEP_DIR}"
+fi
+
+###############################################################################
+# Survey. An empty survey is the pass condition.
+###############################################################################
+say "Survey of state this script recognises as non-fresh"
+left=0
+note() { echo "  $*"; left=$((left + 1)); }
+
+SURVEY_DIRS="/etc/kubernetes /etc/cni /var/lib/kubelet \
+             /var/lib/etcd /var/lib/tailscale \
+             /var/local/openebs /opt/cni /opt/containerd \
+             /ssd/object_store /storage/filer_store"
+# The image stores were kept on purpose, so they are not failures of the wipe.
+# They are reported separately below, because a run that kept them is not a
+# clean-baseline run and should never be mistaken for one later.
+if [ -n "$CONTAINERD_USERS" ]; then
+    SURVEY_DIRS="$SURVEY_DIRS /var/lib/containers"
+elif [ "$KEEP_IMAGES" -eq 0 ]; then
+    SURVEY_DIRS="$SURVEY_DIRS /etc/containerd /var/lib/containerd /var/lib/containers"
+else
+    SURVEY_DIRS="$SURVEY_DIRS /etc/containerd"
+fi
+for d in $SURVEY_DIRS; do
+    [ -e "$d" ] && note "still present: $d"
+done
+
+[ -e "/etc/sudoers.d/${WIPE_USER}" ] && note "still present: /etc/sudoers.d/${WIPE_USER}"
+
+SURVEY_PKGS="kubeadm kubelet kubectl tailscale"
+if [ "$KEEP_IMAGES" -eq 0 ]; then
+    SURVEY_PKGS="$SURVEY_PKGS podman buildah skopeo"
+    [ -z "$CONTAINERD_USERS" ] && SURVEY_PKGS="$SURVEY_PKGS containerd.io"
+fi
+for p in $SURVEY_PKGS; do
+    dpkg -l "$p" 2>/dev/null | grep -q '^ii' && note "still installed: $p"
+done
+
+for u in k8s-api-proxy thinkube-node-ip-sync thinkube-link-watchdog; do
+    systemctl list-unit-files 2>/dev/null | grep -q "^${u}" && note "unit still known: $u"
+done
+
+if [ "$KEEP_HOME" -eq 0 ]; then
+    while IFS= read -r e; do
+        b=$(basename "$e")
+        # ~/.local is back only because the rootless image store was put back
+        # inside it; it is not leftover state the wipe failed to remove.
+        [ "$KEEP_IMAGES" -eq 1 ] && [ "$b" = ".local" ] && continue
+        [ -e "/etc/skel/$b" ] || note "not in /etc/skel: ~/$b"
+    done < <(find "${HOME_DIR}" -mindepth 1 -maxdepth 1 2>/dev/null)
+fi
+
+# Any private key whose public half does not match it will break SSH
+# silently, exactly as it did before this check existed.
+while IFS= read -r key; do
+    [ -f "${key}.pub" ] || continue
+    if [ "$(ssh-keygen -y -f "$key" 2>/dev/null | awk '{print $1" "$2}')" \
+       != "$(awk '{print $1" "$2}' "${key}.pub" 2>/dev/null)" ]; then
+        note "key pair does not match: $key"
+    fi
+done < <(find "${HOME_DIR}" /root -maxdepth 4 -name '*_key' -o -name 'id_*' 2>/dev/null | grep -v '\.pub$')
+
+if [ "$left" -eq 0 ]; then
+    if [ "$KEEP_IMAGES" -eq 1 ]; then
+        echo "  nothing found apart from the image stores, which were kept"
+    else
+        echo "  nothing found — the machine matches the fresh-Ubuntu checklist"
+    fi
+fi
+
+if [ "$KEEP_IMAGES" -eq 1 ]; then
+    cat <<EOF
+
+  ########################################################################
+  #  --keep-images was used: THIS IS NOT A CLEAN-BASELINE WIPE           #
+  #                                                                      #
+  #  Kept: /var/lib/containerd, /var/lib/containers,                     #
+  #        ~/.local/share/containers, and the container runtimes         #
+  #                                                                      #
+  #  The install that follows reuses layers it did not pull or build,    #
+  #  so it does not prove the image steps work from nothing. Good for    #
+  #  iterating on what comes after them; not evidence of a clean         #
+  #  install. Wipe without this flag before trusting a run as one.       #
+  ########################################################################
+EOF
+fi
+
+###############################################################################
+say "Complete"
+cat <<EOF
+
+  Still present: Ubuntu, the '${WIPE_USER}' account, its home, sudo (with
+  the password), sshd, password login, netplan, and the NVIDIA driver.
+
+  NOT cleared by this script — only a reboot clears them:
+    pinned BPF maps in /sys/fs/bpf
+    the cilium_* and k8s0 interfaces
+    tmpfs runtime directories
+
+  Next:
+    1. sudo reboot                 (this machine)
+    2. reboot tkspark              (before it is re-added; its BPF state is
+                                    the fault this rebuild exists to escape)
+    3. on tkspark: thinkube-installer
+       tkamd2 and tkspark are reset automatically by the join playbook.
+EOF
+
+if [ "$DO_REBOOT" -eq 1 ] && [ "$DRY" -eq 0 ]; then
+    echo
+    echo "  rebooting in 5s (Ctrl-C to cancel)"
+    sleep 5
+    reboot
+fi

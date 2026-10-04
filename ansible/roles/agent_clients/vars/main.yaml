@@ -1,0 +1,140 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# The MCP servers every agentic client of Thinkube IDE connects to. This list
+# is the only place a server is named: opencode's opencode.json, Pi's mcp.json
+# and confirmation extension, and Claude Code's user-scope registration are all
+# rendered from it. Adding a server is adding an entry here.
+#
+# name:            server name; the clients derive their tool names from it
+# description:     one sentence on what the server offers (Pi lists it)
+# transport:       http (streamable HTTP) or stdio
+# url:             http only
+# bearer_token_env: http only, optional; the environment variable holding the
+#                   bearer token. The code-server pod carries it (set by
+#                   thinkube-control/17_configure_discovery.yaml). opencode and
+#                   Pi read it at run time; Claude Code is given its value.
+# command, args:   stdio only
+# read_only_tools: patterns (* matches any characters) of the tools that only
+#                  read. Every other tool of the server asks before it runs:
+#                  opencode through its permission rules, Pi through the
+#                  thinkube-confirm extension, and Pi without a UI blocks it.
+agent_mcp_servers:
+  - name: thinkube-control
+    description: Operate the Thinkube platform - services, apps, templates, models, images, secrets and notebooks.
+    transport: http
+    url: "https://control.{{ domain_name }}/mcp"
+    bearer_token_env: THINKUBE_API_TOKEN
+    read_only_tools:
+      - "get_*"
+      - "list_*"
+      - "search_*"
+      - "check_*"
+      - "download_*"
+      - "resolve_llm_model"
+      - "jupyter_list_*"
+      - "jupyter_read_cell"
+      - "jupyter_kernel_status"
+      - "jupyter_notebook_status"
+      - "jupyter_check_*"
+      - "notebook_job_status"
+  - name: tk-package-version
+    description: Latest versions of npm, PyPI, Go and Cargo packages and container images.
+    transport: http
+    url: "https://control.{{ domain_name }}/tk-package-version/mcp"
+    read_only_tools:
+      - "*"
+  # The --secrets file is written by code-server/15_configure_environment.yaml;
+  # it holds THINKUBE_PASSWORD, the Keycloak password the browser types when
+  # signing in to Thinkube apps.
+  - name: playwright
+    description: A headless Chromium browser to open and test web apps.
+    transport: stdio
+    command: /home/thinkube/.npm-global/bin/playwright-mcp
+    args:
+      - --headless
+      - --executable-path
+      - /usr/bin/chromium-browser
+      - --secrets
+      - /home/thinkube/.config/playwright-mcp/secrets.env
+    read_only_tools:
+      - "browser_snapshot"
+      - "browser_take_screenshot"
+      - "browser_console_messages"
+      - "browser_network_requests"
+      - "browser_network_request"
+      - "browser_tabs"
+      - "browser_find"
+      - "browser_wait_for"
+
+# The global operating instructions, in the order AGENTS.md carries them.
+# Each is a file under files/instructions/ or, for .j2, templates/instructions/.
+agent_instruction_parts:
+  - git-policy.md
+  - infra-policy.md
+  - code-comments-policy.md
+  - no-deferral-policy.md
+  - answer-policy.md
+  - plain-english-policy.md
+  - no-fallback-policy.md
+  - ci-cd-policy.md
+  - operations-policy.md
+  - browser-login.md.j2
+
+# The LLM gateway's OpenAI-compatible base URL (thinkube-control's llm-proxy).
+# Clients name models only by the aliases in
+# 40_thinkube/core/thinkube-control/vars/model_aliases.yaml.
+agent_gateway_url: "https://llm.{{ domain_name }}/v1"
+
+# Where the home of the code-server pod lives on the node: the pod mounts it at
+# /home/thinkube.
+agent_home_host_path: "/home/{{ system_username }}/shared-code"
+agent_home_pod_path: /home/thinkube
+
+# Example extensions of the Pi package in the image that every Pi loads; each
+# is linked into ~/.pi/agent/extensions, so it follows the image's Pi version.
+#   permission-gate.ts: asks before rm -rf, sudo, chmod/chown 777 in bash;
+#                       blocks them where there is nobody to ask
+#   subagent:           the subagent tool: Pi hands a task to the agents in
+#                       files/pi-agents, each a separate pi process
+agent_pi_package_dir: /opt/agent-clients/node_modules/@earendil-works/pi-coding-agent
+agent_pi_example_extensions:
+  - permission-gate.ts
+  - subagent
+agent_pi_subagents:
+  - scout
+  - planner
+  - reviewer
+  - worker
+
+# Files the clients read, relative to the home.
+agent_opencode_dir: .config/opencode
+agent_pi_dir: .pi/agent
+agent_claude_dir: .claude
+agent_vscode_user_dir: .local/share/code-server/User
+
+# VS Code's chat panel opens without a GitHub account only once a bring-your-
+# own-key model is configured. The Pi and opencode chats (thinkube-tandem-chat)
+# bring their own model entries, so the panel gets a placeholder named "No
+# model", with no key: VS Code's own agent cannot use it. chat.defaultModel
+# selects it for new chats of VS Code's own agent, in place of Copilot's
+# "Auto". Utility calls (chat titles) go to it too, so none goes to GitHub's
+# models.
+agent_vscode_placeholder_model:
+  name: No model
+  vendor: customendpoint
+  apiType: chat-completions
+  models:
+    - id: no-model
+      name: No model
+      url: "{{ agent_gateway_url }}/chat/completions"
+      toolCalling: true
+      vision: false
+      maxOutputTokens: 1024
+agent_vscode_settings:
+  chat.disableAIFeatures: false
+  chat.defaultModel: no-model
+  chat.utilityModel: customendpoint/no-model
+  chat.utilitySmallModel: customendpoint/no-model
+  telemetry.telemetryLevel: "off"

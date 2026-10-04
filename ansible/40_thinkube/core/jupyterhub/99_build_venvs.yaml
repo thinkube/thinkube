@@ -1,0 +1,229 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# ansible/40_thinkube/core/jupyterhub/99_build_venvs.yaml
+#
+# PURPOSE:
+#   Build pre-packaged Python virtualenvs for JupyterHub and upload to GitHub.
+#   Builds for all GPU architectures in the cluster (arm64, amd64) sequentially.
+#   Fully automated - waits for build completion and uploads to GitHub releases.
+#
+# REQUIREMENTS:
+#   - tk-jupyter-base image built and pushed to Harbor (multi-arch)
+#   - kubectl access to the cluster
+#   - GPU nodes available for each target architecture
+#   - gh CLI authenticated (gh auth login)
+#
+# NOTE: This playbook is self-contained. It creates its own temporary PVC
+#       for the build and cleans it up afterward. No dependency on 11_deploy.yaml.
+#
+# USAGE:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/jupyterhub/99_build_venvs.yaml
+#
+# OUTPUT:
+#   Venv tarballs uploaded to GitHub release at:
+#   https://github.com/thinkube/thinkube-venvs/releases/tag/{version}
+#
+# 🤖 [AI-assisted]
+
+---
+- name: Build and Upload Jupyter Virtualenvs (multi-arch)
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars_files:
+    - vars/venvs.yaml
+
+  vars:
+    build_namespace: "jupyterhub"
+    build_pvc_name: "venvs-build-temp"
+    github_repo: "thinkube/thinkube-venvs"
+    local_output_dir: "/tmp/venvs-output-{{ ansible_facts.date_time.epoch }}"
+    build_architectures:
+      - arm64
+      - amd64
+
+  tasks:
+    - name: Ensure namespace exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ build_namespace }}"
+
+    - name: Create local output directory
+      ansible.builtin.file:
+        path: "{{ local_output_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+
+    - name: Display build info
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════
+          Building Jupyter Venvs {{ jupyter_venvs_version }} (multi-arch)
+          ════════════════════════════════════════════════════════════════
+
+          Architectures: {{ build_architectures | join(', ') }}
+
+          This playbook will:
+          1. Build venvs sequentially for each architecture (20-40 min each)
+          2. Copy tarballs to local filesystem
+          3. Upload to GitHub release automatically
+
+          GitHub repo: {{ github_repo }}
+
+    - name: Check gh CLI is authenticated
+      ansible.builtin.command: gh auth status
+      register: gh_auth
+      failed_when: gh_auth.rc != 0
+      changed_when: false
+      delegate_to: localhost
+
+    - name: Check if GitHub repo exists
+      ansible.builtin.command: gh repo view {{ github_repo }}
+      register: repo_check
+      failed_when: false
+      changed_when: false
+      delegate_to: localhost
+
+    - name: Create GitHub repo if it doesn't exist
+      ansible.builtin.command: >
+        gh repo create {{ github_repo }}
+        --public
+        --description "Pre-built Python virtualenvs for Thinkube JupyterHub"
+      when: repo_check.rc != 0
+      delegate_to: localhost
+
+    - name: Check if repo has commits (releases require non-empty repo)
+      ansible.builtin.shell: |
+        result=$(gh api repos/{{ github_repo }}/commits --jq 'length' 2>&1)
+        if echo "$result" | grep -q "empty"; then
+          echo "empty"
+        else
+          echo "$result"
+        fi
+      register: repo_commits
+      failed_when: false
+      changed_when: false
+      delegate_to: localhost
+
+    - name: Initialize repo with README (required for releases)
+      ansible.builtin.shell: |
+        set -e
+        cd /tmp && rm -rf thinkube-venvs
+        git clone git@github.com:{{ github_repo }}.git thinkube-venvs
+        cd thinkube-venvs
+        echo "# Thinkube Venvs" > README.md
+        echo "" >> README.md
+        echo "Pre-built Python virtualenvs for Thinkube JupyterHub." >> README.md
+        git add README.md
+        git commit -m "Initial commit"
+        git push origin main
+        cd /tmp && rm -rf thinkube-venvs
+      when: repo_commits.stdout | trim == "empty"
+      delegate_to: localhost
+
+    - name: Copy build script to ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: venvs-build-script
+            namespace: "{{ build_namespace }}"
+          data:
+            build-venvs.sh: "{{ lookup('file', playbook_dir + '/scripts/build-venvs.sh') }}"
+            venv-packages.txt: "{{ lookup('file', playbook_dir + '/venv-packages.txt') }}"
+
+    # ================================================================
+    # Build venvs for each architecture sequentially
+    # ================================================================
+    - name: "Build venvs for {{ item }}"
+      ansible.builtin.include_tasks: tasks/build_venvs_for_arch.yaml
+      loop: "{{ build_architectures }}"
+      loop_control:
+        loop_var: target_arch
+
+    # ================================================================
+    # Upload tarballs to GitHub
+    # ================================================================
+    - name: List downloaded tarballs
+      ansible.builtin.find:
+        paths: "{{ local_output_dir }}"
+        patterns: "*.tar.gz"
+      register: tarballs
+      delegate_to: localhost
+
+    - name: Display tarballs found
+      ansible.builtin.debug:
+        msg: "Found {{ tarballs.files | length }} tarballs: {{ tarballs.files | map(attribute='path') | map('basename') | list }}"
+
+    - name: Check if GitHub release already exists
+      ansible.builtin.command: gh release view {{ jupyter_venvs_version }} --repo {{ github_repo }}
+      register: release_exists
+      failed_when: false
+      changed_when: false
+      delegate_to: localhost
+
+    - name: Delete existing GitHub release to replace assets
+      ansible.builtin.command: gh release delete {{ jupyter_venvs_version }} --repo {{ github_repo }} --yes
+      when: release_exists.rc == 0
+      delegate_to: localhost
+
+    - name: Create GitHub release
+      ansible.builtin.shell: |
+        gh release create {{ jupyter_venvs_version }} \
+          --repo {{ github_repo }} \
+          --title "Jupyter Venvs {{ jupyter_venvs_version }}" \
+          --notes "Pre-built Python virtualenvs for JupyterHub.
+
+        These venvs inherit PyTorch from the tk-jupyter-base image via --system-site-packages.
+
+        Venvs included:
+        - **fine-tuning**: Base ML + fine-tuning packages (bitsandbytes, peft, trl, unsloth)
+        - **agent-dev**: Base ML + agent frameworks (langchain, crewai, langgraph, etc.)
+
+        Architectures: {{ build_architectures | join(', ') }}"
+      delegate_to: localhost
+
+    - name: Upload tarballs to GitHub release
+      ansible.builtin.command: >
+        gh release upload {{ jupyter_venvs_version }} {{ item.path }}
+        --repo {{ github_repo }}
+        --clobber
+      loop: "{{ tarballs.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      delegate_to: localhost
+
+    - name: Clean up local output directory
+      ansible.builtin.file:
+        path: "{{ local_output_dir }}"
+        state: absent
+      delegate_to: localhost
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+
+          ════════════════════════════════════════════════════════════════
+          Venvs Build and Upload Complete!
+          ════════════════════════════════════════════════════════════════
+
+          Version: {{ jupyter_venvs_version }}
+          Architectures: {{ build_architectures | join(', ') }}
+          GitHub Release: https://github.com/{{ github_repo }}/releases/tag/{{ jupyter_venvs_version }}
+
+          Uploaded tarballs:
+          {% for tarball in tarballs.files %}
+            - {{ tarball.path | basename }}
+          {% endfor %}
+
+          JupyterHub pods will automatically download these venvs on startup.
+
+          ════════════════════════════════════════════════════════════════

@@ -1,0 +1,373 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/postgresql/10_deploy.yaml
+# Description:
+#   Deploy PostgreSQL database using Quay.io container image with SSL support
+#
+# Requirements:
+#   - Kubernetes (kubeadm) cluster
+#   - TLS certificates available at specified path
+#   - NGINX Ingress Controller configured for TCP passthrough
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/postgresql/10_deploy.yaml
+#
+# Variables from inventory:
+#   - admin_username: PostgreSQL admin user
+#   - admin_password: PostgreSQL admin password (via ADMIN_PASSWORD env var)
+#   - postgres_hostname: Hostname for PostgreSQL access
+#   - postgres_namespace: Namespace for PostgreSQL deployment
+#   - ingress_namespace: Namespace for ingress controller
+#   - primary_ingress_service: Ingress controller service name
+#   - kubectl_bin: Path to kubectl binary
+#
+# Dependencies:
+#   - CORE-001: Kubernetes (kubeadm) Control Node
+#   - CORE-002: Kubernetes (kubeadm) Worker Nodes
+#   - Storage class available (k8s-hostpath)
+
+- name: Deploy PostgreSQL using Quay.io container image
+  hosts: k8s_control_plane  # Use k8s_control_plane (NOT k8s-control-node or gato-p)
+  gather_facts: true
+  become: false
+  vars:
+    ###########################################################################
+    # 1) Basic Postgres Info
+    ###########################################################################
+    postgres_release_name: "postgresql-official"
+    postgres_storage_class: "k8s-hostpath"
+    postgres_persistence_size: "10Gi"
+
+    # Database config
+    postgres_database: "mydatabase"
+    
+    # User authentication from environment variable, .env file, or fallback to sudo password
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    # PostgreSQL image from AWS ECR (official PostgreSQL, no Docker Hub dependency)
+    postgres_image: "public.ecr.aws/docker/library/postgres:18-alpine"
+
+    # We will store DB data in /var/lib/postgresql/data
+    # The official image automatically initializes the DB if empty
+    postgres_data_volume_name: "postgres-data"
+
+    ###########################################################################
+    # 2) SSL / TLS
+    ###########################################################################
+    # TLS secret name - following the naming convention
+    postgres_tls_secret_name: "{{ postgres_namespace }}-tls-secret"
+    postgres_tcp_port: 5432
+
+  pre_tasks:
+    - name: Verify admin password available
+      ansible.builtin.assert:
+        that: admin_password != ''
+        fail_msg: "ADMIN_PASSWORD environment variable must be set"
+        success_msg: "Admin password loaded from environment"
+    
+    - name: Check for required variables
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined or item | length == 0
+      with_items:
+        - admin_username
+        - postgres_hostname
+        - kubeconfig
+        - kubectl_bin
+
+  tasks:
+    ###########################################################################
+    # Task 0) CLEANUP: Remove stale StatefulSet/PVC if pod is not running
+    # Handles the case where a previous partial deployment left broken CSI state
+    ###########################################################################
+    - name: Check if PostgreSQL StatefulSet exists and has ready replicas
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get statefulset {{ postgres_release_name }} -n {{ postgres_namespace }} \
+          -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "absent"
+      register: pg_ready_replicas
+      changed_when: false
+      failed_when: false
+
+    - name: Check if StatefulSet-generated PVC exists from a previous partial run
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pvc data-{{ postgres_release_name }}-0 -n {{ postgres_namespace }} \
+          --ignore-not-found -o name 2>/dev/null
+      register: pg_sts_pvc_check
+      changed_when: false
+      failed_when: false
+
+    - name: Clean up stale StatefulSet and PVC (no running pod + stale PVC = broken CSI state)
+      when: >
+        pg_sts_pvc_check.stdout != "" and
+        (pg_ready_replicas.stdout == "absent" or pg_ready_replicas.stdout == "" or pg_ready_replicas.stdout == "0")
+      block:
+        - name: Delete stale PostgreSQL StatefulSet
+          ansible.builtin.shell: |
+            {{ kubectl_bin }} delete statefulset {{ postgres_release_name }} -n {{ postgres_namespace }} --ignore-not-found
+          changed_when: true
+
+        - name: Delete stale PostgreSQL StatefulSet PVC
+          ansible.builtin.shell: |
+            {{ kubectl_bin }} delete pvc data-{{ postgres_release_name }}-0 -n {{ postgres_namespace }} --ignore-not-found
+          changed_when: true
+
+        - name: Wait for stale PVC to be fully removed
+          ansible.builtin.shell: |
+            attempt=0
+            while true; do
+              result=$({{ kubectl_bin }} get pvc data-{{ postgres_release_name }}-0 -n {{ postgres_namespace }} --ignore-not-found -o name 2>/dev/null)
+              [ -z "$result" ] && echo "PVC removed" && exit 0
+              attempt=$((attempt + 1))
+              [ $attempt -ge 30 ] && echo "Timeout waiting for PVC deletion" && exit 1
+              sleep 2
+            done
+          changed_when: false
+
+    ###########################################################################
+    # Task 1) PREP: Ensure Postgres namespace, create TLS secret
+    ###########################################################################
+    - name: Ensure PostgreSQL namespace exists and apply resource policies
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ postgres_namespace }}"
+        tier: "platform"
+
+    - name: Get wildcard certificate from default namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
+      register: wildcard_cert_raw
+      failed_when: wildcard_cert_raw.rc != 0
+
+    - name: Parse wildcard certificate JSON
+      ansible.builtin.set_fact:
+        wildcard_cert:
+          resources:
+            - "{{ wildcard_cert_raw.stdout | from_json }}"
+    
+    - name: Check if TLS secret already exists in PostgreSQL namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ postgres_tls_secret_name }} -n {{ postgres_namespace }} -o json
+      register: existing_cert_check_raw
+      failed_when: false
+      changed_when: false
+
+    - name: Parse existing certificate check JSON
+      ansible.builtin.set_fact:
+        existing_cert_check:
+          resources: "{{ [existing_cert_check_raw.stdout | from_json] if existing_cert_check_raw.rc == 0 else [] }}"
+    
+    - name: Create temporary manifest for TLS secret
+      ansible.builtin.copy:
+        content: |
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: {{ postgres_tls_secret_name }}
+            namespace: {{ postgres_namespace }}
+          type: kubernetes.io/tls
+          data:
+            tls.crt: {{ wildcard_cert.resources[0].data['tls.crt'] }}
+            tls.key: {{ wildcard_cert.resources[0].data['tls.key'] }}
+        dest: /tmp/postgres-tls-secret.yaml
+        mode: '0600'
+
+    - name: Copy wildcard certificate to PostgreSQL namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/postgres-tls-secret.yaml
+      register: cert_copy
+      changed_when: "'created' in cert_copy.stdout or 'configured' in cert_copy.stdout"
+      
+    - name: Verify TLS secret exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ postgres_tls_secret_name }} -n {{ postgres_namespace }} -o json
+      register: cert_check_raw
+      failed_when: cert_check_raw.rc != 0
+
+    - name: Parse certificate check JSON
+      ansible.builtin.set_fact:
+        cert_check:
+          resources: "{{ [cert_check_raw.stdout | from_json] }}"
+      
+    - name: Verify TLS secret was created successfully
+      ansible.builtin.assert:
+        that:
+          - cert_check.resources | length > 0
+        fail_msg: "Failed to copy wildcard certificate to PostgreSQL namespace"
+        success_msg: "Successfully copied wildcard certificate to PostgreSQL namespace"
+
+    ###########################################################################
+    # Task 2) CREATE STORAGE and CONFIG for PostgreSQL
+    ###########################################################################
+
+    # 2.1) Create a PersistentVolumeClaim for data:
+    - name: Create temporary manifest for PostgreSQL PVC
+      ansible.builtin.copy:
+        content: |
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: {{ postgres_data_volume_name }}
+            namespace: {{ postgres_namespace }}
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: {{ postgres_storage_class }}
+            resources:
+              requests:
+                storage: {{ postgres_persistence_size }}
+        dest: /tmp/postgres-pvc.yaml
+        mode: '0644'
+
+    - name: Create PVC for PostgreSQL data
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/postgres-pvc.yaml
+      register: pvc_create
+      changed_when: "'created' in pvc_create.stdout or 'configured' in pvc_create.stdout"
+
+    ###########################################################################
+    # Task 3) DEPLOY POSTGRESQL (StatefulSet)
+    ###########################################################################
+    - name: Create temporary manifest for PostgreSQL StatefulSet
+      ansible.builtin.copy:
+        content: |
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: {{ postgres_release_name }}
+            namespace: {{ postgres_namespace }}
+            labels:
+              app: postgres-official
+          spec:
+            serviceName: {{ postgres_release_name }}
+            replicas: 1
+            selector:
+              matchLabels:
+                app: postgres-official
+            template:
+              metadata:
+                labels:
+                  app: postgres-official
+              spec:
+                # The platform database stays on the control plane: its
+                # k8s-hostpath volume is node-local, and a worker is the node
+                # that gets removed and re-added.
+                nodeSelector:
+                  node-role.kubernetes.io/control-plane: ""
+                priorityClassName: thinkube-platform
+                securityContext:
+                  fsGroup: 999
+                containers:
+                  - name: postgres
+                    image: {{ postgres_image }}
+                    env:
+                      - name: POSTGRES_USER
+                        value: {{ admin_username }}
+                      - name: POSTGRES_PASSWORD
+                        value: {{ admin_password }}
+                      - name: POSTGRES_DB
+                        value: {{ postgres_database }}
+                      - name: PGDATA
+                        value: /var/lib/postgresql/data
+                    ports:
+                      - containerPort: 5432
+                        name: postgres
+                    volumeMounts:
+                      - name: data
+                        mountPath: /var/lib/postgresql
+                    resources:
+                      requests:
+                        cpu: 250m
+                        memory: 256Mi
+                      limits:
+                        cpu: 1000m
+                        memory: 1Gi
+                volumes: []
+            volumeClaimTemplates:
+              - metadata:
+                  name: data
+                spec:
+                  accessModes: ["ReadWriteOnce"]
+                  storageClassName: {{ postgres_storage_class }}
+                  resources:
+                    requests:
+                      storage: {{ postgres_persistence_size }}
+        dest: /tmp/postgres-statefulset.yaml
+        mode: '0644'
+
+    - name: Deploy PostgreSQL StatefulSet
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/postgres-statefulset.yaml
+      register: statefulset_deploy
+      changed_when: "'created' in statefulset_deploy.stdout or 'configured' in statefulset_deploy.stdout"
+
+    ###########################################################################
+    # Task 4) CREATE SERVICE for PostgreSQL
+    ###########################################################################
+    - name: Create temporary manifest for PostgreSQL Service
+      ansible.builtin.copy:
+        content: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{ postgres_release_name }}
+            namespace: {{ postgres_namespace }}
+            labels:
+              app: postgres-official
+          spec:
+            selector:
+              app: postgres-official
+            ports:
+              - protocol: TCP
+                port: 5432
+                targetPort: 5432
+        dest: /tmp/postgres-service.yaml
+        mode: '0644'
+
+    - name: Create Service for PostgreSQL
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} apply -f /tmp/postgres-service.yaml
+      register: service_create
+      changed_when: "'created' in service_create.stdout or 'configured' in service_create.stdout"
+
+    ###########################################################################
+    # Task 5) WAIT for Postgres Pod
+    ###########################################################################
+    - name: Wait for PostgreSQL pod to be ready
+      ansible.builtin.shell: |
+        attempt=1
+        max_attempts=30
+        while [ $attempt -le $max_attempts ]; do
+          # Get pod status
+          pod_status=$({{ kubectl_bin }} get pods -n {{ postgres_namespace }} -l app=postgres-official -o jsonpath='{.items[0].status.phase}')
+          ready_status=$({{ kubectl_bin }} get pods -n {{ postgres_namespace }} -l app=postgres-official -o jsonpath='{.items[0].status.containerStatuses[0].ready}')
+          
+          # Check for CrashLoopBackOff or Error states
+          if {{ kubectl_bin }} get pods -n {{ postgres_namespace }} -l app=postgres-official | grep -E "CrashLoopBackOff|Error|ErrImagePull|ImagePullBackOff"; then
+            echo "Pod is in error state"
+            exit 1
+          fi
+          
+          # Check if pod is truly ready
+          if [ "$pod_status" = "Running" ] && [ "$ready_status" = "true" ]; then
+            echo "Pod is ready"
+            exit 0
+          fi
+          
+          echo "Waiting for pod to be ready... (attempt $attempt/$max_attempts)"
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+        echo "Timeout waiting for pod to be ready"
+        exit 1
+      register: wait_for_pg
+      failed_when: wait_for_pg.rc != 0
+
+    - name: Wait additional time for Pod to initialize
+      ansible.builtin.pause:
+        seconds: 10
+
+    # TCP routing for PostgreSQL (port 5432) is handled by the Gateway API
+    # TCPRoute created in gateway-api/10_deploy.yaml — no ingress patching needed.

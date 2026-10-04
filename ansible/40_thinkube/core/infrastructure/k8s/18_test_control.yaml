@@ -1,0 +1,224 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Test playbook for the kubeadm control plane installation
+# Description:
+#   Verifies what 10_install_k8s.yaml sets up on the control plane node.
+#   Tests include:
+#   - containerd and kubelet services, kubeadm installed
+#   - k8s0 dummy interface with the stable API address
+#   - kubeconfig pointing at the stable API endpoint
+#   - kubectl and helm in ~/.local/bin
+#   - Node readiness and the removed control-plane NoSchedule taint
+#   - CoreDNS and Cilium running, kube-dns with endpoints
+#   - rawfile-localpv and k8s-hostpath storage classes
+#   - node-ip sync timer
+#   - kubectl aliases (when ~/.thinkube_shared_shell exists)
+#   - UFW forward policy and the control plane ports
+#
+# Usage:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/k8s/18_test_control.yaml
+
+- name: Test Kubernetes Control Plane Installation
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    kubectl_path: "{{ user_home }}/.local/bin/kubectl"
+    helm_path: "{{ user_home }}/.local/bin/helm"
+    user_kubeconfig: "{{ user_home }}/.kube/config"
+    k8s_stable_ip: "172.16.0.1"
+    k8s_aliases_sh: "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh"
+    k8s_aliases_fish: "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.fish"
+
+  tasks:
+    # =====================================================================
+    # Node services and binaries
+    # =====================================================================
+    - name: Check containerd service is active
+      ansible.builtin.command: systemctl is-active containerd
+      register: containerd_active
+      changed_when: false
+      failed_when: containerd_active.stdout != 'active'
+      become: true
+
+    - name: Check kubelet service is active
+      ansible.builtin.command: systemctl is-active kubelet
+      register: kubelet_active
+      changed_when: false
+      failed_when: kubelet_active.stdout != 'active'
+      become: true
+
+    - name: Check kubeadm is installed
+      ansible.builtin.command: kubeadm version -o short
+      register: kubeadm_version
+      changed_when: false
+      failed_when: kubeadm_version.rc != 0
+
+    - name: Verify kubectl exists
+      ansible.builtin.stat:
+        path: "{{ kubectl_path }}"
+      register: kubectl_stat
+      failed_when: not kubectl_stat.stat.exists
+
+    - name: Verify helm exists
+      ansible.builtin.stat:
+        path: "{{ helm_path }}"
+      register: helm_stat
+      failed_when: not helm_stat.stat.exists
+
+    # =====================================================================
+    # Stable API endpoint
+    # =====================================================================
+    - name: Check k8s0 dummy interface carries the stable IP
+      ansible.builtin.command: ip addr show k8s0
+      register: k8s0_check
+      changed_when: false
+      failed_when: k8s_stable_ip not in k8s0_check.stdout
+
+    - name: Check kubeconfig points at the stable API endpoint
+      ansible.builtin.command: grep 'server:' {{ user_kubeconfig }}
+      register: kubeconfig_server
+      changed_when: false
+      failed_when: "('https://' + k8s_stable_ip + ':6443') not in kubeconfig_server.stdout"
+      become: true
+
+    # =====================================================================
+    # Cluster state
+    # =====================================================================
+    - name: Check node Ready condition
+      ansible.builtin.command: >
+        {{ kubectl_path }} get node {{ inventory_hostname }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      environment:
+        KUBECONFIG: "{{ user_kubeconfig }}"
+      register: node_ready
+      changed_when: false
+      failed_when: node_ready.stdout != 'True'
+
+    - name: Check control-plane NoSchedule taint is removed
+      ansible.builtin.command: >
+        {{ kubectl_path }} get node {{ inventory_hostname }}
+        -o jsonpath='{.spec.taints[*].key}'
+      environment:
+        KUBECONFIG: "{{ user_kubeconfig }}"
+      register: node_taints
+      changed_when: false
+      failed_when: "'node-role.kubernetes.io/control-plane' in node_taints.stdout"
+
+    - name: Check CoreDNS pods are running
+      ansible.builtin.command: >
+        {{ kubectl_path }} get pods -n kube-system -l k8s-app=kube-dns
+        -o jsonpath='{.items[*].status.phase}'
+      environment:
+        KUBECONFIG: "{{ user_kubeconfig }}"
+      register: coredns_pods
+      changed_when: false
+      failed_when: "'Running' not in coredns_pods.stdout"
+
+    - name: Check kube-dns service has endpoints
+      ansible.builtin.command: >
+        {{ kubectl_path }} get endpointslices -n kube-system
+        -l kubernetes.io/service-name=kube-dns
+        -o jsonpath='{.items[*].endpoints[*].addresses[*]}'
+      environment:
+        KUBECONFIG: "{{ user_kubeconfig }}"
+      register: kube_dns_endpoints
+      changed_when: false
+      failed_when: kube_dns_endpoints.stdout | length == 0
+
+    - name: Check Cilium agent pods are running
+      ansible.builtin.command: >
+        {{ kubectl_path }} get pods -n kube-system -l k8s-app=cilium
+        -o jsonpath='{.items[*].status.phase}'
+      environment:
+        KUBECONFIG: "{{ user_kubeconfig }}"
+      register: cilium_pods
+      changed_when: false
+      failed_when: "'Running' not in cilium_pods.stdout"
+
+    - name: Check storage classes
+      ansible.builtin.command: >
+        {{ kubectl_path }} get storageclass -o jsonpath='{.items[*].metadata.name}'
+      environment:
+        KUBECONFIG: "{{ user_kubeconfig }}"
+      register: storage_classes
+      changed_when: false
+      failed_when: >-
+        'rawfile-localpv' not in storage_classes.stdout.split() or
+        'k8s-hostpath' not in storage_classes.stdout.split()
+
+    # =====================================================================
+    # Host configuration
+    # =====================================================================
+    - name: Check node-ip sync timer is active
+      ansible.builtin.command: systemctl is-active thinkube-node-ip-sync.timer
+      register: node_ip_sync_timer
+      changed_when: false
+      failed_when: node_ip_sync_timer.stdout != 'active'
+      become: true
+
+    - name: Check if .thinkube_shared_shell exists
+      ansible.builtin.stat:
+        path: "{{ user_home }}/.thinkube_shared_shell"
+      register: shared_shell_dir
+
+    - name: Check k8s aliases files exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ k8s_aliases_sh }}"
+        - "{{ k8s_aliases_fish }}"
+      register: aliases_stat
+      failed_when: not aliases_stat.stat.exists
+      when: shared_shell_dir.stat.exists
+
+    - name: Test kubectl alias in bash
+      ansible.builtin.shell: |
+        source {{ k8s_aliases_sh }}
+        alias k
+      args:
+        executable: /bin/bash
+      register: bash_alias_test
+      changed_when: false
+      when: shared_shell_dir.stat.exists
+
+    - name: Verify UFW forward policy is ACCEPT
+      ansible.builtin.command: grep '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw
+      register: ufw_forward_policy
+      changed_when: false
+      failed_when: "'ACCEPT' not in ufw_forward_policy.stdout"
+
+    - name: Check required UFW rules exist
+      ansible.builtin.command: ufw status
+      register: ufw_status
+      changed_when: false
+      become: true
+
+    - name: Verify control plane ports are allowed
+      ansible.builtin.assert:
+        that:
+          - "'6443/tcp' in ufw_status.stdout"
+          - "'2379:2380/tcp' in ufw_status.stdout"
+          - "'10250/tcp' in ufw_status.stdout"
+          - "'10257/tcp' in ufw_status.stdout"
+          - "'10259/tcp' in ufw_status.stdout"
+          - "'4240/tcp' in ufw_status.stdout"
+          - "'8472/udp' in ufw_status.stdout"
+        fail_msg: "Required control plane ports are not allowed in UFW"
+        success_msg: "Required control plane ports are allowed in UFW"
+
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "Kubernetes Control Plane Test Results: PASS"
+          - "==============================================="
+          - "kubeadm: {{ kubeadm_version.stdout }}"
+          - "Node Ready: {{ node_ready.stdout }}"
+          - "Storage classes: {{ storage_classes.stdout }}"
+          - "Aliases checked: {{ shared_shell_dir.stat.exists }}"
+          - "==============================================="

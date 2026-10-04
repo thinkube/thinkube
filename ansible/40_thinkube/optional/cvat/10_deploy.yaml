@@ -1,0 +1,851 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/cvat/10_deploy.yaml
+# Description:
+#   Deploy CVAT computer vision annotation tool on Kubernetes
+#   Uses PostgreSQL backend and a Keycloak login at the gateway
+#
+# Requirements:
+#   - Kubernetes (kubeadm) must be installed and running
+#   - Harbor registry must be available
+#   - PostgreSQL must be deployed
+#   - Keycloak must be deployed
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/cvat/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#   - harbor_registry: Harbor registry URL
+#   - admin_username: Admin username
+#   - admin_password: Admin password
+#
+# 🤖 [AI-generated]
+
+- name: Deploy CVAT on Kubernetes
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    cvat_namespace: cvat
+    cvat_server_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/cvat-server:latest"
+    cvat_ui_image: "{{ harbor_registry }}/{{ library_project | default('library') }}/cvat-ui:latest"
+    cvat_hostname: "cvat.{{ domain_name }}"
+    # The CLI and SDK use this host: it serves only /api, without the
+    # Keycloak login, and CVAT checks its own tokens or password.
+    cvat_api_hostname: "cvat-api.{{ domain_name }}"
+
+    # Get admin password from environment
+    admin_password: "{{ lookup('env','ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    # Keycloak client for the login at the gateway
+    keycloak_url: "https://auth.{{ domain_name }}"
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ admin_password }}"
+    cvat_client_id: "cvat"
+
+  tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+          - harbor_registry is defined
+          - admin_username is defined
+          - admin_password is defined
+        fail_msg: "Required variables are not defined. Please check your inventory."
+
+    # CVAT ships linux/amd64 images only; thinkube-control passes the node
+    # selector from the component catalog's architectures.
+    - name: Verify the node selector is passed
+      ansible.builtin.assert:
+        that:
+          - component_node_selector is defined
+        fail_msg: "component_node_selector is not set. Install CVAT from thinkube-control, which passes it from the component catalog."
+
+    - name: Create CVAT namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ cvat_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Generate CVAT secret key
+      ansible.builtin.set_fact:
+        cvat_secret_key: "{{ lookup('password', '/dev/null length=50 chars=ascii_letters,digits') }}"
+
+    - name: Create CVAT secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: cvat-secrets
+            namespace: "{{ cvat_namespace }}"
+          type: Opaque
+          stringData:
+            DJANGO_SUPERUSER_USERNAME: "{{ admin_username }}"
+            DJANGO_SUPERUSER_PASSWORD: "{{ admin_password }}"
+            DJANGO_SUPERUSER_EMAIL: "admin@{{ domain_name }}"
+            SECRET_KEY: "{{ cvat_secret_key }}"
+            POSTGRES_USER: "{{ admin_username }}"
+            POSTGRES_PASSWORD: "{{ admin_password }}"
+            POSTGRES_DB: "cvat"
+            VALKEY_PASSWORD: "{{ admin_password }}"
+
+    - name: Create PersistentVolumeClaims for CVAT
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ item.name }}"
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: "{{ item.size }}"
+      loop:
+        - { name: cvat-data-pvc, size: 20Gi }
+        - { name: cvat-keys-pvc, size: 1Gi }
+        - { name: cvat-logs-pvc, size: 5Gi }
+        - { name: cvat-models-pvc, size: 10Gi }
+
+    - name: Create CVAT database in PostgreSQL
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: cvat-db-init
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            restartPolicy: Never
+            nodeSelector: "{{ component_node_selector }}"
+            containers:
+              - name: create-db
+                image: "{{ harbor_registry }}/{{ library_project | default('library') }}/postgres:18-alpine"
+                command:
+                  - sh
+                  - -c
+                  - |
+                    psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'cvat'" | grep -q 1 || psql -h postgresql-official.postgres.svc.cluster.local -U {{ admin_username }} -d postgres -c "CREATE DATABASE cvat"
+                env:
+                  - name: PGPASSWORD
+                    value: "{{ admin_password }}"
+
+    - name: Wait for database creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        name: cvat-db-init
+        namespace: "{{ cvat_namespace }}"
+      register: db_init_pod
+      until:
+        - db_init_pod.resources is defined
+        - db_init_pod.resources | length > 0
+        - db_init_pod.resources[0].status.phase == "Succeeded"
+      retries: 30
+      delay: 5
+
+    # A finished pod would count as a CVAT pod that is not running, and a
+    # redeploy could not start a new one under the same name.
+    - name: Delete the finished database init pod
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        name: cvat-db-init
+        namespace: "{{ cvat_namespace }}"
+        state: absent
+        wait: true
+
+    - name: Get Valkey service info
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: valkey
+        name: valkey
+      register: valkey_service
+      failed_when: valkey_service.resources | length == 0
+
+    - name: Deploy CVAT Backend
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: cvat-backend
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: cvat-backend
+            template:
+              metadata:
+                labels:
+                  app: cvat-backend
+              spec:
+                priorityClassName: thinkube-workload
+                securityContext:
+                  fsGroup: 1000
+                nodeSelector: "{{ component_node_selector }}"
+                containers:
+                  - name: cvat-backend
+                    image: "{{ cvat_server_image }}"
+                    command: ["./backend_entrypoint.sh"]
+                    args: ["init", "run", "server"]
+                    ports:
+                      - containerPort: 8080
+                        name: http
+                    env:
+                      - name: DJANGO_MODWSGI_EXTRA_ARGS
+                        value: ""
+                      - name: SMOKESCREEN_OPTS
+                        value: ""
+                      - name: CVAT_ANALYTICS
+                        value: "1"
+                      - name: CLICKHOUSE_HOST
+                        value: "clickhouse-clickhouse.clickhouse.svc.cluster.local"
+                      - name: CLICKHOUSE_PORT
+                        value: "8123"
+                      - name: CLICKHOUSE_USER
+                        value: "default"
+                      - name: CLICKHOUSE_PASSWORD
+                        value: "{{ admin_password }}"
+                      - name: ALLOWED_HOSTS
+                        value: "*"
+                      - name: CVAT_REDIS_HOST
+                        value: "valkey.valkey.svc.cluster.local"
+                      - name: CVAT_REDIS_INMEM_HOST
+                        value: "valkey.valkey.svc.cluster.local"
+                      - name: CVAT_REDIS_INMEM_PORT
+                        value: "6379"
+                      - name: CVAT_REDIS_INMEM_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: VALKEY_PASSWORD
+                      - name: CVAT_REDIS_ONDISK_HOST
+                        value: "valkey.valkey.svc.cluster.local"
+                      - name: CVAT_REDIS_ONDISK_PORT
+                        value: "6379"
+                      - name: CVAT_REDIS_ONDISK_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: VALKEY_PASSWORD
+                      - name: CVAT_POSTGRES_HOST
+                        value: "postgresql-official.postgres.svc.cluster.local"
+                      - name: CVAT_POSTGRES_PORT
+                        value: "5432"
+                      - name: CVAT_POSTGRES_USER
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_USER
+                      - name: CVAT_POSTGRES_DBNAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_DB
+                      - name: CVAT_POSTGRES_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_PASSWORD
+                      - name: DJANGO_SECRET_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: SECRET_KEY
+                      - name: DJANGO_SUPERUSER_USERNAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_USERNAME
+                      - name: DJANGO_SUPERUSER_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_PASSWORD
+                      - name: DJANGO_SUPERUSER_EMAIL
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_EMAIL
+                      - name: CVAT_SERVER_HOST
+                        value: "{{ cvat_hostname }}"
+                      - name: CVAT_SERVER_PORT
+                        value: "443"
+                      - name: CVAT_HTTPS
+                        value: "1"
+                      - name: USE_ALLAUTH_SOCIAL_ACCOUNTS
+                        value: "False"
+                      - name: IAM_OPA_BUNDLE
+                        value: "1"
+                      - name: DJANGO_SETTINGS_MODULE
+                        value: "cvat.settings.thinkube_sso"
+                    volumeMounts:
+                      - name: cvat-data
+                        mountPath: /home/django/data
+                      - name: cvat-keys
+                        mountPath: /home/django/keys
+                      - name: cvat-logs
+                        mountPath: /home/django/logs
+                      - name: cvat-models
+                        mountPath: /home/django/models
+                      - name: oauth2-middleware
+                        mountPath: /home/django/cvat/apps/thinkube_auth
+                        readOnly: true
+                      - name: django-settings-overlay
+                        mountPath: /home/django/cvat/settings/thinkube_sso.py
+                        subPath: settings_overlay.py
+                        readOnly: true
+                    livenessProbe:
+                      httpGet:
+                        path: /api/server/about
+                        port: http
+                      initialDelaySeconds: 60
+                      periodSeconds: 15
+                      failureThreshold: 5
+                    readinessProbe:
+                      httpGet:
+                        path: /api/server/about
+                        port: http
+                      initialDelaySeconds: 15
+                      periodSeconds: 15
+                    resources:
+                      requests:
+                        memory: "512Mi"
+                        cpu: "250m"
+                      limits:
+                        memory: "2Gi"
+                        cpu: "1"
+                volumes:
+                  - name: cvat-data
+                    persistentVolumeClaim:
+                      claimName: cvat-data-pvc
+                  - name: cvat-keys
+                    persistentVolumeClaim:
+                      claimName: cvat-keys-pvc
+                  - name: cvat-logs
+                    persistentVolumeClaim:
+                      claimName: cvat-logs-pvc
+                  - name: cvat-models
+                    persistentVolumeClaim:
+                      claimName: cvat-models-pvc
+                  - name: oauth2-middleware
+                    configMap:
+                      name: cvat-oauth2-middleware
+                  - name: django-settings-overlay
+                    configMap:
+                      name: cvat-django-settings-overlay
+                initContainers:
+                  - name: wait-for-db
+                    image: "{{ harbor_registry }}/{{ library_project | default('library') }}/busybox:latest"
+                    command: ['sh', '-c', 'until nc -z postgresql-official.postgres.svc.cluster.local 5432; do echo waiting for postgres; sleep 2; done;']
+                  - name: wait-for-valkey
+                    image: "{{ harbor_registry }}/{{ library_project | default('library') }}/busybox:latest"
+                    command: ['sh', '-c', 'until nc -z valkey.valkey.svc.cluster.local 6379; do echo waiting for valkey; sleep 2; done;']
+                  - name: wait-for-clickhouse
+                    image: "{{ harbor_registry }}/{{ library_project | default('library') }}/busybox:latest"
+                    command: ['sh', '-c', 'until nc -z clickhouse-clickhouse.clickhouse.svc.cluster.local 8123; do echo waiting for clickhouse; sleep 2; done;']
+                  - name: create-superuser
+                    image: "{{ cvat_server_image }}"
+                    command:
+                      - /bin/bash
+                      - -c
+                      - |
+                        python manage.py migrate --noinput
+                        python manage.py shell <<EOF
+                        from django.contrib.auth import get_user_model
+                        User = get_user_model()
+                        if not User.objects.filter(username='$DJANGO_SUPERUSER_USERNAME').exists():
+                            User.objects.create_superuser(
+                                username='$DJANGO_SUPERUSER_USERNAME',
+                                email='$DJANGO_SUPERUSER_EMAIL',
+                                password='$DJANGO_SUPERUSER_PASSWORD'
+                            )
+                            print('Superuser created successfully')
+                        else:
+                            print('Superuser already exists')
+                        EOF
+                    env:
+                      - name: DJANGO_SUPERUSER_USERNAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_USERNAME
+                      - name: DJANGO_SUPERUSER_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_PASSWORD
+                      - name: DJANGO_SUPERUSER_EMAIL
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: DJANGO_SUPERUSER_EMAIL
+                      - name: CVAT_POSTGRES_HOST
+                        value: "postgresql-official.postgres.svc.cluster.local"
+                      - name: CVAT_POSTGRES_PORT
+                        value: "5432"
+                      - name: CVAT_POSTGRES_USER
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_USER
+                      - name: CVAT_POSTGRES_DBNAME
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_DB
+                      - name: CVAT_POSTGRES_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: POSTGRES_PASSWORD
+                      - name: DJANGO_SECRET_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: cvat-secrets
+                            key: SECRET_KEY
+
+    - name: Create ConfigMap for the gateway login RemoteUser middleware
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cvat-oauth2-middleware
+            namespace: "{{ cvat_namespace }}"
+          data:
+            middleware.py: "{{ lookup('file', 'templates/remote_user_middleware.py.j2') }}"
+            __init__.py: |
+              # Make this directory a Python package
+              from .middleware import OAuth2ProxyRemoteUserMiddleware, OAuth2ProxyRemoteUserBackend
+              __all__ = ['OAuth2ProxyRemoteUserMiddleware', 'OAuth2ProxyRemoteUserBackend']
+
+    - name: Create ConfigMap for Django settings overlay
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cvat-django-settings-overlay
+            namespace: "{{ cvat_namespace }}"
+          data:
+            settings_overlay.py: "{{ lookup('file', 'templates/django_settings_overlay.py.j2') }}"
+
+    - name: Create CVAT Backend Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: cvat-backend
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            selector:
+              app: cvat-backend
+            ports:
+              - port: 8080
+                targetPort: 8080
+                name: http
+
+    - name: Deploy OPA (Open Policy Agent)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: opa
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: opa
+            template:
+              metadata:
+                labels:
+                  app: opa
+              spec:
+                priorityClassName: thinkube-workload
+                nodeSelector: "{{ component_node_selector }}"
+                containers:
+                  - name: opa
+                    image: "{{ harbor_registry }}/{{ library_project | default('library') }}/opa:0.63.0"
+                    args:
+                      - "run"
+                      - "--server"
+                      - "--log-level=error"
+                      - "--set=services.cvat.url=http://cvat-backend:8080"
+                      - "--set=bundles.cvat.service=cvat"
+                      - "--set=bundles.cvat.resource=/api/auth/rules"
+                      - "--set=bundles.cvat.polling.min_delay_seconds=5"
+                      - "--set=bundles.cvat.polling.max_delay_seconds=15"
+                      - "--set=bundles.cvat.persist=true"
+                      - "--set=status.console=false"
+                    ports:
+                      - containerPort: 8181
+                        name: http
+                    volumeMounts:
+                      - name: opa-data
+                        mountPath: /.opa
+                    resources:
+                      limits:
+                        cpu: "200m"
+                        memory: "256Mi"
+                      requests:
+                        cpu: "100m"
+                        memory: "128Mi"
+                volumes:
+                  - name: opa-data
+                    emptyDir: {}
+
+    - name: Create OPA Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: opa
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            selector:
+              app: opa
+            ports:
+              - port: 8181
+                targetPort: 8181
+                name: http
+
+    - name: Deploy CVAT UI
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: cvat-ui
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: cvat-ui
+            template:
+              metadata:
+                labels:
+                  app: cvat-ui
+              spec:
+                priorityClassName: thinkube-workload
+                nodeSelector: "{{ component_node_selector }}"
+                containers:
+                  - name: cvat-ui
+                    image: "{{ cvat_ui_image }}"
+                    ports:
+                      - containerPort: 8000
+                        name: http
+                    resources:
+                      requests:
+                        memory: "128Mi"
+                        cpu: "100m"
+                      limits:
+                        memory: "512Mi"
+                        cpu: "200m"
+
+    - name: Create CVAT UI Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: cvat-ui
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            selector:
+              app: cvat-ui
+            ports:
+              - port: 80
+                targetPort: 8000
+                name: http
+
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to CVAT namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ cvat_namespace }}-tls-secret"
+            namespace: "{{ cvat_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    # Browser routes on cvat_hostname. The gateway passes the Keycloak token
+    # as "Authorization: Bearer" to its JWT check; each rule removes it again,
+    # because CVAT reads any Bearer token as one of its own access tokens.
+    - name: Create CVAT API HTTPRoute
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: cvat-api-route
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name | default('thinkube-gateway') }}"
+                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+                sectionName: https
+            hostnames:
+              - "{{ cvat_hostname }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /api
+                backendRefs:
+                  - name: cvat-backend
+                    port: 8080
+                filters:
+                  - type: RequestHeaderModifier
+                    requestHeaderModifier:
+                      remove: ["Authorization"]
+                timeouts:
+                  request: "1200s"
+
+    - name: Create CVAT Main HTTPRoute
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: cvat-main-route
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name | default('thinkube-gateway') }}"
+                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+                sectionName: https
+            hostnames:
+              - "{{ cvat_hostname }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /static
+                backendRefs:
+                  - name: cvat-backend
+                    port: 8080
+                filters:
+                  - type: RequestHeaderModifier
+                    requestHeaderModifier:
+                      remove: ["Authorization"]
+                timeouts:
+                  request: "1200s"
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /django-rq
+                backendRefs:
+                  - name: cvat-backend
+                    port: 8080
+                filters:
+                  - type: RequestHeaderModifier
+                    requestHeaderModifier:
+                      remove: ["Authorization"]
+                timeouts:
+                  request: "1200s"
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: cvat-ui
+                    port: 80
+                filters:
+                  - type: RequestHeaderModifier
+                    requestHeaderModifier:
+                      remove: ["Authorization"]
+                timeouts:
+                  request: "1200s"
+
+    - name: Create CVAT CLI API HTTPRoute
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: cvat-cli-api-route
+            namespace: "{{ cvat_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name | default('thinkube-gateway') }}"
+                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+                sectionName: https
+            hostnames:
+              - "{{ cvat_api_hostname }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /api
+                backendRefs:
+                  - name: cvat-backend
+                    port: 8080
+                timeouts:
+                  request: "1200s"
+
+    # --- Keycloak login for CVAT ---
+    # The gateway handles the login itself. An oauth2-proxy route for
+    # /oauth2 on this host would take the gateway's /oauth2/callback, so any
+    # oauth2-proxy route, release and session store is removed.
+    - name: Remove the oauth2-proxy route, release and session store
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete httproute oauth2-proxy-ingress -n {{ cvat_namespace }} --ignore-not-found
+        {{ kubectl_bin }} delete deployment,service ephemeral-valkey -n {{ cvat_namespace }} --ignore-not-found
+        if {{ helm_bin }} status oauth2-proxy -n {{ cvat_namespace }} >/dev/null 2>&1; then
+          {{ helm_bin }} uninstall oauth2-proxy -n {{ cvat_namespace }}
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: oauth2_proxy_removal
+      changed_when: "'deleted' in oauth2_proxy_removal.stdout or 'uninstalled' in oauth2_proxy_removal.stdout"
+
+    - name: Create or update the Keycloak client for CVAT
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ cvat_client_id }}"
+        keycloak_client_body:
+          clientId: "{{ cvat_client_id }}"
+          enabled: true
+          protocol: openid-connect
+          publicClient: false
+          standardFlowEnabled: true
+          redirectUris:
+            - "https://{{ cvat_hostname }}/oauth2/callback"
+          webOrigins:
+            - "https://{{ cvat_hostname }}"
+          baseUrl: "https://{{ cvat_hostname }}"
+          attributes:
+            post.logout.redirect.uris: "+"
+
+    # Browsers log in through Keycloak; the gateway then sets
+    # X-Auth-Request-Email from the verified token, and CVAT logs the user in
+    # from it. The CLI host (cvat-cli-api-route) has no Keycloak login.
+    - name: Require a Keycloak login on the CVAT routes
+      ansible.builtin.include_role:
+        name: gateway_oidc
+      vars:
+        gateway_oidc_namespace: "{{ cvat_namespace }}"
+        gateway_oidc_route_names: ["cvat-main-route", "cvat-api-route"]
+        gateway_oidc_hostname: "{{ cvat_hostname }}"
+        gateway_oidc_client_id: "{{ cvat_client_id }}"
+        gateway_oidc_client_secret: "{{ keycloak_client_secret }}"
+        gateway_oidc_claim_headers:
+          - header: X-Auth-Request-Email
+            claim: email
+    # --- end Keycloak login for CVAT ---
+
+    # PostgreSQL readiness is checked by init containers in the deployment
+    # No separate wait needed since we use shared core PostgreSQL
+
+    - name: Wait for CVAT Backend deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ cvat_namespace }}"
+        name: cvat-backend
+      register: backend_status
+      until:
+        - backend_status.resources is defined
+        - backend_status.resources | length > 0
+        - backend_status.resources[0].status.replicas is defined
+        - backend_status.resources[0].status.readyReplicas is defined
+        - backend_status.resources[0].status.replicas == backend_status.resources[0].status.readyReplicas
+      retries: 30
+      delay: 10
+
+    - name: Create CVAT config from template
+      ansible.builtin.template:
+        src: templates/cvat-config.yaml.j2
+        dest: /tmp/cvat-config.yaml
+        mode: '0600'
+
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy CVAT config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.cvat
+        {{ kubectl_bin }} cp /tmp/cvat-config.yaml code-server/{{ code_server_pod.stdout }}:/home/thinkube/.cvat/config.yaml
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.cvat/config.yaml
+        rm -f /tmp/cvat-config.yaml
+        echo '✅ CVAT CLI configured in code-server'
+
+    - name: Display access information
+      ansible.builtin.debug:
+        msg:
+          - "CVAT has been deployed successfully!"
+          - "Access URL: https://{{ cvat_hostname }}"
+          - "Default admin user: {{ admin_username }}"
+          - "Default admin password: {{ admin_password }}"
+          - "Note: the gateway requires a Keycloak login; the CLI uses CVAT tokens"
+          - "Computer vision annotation features are available"

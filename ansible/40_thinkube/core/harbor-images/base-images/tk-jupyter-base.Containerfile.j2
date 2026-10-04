@@ -1,0 +1,231 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Jupyter Base - Minimal JupyterLab environment with NVIDIA PyTorch
+# Base: NVIDIA PyTorch 25.11 (November 2025) - post DGX Spark release
+# Includes: JupyterLab, JupyterHub, Claude Code CLI
+# ML packages are installed in persistent venvs on JuiceFS, not in this image
+
+# NGC PyTorch. The tag is chosen for its torch version, which is load-bearing:
+# everything in the fine-tuning venv is compiled against it, and Unsloth
+# declares torch<2.12.0 in every release to date.
+#
+#   26.01 and older -> torch 2.10   torchao >=0.16 unusable (needs 2.11)
+#   26.02 / 26.03   -> torch 2.11   satisfies both bounds
+#   26.04 / 26.05   -> torch 2.12   past Unsloth's declared ceiling
+#   26.06 / 26.07   -> torch 2.13   further past it
+#
+# Before moving this tag, check the torch it ships against Unsloth's current
+# range, and re-run the venv build - its verification step fails the build if
+# the compiled extensions no longer load against the new torch.
+#   crane config --platform linux/arm64 nvcr.io/nvidia/pytorch:<tag> \
+#     | grep pytorch.version
+FROM {{ harbor_registry }}/library/pytorch:{{ jupyter_base_pytorch_tag }}
+
+# Avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ============================================================
+# SYSTEM PACKAGES
+# ============================================================
+
+# Install additional system dependencies
+# Note: NVIDIA base already has Python, git, curl, etc.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        vim \
+        build-essential \
+        ca-certificates \
+        gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 24.x LTS (Claude Code CLI and JupyterLab extension builds),
+# the same major version as the code-server image
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI globally
+RUN npm install -g @anthropic-ai/claude-code && \
+    NPM_PREFIX=$(npm config get prefix) && \
+    NPM_BIN="$NPM_PREFIX/bin" && \
+    if [ -f "$NPM_BIN/claude" ]; then \
+        ln -sf "$NPM_BIN/claude" /usr/local/bin/claude; \
+    elif [ -f "$NPM_BIN/claude-code" ]; then \
+        ln -sf "$NPM_BIN/claude-code" /usr/local/bin/claude; \
+    else \
+        echo "ERROR: Claude binary not found in $NPM_BIN!"; \
+        exit 1; \
+    fi
+
+# ============================================================
+# USER SETUP: thinkube (UID 1000)
+# ============================================================
+
+# NVIDIA image runs as root by default
+# Create thinkube user with UID 1000 for consistency across services
+RUN if id 1000 2>/dev/null; then \
+        EXISTING_USER=$(id -nu 1000); \
+        if [ "$EXISTING_USER" != "thinkube" ]; then \
+            usermod -l thinkube -d /home/thinkube -m $EXISTING_USER 2>/dev/null || \
+            (userdel -f $EXISTING_USER && useradd -m -s /bin/bash -N -u 1000 thinkube); \
+        fi; \
+    else \
+        useradd -m -s /bin/bash -N -u 1000 thinkube; \
+    fi
+
+ENV NB_UID=1000
+ENV NB_GID=100
+ENV NB_USER=thinkube
+
+# ============================================================
+# JUPYTER INSTALLATION
+# ============================================================
+
+USER root
+
+# Install uv for fast package installation
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Install JupyterLab and JupyterHub to system Python
+# Note: --break-system-packages needed for PEP 668 externally managed Python in NVIDIA 25.11+
+RUN uv pip install --system --break-system-packages \
+    jupyterlab==4.5.0 \
+    jupyterhub==5.3.0 \
+    jupyter-collaboration \
+    ipykernel \
+    ipywidgets \
+    jupyterlab-widgets && \
+    pip uninstall -y jupytext jupyterlab-jupytext 2>/dev/null || true
+
+# Remove the default python3 kernel - we use venv kernels from hostPath instead
+# This prevents the "Python 3 (ipykernel)" from appearing in the launcher
+RUN jupyter kernelspec remove -y python3 || true
+
+# ============================================================
+# THINKUBE INTEGRATION
+# ============================================================
+
+# Cache bust — ensures all thinkube-specific files are refreshed on rebuild
+ARG CACHE_BUST=1
+RUN echo "Cache bust: ${CACHE_BUST}"
+
+# Copy Thinkube environment configuration
+COPY .thinkube_env /home/thinkube/.thinkube_env
+RUN chown $NB_UID:$NB_GID /home/thinkube/.thinkube_env
+
+# Source Thinkube environment in bashrc
+RUN echo 'if [ -f /home/thinkube/.thinkube_env ]; then source /home/thinkube/.thinkube_env; fi' >> /home/thinkube/.bashrc
+
+# Add Jupyter flavor identifier (base - kernels come from venvs)
+RUN echo "base" > /home/thinkube/.jupyter_flavor && \
+    chown $NB_UID:$NB_GID /home/thinkube/.jupyter_flavor
+
+# Copy startup script
+COPY startup.sh /usr/local/bin/startup.sh
+RUN chmod +x /usr/local/bin/startup.sh
+
+# Copy Thinkube environment setup files
+RUN mkdir -p /opt/thinkube
+COPY 00-thinkube-env.py /opt/thinkube/
+COPY test-thinkube-services.ipynb /opt/thinkube/
+# The icons notebooks show, at the path their first cells name
+# (../../../icons from a notebook two folders down the notebooks folder).
+# Plain files in the image: a ConfigMap mount would make each one a link into
+# a hidden ..data folder, which Jupyter refuses to serve.
+COPY icons/ /home/thinkube/thinkube/icons/
+
+# Copy helper modules
+COPY check_jupyter_flavor.py /opt/thinkube/
+COPY thinkube_models.py /opt/thinkube/
+
+# Install helpers to system Python
+# Note: NVIDIA image uses different Python path
+RUN PYTHON_SITE=$(python -c "import site; print(site.getsitepackages()[0])") && \
+    cp /opt/thinkube/check_jupyter_flavor.py $PYTHON_SITE/ && \
+    cp /opt/thinkube/thinkube_models.py $PYTHON_SITE/
+
+# OpenAI Harmony - Parser for GPT-OSS harmony format responses
+# Pre-download tiktoken vocab file for offline support
+RUN uv pip install --system --break-system-packages openai-harmony && \
+    mkdir -p /opt/tiktoken_encodings && \
+    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        -o /opt/tiktoken_encodings/o200k_base.tiktoken \
+        "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
+ENV TIKTOKEN_ENCODINGS_BASE=/opt/tiktoken_encodings
+
+# ============================================================
+# JUPYTER EXTENSIONS
+# ============================================================
+
+# tk-notebook-mcp: the server extension thinkube-control forwards notebook
+# operations to (no frontend; it serves /api/tk-notebook/mcp on this server).
+# The theme is the only labextension, so the lab build is for it.
+RUN \
+    uv pip install --system --break-system-packages --reinstall \
+    https://github.com/thinkube/tk-notebook-mcp/releases/download/wheel-{{ thinkube_ref }}/tk_notebook_mcp-0.1.0-py3-none-any.whl && \
+    uv pip install --system --break-system-packages --reinstall \
+    git+https://github.com/thinkube/thinkube-notebooks-theme.git@{{ thinkube_ref }} && \
+    jupyter lab build --minimize=False
+
+# The JupyterLab tab icons: the Thinkube Notebooks icon (the notebook-text
+# hexagon from thinkube-style), with a yellow dot while a kernel is busy.
+# notebook-text-256.png is a render of that SVG.
+COPY make_favicons.py notebook-text-256.png /tmp/favicons/
+RUN python3 /tmp/favicons/make_favicons.py /tmp/favicons/notebook-text-256.png \
+      "$(python3 -c 'import jupyter_server, os; print(os.path.join(os.path.dirname(jupyter_server.__file__), "static", "favicons"))')" && \
+    rm -rf /tmp/favicons
+
+# The browser tab says "Notebooks": JupyterLab titles the page with the page
+# configuration's appName, and page_config.json files are applied on top of
+# the server's own values. The page's first title, shown while it loads, is
+# changed too; the grep stops the build if the lab build renamed it.
+RUN mkdir -p /usr/local/etc/jupyter/labconfig && \
+    printf '%s' '{"appName":"Notebooks"}' > /usr/local/etc/jupyter/labconfig/page_config.json && \
+    sed -i 's|<title>JupyterLab</title>|<title>Notebooks</title>|' /usr/local/share/jupyter/lab/static/index.html && \
+    grep -q '<title>Notebooks</title>' /usr/local/share/jupyter/lab/static/index.html
+
+# Settings every page starts with. User settings live in the home folder, which
+# is not persistent, so a choice made in a page lasts only until the server
+# stops; these are the choices that hold for every server.
+#   - The Thinkube Notebooks theme (a page Thinkube IDE frames asks for light or
+#     dark with ?tk-theme=).
+#   - The notebook page without its header (View > Show Header).
+#   - No question about Jupyter news and no check for newer JupyterLab releases:
+#     the platform upgrades Jupyter with its image, not from inside a page.
+# The File menu keeps Hub Control Panel, which is where a server is stopped or
+# restarted from inside JupyterLab.
+RUN mkdir -p /usr/local/share/jupyter/lab/settings && \
+    printf '%s' '{"@jupyterlab/apputils-extension:themes":{"theme":"thinkube-notebooks-theme"},"@jupyter-notebook/application-extension:top":{"visible":"no"},"@jupyterlab/apputils-extension:notification":{"fetchNews":"false","checkForUpdates":false}}' \
+    > /usr/local/share/jupyter/lab/settings/overrides.json
+
+# ============================================================
+# RUNTIME CONFIGURATION
+# ============================================================
+
+# XDG directories in the user's home.
+# Kubernetes creates any missing parent of a volume mount as root:root, so
+# /home/thinkube/.config must already exist and belong to the user before the
+# pod mounts anything beneath it. Otherwise every library that caches there
+# — matplotlib's font cache among them — is denied and falls back to /tmp,
+# warning on each import and rebuilding its cache every session.
+RUN mkdir -p /home/thinkube/.config /home/thinkube/.cache /home/thinkube/.local/share && \
+    chown -R $NB_UID:$NB_GID /home/thinkube/.config /home/thinkube/.cache /home/thinkube/.local
+
+USER thinkube
+WORKDIR /home/thinkube
+
+# Add user's local bin to PATH
+ENV PATH="/home/thinkube/.local/bin:${PATH}"
+
+# Expose JupyterLab port
+EXPOSE 8888
+
+# Use startup script as entrypoint
+ENTRYPOINT ["/usr/local/bin/startup.sh"]
+
+# Default command (JupyterHub will override with jupyterhub-singleuser)
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
+
+# 🤖 AI-assisted

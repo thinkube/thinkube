@@ -1,0 +1,109 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/seaweedfs/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for SeaweedFS by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - SeaweedFS must be deployed
+#   - Kubectl access to the Kubernetes (kubeadm) cluster
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/seaweedfs/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Configure SeaweedFS service discovery
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    component_version: "{{ lookup('file', playbook_dir + '/VERSION') }}"
+    seaweedfs_namespace: seaweedfs
+
+  tasks:
+    - name: Get S3 credentials from secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ seaweedfs_namespace }}"
+        name: seaweedfs-s3-config
+      register: s3_secret
+      failed_when: s3_secret.resources | length == 0
+
+    - name: Set S3 credentials facts
+      ansible.builtin.set_fact:
+        s3_access_key: "{{ s3_secret.resources[0].data['access_key'] | b64decode }}"
+        s3_secret_key: "{{ s3_secret.resources[0].data['secret_key'] | b64decode }}"
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: seaweedfs
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "core"
+              thinkube.io/service-name: "seaweedfs"
+              thinkube.io/component-version: "{{ component_version }}"
+          data:
+            service.yaml: |
+              service:
+                name: seaweedfs
+                display_name: "Thinkube Storage"
+                powered_by: "SeaweedFS"
+                description: "Distributed file storage system"
+                type: core
+                category: storage
+                icon: /icons/tk_data.svg
+                component_version: "{{ component_version }}"
+
+                endpoints:
+                  - name: web
+                    type: http
+                    url: "https://{{ object_storage_ui_hostname }}"
+                    health_url: "https://{{ object_storage_ui_hostname }}/"
+                    description: "Web interface"
+                    primary: true
+                    
+                dependencies: []
+                  
+                scaling:
+                  resource_type: statefulset
+                  resource_name: seaweedfs-master
+                  namespace: seaweedfs
+                  min_replicas: 1
+                  can_disable: false
+
+                environment_variables:
+                  - name: SEAWEEDFS_S3_ENDPOINT
+                    value: "https://s3.{{ domain_name }}"
+                  - name: SEAWEEDFS_ACCESS_KEY
+                    value: "{{ s3_access_key }}"
+                  - name: SEAWEEDFS_SECRET_KEY
+                    value: "{{ s3_secret_key }}"
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: seaweedfs
+      register: configmap_info
+      
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for SeaweedFS"
+      when: configmap_info.resources | length > 0

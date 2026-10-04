@@ -1,0 +1,342 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/k8s/19_rollback_control.yaml
+#
+# Rollback playbook for the Thinkube Kubernetes Cluster control plane
+# (kubeadm-installed).
+#
+# WARNING: This destroys the Kubernetes cluster and all resources.
+# Volumes provisioned by OpenEBS Rawfile CSI are deleted; their backing
+# raw-file images on disk are removed. JuiceFS data in SeaweedFS is not
+# touched (lives outside the cluster). Harbor / Keycloak / PostgreSQL
+# data backed by rawfile-localpv IS lost.
+#
+# After this runs, the host is ready for a fresh
+# `10_install_k8s.yaml` run.
+#
+# Usage:
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/k8s/19_rollback_control.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Rollback Thinkube Kubernetes Cluster — Control Plane
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    kubectl_path: "{{ user_home }}/.local/bin/kubectl"
+    helm_path: "{{ user_home }}/.local/bin/helm"
+
+  tasks:
+    # =====================================================================
+    # kubeadm reset — clean shutdown of the cluster
+    # =====================================================================
+    - name: Check if cluster is initialised
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: _admin_conf
+
+    - name: Check if kubeadm is installed
+      ansible.builtin.stat:
+        path: /usr/bin/kubeadm
+      register: _kubeadm_binary
+
+    # kubeadm reset hangs on CRI gRPC calls to containerd when pods
+    # are stuck (known bug since 2018, no timeout in removeContainers).
+    # Pre-kill everything ourselves, restart containerd, then reset.
+    - name: Stop kubelet to prevent pod respawns
+      ansible.builtin.systemd:
+        name: kubelet
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove static pod manifests
+      ansible.builtin.shell: rm -f /etc/kubernetes/manifests/*.yaml
+      failed_when: false
+
+    - name: Kill kube-apiserver / etcd / scheduler / controller-manager processes
+      ansible.builtin.shell: |
+        pkill -9 -f kube-apiserver || true
+        pkill -9 -f kube-controller-manager || true
+        pkill -9 -f kube-scheduler || true
+        pkill -9 -f etcd || true
+      failed_when: false
+
+    - name: Wait for port 6443 to be released
+      ansible.builtin.wait_for:
+        port: 6443
+        state: stopped
+        timeout: 15
+      failed_when: false
+
+    - name: Force-stop all containers via crictl
+      ansible.builtin.shell: |
+        export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+        crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" stopp $(crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" pods -q 2>/dev/null) 2>/dev/null || true
+        crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" stop $(crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" ps -aq 2>/dev/null) 2>/dev/null || true
+        crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" rmp --all --force 2>/dev/null || true
+        crictl --runtime-endpoint "$CONTAINER_RUNTIME_ENDPOINT" rm --all --force 2>/dev/null || true
+      failed_when: false
+
+    - name: Restart containerd to clear wedged CRI state
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+      failed_when: false
+
+    - name: Wait for containerd to be ready
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Run kubeadm reset (skip cleanup-node — already done above)
+      ansible.builtin.command: >
+        kubeadm reset --force
+        --cri-socket unix:///run/containerd/containerd.sock
+      when: _kubeadm_binary.stat.exists
+      register: _kubeadm_reset
+      failed_when: false
+      changed_when: _kubeadm_reset.rc == 0
+
+    # =====================================================================
+    # Wipe state directories owned by Thinkube
+    # =====================================================================
+    - name: Unmount any lingering kubelet pod volumes
+      ansible.builtin.shell: |
+        mount | awk '/\/var\/lib\/kubelet\/pods/ {print $3}' | xargs -r -I {} umount -l {} 2>/dev/null || true
+      changed_when: false
+
+    - name: Remove cluster + container runtime state directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /etc/cni/net.d
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /var/openebs           # OpenEBS Rawfile dataroot (default)
+        - /var/lib/rawfile-localpv  # alternate OpenEBS path observed in some chart versions
+        - /var/csi               # CSI persistent volume data (rawfile-localpv)
+      failed_when: false
+
+    - name: Remove user kubeconfig
+      ansible.builtin.file:
+        path: "{{ user_home }}/.kube"
+        state: absent
+
+    - name: Remove vanilla kubectl / helm binaries from ~/.local/bin
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ kubectl_path }}"
+        - "{{ helm_path }}"
+
+    - name: Remove Thinkube-owned kernel module and sysctl drop-ins
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/modules-load.d/thinkube-k8s.conf
+        - /etc/sysctl.d/99-thinkube-k8s.conf
+
+    # The apt sources and packages Thinkube added stay: they may be the
+    # user's as much as ours (DGX OS ships docker from docker's own
+    # repository), and the next install is idempotent over them. The
+    # commands below remove them when the user wants that.
+    - name: Say which apt sources and packages were left in place
+      ansible.builtin.debug:
+        msg:
+          - "Left in place: the apt sources and packages Thinkube added."
+          - "To remove the sources and keys:"
+          - "  sudo rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/docker.asc /etc/apt/keyrings/kubernetes-apt-keyring.gpg && sudo apt-get update"
+          - "To remove the packages (containerd.io is also docker's: keep it where docker is installed):"
+          - "  sudo apt-mark unhold kubeadm kubelet kubectl containerd.io && sudo apt-get purge kubeadm kubelet kubectl kubernetes-cni containerd.io"
+
+    # =====================================================================
+    # Shell alias cleanup
+    # =====================================================================
+    - name: Check if thinkube_shared_shell directory exists
+      ansible.builtin.stat:
+        path: "{{ user_home }}/.thinkube_shared_shell"
+      register: _shared_shell_dir
+
+    - name: Remove k8s alias files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.sh"
+        - "{{ user_home }}/.thinkube_shared_shell/aliases/k8s_aliases.fish"
+      when: _shared_shell_dir.stat.exists
+
+    # =====================================================================
+    # Cilium / kubelet network interfaces
+    # =====================================================================
+    - name: Enumerate Cilium-created interfaces
+      ansible.builtin.shell: |
+        ip -o link show | awk -F': ' '/cilium|lxc/ {print $2}' | sed 's/@.*//' | sort -u
+      register: _cilium_interfaces
+      changed_when: false
+
+    - name: Delete Cilium-created interfaces
+      ansible.builtin.command: "ip link delete {{ item }}"
+      loop: "{{ _cilium_interfaces.stdout_lines | default([]) }}"
+      when: _cilium_interfaces.stdout_lines | length > 0
+      failed_when: false
+      changed_when: true
+
+    # =====================================================================
+    # UFW rule cleanup (kubeadm-specific port set)
+    # =====================================================================
+    - name: Remove kubeadm UFW rules
+      block:
+        - name: Remove k8s API server port rule (6443/tcp)
+          community.general.ufw:
+            rule: allow
+            port: '6443'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove etcd client + peer rule (2379:2380/tcp)
+          community.general.ufw:
+            rule: allow
+            port: '2379:2380'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove controller-manager rule (10257/tcp)
+          community.general.ufw:
+            rule: allow
+            port: '10257'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove scheduler rule (10259/tcp)
+          community.general.ufw:
+            rule: allow
+            port: '10259'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove kubelet API rule (10250/tcp)
+          community.general.ufw:
+            rule: allow
+            port: '10250'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove Cilium health rule (4240/tcp)
+          community.general.ufw:
+            rule: allow
+            port: '4240'
+            proto: tcp
+            delete: true
+          failed_when: false
+
+        - name: Remove Cilium VXLAN rule (8472/udp)
+          community.general.ufw:
+            rule: allow
+            port: '8472'
+            proto: udp
+            delete: true
+          failed_when: false
+
+        # Disable UFW BEFORE the iptables flush below. If UFW config says
+        # enabled but the iptables flush wipes its chains, the next install
+        # will hit "ERROR: problem running" on UFW's reload.
+        - name: Disable UFW so its config matches the post-flush reality
+          community.general.ufw:
+            state: disabled
+          failed_when: false
+
+    # =====================================================================
+    # DNS: remove stale BIND9 config so host falls back to ISP DNS
+    # =====================================================================
+    - name: Remove Thinkube DNS config (BIND9 IP becomes stale after rollback)
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d/10-thinkube.conf
+        state: absent
+      register: _dns_cleanup
+
+    - name: Restart systemd-resolved to pick up DNS change
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+      when: _dns_cleanup.changed
+
+    # =====================================================================
+    # Tailscale: remove split DNS (stale entry breaks tailnet-wide DNS)
+    # Device cleanup is handled by tailscale-operator/10_deploy.yaml
+    # =====================================================================
+    - name: Remove Tailscale split DNS for domain
+      ansible.builtin.uri:
+        url: "https://api.tailscale.com/api/v2/tailnet/-/dns/split-dns"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ tailscale_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        # Ansible does not template mapping keys, so the body is built as one expression.
+        body: "{{ {domain_name: []} }}"
+        status_code: [200]
+      when:
+        - tailscale_api_token is defined and tailscale_api_token | length > 0
+        - overlay_provider | default('') == 'tailscale'
+      become: false
+
+    # =====================================================================
+    # iptables reset (last step — anything that follows must re-add rules)
+    # =====================================================================
+    - name: Flush iptables and reset default policies
+      ansible.builtin.shell: |
+        iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+        ip6tables -F
+        ip6tables -X
+        ip6tables -t nat -F 2>/dev/null || true
+        ip6tables -t nat -X 2>/dev/null || true
+        ip6tables -P INPUT ACCEPT
+        ip6tables -P FORWARD ACCEPT
+        ip6tables -P OUTPUT ACCEPT
+      changed_when: true
+
+  post_tasks:
+    - name: Display rollback summary
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "Thinkube Kubernetes Cluster — Control Plane Rolled Back"
+          - "==============================================="
+          - "Removed:"
+          - "  - Cluster state via kubeadm reset"
+          - "  - apt packages: left installed; the install moves them to its pinned versions"
+          - "  - apt sources and keys: left in place (the task above prints the removal command)"
+          - "  - State directories: /etc/kubernetes, /etc/cni/net.d,"
+          - "    /var/lib/{kubelet,etcd,openebs}, /var/lib/rawfile-localpv"
+          - "  - Vanilla kubectl/helm from ~/.local/bin"
+          - "  - Kernel module + sysctl drop-ins under /etc/{modules-load,sysctl}.d/"
+          - "  - Cilium-created network interfaces"
+          - "  - kubeadm UFW rules; UFW disabled before iptables flush"
+          - "  - All iptables rules (filter + nat)"
+          - "==============================================="
+          - "Next steps:"
+          - "  - Run 10_install_k8s.yaml for a fresh install"
+          - "  - Or verify clean state: ip link show; ps aux | grep -E 'kube|containerd'"
+          - "==============================================="

@@ -1,0 +1,192 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/gpu_operator/15_configure_time_slicing.yaml
+# Description:
+#   Configures GPU time-slicing to allow multiple pods to share GPUs.
+#   Applied to ALL GPU nodes with per-family profiles:
+#     - dgx-spark (Blackwell/UMA): 4 virtual GPUs per physical GPU
+#     - consumer (discrete GPUs): 2 virtual GPUs per physical GPU
+#
+# Requirements:
+#   - GPU Operator already installed (run 10_deploy.yaml first)
+#   - GPU nodes must have nvidia.com/gpu.present=true label (set by GFD)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/gpu_operator/15_configure_time_slicing.yaml
+#
+# Time-slicing shares GPU memory — monitor total usage to avoid OOM.
+#
+# 🤖 [AI-assisted]
+
+- name: Configure GPU Time-Slicing
+  hosts: k8s_control_plane
+  become: false
+
+  pre_tasks:
+    - name: Verify required variables exist
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined
+      loop:
+        - kubeconfig
+        - kubectl_bin
+
+    # Filter for nodes where the device-plugin is NOT disabled. NFD sets
+    # nvidia.com/gpu.present=true on ALL GPU nodes including pre-Volta;
+    # the deploy playbook sets gpu.deploy.device-plugin=false on
+    # unsupported ones. Querying both labels gives only the nodes where
+    # the GPU operator actually schedules DaemonSets.
+    - name: Get supported GPU nodes from Kubernetes labels
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get nodes -l 'nvidia.com/gpu.present=true,nvidia.com/gpu.deploy.device-plugin!=false' \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.nvidia\.com/gpu\.family}{"\t"}{.metadata.labels.nvidia\.com/gpu\.product}{"\n"}{end}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gpu_nodes_raw
+      changed_when: false
+
+    - name: Parse GPU node information
+      ansible.builtin.set_fact:
+        gpu_nodes: >-
+          {%- set nodes = [] -%}
+          {%- for line in gpu_nodes_raw.stdout_lines -%}
+            {%- set parts = line.split('\t') -%}
+            {%- if parts | length >= 3 -%}
+              {%- set node_name = parts[0] -%}
+              {%- set family = parts[1] | default('') -%}
+              {%- set product = parts[2] | default('') -%}
+              {%- set is_uma = (family == 'blackwell') or ('GB10' in product) or ('DGX' in product) -%}
+              {%- set profile = 'dgx-spark' if is_uma else 'consumer' -%}
+              {%- set _ = nodes.append({'name': node_name, 'family': family, 'product': product, 'profile': profile}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ nodes }}
+
+    - name: Skip if no GPU nodes in cluster
+      ansible.builtin.meta: end_play
+      when: gpu_nodes | length == 0
+
+    - name: Display detected GPU nodes
+      ansible.builtin.debug:
+        msg: "{{ item.name }}: {{ item.product }} ({{ item.family }}) → profile: {{ item.profile }}"
+      loop: "{{ gpu_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+  vars:
+    gpu_operator_namespace: gpu-operator
+    time_slicing_config_name: time-slicing-config
+    dgx_spark_replicas: 4
+    consumer_replicas: 2
+
+  tasks:
+    - name: Check if GPU Operator is installed
+      ansible.builtin.command: "{{ kubectl_bin }} get namespace {{ gpu_operator_namespace }}"
+      register: gpu_ns_check
+      failed_when: gpu_ns_check.rc != 0
+      changed_when: false
+
+    - name: Create time-slicing ConfigMap with per-family profiles
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: {{ time_slicing_config_name }}
+          namespace: {{ gpu_operator_namespace }}
+        data:
+          default: |-
+            version: v1
+          dgx-spark: |-
+            version: v1
+            flags:
+              migStrategy: none
+            sharing:
+              timeSlicing:
+                renameByDefault: false
+                failRequestsGreaterThanOne: false
+                resources:
+                - name: nvidia.com/gpu
+                  replicas: {{ dgx_spark_replicas }}
+          consumer: |-
+            version: v1
+            flags:
+              migStrategy: none
+            sharing:
+              timeSlicing:
+                renameByDefault: false
+                failRequestsGreaterThanOne: false
+                resources:
+                - name: nvidia.com/gpu
+                  replicas: {{ consumer_replicas }}
+        EOF
+      register: configmap_result
+      changed_when: "'created' in configmap_result.stdout or 'configured' in configmap_result.stdout"
+
+    - name: Label GPU nodes with time-slicing profile
+      ansible.builtin.command: >
+        {{ kubectl_bin }} label node {{ item.name }}
+        nvidia.com/device-plugin.config={{ item.profile }} --overwrite
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ gpu_nodes }}"
+      loop_control:
+        label: "{{ item.name }} → {{ item.profile }}"
+      changed_when: true
+
+    - name: Patch ClusterPolicy to use per-node time-slicing config
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch clusterpolicy cluster-policy --type='json' -p='[
+          {
+            "op": "add",
+            "path": "/spec/devicePlugin/config",
+            "value": {
+              "name": "{{ time_slicing_config_name }}",
+              "default": "default"
+            }
+          }
+        ]'
+      register: patch_result
+      changed_when: "'patched' in patch_result.stdout"
+
+    - name: Wait for device plugin pods to restart
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting for device plugin to restart with new configuration..."
+      when: patch_result is changed
+
+    - name: Wait for device plugin pods to be running
+      ansible.builtin.shell: |
+        i=1
+        while [ $i -le 60 ]; do
+          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -l app=nvidia-device-plugin-daemonset --field-selector=status.phase=Running -o json | jq '.items | length')
+          if [ "$count" -ge 1 ]; then
+            echo "✓ Device plugin pods are running"
+            exit 0
+          fi
+          echo "Waiting for device plugin pods... (attempt $i/60)"
+          sleep 5
+          i=$((i + 1))
+        done
+        echo "ERROR: Device plugin pods not running"
+        exit 1
+      register: device_plugin_wait
+      changed_when: false
+      when: patch_result is changed
+
+    - name: Verify GPU time-slicing enabled
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get nodes -o json | jq -r '
+          .items[] |
+          select(.status.capacity."nvidia.com/gpu" != null) |
+          "Node: \(.metadata.name) - Physical: \(.status.capacity."nvidia.com/gpu") -> Virtual: \(.status.allocatable."nvidia.com/gpu") (profile: \(.metadata.labels."nvidia.com/device-plugin.config" // "default"))"
+        '
+      register: verification_result
+      changed_when: false
+
+    - name: Display GPU allocation
+      ansible.builtin.debug:
+        var: verification_result.stdout_lines

@@ -1,0 +1,60 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Adds Gitea's SSH host keys to ArgoCD's known hosts.
+#
+# The ArgoCD Helm chart owns argocd-ssh-known-hosts-cm and rewrites it on
+# every upgrade, so the keys are set in the release values
+# (configs.ssh.extraHosts), not in the ConfigMap. The upgrade keeps the
+# installed chart version and every other value.
+#
+# Vars (group_vars): gitea_hostname, argocd_namespace, argocd_release_name,
+# argocd_chart_name, helm_bin, kubectl_bin
+
+- name: Read Gitea's SSH host keys
+  ansible.builtin.command: ssh-keyscan -p 2222 -t rsa,ecdsa,ed25519 {{ gitea_hostname }}
+  register: gitea_keyscan
+  changed_when: false
+  failed_when: gitea_keyscan.rc != 0 or gitea_keyscan.stdout | trim == ""
+
+- name: Read the installed ArgoCD chart version
+  ansible.builtin.command: >
+    {{ helm_bin }} list --namespace {{ argocd_namespace }}
+    --filter '^{{ argocd_release_name }}$' --output json
+  register: argocd_release
+  changed_when: false
+  failed_when: argocd_release.rc != 0 or (argocd_release.stdout | from_json | length) != 1
+
+- name: Write the known-hosts values file
+  ansible.builtin.copy:
+    dest: /tmp/argocd-gitea-known-hosts.yaml
+    content: "{{ {'configs': {'ssh': {'extraHosts': gitea_keyscan.stdout}}} | to_nice_yaml }}"
+    mode: "0600"
+
+- name: Add Gitea's host keys to the ArgoCD release
+  ansible.builtin.command: >
+    {{ helm_bin }} upgrade {{ argocd_release_name }} argo-helm/{{ argocd_chart_name }}
+    --namespace {{ argocd_namespace }}
+    --version {{ (argocd_release.stdout | from_json)[0].chart | regex_replace('^' ~ argocd_chart_name ~ '-', '') }}
+    --reuse-values
+    -f /tmp/argocd-gitea-known-hosts.yaml
+  changed_when: true
+
+- name: Remove the known-hosts values file
+  ansible.builtin.file:
+    path: /tmp/argocd-gitea-known-hosts.yaml
+    state: absent
+
+# The repo server reads known hosts at start; a restart makes the new keys
+# take effect now instead of after the ConfigMap volume sync.
+- name: Restart the ArgoCD repo server
+  ansible.builtin.command: >
+    {{ kubectl_bin }} -n {{ argocd_namespace }} rollout restart deployment argocd-repo-server
+  changed_when: true
+
+- name: Wait for the ArgoCD repo server
+  ansible.builtin.command: >
+    {{ kubectl_bin }} -n {{ argocd_namespace }}
+    rollout status deployment/argocd-repo-server --timeout=180s
+  changed_when: false

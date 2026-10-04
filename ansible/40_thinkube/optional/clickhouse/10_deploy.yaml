@@ -1,0 +1,221 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/clickhouse/10_deploy.yaml
+# Description:
+#   Deploy ClickHouse analytics database on Kubernetes with external access
+#   Provides analytics capabilities for CVAT and other services
+#   Configures both HTTP (port 8123) and native TCP (port 9000) access
+#
+# Requirements:
+#   - Kubernetes (kubeadm) must be installed and running
+#   - NGINX Ingress Controller with TCP passthrough support
+#   - Wildcard TLS certificate in default namespace
+#   - Helm must be available
+#   - ADMIN_PASSWORD environment variable must be set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/clickhouse/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+#   - helm_bin: Path to helm binary
+#   - admin_username: Admin username
+#   - ingress_namespace: Namespace for ingress controller
+#   - primary_ingress_service: Ingress controller service name
+#   - primary_ingress_class: Ingress class name
+#   - kubectl_bin: Path to kubectl binary
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy ClickHouse on Kubernetes
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    clickhouse_namespace: clickhouse
+    # Get admin password from environment
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') }}"
+    clickhouse_hostname: "clickhouse.{{ domain_name }}"
+    clickhouse_http_port: 8123
+    clickhouse_native_port: 9000
+    clickhouse_tls_secret_name: "{{ clickhouse_namespace }}-tls-secret"
+
+  tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - kubeconfig is defined
+          - admin_username is defined
+          - admin_password is defined and admin_password != ""
+        fail_msg: "Required variables are not defined. Please check your inventory or environment."
+
+    - name: Create ClickHouse namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        name: "{{ clickhouse_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Add Altinity Helm repository
+      kubernetes.core.helm_repository:
+        binary_path: "{{ helm_bin }}"
+        name: altinity
+        repo_url: https://helm.altinity.com
+
+    - name: Deploy ClickHouse using Altinity chart
+      kubernetes.core.helm:
+        binary_path: "{{ helm_bin }}"
+        name: clickhouse
+        chart_ref: altinity/clickhouse
+        release_namespace: "{{ clickhouse_namespace }}"
+        kubeconfig: "{{ kubeconfig }}"
+        create_namespace: false
+        values:
+          priorityClassName: thinkube-workload
+          clickhouse:
+            replicasCount: 1
+            shardsCount: 1
+            defaultUser:
+              password: "{{ admin_password }}"
+              allowExternalAccess: true
+            persistence:
+              enabled: true
+              size: 10Gi
+              storageClass: k8s-hostpath
+            extraVolumes: []
+            extraContainers: []
+      register: clickhouse_helm_result
+      retries: 5
+      delay: 10
+      until: clickhouse_helm_result is not failed
+
+    - name: Wait for ClickHouse to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ clickhouse_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/name=clickhouse
+      register: clickhouse_pods
+      until:
+        - clickhouse_pods.resources is defined
+        - clickhouse_pods.resources | length > 0
+        - clickhouse_pods.resources[0].status.phase == "Running"
+      retries: 30
+      delay: 10
+
+    ###########################################################################
+    # Configure external access via Ingress
+    ###########################################################################
+    - name: Get wildcard certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard certificate to ClickHouse namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ clickhouse_tls_secret_name }}"
+            namespace: "{{ clickhouse_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    - name: Create ClickHouse HTTPRoute
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: clickhouse-route
+            namespace: "{{ clickhouse_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name }}"
+                namespace: "{{ gateway_namespace }}"
+                sectionName: https
+            hostnames:
+              - "{{ clickhouse_hostname }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: clickhouse-clickhouse
+                    port: "{{ clickhouse_http_port }}"
+
+    # Clients reach this service through the TCPRoute gateway-api/10_deploy.yaml
+    # creates in the gateway's namespace. A route may send traffic to a Service
+    # in another namespace only when that namespace grants it, and the grant
+    # lives in this namespace, which a rollback can delete; the deploy creates
+    # it with the namespace.
+    - name: Allow the gateway's TCP routes to reach the Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1beta1
+          kind: ReferenceGrant
+          metadata:
+            name: allow-gateway-tcp
+            namespace: "{{ clickhouse_namespace }}"
+          spec:
+            from:
+              - group: gateway.networking.k8s.io
+                kind: TCPRoute
+                namespace: "{{ gateway_namespace }}"
+            to:
+              - group: ""
+                kind: Service
+
+    - name: Create ClickHouse config from template
+      ansible.builtin.template:
+        src: templates/clickhouse-config.xml.j2
+        dest: /tmp/clickhouse-config.xml
+        mode: '0600'
+
+    - name: Get code-server pod name
+      ansible.builtin.shell: "{{ kubectl_bin }} get pods -n code-server -l app=code-server -o jsonpath='{.items[0].metadata.name}'"
+      register: code_server_pod
+      changed_when: false
+
+    - name: Copy ClickHouse config to code-server pod
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- mkdir -p /home/thinkube/.clickhouse-client
+        {{ kubectl_bin }} cp /tmp/clickhouse-config.xml code-server/{{ code_server_pod.stdout }}:/home/thinkube/.clickhouse-client/config.xml
+        {{ kubectl_bin }} exec -n code-server {{ code_server_pod.stdout }} -- chmod 600 /home/thinkube/.clickhouse-client/config.xml
+        rm -f /tmp/clickhouse-config.xml
+        echo '✅ ClickHouse CLI configured in code-server'
+
+    - name: Display ClickHouse connection info
+      ansible.builtin.debug:
+        msg:
+          - "ClickHouse has been deployed successfully!"
+          - "External HTTPS URL: https://{{ clickhouse_hostname }}"
+          - "Native TCP: {{ clickhouse_hostname }}:{{ clickhouse_native_port }}"
+          - "Service: clickhouse-clickhouse-cluster.{{ clickhouse_namespace }}.svc.cluster.local"
+          - "HTTP Port: {{ clickhouse_http_port }}"
+          - "Native Port: {{ clickhouse_native_port }}"
+          - "Default user: default"
+          - "Password: (from ADMIN_PASSWORD)"

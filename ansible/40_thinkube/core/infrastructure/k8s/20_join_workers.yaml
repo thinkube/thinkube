@@ -1,0 +1,968 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/k8s/20_join_workers.yaml
+#
+# Joins worker nodes to the kubeadm-managed Thinkube Kubernetes Cluster.
+#
+# Workflow per worker:
+#   1. UFW rules
+#   2. Node-local API VIP: the same k8s0 dummy (k8s_stable_ip) the control
+#      plane has, plus a socket proxy forwarding 172.16.0.1:6443 to the
+#      control plane's LAN IP — so the cluster's stable API endpoint
+#      resolves locally on every node and nothing network-dependent is
+#      baked into certs, kubeconfigs, or Cilium
+#      Plus two self-healing timers: node-ip sync (address moved under the
+#      node) and the link watchdog (NIC dead: bounce → PCI re-probe → reboot)
+#   3. containerd.io + kubeadm/kubelet/kubectl via the same roles the
+#      control plane used (kubeadm_install + containerd_install)
+#   4. Token + CA hash issued by the control plane (delegate_to)
+#   5. JoinConfiguration rendered locally; `kubeadm join --config` runs
+#      against the VIP
+#   6. Wait for node to be Ready, with a Cilium-on-new-node self-heal
+#      step for a known Cilium init container failure
+#   7. Cilium IPAM wait + restart pods with stale CIDR-conflict IPs
+#
+# After all workers join, two follow-up plays:
+#   - Control plane: pin CoreDNS to control plane node; wait for all
+#     nodes Ready
+#   - Localhost: append worker hosts to the user's ~/.ssh/config so
+#     code-server can reach them
+#
+# Requirements:
+#   - Ubuntu 24.04 LTS, 16 cores, 64 GB RAM, 1 TB disk per worker
+#   - Control plane already initialised by 10_install_k8s.yaml
+#   - UFW enabled on the worker
+#
+# Variables from inventory:
+#   - system_username:        User to install kubectl/helm for
+#   - overlay_provider:       'zerotier' or 'tailscale'
+#   - overlay_subnet_prefix:  ZeroTier subnet prefix (ZeroTier mode only)
+#   - control_plane_host:     Hostname of the control plane in inventory
+#
+# Pinned versions are role-default values reflecting the
+# v1.36.4+thinkube.0.1.0 release manifest. Phase 4 of the kubeadm
+# migration will resolve them from thinkube-metadata at install time.
+#
+# 🤖 [AI-assisted]
+
+- name: Join Worker Nodes to Thinkube Kubernetes Cluster
+  hosts: k8s_workers
+  gather_facts: true
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+    kubectl_wrapper_path: "{{ user_home }}/.local/bin/kubectl"
+    helm_wrapper_path: "{{ user_home }}/.local/bin/helm"
+    control_plane_host: "{{ groups['k8s_control_plane'][0] }}"
+
+    # Stable API endpoint, same value as in 10_install_k8s.yaml. The worker
+    # gets its own k8s0 dummy carrying this IP plus a local socket proxy to
+    # the control plane's LAN IP, so the VIP resolves on every node.
+    k8s_stable_ip: "172.16.0.1"
+
+    # Link watchdog escalation, in consecutive failed one-minute checks:
+    # bounce the interface, re-probe its PCI device, reboot. Overridable
+    # from inventory for hosts with known-flaky links or slow networks.
+    link_watchdog_reset_after: "{{ link_watchdog_reset_after_override | default(3) }}"
+    link_watchdog_rebind_after: "{{ link_watchdog_rebind_after_override | default(6) }}"
+    link_watchdog_reboot_after: "{{ link_watchdog_reboot_after_override | default(12) }}"
+    link_watchdog_boot_grace_seconds: "{{ link_watchdog_boot_grace_seconds_override | default(600) }}"
+
+    # Version pins — release-manifest values for v1.36.4+thinkube.0.1.0
+    kubeadm_k8s_minor: "1.36"
+    kubeadm_k8s_patch: "1.36.4"
+    kubeadm_k8s_apt_revision: "1.1"
+    containerd_apt_version: "2.2.4-1"
+    helm_install_version: "v3.16.4"
+
+  pre_tasks:
+    - name: Verify required variables exist
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: vars[item] is not defined
+      loop:
+        - system_username
+        - overlay_provider
+
+    - name: Verify ZeroTier-specific variables exist (ZeroTier mode only)
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined (required when overlay_provider is 'zerotier')"
+      when:
+        - overlay_provider == 'zerotier'
+        - vars[item] is not defined
+      loop:
+        - overlay_subnet_prefix
+
+  tasks:
+    # =====================================================================
+    # UFW firewall configuration (worker scope — no etcd / scheduler ports)
+    # =====================================================================
+    # cache_valid_time skips the full repo refresh when the cache is
+    # fresh — on hosts with many vendor repos (DGX Spark ships 14) a
+    # forced update takes minutes and one slow mirror fails the join.
+    - name: Ensure UFW is installed
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      become: true
+      register: _ufw_install
+      retries: 3
+      delay: 10
+      until: _ufw_install is succeeded
+
+    - name: Configure UFW default forward policy to ACCEPT (required for k8s networking)
+      ansible.builtin.lineinfile:
+        path: /etc/default/ufw
+        regexp: '^DEFAULT_FORWARD_POLICY='
+        line: 'DEFAULT_FORWARD_POLICY="ACCEPT"'
+        backup: true
+      notify: reload_ufw
+      become: true
+
+    - name: Allow SSH (22/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '22'
+        proto: tcp
+        comment: 'SSH access'
+      become: true
+
+    - name: Allow kubelet API port (10250/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '10250'
+        proto: tcp
+        comment: 'k8s kubelet'
+      become: true
+
+    # Pod traffic DNAT'd by Cilium to the node-local API VIP arrives via
+    # Cilium interfaces and must pass the INPUT chain to reach the proxy.
+    - name: Allow node-local API VIP port (6443/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '6443'
+        proto: tcp
+        comment: 'k8s API node-local proxy'
+      become: true
+
+    # The node-ip sync re-resolves the control plane's hostname at boot
+    # via LLMNR. Ubuntu ships systemd-resolved with LLMNR disabled, so
+    # enable it explicitly and open its query port.
+    - name: Create systemd-resolved drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Enable LLMNR in systemd-resolved
+      ansible.builtin.copy:
+        content: |
+          # Managed by Thinkube — boot-time control-plane re-resolution
+          # (thinkube-node-ip-sync) uses LLMNR on the local link.
+          [Resolve]
+          LLMNR=yes
+        dest: /etc/systemd/resolved.conf.d/10-thinkube-llmnr.conf
+        mode: '0644'
+      become: true
+      register: _llmnr_conf
+
+    - name: Restart systemd-resolved to apply LLMNR setting
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+      become: true
+      when: _llmnr_conf is changed
+
+    - name: Allow LLMNR name resolution (5355/udp)
+      community.general.ufw:
+        rule: allow
+        port: '5355'
+        proto: udp
+        comment: 'LLMNR name resolution'
+      become: true
+
+    - name: Allow Cilium health port (4240/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '4240'
+        proto: tcp
+        comment: 'Cilium networking'
+      become: true
+
+    - name: Allow Cilium VXLAN port (8472/udp)
+      community.general.ufw:
+        rule: allow
+        port: '8472'
+        proto: udp
+        comment: 'Cilium VXLAN'
+      become: true
+
+    - name: Allow Cilium agent metrics port (9962/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '9962'
+        proto: tcp
+        comment: 'Cilium agent metrics'
+      become: true
+
+    - name: Allow traffic on cilium_host interface
+      community.general.ufw:
+        rule: allow
+        interface: cilium_host
+        direction: in
+      become: true
+
+    - name: Allow outbound traffic on cilium_host interface
+      community.general.ufw:
+        rule: allow
+        interface: cilium_host
+        direction: out
+      become: true
+
+    # Overlay rules: Tailscale's installer trusts tailscale0 + opens
+    # UDP/41641 itself. ZeroTier needs explicit allow rules for zt+ and
+    # an SSH-from-overlay rule keyed on the subnet.
+    - name: Allow all traffic on ZeroTier interfaces
+      community.general.ufw:
+        rule: allow
+        interface: "zt+"
+        direction: in
+        comment: 'ZeroTier overlay'
+      become: true
+      when: overlay_provider == 'zerotier'
+
+    - name: Allow outbound traffic on ZeroTier interfaces
+      community.general.ufw:
+        rule: allow
+        interface: "zt+"
+        direction: out
+        comment: 'ZeroTier overlay'
+      become: true
+      when: overlay_provider == 'zerotier'
+
+    - name: Allow SSH from ZeroTier subnet
+      community.general.ufw:
+        rule: allow
+        src: "{{ overlay_subnet_prefix }}0/24"
+        port: '22'
+        proto: tcp
+        comment: 'SSH from ZeroTier'
+      become: true
+      when: overlay_provider == 'zerotier'
+
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled
+      become: true
+
+    # =====================================================================
+    # Node-local API VIP (k8s0 dummy + socket proxy)
+    # =====================================================================
+    # The cluster's API endpoint is k8s_stable_ip everywhere (certs,
+    # cluster-info, kubeconfigs, Cilium k8sServiceHost). The worker makes
+    # that IP local: the same k8s0 dummy the control plane carries, plus a
+    # socket-activated proxy forwarding it to the control plane's LAN IP.
+    # Only ordinary worker→CP LAN traffic crosses the wire — the VIP never
+    # does — which keeps the control plane movable across networks.
+    - name: Create systemd-networkd config directory
+      ansible.builtin.file:
+        path: /etc/systemd/network
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Create k8s dummy interface netdev configuration
+      ansible.builtin.copy:
+        content: |
+          [NetDev]
+          Name=k8s0
+          Kind=dummy
+          Description=Kubernetes API Server stable interface
+        dest: /etc/systemd/network/10-k8s-dummy.netdev
+        mode: '0644'
+      become: true
+      notify: restart_networkd
+
+    - name: Create k8s dummy interface network configuration
+      ansible.builtin.copy:
+        content: |
+          [Match]
+          Name=k8s0
+
+          [Network]
+          Address={{ k8s_stable_ip }}/32
+
+          [Link]
+          RequiredForOnline=no
+        dest: /etc/systemd/network/10-k8s-dummy.network
+        mode: '0644'
+      become: true
+      notify: restart_networkd
+
+    - name: Enable and start systemd-networkd
+      ansible.builtin.systemd:
+        name: systemd-networkd
+        enabled: true
+        state: started
+      become: true
+
+    - name: Install API VIP proxy socket unit
+      ansible.builtin.template:
+        src: k8s-api-proxy.socket.j2
+        dest: /etc/systemd/system/k8s-api-proxy.socket
+        mode: '0644'
+      become: true
+      notify: daemon_reload
+
+    - name: Install API VIP proxy service unit
+      ansible.builtin.template:
+        src: k8s-api-proxy.service.j2
+        dest: /etc/systemd/system/k8s-api-proxy.service
+        mode: '0644'
+      become: true
+      notify: daemon_reload
+
+    - name: Flush handlers to apply network config and unit changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify k8s dummy interface exists
+      ansible.builtin.command: ip addr show k8s0
+      become: true
+      register: k8s_interface_check
+      changed_when: false
+      failed_when: k8s_interface_check.rc != 0
+
+    - name: Enable and start API VIP proxy socket
+      ansible.builtin.systemd:
+        name: k8s-api-proxy.socket
+        enabled: true
+        state: started
+      become: true
+
+    # Boot-time self-healing: rewrites kubelet's --node-ip from the
+    # default route and repoints the proxy backend by re-resolving the
+    # control plane's hostname, so a network move is "plug in and boot".
+    - name: Install node-ip sync script
+      ansible.builtin.template:
+        src: thinkube-node-ip-sync.sh.j2
+        dest: /usr/local/bin/thinkube-node-ip-sync
+        mode: '0755'
+      vars:
+        node_ip_sync_managed_by: 20_join_workers.yaml
+        node_ip_sync_cp_hostname: "{{ control_plane_host }}"
+      become: true
+
+    - name: Install node-ip sync unit
+      ansible.builtin.copy:
+        src: thinkube-node-ip-sync.service
+        dest: /etc/systemd/system/thinkube-node-ip-sync.service
+        mode: '0644'
+      become: true
+
+    - name: Install node-ip sync watch unit
+      ansible.builtin.copy:
+        src: thinkube-node-ip-sync-watch.service
+        dest: /etc/systemd/system/thinkube-node-ip-sync-watch.service
+        mode: '0644'
+      become: true
+
+    - name: Install node-ip sync timer
+      ansible.builtin.copy:
+        src: thinkube-node-ip-sync.timer
+        dest: /etc/systemd/system/thinkube-node-ip-sync.timer
+        mode: '0644'
+      become: true
+
+    - name: Enable node-ip sync at boot
+      ansible.builtin.systemd:
+        name: thinkube-node-ip-sync.service
+        enabled: true
+        daemon_reload: true
+      become: true
+
+    # A lease that renews onto a different address while the node is up is
+    # invisible to the boot unit; the timer is what makes the move survivable
+    # without a reboot.
+    - name: Enable node-ip sync timer
+      ansible.builtin.systemd:
+        name: thinkube-node-ip-sync.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      become: true
+
+    # =====================================================================
+    # Link watchdog: self-reset, then self-reboot, on a dead physical link
+    # =====================================================================
+    # A worker whose NIC hangs is not down — it is up and unreachable, and
+    # nothing outside it can help. The watchdog judges only the local link
+    # (default route + gateway), so a control-plane outage never triggers it.
+    # /sys/class/net holds one symlink per interface; a wireless one has a
+    # `wireless` directory behind it.
+    - name: Detect wireless interfaces on the worker
+      ansible.builtin.find:
+        paths: /sys/class/net
+        file_type: link
+        recurse: false
+      register: _net_ifaces
+      tags: [link_watchdog]
+
+    - name: Check which interfaces are wireless
+      ansible.builtin.stat:
+        path: "{{ item.path }}/wireless"
+      loop: "{{ _net_ifaces.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: _wireless_stat
+      tags: [link_watchdog]
+
+    # `iw` is what the watchdog uses to turn wireless power saving off;
+    # pointless on wired-only hosts.
+    - name: Install iw on hosts with a wireless interface
+      ansible.builtin.apt:
+        name: iw
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      become: true
+      when: _wireless_stat.results | selectattr('stat.exists') | list | length > 0
+      register: _iw_install
+      retries: 3
+      delay: 10
+      until: _iw_install is succeeded
+      tags: [link_watchdog]
+
+    - name: Install link watchdog script
+      ansible.builtin.template:
+        src: thinkube-link-watchdog.sh.j2
+        dest: /usr/local/bin/thinkube-link-watchdog
+        mode: '0755'
+      vars:
+        link_watchdog_managed_by: 20_join_workers.yaml
+      become: true
+      tags: [link_watchdog]
+
+    - name: Install link watchdog units
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: '0644'
+      loop:
+        - thinkube-link-watchdog.service
+        - thinkube-link-watchdog.timer
+      become: true
+      tags: [link_watchdog]
+
+    - name: Enable link watchdog timer
+      ansible.builtin.systemd:
+        name: thinkube-link-watchdog.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      become: true
+      tags: [link_watchdog]
+
+    # Gate the join on the full path working end-to-end: dummy → local
+    # proxy → control plane apiserver. /version is anonymous-allowed.
+    - name: Verify control plane API is reachable through the node-local VIP
+      ansible.builtin.command: >
+        curl -ks --max-time 10 https://{{ k8s_stable_ip }}:6443/version
+      register: _vip_check
+      retries: 12
+      delay: 5
+      until: _vip_check.rc == 0 and 'gitVersion' in _vip_check.stdout
+      changed_when: false
+
+    # =====================================================================
+    # containerd + kubeadm/kubelet/kubectl install (via roles)
+    # =====================================================================
+    - name: Install containerd.io with Thinkube config
+      ansible.builtin.import_role:
+        name: containerd_install
+
+    - name: Install kubeadm + kubelet + kubectl
+      ansible.builtin.import_role:
+        name: kubeadm_install
+
+    # =====================================================================
+    # Install vanilla upstream kubectl + helm to ~/.local/bin
+    # =====================================================================
+    # No kubeconfig is created on workers — operators wanting to drive
+    # the cluster should SSH to the control plane. kubectl is still
+    # installed so playbooks that templatize kubectl_bin on worker hosts
+    # don't break (they typically delegate_to the control plane anyway).
+    - name: Create .local/bin directory for user
+      ansible.builtin.file:
+        path: "{{ user_home }}/.local/bin"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: '0755'
+      become_user: "{{ user }}"
+
+    - name: Detect system architecture
+      ansible.builtin.set_fact:
+        system_arch: "{{ 'arm64' if ansible_facts.architecture == 'aarch64' else 'amd64' }}"
+
+    - name: Download kubectl binary
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/release/v{{ kubeadm_k8s_patch }}/bin/linux/{{ system_arch }}/kubectl"
+        dest: "{{ kubectl_wrapper_path }}"
+        mode: '0755'
+        owner: "{{ user }}"
+        group: "{{ user }}"
+      become_user: "{{ user }}"
+      register: _kubectl_download
+      retries: 5
+      delay: 10
+      until: _kubectl_download is succeeded
+
+    - name: Download helm installer
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3"
+        dest: "/tmp/get-helm-3.sh"
+        mode: '0755'
+        force: true
+      become: true
+
+    - name: Install helm binary
+      ansible.builtin.shell: |
+        export HELM_INSTALL_DIR="{{ user_home }}/.local/bin"
+        export USE_SUDO=false
+        export DESIRED_VERSION="{{ helm_install_version }}"
+        /tmp/get-helm-3.sh
+      args:
+        creates: "{{ helm_wrapper_path }}"
+      environment:
+        PATH: "{{ user_home }}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      become_user: "{{ user }}"
+      register: _helm_install
+      retries: 5
+      delay: 10
+      until: _helm_install.rc == 0
+
+    - name: Set helm binary ownership
+      ansible.builtin.file:
+        path: "{{ helm_wrapper_path }}"
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: '0755'
+      become: true
+
+    # =====================================================================
+    # Check whether this worker is already in the cluster
+    # =====================================================================
+    - name: Check if this worker is already joined to the cluster
+      ansible.builtin.command: >
+        {{ control_plane_kubectl }} get node {{ inventory_hostname }}
+      delegate_to: "{{ control_plane_host }}"
+      vars:
+        control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+      environment:
+        KUBECONFIG: "/home/{{ system_username }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _node_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Set already_joined fact
+      ansible.builtin.set_fact:
+        already_joined: "{{ _node_exists.rc == 0 }}"
+
+    # =====================================================================
+    # Reset orphaned local state before a fresh join
+    # =====================================================================
+    # A node that was previously joined and later removed from the cluster
+    # (or whose control plane was rebuilt) still carries local k8s state:
+    # /etc/kubernetes/kubelet.conf, the PKI, and a running kubelet on :10250.
+    # The control plane no longer lists it, so already_joined is false and we
+    # take the fresh-join path — but kubeadm's preflight then refuses because
+    # the node is already configured. Detect that orphaned state and clear it
+    # with `kubeadm reset` so the join can proceed.
+    #
+    # Guard: only reset when the control plane *positively* reported the node
+    # as NotFound (not merely unreachable). A transient API error also yields
+    # already_joined=false, and we must never wipe a healthy node on a blip.
+    - name: Check for orphaned local kubelet config
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      become: true
+      register: _local_kubelet_conf
+      when:
+        - not already_joined
+        - "'NotFound' in (_node_exists.stderr | default(''))"
+
+    - name: Reset orphaned Kubernetes state before joining
+      when:
+        - not already_joined
+        - "'NotFound' in (_node_exists.stderr | default(''))"
+        - _local_kubelet_conf.stat.exists | default(false)
+      become: true
+      block:
+        - name: Run kubeadm reset on orphaned node
+          ansible.builtin.command: kubeadm reset -f
+          register: _orphan_reset
+          changed_when: _orphan_reset.rc == 0
+
+        - name: Remove stale CNI network config
+          ansible.builtin.file:
+            path: /etc/cni/net.d
+            state: absent
+
+        - name: Stop kubelet after reset
+          ansible.builtin.systemd:
+            name: kubelet
+            state: stopped
+
+        - name: Report orphaned-node reset
+          ansible.builtin.debug:
+            msg: "Reset orphaned k8s state on {{ inventory_hostname }} before re-join."
+
+    # =====================================================================
+    # Generate join token + discovery CA hash on the control plane
+    # =====================================================================
+    - name: Generate kubeadm join command on control plane
+      ansible.builtin.command: kubeadm token create --print-join-command --ttl 1h
+      delegate_to: "{{ control_plane_host }}"
+      become: true
+      register: _join_cmd
+      changed_when: false
+      when: not already_joined
+
+    - name: Extract join token from kubeadm output
+      ansible.builtin.set_fact:
+        join_token: "{{ _join_cmd.stdout | regex_search('--token\\s+(\\S+)', '\\1') | first }}"
+        join_ca_cert_hash: "{{ _join_cmd.stdout | regex_search('--discovery-token-ca-cert-hash\\s+(\\S+)', '\\1') | first }}"
+      when:
+        - not already_joined
+        - _join_cmd is defined
+        - _join_cmd.stdout is defined
+
+    - name: Display join token (masked)
+      ansible.builtin.debug:
+        msg: "Join token issued for {{ inventory_hostname }}: {{ join_token[:8] }}...{{ join_token[-4:] }}"
+      when:
+        - not already_joined
+        - join_token is defined
+
+    # =====================================================================
+    # kubeadm join
+    # =====================================================================
+    - name: Render kubeadm join configuration
+      ansible.builtin.template:
+        src: kubeadm-join-config.yaml.j2
+        dest: /tmp/kubeadm-join.yaml
+        mode: '0600'
+      become: true
+      when:
+        - not already_joined
+        - join_token is defined
+
+    - name: Run kubeadm join
+      ansible.builtin.command: kubeadm join --config /tmp/kubeadm-join.yaml
+      become: true
+      when:
+        - not already_joined
+        - join_token is defined
+      register: _join_result
+      changed_when: _join_result.rc == 0
+
+    - name: Remove ephemeral join configuration (contains token)
+      ansible.builtin.file:
+        path: /tmp/kubeadm-join.yaml
+        state: absent
+      become: true
+
+    # =====================================================================
+    # Wait for worker to appear in the cluster
+    # =====================================================================
+    - name: Wait for worker node to appear in cluster
+      ansible.builtin.command: >
+        {{ control_plane_kubectl }} get node {{ inventory_hostname }}
+      delegate_to: "{{ control_plane_host }}"
+      vars:
+        control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+      environment:
+        KUBECONFIG: "/home/{{ system_username }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _node_check
+      retries: 30
+      delay: 10
+      until: _node_check.rc == 0
+      changed_when: false
+      when: not already_joined
+
+    # =====================================================================
+    # Wait for Ready, with Cilium-on-new-node self-heal fallback
+    # =====================================================================
+    # Wait up to ~2 min for Ready. If the cilium-agent pod's emptyDir
+    # is wedged on first schedule (CrashLoopBackOff with the
+    # "Non-existent configuration directory /tmp/cilium/config-map"
+    # fatal), the node never recovers on its own — force-deleting that
+    # pod once makes kubelet recreate it cleanly. Self-heal that single
+    # case via block/rescue so users never have to kubectl into a
+    # wedged join. The bug is in Cilium's init container.
+    - name: Wait for worker node to become Ready (with Cilium self-heal fallback)
+      when: not already_joined
+      vars:
+        control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+      environment:
+        KUBECONFIG: "/home/{{ system_username }}/.kube/config"
+      block:
+        - name: Wait for worker node to become Ready
+          ansible.builtin.command: >
+            {{ control_plane_kubectl }} get node {{ inventory_hostname }}
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+          delegate_to: "{{ control_plane_host }}"
+          become_user: "{{ system_username }}"
+          register: _node_ready
+          retries: 12
+          delay: 10
+          until: _node_ready.stdout == 'True'
+          changed_when: false
+
+      rescue:
+        - name: Inspect Cilium pods on stuck node
+          ansible.builtin.command: >
+            {{ control_plane_kubectl }} -n kube-system get pod -l k8s-app=cilium
+            --field-selector spec.nodeName={{ inventory_hostname }}
+            -o json
+          delegate_to: "{{ control_plane_host }}"
+          become_user: "{{ system_username }}"
+          register: _cilium_pods_json
+          changed_when: false
+
+        - name: Identify wedged Cilium pod (not ready, restartCount >= 2)
+          ansible.builtin.set_fact:
+            wedged_cilium_pod: >-
+              {{
+                (_cilium_pods_json.stdout | from_json | json_query(
+                  'items[?status.containerStatuses[?name==`cilium-agent` && ready==`false` && restartCount>=`2`]].metadata.name'
+                )) | first | default('')
+              }}
+
+        - name: Force-delete wedged Cilium pod so kubelet recreates it cleanly
+          ansible.builtin.command: >
+            {{ control_plane_kubectl }} -n kube-system delete pod {{ wedged_cilium_pod }}
+            --force --grace-period=0
+          delegate_to: "{{ control_plane_host }}"
+          become_user: "{{ system_username }}"
+          when: wedged_cilium_pod | length > 0
+
+        - name: Fail if no wedged Cilium pod was found (different root cause)
+          ansible.builtin.fail:
+            msg: >-
+              Worker {{ inventory_hostname }} did not become Ready within 2 minutes
+              and no wedged Cilium pod was found to self-heal. Investigate the
+              node's CNI / kubelet state on the control plane.
+          when: wedged_cilium_pod | length == 0
+
+        - name: Wait for worker node to become Ready (after Cilium self-heal)
+          ansible.builtin.command: >
+            {{ control_plane_kubectl }} get node {{ inventory_hostname }}
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+          delegate_to: "{{ control_plane_host }}"
+          become_user: "{{ system_username }}"
+          register: _node_ready_post_heal
+          retries: 30
+          delay: 10
+          until: _node_ready_post_heal.stdout == 'True'
+          changed_when: false
+
+    # =====================================================================
+    # Wait for Cilium IPAM on the new node + restart pods with stale IPs
+    # =====================================================================
+    - name: Wait for Cilium IPAM to allocate pod CIDR on the new node
+      ansible.builtin.shell: |
+        set -o pipefail
+        POD=$({{ control_plane_kubectl }} get pod -n kube-system -l k8s-app=cilium \
+          --field-selector spec.nodeName={{ inventory_hostname }} \
+          -o jsonpath='{.items[0].metadata.name}')
+        {{ control_plane_kubectl }} exec -n kube-system "$POD" -- cilium status --brief
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ control_plane_host }}"
+      vars:
+        control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+      environment:
+        KUBECONFIG: "/home/{{ system_username }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _cilium_ipam
+      retries: 12
+      delay: 5
+      until: _cilium_ipam.rc == 0
+      changed_when: false
+      when: not already_joined
+
+    - name: Restart pods with stale 10.88.x IPs (CNI bootstrap fallback range)
+      ansible.builtin.shell: |
+        stale=$({{ control_plane_kubectl }} get pods -A \
+          --field-selector spec.nodeName={{ inventory_hostname }} \
+          -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}:{.status.podIP}{"\n"}{end}' \
+          | grep ':10\.88\.' || true)
+        if [ -n "$stale" ]; then
+          echo "$stale" | while IFS=: read -r nspod ip; do
+            ns="${nspod%%/*}"
+            pod="${nspod#*/}"
+            echo "Restarting $ns/$pod (stale IP $ip)"
+            {{ control_plane_kubectl }} delete pod "$pod" -n "$ns" --grace-period=5 2>/dev/null || true
+          done
+        else
+          echo "No stale pods found"
+        fi
+      delegate_to: "{{ control_plane_host }}"
+      vars:
+        control_plane_kubectl: "/home/{{ system_username }}/.local/bin/kubectl"
+      environment:
+        KUBECONFIG: "/home/{{ system_username }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _stale_restart
+      changed_when: "'Restarting' in _stale_restart.stdout"
+      when: not already_joined
+
+    - name: Display worker join status
+      ansible.builtin.debug:
+        msg: "Worker {{ inventory_hostname }} joined and Ready (Cilium IPAM active)"
+      when: not already_joined
+
+  handlers:
+    - name: reload_ufw
+      ansible.builtin.shell: |
+        ufw disable
+        ufw --force enable
+      become: true
+      listen: reload_ufw
+      changed_when: true
+
+    - name: restart_networkd
+      ansible.builtin.systemd:
+        name: systemd-networkd
+        state: restarted
+      become: true
+      listen: restart_networkd
+
+    - name: daemon_reload
+      ansible.builtin.systemd:
+        daemon_reload: true
+      become: true
+      listen: daemon_reload
+
+
+# =========================================================================
+# After all workers join — pin CoreDNS to the control plane + verify ready
+# =========================================================================
+- name: Pin Critical Services and Verify Cluster Status
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+
+  vars:
+    user: "{{ system_username }}"
+    user_home: "/home/{{ user }}"
+
+  tasks:
+    - name: Pin CoreDNS to control plane node
+      ansible.builtin.command: >
+        /home/{{ system_username }}/.local/bin/kubectl -n kube-system patch deployment coredns
+        --type=merge
+        -p '{"spec":{"template":{"spec":{"nodeSelector":{"node-role.kubernetes.io/control-plane":""}}}}}'
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _coredns_pin
+      changed_when: "'patched' in _coredns_pin.stdout and 'no change' not in _coredns_pin.stdout"
+
+    - name: Wait for CoreDNS rollout after pinning
+      ansible.builtin.command: >
+        /home/{{ system_username }}/.local/bin/kubectl -n kube-system rollout status deployment/coredns --timeout=120s
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ system_username }}"
+      when: _coredns_pin is changed
+      changed_when: false
+
+    - name: Get all cluster nodes
+      ansible.builtin.command: /home/{{ system_username }}/.local/bin/kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _all_nodes
+      changed_when: false
+
+    - name: Display cluster nodes
+      ansible.builtin.debug:
+        var: _all_nodes.stdout_lines
+
+    - name: Wait for all nodes to be Ready
+      ansible.builtin.shell: |
+        /home/{{ system_username }}/.local/bin/kubectl get nodes --no-headers | grep -c " Ready " || echo 0
+      environment:
+        KUBECONFIG: "{{ user_home }}/.kube/config"
+      become_user: "{{ system_username }}"
+      register: _ready_count
+      changed_when: false
+      until: _ready_count.stdout | int == (groups['k8s_control_plane'] | length + groups['k8s_workers'] | length)
+      retries: 18
+      delay: 10
+
+    - name: Display worker join summary
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "Thinkube Kubernetes Worker Join Complete"
+          - "==============================================="
+          - "Total nodes in cluster: {{ _ready_count.stdout }}"
+          - "  Control plane nodes: {{ groups['k8s_control_plane'] | length }}"
+          - "  Worker nodes:        {{ groups['k8s_workers'] | length }}"
+          - "==============================================="
+          - "Next Steps:"
+          - "1. Test worker nodes: ansible/40_thinkube/core/infrastructure/k8s/28_test_worker.yaml"
+          - "2. Install GPU Operator: ansible/40_thinkube/core/infrastructure/gpu_operator/10_deploy.yaml"
+          - "==============================================="
+
+
+# =========================================================================
+# After everything — append worker hosts to local SSH config for code-server
+# =========================================================================
+- name: Update Code-Server SSH Config with Worker Nodes
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars:
+    ssh_config_path: "{{ lookup('env', 'HOME') }}/.ssh/config"
+
+  tasks:
+    # LAN addresses move (DHCP); the connection goes through
+    # thinkube-node-ip, which asks the cluster for the current address at
+    # connect time. ZeroTier overlay addresses are static and used directly.
+    - name: Add worker nodes to code-server SSH config
+      tags: [ssh_config]
+      vars:
+        host_ip_key: "{{ 'overlay_ip' if overlay_provider == 'zerotier' else 'lan_ip' }}"
+      ansible.builtin.blockinfile:
+        path: "{{ ssh_config_path }}"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - WORKER {{ item }}"
+        block: |
+          # Worker node: {{ item }}
+          Host {{ item }} {{ item }}.{{ domain_name }}
+          {% if overlay_provider == 'zerotier' %}
+              HostName {{ hostvars[item][host_ip_key] }}
+          {% else %}
+              ProxyCommand /home/{{ system_username }}/.local/bin/thinkube-node-ip --connect {{ item }} 22 {{ hostvars[item][host_ip_key] }}
+          {% endif %}
+              User {{ system_username }}
+              StrictHostKeyChecking no
+              UserKnownHostsFile /dev/null
+              LogLevel ERROR
+              IdentityFile ~/.ssh/thinkube_cluster_key
+        mode: '0600'
+        create: false
+      loop: "{{ groups['k8s_workers'] }}"
+      when: hostvars[item][host_ip_key] is defined

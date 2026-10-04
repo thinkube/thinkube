@@ -1,0 +1,115 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ArgoCD's SSH known hosts are not set here: the ArgoCD Helm chart owns
+# them, with GitHub in its defaults and Gitea added by the
+# argocd_gitea_known_hosts role.
+
+- name: Read SSH private key from remote host for ArgoCD
+  ansible.builtin.slurp:
+    src: "{{ code_source_path }}/.ssh/{{ github_repo_name }}/id_ed25519"
+  register: ssh_private_key_content
+  when: use_github
+
+- name: Create SSH key secret for ArgoCD GitHub access
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: github-{{ github_repo_name }}-ssh
+        namespace: "{{ argocd_namespace }}"
+        labels:
+          argocd.argoproj.io/secret-type: repository
+      stringData:
+        url: "{{ github_repo_url }}"
+        sshPrivateKey: "{{ ssh_private_key_content.content | b64decode }}"
+        type: git
+  when: use_github
+
+- name: Get Gitea admin token from secret
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Secret
+    namespace: gitea
+    name: gitea-admin-token
+  register: gitea_token_secret
+  when: not use_github
+
+- name: Set Gitea token fact
+  ansible.builtin.set_fact:
+    gitea_admin_token: "{{ gitea_token_secret.resources[0].data.token | b64decode }}"
+  when: 
+    - not use_github
+    - gitea_token_secret.resources | length > 0
+
+# Get the Gitea SSH key from argo namespace
+- name: Get Gitea SSH key from argo namespace
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Secret
+    namespace: argo
+    name: gitea-ssh-key
+  register: gitea_ssh_key_secret
+  when: not use_github
+
+- name: Create SSH repository secret for Gitea access
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: gitea-{{ app_name }}-ssh
+        namespace: "{{ argocd_namespace }}"
+        labels:
+          argocd.argoproj.io/secret-type: repository
+      stringData:
+        url: "ssh://git@{{ gitea_hostname }}:2222/{{ gitea_org }}/{{ gitea_repo_name }}.git"
+        sshPrivateKey: "{{ gitea_ssh_key_secret.resources[0].data['ssh-privatekey'] | b64decode }}"
+        type: git
+  when:
+    - not use_github
+    - gitea_ssh_key_secret.resources | length > 0
+
+- name: Create ArgoCD Application
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "{{ app_name }}"
+        namespace: "{{ argocd_namespace }}"
+        # No annotations needed - webhook adapter handles image updates directly
+      spec:
+        project: default
+        source:
+          repoURL: "{% if use_github %}{{ github_repo_url }}{% else %}ssh://git@{{ gitea_hostname }}:2222/{{ gitea_org }}/{{ gitea_repo_name }}.git{% endif %}"
+          targetRevision: HEAD
+          path: "{{ argocd_repo_path | default('k8s') }}"
+        destination:
+          server: https://kubernetes.default.svc
+          namespace: "{{ app_namespace }}"
+        syncPolicy:
+          # Automated sync disabled - webhook adapter will handle Git updates after images are ready
+          syncOptions:
+          - CreateNamespace=true
+        revisionHistoryLimit: 3
+
+- name: Wait for application to be created
+  ansible.builtin.pause:
+    seconds: 5
+
+- name: Hard refresh application to detect source type
+  ansible.builtin.shell: |
+    ~/.local/bin/argocd app get {{ app_name }} --hard-refresh || true
+  register: app_refresh_result
+

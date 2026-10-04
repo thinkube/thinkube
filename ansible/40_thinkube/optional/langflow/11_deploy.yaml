@@ -1,0 +1,411 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/langflow/11_deploy.yaml
+# Description:
+#   Deploy Langflow with OAuth2 Proxy (Keycloak SSO) and PostgreSQL persistence.
+#   All traffic routes through oauth2-proxy which proxies authenticated requests
+#   to Langflow running in insecure (auto-login) mode.
+#
+# Requirements:
+#   - Kubernetes (kubeadm) must be installed
+#   - Keycloak must be deployed (CORE-006)
+#   - PostgreSQL must be deployed (CORE-002)
+#   - ADMIN_PASSWORD environment variable set
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/optional/langflow/11_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain name
+#   - langflow_namespace: Kubernetes namespace for Langflow
+#   - langflow_hostname: Hostname for Langflow (e.g., langflow.example.com)
+#   - langflow_client_id: OAuth2 client ID in Keycloak
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username
+#   - kubeconfig: Path to kubeconfig file
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to Helm binary
+#
+# Dependencies:
+#   - CORE-002: PostgreSQL must be deployed
+#   - CORE-006: Keycloak must be deployed
+
+- name: Deploy Langflow with OAuth2 Proxy and PostgreSQL
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    k8s_namespace: "langflow"
+    langflow_fqdn: "langflow.{{ domain_name }}"
+    tls_secret_name: "tls-cmxela-com"
+
+    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    # PostgreSQL settings
+    postgres_namespace: "postgres"
+    postgres_release_name: "postgresql-official"
+    langflow_db_name: "langflow"
+    langflow_db_user: "{{ admin_username }}"
+    langflow_db_password: "{{ admin_password }}"
+
+    # Valkey settings for oauth2-proxy sessions
+    valkey_namespace: "{{ k8s_namespace }}"
+    valkey_kubeconfig: "{{ kubeconfig }}"
+
+    # OAuth2 Proxy settings
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ admin_password }}"
+
+    oauth2_proxy_namespace: "{{ k8s_namespace }}"
+    oauth2_proxy_name: "oauth2-proxy"
+    oauth2_proxy_client_id: "langflow"
+    oauth2_proxy_dashboard_host: "{{ langflow_fqdn }}"
+    oauth2_proxy_oidc_issuer_url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}"
+    oauth2_proxy_cookie_domain: ".{{ domain_name }}"
+    oauth2_proxy_ingress_host: "{{ langflow_fqdn }}"
+    oauth2_proxy_ingress_tls_secret_name: "{{ tls_secret_name }}"
+    oauth2_proxy_redirect_url: "https://{{ langflow_fqdn }}/oauth2/callback"
+    oauth2_proxy_kubeconfig: "{{ kubeconfig }}"
+    oauth2_proxy_helm_bin: "{{ helm_bin }}"
+    oauth2_proxy_keycloak_debug: true
+    oauth2_proxy_session_store_type: "redis"
+    oauth2_proxy_redis_service: "ephemeral-valkey"
+    oauth2_proxy_cookie_samesite: "lax"
+    # Disable the role's built-in /oauth2 HTTPRoute — we create a single catch-all route
+    oauth2_proxy_ingress_enabled: false
+    # Proxy all traffic to Langflow upstream
+    oauth2_proxy_extra_args:
+      - "--upstream=http://langflow.{{ k8s_namespace }}.svc.cluster.local:7860"
+      - "--email-domain=*"
+      - "--skip-provider-button=true"
+
+  tasks:
+    ###########################################################################
+    # Step 1: Create Namespace and TLS Secret
+    ###########################################################################
+    - name: Ensure Langflow namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ k8s_namespace }}"
+
+    - name: Get wildcard TLS certificate from default namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: default
+        name: "{{ domain_name.replace('.', '-') }}-tls"
+      register: wildcard_cert
+      failed_when: wildcard_cert.resources | length == 0
+
+    - name: Copy wildcard TLS certificate to Langflow namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ tls_secret_name }}"
+            namespace: "{{ k8s_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ wildcard_cert.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ wildcard_cert.resources[0].data['tls.key'] }}"
+
+    ###########################################################################
+    # Step 2: Create PostgreSQL Database for Langflow
+    ###########################################################################
+    - name: Check if Langflow database exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/{{ postgres_release_name }} -- \
+          psql -U {{ admin_username }} -d postgres -tAc \
+          "SELECT 1 FROM pg_database WHERE datname='{{ langflow_db_name }}';"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: db_exists
+      changed_when: false
+      failed_when: false
+
+    - name: Create Langflow database
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ postgres_namespace }} statefulset/{{ postgres_release_name }} -- \
+          psql -U {{ admin_username }} -d postgres -c "CREATE DATABASE {{ langflow_db_name }};"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: db_exists.stdout.strip() != "1"
+      register: create_db
+      changed_when: create_db.rc == 0
+
+    ###########################################################################
+    # Step 3: Create Langflow Secret
+    ###########################################################################
+    - name: Create Langflow secret (DB URL + secret key)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: langflow-secret
+            namespace: "{{ k8s_namespace }}"
+          type: Opaque
+          data:
+            database-url: "{{ ('postgresql://' + langflow_db_user + ':' + langflow_db_password + '@' + postgres_release_name + '.' + postgres_namespace + '.svc.cluster.local:5432/' + langflow_db_name) | b64encode }}"
+            secret-key: "{{ (langflow_db_password + '-langflow-secret') | b64encode }}"
+
+    ###########################################################################
+    # Step 4: Deploy Ephemeral Valkey for oauth2-proxy sessions
+    ###########################################################################
+    - name: Deploy Ephemeral Valkey for session storage
+      ansible.builtin.include_role:
+        name: valkey/ephemeral_valkey
+      vars:
+        valkey_registry: "{{ harbor_registry }}/library"
+
+    ###########################################################################
+    # Step 5: Deploy OAuth2 Proxy (handles Keycloak client creation + deploy)
+    ###########################################################################
+    - name: Deploy OAuth2 Proxy with Keycloak authentication
+      ansible.builtin.include_role:
+        name: oauth2_proxy
+
+    ###########################################################################
+    # Step 6: Create PVC for Langflow data
+    ###########################################################################
+    - name: Create PVC for Langflow data
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: langflow-data
+            namespace: "{{ k8s_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+
+    - name: Create PVC for Langflow custom nodes
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: langflow-custom-nodes
+            namespace: "{{ k8s_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+
+    ###########################################################################
+    # Step 7: Deploy Langflow
+    ###########################################################################
+    - name: Deploy Langflow
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: langflow
+            namespace: "{{ k8s_namespace }}"
+            labels:
+              app: langflow
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: langflow
+            template:
+              metadata:
+                labels:
+                  app: langflow
+              spec:
+                securityContext:
+                  # Langflow container runs as uid=1000(user). Set fsGroup so
+                  # mounted PVCs (langflow-data, langflow-custom-nodes) are
+                  # group-owned by gid 1000 with g+rwx — required for template
+                  # deploy playbooks to write node files into /app/custom_nodes.
+                  fsGroup: 1000
+                  fsGroupChangePolicy: OnRootMismatch
+                containers:
+                  - name: langflow
+                    image: "{{ harbor_registry }}/{{ library_project | default('library') }}/langflow:latest"
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 7860
+                        name: http
+                    env:
+                      - name: LANGFLOW_DATABASE_URL
+                        valueFrom:
+                          secretKeyRef:
+                            name: langflow-secret
+                            key: database-url
+                      - name: LANGFLOW_SECRET_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: langflow-secret
+                            key: secret-key
+                      - name: LANGFLOW_AUTO_LOGIN
+                        value: "true"
+                      - name: LANGFLOW_HOST
+                        value: "0.0.0.0"
+                      - name: LANGFLOW_PORT
+                        value: "7860"
+                      - name: LANGFLOW_WORKERS
+                        value: "1"
+                      # Enable the /api/v2/workflows endpoint (the production
+                      # execution path the KubeXlat API Gateway will call).
+                      # Off by default in Langflow 1.8+ behind a "Developer API"
+                      # feature gate; KubeXlat relies on it so we turn it on.
+                      - name: LANGFLOW_DEVELOPER_API_ENABLED
+                        value: "true"
+                      - name: LANGFLOW_COMPONENTS_PATH
+                        value: "/app/custom_nodes"
+                      # Auto-populate Global Model Providers from env on every
+                      # startup. Default Langflow list already covers OpenAI,
+                      # Anthropic, Google, Groq, Cohere, HuggingFace, Azure, etc.
+                      # — extend it here with provider variables Langflow does
+                      # not ship by default (e.g. Ollama's base URL).
+                      - name: LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT
+                        value: "OLLAMA_BASE_URL"
+                      - name: OLLAMA_BASE_URL
+                        value: "http://ollama.ollama.svc.cluster.local:11434"
+                    volumeMounts:
+                      # Langflow image has HOME=/app/data and writes its cache
+                      # (profile pictures, uploads, component stubs) under
+                      # /app/data/.cache/langflow. Mount the PVC there — the
+                      # historic /root/.cache/langflow path was unreachable to
+                      # the uid=1000 container user and the PVC was unused.
+                      - name: langflow-data
+                        mountPath: /app/data/.cache/langflow
+                      - name: langflow-custom-nodes
+                        mountPath: /app/custom_nodes
+                    resources:
+                      requests:
+                        cpu: "500m"
+                        memory: "1Gi"
+                      limits:
+                        cpu: "2"
+                        memory: "4Gi"
+                    readinessProbe:
+                      httpGet:
+                        path: /health
+                        port: 7860
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      failureThreshold: 6
+                    livenessProbe:
+                      httpGet:
+                        path: /health
+                        port: 7860
+                      initialDelaySeconds: 60
+                      periodSeconds: 30
+                      failureThreshold: 3
+                volumes:
+                  - name: langflow-data
+                    persistentVolumeClaim:
+                      claimName: langflow-data
+                  - name: langflow-custom-nodes
+                    persistentVolumeClaim:
+                      claimName: langflow-custom-nodes
+
+    - name: Create Langflow Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: langflow
+            namespace: "{{ k8s_namespace }}"
+          spec:
+            selector:
+              app: langflow
+            ports:
+              - name: http
+                port: 7860
+                targetPort: 7860
+            type: ClusterIP
+
+    ###########################################################################
+    # Step 8: Create HTTPRoute (all traffic → oauth2-proxy → langflow upstream)
+    ###########################################################################
+    - name: Create Langflow HTTPRoute via OAuth2 Proxy
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: langflow-route
+            namespace: "{{ k8s_namespace }}"
+          spec:
+            parentRefs:
+              - name: "{{ gateway_name | default('thinkube-gateway') }}"
+                namespace: "{{ gateway_namespace | default('gateway-system') }}"
+                sectionName: https
+            hostnames:
+              - "{{ langflow_fqdn }}"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: oauth2-proxy
+                    port: 80
+
+    ###########################################################################
+    # Step 9: Wait for Langflow to be ready
+    ###########################################################################
+    - name: Wait for Langflow deployment to be ready
+      ansible.builtin.shell: |
+        for i in $(seq 1 24); do
+          READY=$({{ kubectl_bin }} -n {{ k8s_namespace }} get deployment langflow \
+            -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          if [ "${READY}" = "1" ]; then
+            echo "Langflow is ready"
+            exit 0
+          fi
+          echo "Waiting for Langflow... attempt $i (ready: ${READY})"
+          sleep 10
+        done
+        echo "Timeout waiting for Langflow"
+        exit 1
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wait_result
+      changed_when: false
+      failed_when: wait_result.rc != 0
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Langflow deployment complete"
+          - "URL: https://{{ langflow_fqdn }}"
+          - "Authentication: Keycloak SSO via OAuth2 Proxy"
+          - "Database: PostgreSQL ({{ langflow_db_name }})"

@@ -1,0 +1,752 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/acme-certificates/10_deploy.yaml
+# Description:
+#   Manages SSL certificates using acme.sh and Let's Encrypt
+#   - Installs and configures acme.sh
+#   - Sets up Cloudflare DNS validation
+#   - Issues and renews wildcard certificates for multiple domains
+#   - Creates Kubernetes secret compatible with cert-manager format
+#
+# Requirements:
+#   - Kubernetes (kubeadm) installed on the control plane
+#   - Cloudflare API token in cloudflare_api_token variable
+#   - Access to Let's Encrypt services
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/acme-certificates/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Main domain for the cluster
+#   - cloudflare_api_token: Cloudflare API token for DNS validation
+#   - admin_email: Email for Let's Encrypt registration
+#   - system_username: System user for certificate management
+#   - github_token: GitHub token with repo permissions (used for certificate backup)
+#   - github_certificates_repo: (Optional) Repository name (default: "thinkube-certificates")
+#   - cert_backup_password: (Optional) Encryption password (default: admin_password)
+#
+# 🤖 [AI-assisted]
+
+- name: Manage SSL Certificates with acme.sh
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: true
+  vars:
+    acme_home: "/home/{{ system_username }}/.acme.sh"
+    cert_dir: "/etc/ssl/thinkube"
+    certificate_domains:
+      - "{{ domain_name }}"
+      - "*.{{ domain_name }}"
+    required_packages:
+      - cron
+      - openssl
+    cert_renewal_age_days: 30
+    acme_installer_url: "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh"
+    acme_installer_path: "/tmp/acme.sh"
+    letsencrypt_server: "letsencrypt"
+    tls_crt_path: "{{ cert_dir }}/{{ domain_name }}/fullchain.cer"
+    tls_key_path: "{{ cert_dir }}/{{ domain_name }}/{{ domain_name }}.key"
+    hook_script_dir: "{{ cert_dir }}/scripts"
+    hook_script_path: "{{ cert_dir }}/scripts/sync-k8s-tls.sh"
+    # kubectl_bin and kubeconfig inherited from inventory
+    env_file_path: "{{ ansible_facts.env.HOME }}/.env"
+
+  pre_tasks:
+    - name: Set github_token from environment
+      ansible.builtin.set_fact:
+        github_token: "{{ github_token | default(lookup('env', 'GITHUB_TOKEN'), true) }}"
+
+    - name: Resolve the GitHub username from the token
+      ansible.builtin.include_role:
+        name: common/github_username
+
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - cloudflare_api_token is defined
+          - admin_email is defined
+          - system_username is defined
+        fail_msg: "Required variables not defined in inventory"
+
+    - name: Install required system packages
+      ansible.builtin.apt:
+        name: "{{ required_packages }}"
+        state: present
+        update_cache: true
+      become: true
+
+    - name: Ensure cron service is enabled and running
+      ansible.builtin.systemd:
+        name: cron
+        enabled: true
+        state: started
+      become: true
+
+    - name: Ensure certificate directory exists with proper permissions
+      ansible.builtin.file:
+        path: "{{ cert_dir }}/{{ domain_name }}"
+        state: directory
+        mode: '0700'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      become: true
+
+    - name: Check acme.sh installation
+      ansible.builtin.stat:
+        path: "{{ acme_home }}/acme.sh"
+      register: acme_check
+      become: false
+      become_user: "{{ system_username }}"
+
+    - name: Clone acme.sh repository
+      ansible.builtin.git:
+        repo: 'https://github.com/acmesh-official/acme.sh.git'
+        dest: '/tmp/acme.sh-repo'
+        version: 'master'
+        depth: 1
+      when: not acme_check.stat.exists
+      become: false
+      become_user: "{{ system_username }}"
+
+    - name: Install acme.sh
+      ansible.builtin.shell: |
+        cd /tmp/acme.sh-repo && ./acme.sh --install --home {{ acme_home }}
+      args:
+        creates: "{{ acme_home }}/acme.sh"
+        executable: /bin/bash
+      when: not acme_check.stat.exists
+      become: false
+      become_user: "{{ system_username }}"
+
+    - name: Clean up acme.sh repository
+      ansible.builtin.file:
+        path: '/tmp/acme.sh-repo'
+        state: absent
+      when: not acme_check.stat.exists
+
+    - name: Check acme.sh account registration
+      ansible.builtin.shell: |
+        {{ acme_home }}/acme.sh --list
+      register: acme_account
+      changed_when: false
+      become: false
+      become_user: "{{ system_username }}"
+      args:
+        executable: /bin/bash
+
+    - name: Configure Let's Encrypt as default CA
+      ansible.builtin.shell: |
+        {{ acme_home }}/acme.sh --set-default-ca --server {{ letsencrypt_server }}
+      when: "'ACCOUNT' not in acme_account.stdout"
+      changed_when: false
+      become: false
+      become_user: "{{ system_username }}"
+      args:
+        executable: /bin/bash
+
+    - name: Register acme.sh account
+      ansible.builtin.shell: |
+        {{ acme_home }}/acme.sh --register-account -m {{ admin_email }}
+      when: "'ACCOUNT' not in acme_account.stdout"
+      changed_when: "'ACCOUNT' not in acme_account.stdout"
+      become: false
+      become_user: "{{ system_username }}"
+      args:
+        executable: /bin/bash
+
+    - name: Verify Cloudflare API token
+      ansible.builtin.shell: echo $CF_Token
+      register: cf_token
+      environment:
+        CF_Token: "{{ cloudflare_api_token }}"
+      changed_when: false
+      become: false
+      become_user: "{{ system_username }}"
+      args:
+        executable: /bin/bash
+
+    - name: Fail if Cloudflare API token is not set
+      ansible.builtin.fail:
+        msg: "Cloudflare API token is not set in cloudflare_api_token variable"
+      when: cf_token.stdout == ""
+
+    # ------------------------------------------------------------------
+    # Recovery from the GitHub backup
+    #
+    # The backup written at the end of this playbook is the only copy that
+    # outlives the machine: a reinstalled disk keeps nothing, and
+    # thinkube-wipe.sh empties the home directory, taking acme.sh's own
+    # record of the certificate with it. Restoring here, ahead of the
+    # checks that decide whether to issue, lets a rebuilt machine carry on
+    # with the certificate it already had instead of asking Let's Encrypt
+    # for another one — the same set of names may only be issued five
+    # times a week.
+    #
+    # None of this has to succeed. With no repository, nothing in it, or a
+    # backup password that no longer matches, the checks below find no
+    # certificate and issue one, which is the behaviour this playbook had
+    # before the restore existed.
+    # ------------------------------------------------------------------
+    - name: Set backup variables
+      ansible.builtin.set_fact:
+        cert_backup_password: "{{ lookup('env', 'ANSIBLE_BECOME_PASSWORD') }}"
+        github_certificates_repo: "thinkube-certificates"
+      when:
+        - github_token is defined
+
+    - name: Check what the machine still has of the certificate
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: cert_state_before_restore
+      loop:
+        - "{{ tls_crt_path }}"
+        - "{{ acme_home }}/{{ domain_name }}_ecc/{{ domain_name }}.conf"
+
+    - name: Restore the certificate from the GitHub backup
+      when:
+        - github_token is defined
+        - cert_state_before_restore.results | rejectattr('stat.exists') | list | length > 0
+      block:
+        - name: Create temporary directory for the restore
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: _cert_restore
+          register: restore_temp_dir
+
+        - name: Clone the certificate backup repository
+          ansible.builtin.shell: |
+            git clone --depth 1 \
+              https://{{ github_token }}@github.com/{{ github_username }}/{{ github_certificates_repo }}.git \
+              {{ restore_temp_dir.path }}/repo
+          register: restore_clone
+          failed_when: false
+          changed_when: false
+          args:
+            executable: /bin/bash
+
+        # Exit 90 says the backup holds no certificate, which is not a
+        # failure: the repository exists because some earlier run created
+        # it, and an empty one is the same as none at all.
+        - name: Decrypt the certificate and the acme.sh record into place
+          ansible.builtin.shell: |
+            set -euo pipefail
+            repo={{ restore_temp_dir.path }}/repo
+            decrypt() {
+              openssl enc -d -aes-256-cbc -pbkdf2 -in "$1" -out "$2" -k "{{ cert_backup_password }}"
+            }
+
+            [ -f "$repo/{{ domain_name }}.crt.enc" ] || exit 90
+
+            decrypt "$repo/{{ domain_name }}.crt.enc" {{ tls_crt_path }}
+            decrypt "$repo/{{ domain_name }}.key.enc" {{ tls_key_path }}
+            if [ -f "$repo/{{ domain_name }}.cer.enc" ]; then
+              decrypt "$repo/{{ domain_name }}.cer.enc" {{ cert_dir }}/{{ domain_name }}/{{ domain_name }}.cer
+            fi
+            chmod 0600 {{ cert_dir }}/{{ domain_name }}/*
+
+            # acme.sh renews and installs from this record, not from the
+            # files above. Without it the certificate cannot be renewed and
+            # cannot be given a reload hook, so a backup that predates the
+            # record is only worth the files it carries.
+            if [ -f "$repo/{{ domain_name }}.acme.tar.gz.enc" ]; then
+              decrypt "$repo/{{ domain_name }}.acme.tar.gz.enc" {{ restore_temp_dir.path }}/acme.tar.gz
+              mkdir -p {{ acme_home }}
+              tar -C {{ acme_home }} -xzf {{ restore_temp_dir.path }}/acme.tar.gz
+              chmod -R go-rwx {{ acme_home }}/{{ domain_name }}_ecc
+            fi
+          register: restore_result
+          failed_when: false
+          changed_when: restore_result.rc == 0
+          when: restore_clone.rc == 0
+          args:
+            executable: /bin/bash
+
+        - name: Report what the restore recovered
+          ansible.builtin.debug:
+            msg: >-
+              {{
+                'No backup repository to restore from; the certificate will be issued.'
+                if restore_clone.rc != 0 else
+                'The backup holds no certificate; one will be issued.'
+                if restore_result.rc | default(90) == 90 else
+                'Certificate restored from the backup.'
+                if restore_result.rc | default(1) == 0 else
+                'The backup could not be restored (wrong backup password?); the certificate will be issued.'
+              }}
+
+        - name: Clean up the restore directory
+          ansible.builtin.file:
+            path: "{{ restore_temp_dir.path }}"
+            state: absent
+
+    - name: Check existing certificate
+      ansible.builtin.stat:
+        path: "{{ tls_crt_path }}"
+      register: cert_file
+      become: false
+      become_user: "{{ system_username }}"
+
+    - name: Get existing certificate domains if certificate exists
+      ansible.builtin.shell: |
+        openssl x509 -in {{ tls_crt_path }} -text -noout | grep -oP '(?<=DNS:)[^,]*' | sort
+      register: existing_domains
+      when: cert_file.stat.exists
+      changed_when: false
+      ignore_errors: true
+      become: false
+      become_user: "{{ system_username }}"
+      args:
+        executable: /bin/bash
+
+    - name: Check certificate expiry
+      ansible.builtin.shell: |
+        openssl x509 -in {{ tls_crt_path }} -checkend $(( {{ cert_renewal_age_days }} * 86400 ))
+      register: cert_expiry_check
+      when: cert_file.stat.exists
+      changed_when: false
+      failed_when: false
+      become: false
+      become_user: "{{ system_username }}"
+
+    # acme.sh keeps its own record of a certificate — the names, the CA, the
+    # key length, the reload command — under <domain>_ecc, _ecc because the
+    # certificate is issued with --keylength ec-256. Renewal and
+    # --install-cert both work from that record and not from the files in
+    # {{ cert_dir }}, so a certificate acme.sh has no record of cannot be
+    # renewed and cannot be given a reload hook: 15_configure_renewal_hook
+    # fails on it outright. The two halves part company whenever the files
+    # outlive the home directory, which is what thinkube-wipe.sh leaves
+    # behind, so the record is worth checking on its own.
+    - name: Check the acme.sh record of the certificate
+      ansible.builtin.stat:
+        path: "{{ acme_home }}/{{ domain_name }}_ecc/{{ domain_name }}.conf"
+      register: acme_record
+      become: false
+      become_user: "{{ system_username }}"
+
+    - name: Determine if certificate needs renewal
+      ansible.builtin.set_fact:
+        needs_renewal: >-
+          {{
+            not cert_file.stat.exists or
+            not acme_record.stat.exists or
+            cert_expiry_check.rc != 0 or
+            (existing_domains.stdout_lines | default([]) | sort) != (certificate_domains | sort)
+          }}
+
+    - name: Debug certificate status
+      ansible.builtin.debug:
+        msg:
+          - "Certificate exists: {{ cert_file.stat.exists }}"
+          - "acme.sh has a record of it: {{ acme_record.stat.exists }}"
+          - "Certificate domains match: {{ (existing_domains.stdout_lines | default([]) | sort) == (certificate_domains | sort) if cert_file.stat.exists else 'N/A' }}"
+          - "Certificate expiry check: {{ 'Valid' if cert_expiry_check.rc | default(1) == 0 else 'Needs renewal' if cert_file.stat.exists else 'N/A' }}"
+          - "Needs renewal: {{ needs_renewal }}"
+
+    # The renewal hook script must exist BEFORE `acme.sh --issue`, because
+    # acme.sh runs the --reloadcmd immediately after installing the cert
+    # files. Without this, the very first issue fails even though Let's
+    # Encrypt has already issued the cert. (15_configure_renewal_hook.yaml
+    # later re-installs this same script — leaving the duplication for
+    # idempotency: this playbook is self-sufficient if anyone runs it
+    # standalone.)
+    - name: Create renewal hook script directory
+      ansible.builtin.file:
+        path: "{{ hook_script_dir }}"
+        state: directory
+        mode: '0750'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      become: true
+
+    - name: Install renewal hook script (sync wildcard cert to k8s TLS secrets)
+      ansible.builtin.copy:
+        dest: "{{ hook_script_path }}"
+        mode: '0750'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        content: |
+          #!/usr/bin/env bash
+          # sync-k8s-tls.sh — Sync renewed wildcard cert to all Kubernetes TLS secrets
+          # Called by acme.sh --reloadcmd after certificate renewal.
+          #
+          # Safety: only patches secrets whose tls.crt SANs match the new
+          # wildcard cert's SANs. Non-wildcard TLS secrets are never touched.
+
+          set -euo pipefail
+
+          KUBECTL="{{ kubectl_bin }}"
+          KUBECONFIG="{{ kubeconfig }}"
+          export KUBECONFIG
+
+          TLS_CRT="{{ tls_crt_path }}"
+          TLS_KEY="{{ tls_key_path }}"
+          LOG_TAG="sync-k8s-tls"
+
+          log() { logger -t "$LOG_TAG" "$*"; echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
+
+          NEW_CRT_B64=$(base64 -w0 < "$TLS_CRT")
+          NEW_KEY_B64=$(base64 -w0 < "$TLS_KEY")
+
+          SECRETS=$($KUBECTL get secrets --all-namespaces \
+            --field-selector type=kubernetes.io/tls \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.data.tls\.crt}{"\n"}{end}')
+
+          UPDATED=0
+          SKIPPED=0
+
+          while IFS=' ' read -r ns name old_crt_b64; do
+            [ -z "$ns" ] && continue
+
+            if [ "$old_crt_b64" = "$NEW_CRT_B64" ]; then
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            OLD_SANS=$(echo "$old_crt_b64" | base64 -d 2>/dev/null | \
+              openssl x509 -noout -ext subjectAltName 2>/dev/null | \
+              grep -oP 'DNS:[^,]+' | sort || true)
+            NEW_SANS=$(openssl x509 -in "$TLS_CRT" -noout -ext subjectAltName 2>/dev/null | \
+              grep -oP 'DNS:[^,]+' | sort || true)
+
+            if [ "$OLD_SANS" != "$NEW_SANS" ]; then
+              log "SKIP $ns/$name — different SANs"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            $KUBECTL patch secret "$name" -n "$ns" \
+              --type='json' \
+              -p="[
+                {\"op\": \"replace\", \"path\": \"/data/tls.crt\", \"value\": \"$NEW_CRT_B64\"},
+                {\"op\": \"replace\", \"path\": \"/data/tls.key\", \"value\": \"$NEW_KEY_B64\"}
+              ]" >/dev/null
+
+            log "UPDATED $ns/$name"
+            UPDATED=$((UPDATED + 1))
+          done <<< "$SECRETS"
+
+          log "Done: $UPDATED secrets updated, $SKIPPED skipped"
+          log "TLS secrets updated — Cilium Gateway will reload certificates automatically"
+      become: true
+
+    - name: Issue new SSL certificate
+      ansible.builtin.shell: |
+        {{ acme_home }}/acme.sh --issue --dns dns_cf \
+        {% for domain in certificate_domains %}-d {{ domain }} {% endfor %} \
+        --keylength ec-256 \
+        --cert-file {{ cert_dir }}/{{ domain_name }}/{{ domain_name }}.cer \
+        --key-file {{ tls_key_path }} \
+        --fullchain-file {{ tls_crt_path }} \
+        --reloadcmd "{{ hook_script_path }}"
+      environment:
+        CF_Token: "{{ cloudflare_api_token }}"
+      when: needs_renewal
+      become: false
+      become_user: "{{ system_username }}"
+      args:
+        executable: /bin/bash
+
+    - name: Set proper certificate file permissions
+      ansible.builtin.file:
+        path: "{{ cert_dir }}/{{ domain_name }}/{{ item }}"
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      loop:
+        - "{{ domain_name }}.cer"
+        - "{{ domain_name }}.key"
+        - "fullchain.cer"
+      when: needs_renewal
+
+    - name: Delete existing TLS secret if present (for update)
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete secret {{ domain_name | replace('.', '-') }}-tls -n default --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: delete_secret
+      changed_when: "'deleted' in delete_secret.stdout"
+      args:
+        executable: /bin/bash
+
+    - name: Create/Update Kubernetes TLS secret using kubectl
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} create secret tls {{ domain_name | replace('.', '-') }}-tls \
+          --cert={{ tls_crt_path }} \
+          --key={{ tls_key_path }} \
+          -n default
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: create_secret
+      changed_when: true
+      args:
+        executable: /bin/bash
+
+    - name: Label the TLS secret
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} label secret {{ domain_name | replace('.', '-') }}-tls \
+          -n default \
+          app.kubernetes.io/managed-by=acme.sh \
+          app.kubernetes.io/name=wildcard-certificate \
+          --overwrite
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      args:
+        executable: /bin/bash
+
+    - name: Verify secret was created
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name | replace('.', '-') }}-tls -n default
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: secret_check
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Display certificate information
+      ansible.builtin.debug:
+        msg:
+          - "Certificate domains: {{ certificate_domains | join(', ') }}"
+          - "Certificate location: {{ cert_dir }}/{{ domain_name }}/"
+          - "Kubernetes secret: default/{{ domain_name | replace('.', '-') }}-tls"
+          - "Secret created: {{ secret_check.rc == 0 }}"
+
+    # GitHub Backup Block - Optional certificate backup to user's GitHub repository
+    # cert_backup_password and github_certificates_repo are set further up,
+    # where the restore needs them.
+    - name: Check if GitHub backup repository exists
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/{{ github_username }}/{{ github_certificates_repo }}"
+        method: GET
+        headers:
+          Authorization: "token {{ github_token }}"
+        status_code: [200, 404]
+      register: github_repo_check
+      when: 
+        - github_token is defined
+
+    - name: Create GitHub backup repository if it doesn't exist
+      ansible.builtin.uri:
+        url: "https://api.github.com/user/repos"
+        method: POST
+        headers:
+          Authorization: "token {{ github_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ github_certificates_repo }}"
+          description: "Encrypted backup of Thinkube SSL certificates"
+          private: true
+          auto_init: false
+        status_code: [201]
+      when: 
+        - github_token is defined
+        - github_repo_check.status == 404
+
+    - name: Create temporary directory for certificate backup
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: "_cert_backup"
+      register: backup_temp_dir
+      when: 
+        - github_token is defined
+
+    - name: Initialize git repository in backup directory
+      ansible.builtin.shell: |
+        cd {{ backup_temp_dir.path }}
+        git init
+        git config user.name "Thinkube Certificate Backup"
+        git config user.email "{{ admin_email }}"
+      when: 
+        - github_token is defined
+      args:
+        executable: /bin/bash
+
+    - name: Create backup README file
+      ansible.builtin.copy:
+        dest: "{{ backup_temp_dir.path }}/README.md"
+        content: |
+          # Thinkube Certificate Backup
+
+          This repository contains encrypted backups of SSL certificates for domain: {{ domain_name }}
+
+          ## Certificate Details
+          - Domain: {{ domain_name }}
+          - Backup Date: {{ ansible_facts.date_time.iso8601 }}
+          - Domains Covered: {{ certificate_domains | join(', ') }}
+
+          ## Contents
+
+          - `{{ domain_name }}.crt.enc` — the full chain
+          - `{{ domain_name }}.cer.enc` — the leaf certificate
+          - `{{ domain_name }}.key.enc` — the private key
+          - `{{ domain_name }}.acme.tar.gz.enc` — acme.sh's own record of the
+            certificate (`~/.acme.sh/{{ domain_name }}_ecc/`), without which
+            the certificate above cannot be renewed
+
+          10_deploy.yaml restores all of this by itself on a machine that has
+          lost it, so a rebuilt machine keeps its certificate instead of
+          asking Let's Encrypt for another.
+
+          ## Decryption Instructions
+
+          To decrypt the certificate files by hand:
+
+          ```bash
+          # Decrypt certificate file
+          openssl enc -aes-256-cbc -d -pbkdf2 -in {{ domain_name }}.crt.enc -out {{ domain_name }}.crt
+
+          # Decrypt key file
+          openssl enc -aes-256-cbc -d -pbkdf2 -in {{ domain_name }}.key.enc -out {{ domain_name }}.key
+
+          # Decrypt acme.sh's record, into ~/.acme.sh/
+          openssl enc -aes-256-cbc -d -pbkdf2 -in {{ domain_name }}.acme.tar.gz.enc | tar -C ~/.acme.sh -xz
+          ```
+
+          You will be prompted for the decryption password that was configured during backup.
+
+          ## Restore to Kubernetes
+
+          After decrypting, create the Kubernetes secret:
+
+          ```bash
+          kubectl create secret tls {{ domain_name | replace('.', '-') }}-tls \
+            --cert={{ domain_name }}.crt \
+            --key={{ domain_name }}.key \
+            --namespace=default
+          ```
+
+          ## Security Notes
+          - Keep your decryption password secure
+          - Certificate files are encrypted with AES-256-CBC
+          - This repository should remain private
+          - Rotate certificates regularly using Let's Encrypt
+
+          ---
+          🤖 Automated backup generated by Thinkube
+        mode: '0644'
+      when: 
+        - github_token is defined
+
+    - name: Encrypt and backup certificate file
+      ansible.builtin.shell: |
+        openssl enc -aes-256-cbc -pbkdf2 -in {{ tls_crt_path }} -out {{ backup_temp_dir.path }}/{{ domain_name }}.crt.enc -k "{{ cert_backup_password }}"
+      when: 
+        - github_token is defined
+      args:
+        executable: /bin/bash
+
+    - name: Encrypt and backup key file
+      ansible.builtin.shell: |
+        openssl enc -aes-256-cbc -pbkdf2 -in {{ tls_key_path }} -out {{ backup_temp_dir.path }}/{{ domain_name }}.key.enc -k "{{ cert_backup_password }}"
+      when: 
+        - github_token is defined
+      args:
+        executable: /bin/bash
+
+    # The leaf certificate on its own: --cert-file writes it and
+    # 15_configure_renewal_hook names it, so a restore that skipped it
+    # would leave the machine a file short of what it had.
+    - name: Encrypt and backup the leaf certificate
+      ansible.builtin.shell: |
+        openssl enc -aes-256-cbc -pbkdf2 -in {{ cert_dir }}/{{ domain_name }}/{{ domain_name }}.cer -out {{ backup_temp_dir.path }}/{{ domain_name }}.cer.enc -k "{{ cert_backup_password }}"
+      when:
+        - github_token is defined
+      args:
+        executable: /bin/bash
+
+    # acme.sh's record of the certificate. The files above are of no use
+    # without it: acme.sh renews and installs from this directory, so a
+    # machine restored without it holds a certificate nothing can renew.
+    # The certificate's private key is in here as well, and is already in
+    # this repository beside it; the ACME account key is deliberately left
+    # out, since the playbook registers an account when it finds none.
+    - name: Encrypt and backup the acme.sh record
+      ansible.builtin.shell: |
+        set -o pipefail
+        tar -C {{ acme_home }} -cz {{ domain_name }}_ecc | \
+          openssl enc -aes-256-cbc -pbkdf2 -out {{ backup_temp_dir.path }}/{{ domain_name }}.acme.tar.gz.enc -k "{{ cert_backup_password }}"
+      when:
+        - github_token is defined
+      args:
+        executable: /bin/bash
+
+    - name: Create backup metadata file
+      ansible.builtin.copy:
+        dest: "{{ backup_temp_dir.path }}/backup-metadata.json"
+        content: |
+          {
+            "domain": "{{ domain_name }}",
+            "backup_date": "{{ ansible_facts.date_time.iso8601 }}",
+            "certificate_domains": {{ certificate_domains | to_json }},
+            "backup_format": "openssl-aes256-cbc-pbkdf2",
+            "thinkube_version": "milestone-2"
+          }
+        mode: '0644'
+      when: 
+        - github_token is defined
+
+    - name: Add files to git and commit
+      ansible.builtin.shell: |
+        cd {{ backup_temp_dir.path }}
+        git add .
+        git commit -m "Certificate backup for {{ domain_name }} - {{ ansible_facts.date_time.date }}"
+      when: 
+        - github_token is defined
+      args:
+        executable: /bin/bash
+
+    - name: Push backup to GitHub repository
+      ansible.builtin.shell: |
+        cd {{ backup_temp_dir.path }}
+        git remote add origin https://{{ github_token }}@github.com/{{ github_username }}/{{ github_certificates_repo }}.git
+        git branch -M main
+        git push --force -u origin main
+      when: 
+        - github_token is defined
+      register: github_push_result
+      failed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Display backup status
+      ansible.builtin.debug:
+        msg:
+          - "GitHub backup enabled: true"
+          - "Certificate renewed: {{ 'Yes' if needs_renewal else 'No - using existing certificate' }}"
+          - "Repository: {{ github_username }}/thinkube-certificates"
+          - "Backup result: {{ 'Success' if (github_push_result is defined and github_push_result.rc is defined and github_push_result.rc == 0) else 'Failed - check error above' if (github_push_result is defined and github_push_result.rc != 0) else 'Not attempted' }}"
+      when: 
+        - github_token is defined
+
+    - name: Handle backup push failure
+      ansible.builtin.fail:
+        msg: "Failed to push certificate backup to GitHub: {{ github_push_result.stderr | default('Unknown error') }}"
+      when: 
+        - github_token is defined
+        - github_push_result is defined
+        - github_push_result.rc != 0
+
+    - name: Clean up temporary backup directory
+      ansible.builtin.file:
+        path: "{{ backup_temp_dir.path }}"
+        state: absent
+      when: 
+        - github_token is defined
+        - backup_temp_dir is defined
+
+    - name: Schedule automatic renewal
+      ansible.builtin.cron:
+        name: "acme.sh auto renewal"
+        user: "{{ system_username }}"
+        job: "{{ acme_home }}/acme.sh --cron --home {{ acme_home }} > /dev/null"
+        minute: "{{ range(0, 60) | random }}"
+        hour: "{{ range(0, 24) | random }}"
+        state: present

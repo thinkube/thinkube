@@ -1,0 +1,739 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Thinkube code-server Development Image
+# Complete development platform built on Ubuntu 24.04 LTS
+#
+# Built from: ansible/40_thinkube/core/harbor/16_build_codeserver_image.yaml
+# Registry: {{ harbor_registry }}/library/code-server-dev:latest
+#
+# Includes:
+# - Ubuntu 24.04 LTS with Python 3.12
+# - Node.js 20.x LTS + code-server
+# - Platform tools: kubectl, helm, k9s, podman, skopeo
+# - Ansible + copier (system-wide, always available)
+# - Thinkube services: argo, argocd, gh, tea (gitea), nats
+# - Development: jq, yq, ripgrep, fd, bat, httpie
+# - Database clients: psql, redis-tools
+# - Python tools: mlflow, devpi-client, ansible-lint
+
+FROM {{ harbor_registry }}/library/ubuntu:24.04
+
+USER root
+
+# Set environment to non-interactive to avoid prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+
+###############################################################################
+# System Packages - Foundation
+###############################################################################
+RUN apt-get update && apt-get install -y \
+    # Build essentials
+    build-essential \
+    curl \
+    wget \
+    git \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    # Python 3.12 and development tools
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    # Extension-host test harness (@vscode/test-electron downloads a desktop
+    # VS Code whose binary needs GTK/NSS/GBM/ALSA + a virtual display). These
+    # were once installed ad hoc in a pod and EVAPORATED on rebuild — the
+    # tandem orchestrator's run preflight then failed on libgtk-3.so.0
+    # (2026-08-05). System libraries belong in the image, never in a pod.
+    libgtk-3-0t64 \
+    libnss3 \
+    libgbm1 \
+    libasound2t64 \
+    xvfb \
+    # Tauri v2 build prerequisites: the installer's Rust side links GTK,
+    # WebKitGTK and OpenSSL through pkg-config, so `cargo check` needs these
+    # development packages
+    pkg-config \
+    file \
+    libssl-dev \
+    libwebkit2gtk-4.1-dev \
+    libxdo-dev \
+    libayatana-appindicator3-dev \
+    librsvg2-dev \
+    # System management
+    sudo \
+    # Ansible authenticates to the cluster hosts with a password (tk_ansible)
+    sshpass \
+    # Utilities
+    vim \
+    nano \
+    less \
+    tree \
+    unzip \
+    zip \
+    jq \
+    # Shells
+    zsh \
+    fish \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3.12 as default python3
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+# Remove PEP 668 EXTERNALLY-MANAGED marker (safe in containers)
+RUN rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
+
+###############################################################################
+# Create thinkube user (UID 1000) - replacing default ubuntu user
+###############################################################################
+# Delete the ubuntu user that comes with Ubuntu 24.04 base image
+RUN userdel -r ubuntu 2>/dev/null || true
+
+# Create thinkube user with UID 1000
+RUN useradd -m -u 1000 -s /bin/bash thinkube
+
+# Add thinkube user to sudoers with NOPASSWD for development convenience
+RUN echo "thinkube ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/thinkube && \
+    chmod 0440 /etc/sudoers.d/thinkube
+
+###############################################################################
+# Node.js 24.x LTS - the major version code-server runs extensions on; every
+# Thinkube VS Code extension builds and packages with it (.nvmrc = 24)
+###############################################################################
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+###############################################################################
+# Setup thinkube user directories
+###############################################################################
+RUN mkdir -p /home/thinkube/.local/share/code-server && \
+    mkdir -p /home/thinkube/.kube && \
+    mkdir -p /home/thinkube/.config/containers && \
+    chown -R thinkube:thinkube /home/thinkube
+
+###############################################################################
+# Container Tools - Podman (not Docker!)
+###############################################################################
+RUN apt-get update && apt-get install -y \
+    podman \
+    skopeo \
+    podman-compose \
+    && rm -rf /var/lib/apt/lists/*
+
+###############################################################################
+# Database Clients
+###############################################################################
+RUN apt-get update && apt-get install -y \
+    postgresql-client \
+    redis-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+###############################################################################
+# Chromium Browser - For Playwright MCP (headless browser automation)
+# Uses Playwright's bundled Chromium instead of the Ubuntu snap stub
+###############################################################################
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+# Chrome for Testing build that playwright 1.63 pins for chromium v1243.
+# Pinned rather than resolved at build time so two builds of this image get the
+# same browser.
+ARG CHROME_FOR_TESTING_VERSION=153.0.8010.12
+# We fetch the browser with curl instead of `playwright install`. On 2026-09-08
+# playwright's downloader failed this build three times, hours apart: it opened
+# the connection and then gave up after its 30s timeout having transferred zero
+# bytes, five attempts each time. curl pulls the same URL on the same node at
+# ~37 MB/s. (It is not IPv6 — forcing ipv4first changed nothing.)
+#
+# Dropping playwright's downloader is safe because nothing here resolves
+# browsers through its registry: Playwright MCP is launched with
+# `--executable-path /usr/bin/chromium-browser` (thinkube-control/
+# 13_configure_code_server.yaml), so the only contract this image owes is a
+# working binary at that path. `install-deps` still pulls the system libraries.
+RUN npx -y playwright@1.63.0 install-deps chromium && \
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+        -o /tmp/chrome-linux64.zip \
+        "https://cdn.playwright.dev/builds/cft/${CHROME_FOR_TESTING_VERSION}/linux64/chrome-linux64.zip" && \
+    mkdir -p /opt/playwright-browsers && \
+    unzip -q /tmp/chrome-linux64.zip -d /opt/playwright-browsers && \
+    rm -f /tmp/chrome-linux64.zip && \
+    # Create symlink so Playwright MCP can find chromium-browser
+    CHROME_BIN=$(find /opt/playwright-browsers -name chrome -path "*/chrome-linux*/*" | head -1) && \
+    if [ -z "$CHROME_BIN" ]; then echo "❌ ERROR: chromium binary not found under /opt/playwright-browsers"; exit 1; fi && \
+    chmod +x "$CHROME_BIN" && \
+    ln -sf "$CHROME_BIN" /usr/bin/chromium-browser && \
+    # Fail here, not at MCP start-up, if the browser can't actually run
+    "$CHROME_BIN" --version && \
+    # Make browsers dir writable by thinkube user (MCP server creates temp dirs here)
+    chown -R 1000:1000 /opt/playwright-browsers && \
+    rm -rf /var/lib/apt/lists/* /root/.npm
+
+###############################################################################
+# Modern CLI Utilities
+###############################################################################
+RUN apt-get update && apt-get install -y \
+    gettext-base \
+    ripgrep \
+    fd-find \
+    bat \
+    httpie \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create symlinks for Ubuntu-specific command names
+RUN ln -sf /usr/bin/batcat /usr/local/bin/bat && \
+    ln -sf /usr/bin/fdfind /usr/local/bin/fd
+
+###############################################################################
+# Starship Prompt - Pre-install for all shells
+#
+# Download the release tarball directly so we control the retries on the
+# slow leg (GitHub release fetch). The official install.sh pipes its own
+# unretried curl to GitHub, which fails intermittently with exit 35.
+###############################################################################
+ARG STARSHIP_VERSION=v1.21.1
+RUN ARCH="$(uname -m)" && \
+    case "$ARCH" in \
+        x86_64) STARSHIP_ARCH="x86_64-unknown-linux-musl" ;; \
+        aarch64) STARSHIP_ARCH="aarch64-unknown-linux-musl" ;; \
+        *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/starship/starship/releases/download/${STARSHIP_VERSION}/starship-${STARSHIP_ARCH}.tar.gz" \
+        -o /tmp/starship.tar.gz && \
+    tar -xzf /tmp/starship.tar.gz -C /usr/local/bin starship && \
+    chmod +x /usr/local/bin/starship && \
+    rm /tmp/starship.tar.gz && \
+    starship --version
+
+###############################################################################
+# D2 - diagram renderer used by the documentation builds
+###############################################################################
+ARG D2_VERSION=v0.9.0
+RUN ARCH="$(uname -m)" && \
+    case "$ARCH" in \
+        x86_64) D2_ARCH="amd64" ;; \
+        aarch64) D2_ARCH="arm64" ;; \
+        *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/terrastruct/d2/releases/download/${D2_VERSION}/d2-${D2_VERSION}-linux-${D2_ARCH}.tar.gz" \
+        -o /tmp/d2.tar.gz && \
+    tar -xzf /tmp/d2.tar.gz -C /tmp && \
+    install -m 0755 "/tmp/d2-${D2_VERSION}/bin/d2" /usr/local/bin/d2 && \
+    rm -rf /tmp/d2.tar.gz "/tmp/d2-${D2_VERSION}" && \
+    d2 --version
+
+###############################################################################
+# Agentic clients: opencode and Pi at the exact versions agent-clients/
+# package.json names. The build resolves the dependency tree and installs
+# exactly that tree with no package scripts, except opencode-ai's postinstall,
+# which links the opencode binary for this architecture; package-lock.json
+# stays in /opt/agent-clients as the record of what the image carries. VS
+# Code's chat reaches both through the thinkube-tandem-chat extension
+# (@pi, @opencode), installed by 15_configure_environment.yaml.
+#
+# Nothing a client does leaves the cluster by default:
+#   opencode: no update check, no models.dev/models.opencode.ai catalog fetch,
+#     no LSP server downloads, no built-in provider auth plugins, and no
+#     reading of Claude Code's files (it has its own AGENTS.md).
+#   Pi: no install telemetry, no version check, no pi.dev catalog refresh.
+#   Claude Code: no telemetry, no error reporting, no self-update.
+# Session sharing (opencode) is off in its config, written by
+# roles/agent_clients.
+###############################################################################
+ENV OPENCODE_DISABLE_AUTOUPDATE=1 \
+    OPENCODE_DISABLE_MODELS_FETCH=1 \
+    OPENCODE_DISABLE_LSP_DOWNLOAD=1 \
+    OPENCODE_DISABLE_DEFAULT_PLUGINS=1 \
+    OPENCODE_DISABLE_CLAUDE_CODE=1 \
+    PI_OFFLINE=1 \
+    PI_TELEMETRY=0 \
+    DISABLE_TELEMETRY=1 \
+    DISABLE_ERROR_REPORTING=1 \
+    DISABLE_AUTOUPDATER=1
+COPY agent-clients/ /opt/agent-clients/
+RUN cd /opt/agent-clients && \
+    npm install --package-lock-only --ignore-scripts --no-audit --no-fund && \
+    npm ci --ignore-scripts --omit=dev --no-audit --no-fund && \
+    (cd node_modules/opencode-ai && node postinstall.mjs) && \
+    rm -rf /root/.npm && \
+    ln -s /opt/agent-clients/node_modules/.bin/opencode /usr/local/bin/opencode && \
+    ln -s /opt/agent-clients/node_modules/.bin/pi /usr/local/bin/pi && \
+    opencode --version && \
+    pi --version
+
+###############################################################################
+# Kubernetes Tools
+###############################################################################
+
+# kubectl - Kubernetes CLI
+ARG TARGETARCH
+RUN curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://dl.k8s.io/release/v1.36.4/bin/linux/${TARGETARCH}/kubectl" \
+        -o /usr/local/bin/kubectl && \
+    chmod +x /usr/local/bin/kubectl
+
+# Helm - Kubernetes Package Manager (pinned for reproducible builds)
+RUN HELM_VERSION=v3.20.2 && \
+    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz" \
+        -o /tmp/helm.tar.gz && \
+    tar -xzf /tmp/helm.tar.gz -C /tmp && \
+    mv /tmp/linux-${TARGETARCH}/helm /usr/local/bin/helm && \
+    chmod +x /usr/local/bin/helm && \
+    rm -rf /tmp/helm.tar.gz /tmp/linux-${TARGETARCH}
+
+# k9s - Terminal UI for Kubernetes
+RUN curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/derailed/k9s/releases/download/v0.32.0/k9s_Linux_${TARGETARCH}.tar.gz" \
+        -o /tmp/k9s.tar.gz && \
+    tar -xzf /tmp/k9s.tar.gz -C /tmp k9s && \
+    mv /tmp/k9s /usr/local/bin/ && \
+    chmod +x /usr/local/bin/k9s && \
+    rm -f /tmp/k9s.tar.gz
+
+# stern - Multi-pod log tailing
+RUN curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/stern/stern/releases/download/v1.28.0/stern_1.28.0_linux_${TARGETARCH}.tar.gz" \
+        -o /tmp/stern.tar.gz && \
+    tar -xzf /tmp/stern.tar.gz -C /tmp stern && \
+    mv /tmp/stern /usr/local/bin/ && \
+    chmod +x /usr/local/bin/stern && \
+    rm -f /tmp/stern.tar.gz
+
+# kubectx and kubens - Context/namespace switcher
+RUN git clone --depth 1 https://github.com/ahmetb/kubectx /opt/kubectx && \
+    ln -s /opt/kubectx/kubectx /usr/local/bin/kubectx && \
+    ln -s /opt/kubectx/kubens /usr/local/bin/kubens
+
+# hydrophone - Kubernetes conformance test runner (CNCF Certified Kubernetes
+# submissions). Release assets use x86_64/arm64, not amd64/arm64.
+RUN HYDROPHONE_VERSION=v0.8.0 && \
+    case "${TARGETARCH}" in \
+        amd64) HYDROPHONE_ARCH=x86_64 ;; \
+        arm64) HYDROPHONE_ARCH=arm64 ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/kubernetes-sigs/hydrophone/releases/download/${HYDROPHONE_VERSION}/hydrophone_Linux_${HYDROPHONE_ARCH}.tar.gz" | \
+        tar xz -C /usr/local/bin hydrophone && \
+    chmod +x /usr/local/bin/hydrophone && \
+    hydrophone --help > /dev/null
+
+###############################################################################
+# Argo Tools (Workflows + CD)
+###############################################################################
+
+# Argo Workflows CLI
+RUN curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/argoproj/argo-workflows/releases/download/v3.5.5/argo-linux-${TARGETARCH}.gz" \
+        -o /tmp/argo.gz && \
+    gunzip /tmp/argo.gz && \
+    chmod +x /tmp/argo && \
+    mv /tmp/argo /usr/local/bin/argo
+
+# ArgoCD CLI
+RUN curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/argoproj/argo-cd/releases/download/v2.10.0/argocd-linux-${TARGETARCH}" \
+        -o /usr/local/bin/argocd && \
+    chmod +x /usr/local/bin/argocd
+
+###############################################################################
+# Git Tools
+###############################################################################
+
+# GitHub CLI
+# Use curl -o directly (not curl | dd) so a download failure aborts the
+# step. The previous `curl | dd` swallowed transient SSL errors to
+# cli.github.com, leaving a 0-byte keyring and a downstream NO_PUBKEY
+# failure on `apt-get update`. Retry flags match the rest of this file.
+RUN curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
+    https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+    apt-get update && \
+    apt-get install -y gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Gitea CLI (tea)
+RUN curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://dl.gitea.io/tea/0.9.2/tea-0.9.2-linux-${TARGETARCH}" \
+        -o /usr/local/bin/tea && \
+    chmod +x /usr/local/bin/tea
+
+###############################################################################
+# Thinkube Service CLIs
+###############################################################################
+
+# NATS CLI
+RUN curl -sf https://binaries.nats.dev/nats-io/natscli/nats@latest | sh && \
+    mv nats /usr/local/bin/
+
+# Perses CLI (percli)
+RUN curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/perses/perses/releases/download/v0.52.0/perses_0.52.0_linux_${TARGETARCH}.tar.gz" \
+        -o /tmp/perses.tar.gz && \
+    tar -xzf /tmp/perses.tar.gz -C /tmp percli && \
+    mv /tmp/percli /usr/local/bin/percli && \
+    chmod +x /usr/local/bin/percli && \
+    rm -f /tmp/perses.tar.gz
+
+# yq - YAML processor
+RUN wget -q --tries=5 --waitretry=5 --retry-connrefused \
+         https://github.com/mikefarah/yq/releases/download/v4.40.5/yq_linux_${TARGETARCH} \
+         -O /usr/local/bin/yq && \
+    chmod +x /usr/local/bin/yq
+
+# crane - Container registry tool (image copy, manifest manipulation)
+# go-containerregistry release assets use x86_64/arm64, not amd64/arm64.
+RUN case "${TARGETARCH}" in \
+        amd64) CRANE_ARCH=x86_64 ;; \
+        arm64) CRANE_ARCH=arm64 ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_${CRANE_ARCH}.tar.gz" | \
+        tar xz -C /usr/local/bin crane && \
+    chmod +x /usr/local/bin/crane
+
+###############################################################################
+# Python Tools - Installed via 15_configure_environment.yaml
+###############################################################################
+# Python packages (ansible, copier, kubernetes, service SDKs) are NOT installed
+# in the Dockerfile because they would be lost when shared-code volume mounts.
+# They are installed to ~/.local via 15_configure_environment.yaml playbook.
+
+###############################################################################
+# Developer toolchain, formerly installed into the RUNNING pod by
+# code-server/15_configure_environment.yaml. At runtime /home/thinkube is the
+# shared-code hostPath mount, so anything baked under the home is invisible;
+# these live under /opt and /usr/local, which the mount does not cover, and
+# survive pod recreation. (The add-nodes flow recreates the pod for its env
+# update — that is how the tk_* symlinks went missing on 2026-10-02.)
+###############################################################################
+
+# uv: the installer honours UV_UNMANAGED_INSTALL to place uv and uvx in a
+# directory of our choosing without touching shell profiles.
+RUN curl --retry 5 --retry-delay 5 --retry-all-errors -LsSf https://astral.sh/uv/install.sh \
+        | env UV_UNMANAGED_INSTALL=/usr/local/bin sh && \
+    uv --version && uvx --version
+
+# Rust toolchain outside the home. The user owns it afterwards so
+# `cargo install` and `rustup update` still work from a terminal.
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo
+RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-delay 5 --retry-all-errors -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path && \
+    /opt/cargo/bin/rustc --version && \
+    /opt/cargo/bin/cargo --version
+
+# rtk = Rust Token Killer (github.com/rtk-ai/rtk), built from source into
+# /usr/local/bin. The crates.io `rtk` is an unrelated project, hence --git.
+# `rtk gain` is a real subcommand, so it proves the right binary was built.
+# The cargo registry and git caches are build-time only and are dropped to
+# keep the image small; cargo refetches them on demand.
+RUN /opt/cargo/bin/cargo install --git https://github.com/rtk-ai/rtk --locked --root /usr/local && \
+    /usr/local/bin/rtk gain && \
+    rm -rf /opt/cargo/registry /opt/cargo/git && \
+    chown -R thinkube:thinkube /opt/rustup /opt/cargo
+
+# Thinkube CLI entry points. The targets are in the user's shared-code
+# checkout, mounted at runtime, so the links dangle at build time and
+# resolve once the pod runs.
+RUN for t in tk_ansible tk_ssh tk_images tk_clone_dev; do \
+        ln -sf "/home/thinkube/thinkube-platform/core/thinkube/scripts/${t}" "/usr/local/bin/${t}"; \
+    done
+
+# Ubuntu's /etc/profile rebuilds PATH for login shells, so the image ENV
+# alone does not reach a terminal. bash reads /etc/profile.d, zsh gets it
+# through /etc/zsh/zprofile, fish reads /etc/fish/conf.d. /usr/local/bin is
+# on every default PATH already; only the cargo bin dir needs adding.
+RUN printf '%s\n' \
+        'export RUSTUP_HOME=/opt/rustup' \
+        'export CARGO_HOME=/opt/cargo' \
+        'case ":$PATH:" in *":/opt/cargo/bin:"*) ;; *) export PATH="/opt/cargo/bin:$PATH" ;; esac' \
+        > /etc/profile.d/thinkube-tools.sh && \
+    mkdir -p /etc/fish/conf.d && \
+    printf '%s\n' \
+        'set -gx RUSTUP_HOME /opt/rustup' \
+        'set -gx CARGO_HOME /opt/cargo' \
+        'fish_add_path --global --prepend /opt/cargo/bin' \
+        > /etc/fish/conf.d/thinkube-tools.fish
+
+###############################################################################
+# code-server - VSCode in the browser
+#
+# code-server and the steps that change its files come last, so a new
+# code-server version rebuilds only these steps. The build passes the latest
+# release as CODE_SERVER_VERSION (harbor-images/16_build_codeserver_image.yaml);
+# the cached step is reused only while that version is unchanged.
+###############################################################################
+ARG CODE_SERVER_VERSION
+RUN test -n "${CODE_SERVER_VERSION}" && \
+    curl -fsSL https://code-server.dev/install.sh | sh -s -- --version "${CODE_SERVER_VERSION}" && \
+    code-server --version | grep -q "^${CODE_SERVER_VERSION} "
+
+# code-server bundles the GitHub Copilot extension, which puts a Copilot item in
+# the status bar and asks for a GitHub sign-in. Thinkube IDE's agents are Claude
+# Code and Thinkube Tandem Chat, so the bundled extension is removed.
+RUN rm -rf /usr/lib/code-server/lib/vscode/extensions/copilot && \
+    test ! -e /usr/lib/code-server/lib/vscode/extensions/copilot
+
+# Create code symlink for Claude Code IDE integration
+RUN if [ -f /usr/bin/code-server ]; then \
+        ln -s /usr/bin/code-server /usr/bin/code; \
+        echo "✅ Created symlink: /usr/bin/code -> /usr/bin/code-server"; \
+    else \
+        echo "❌ ERROR: /usr/bin/code-server not found!"; \
+        exit 1; \
+    fi && \
+    if [ -d /usr/lib/code-server/lib/vscode/bin/remote-cli ]; then \
+        ln -s /usr/lib/code-server/lib/vscode/bin/remote-cli/code-server /usr/lib/code-server/lib/vscode/bin/remote-cli/code; \
+        echo "✅ Created remote-cli symlink"; \
+    fi
+
+# Customize code-server branding to Thinkube.
+RUN jq '.nameShort = "Thinkube" | .nameLong = "Thinkube" | .applicationName = "thinkube"' \
+    /usr/lib/code-server/lib/vscode/product.json > /tmp/product.json && \
+    mv /tmp/product.json /usr/lib/code-server/lib/vscode/product.json && \
+    if jq -e '.nameShort == "Thinkube" and .nameLong == "Thinkube" and .applicationName == "thinkube"' /usr/lib/code-server/lib/vscode/product.json > /dev/null; then \
+        echo "✅ Customized code-server branding to Thinkube"; \
+    else \
+        echo "❌ ERROR: Branding customization failed"; \
+        jq . /usr/lib/code-server/lib/vscode/product.json; \
+        exit 1; \
+    fi
+
+###############################################################################
+# Nerd Fonts - Properly integrated with code-server's /_static route
+###############################################################################
+# Download and extract Nerd Fonts
+RUN mkdir -p /tmp/nerdfonts && cd /tmp/nerdfonts && \
+    for font in FiraCode JetBrainsMono Hack CascadiaCode; do \
+        wget -q --tries=5 --waitretry=5 --retry-connrefused \
+             https://github.com/ryanoasis/nerd-fonts/releases/download/v3.1.1/${font}.zip && \
+        unzip -q ${font}.zip -d ${font} && \
+        rm ${font}.zip; \
+    done
+
+# Convert TTF to WOFF2 and install to code-server static directory
+RUN apt-get update && apt-get install -y woff2 && \
+    mkdir -p /usr/lib/code-server/src/browser/media/fonts && \
+    cd /tmp/nerdfonts && \
+    find . -name "*NerdFont-Regular.ttf" -o -name "*NerdFont-Bold.ttf" | while read ttf; do \
+        woff2_compress "$ttf"; \
+        cp "${ttf%.ttf}.woff2" /usr/lib/code-server/src/browser/media/fonts/; \
+    done && \
+    apt-get remove -y woff2 && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* /tmp/nerdfonts
+
+# Create fonts.css with @font-face declarations (avoiding heredoc to prevent parsing issues)
+RUN printf '%s\n' \
+    '@font-face {' \
+    '    font-family: "FiraCode Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/FiraCodeNerdFont-Regular.woff2") format("woff2");' \
+    '    font-weight: 400;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "FiraCode Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/FiraCodeNerdFont-Bold.woff2") format("woff2");' \
+    '    font-weight: 700;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "JetBrainsMono Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/JetBrainsMonoNerdFont-Regular.woff2") format("woff2");' \
+    '    font-weight: 400;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "JetBrainsMono Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/JetBrainsMonoNerdFont-Bold.woff2") format("woff2");' \
+    '    font-weight: 700;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "Hack Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/HackNerdFont-Regular.woff2") format("woff2");' \
+    '    font-weight: 400;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "Hack Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/HackNerdFont-Bold.woff2") format("woff2");' \
+    '    font-weight: 700;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "CaskaydiaCove Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/CaskaydiaCoveNerdFont-Regular.woff2") format("woff2");' \
+    '    font-weight: 400;' \
+    '    font-style: normal;' \
+    '}' \
+    '' \
+    '@font-face {' \
+    '    font-family: "CaskaydiaCove Nerd Font";' \
+    '    src: url("/_static/src/browser/media/fonts/CaskaydiaCoveNerdFont-Bold.woff2") format("woff2");' \
+    '    font-weight: 700;' \
+    '    font-style: normal;' \
+    '}' \
+    > /usr/lib/code-server/src/browser/pages/fonts.css
+
+###############################################################################
+# Thinkube typography - the fonts of Thinkube Notebooks
+###############################################################################
+# Interface: Poppins. Editor and terminal: Noto Sans Mono, in its Nerd Font
+# build so the Starship prompt keeps its icons. code-server only loads fonts it
+# serves itself (font-src 'self'), so the files are part of the image.
+ARG POPPINS_COMMIT=8b0a1d0f5983c89bc2b93f1b5fb55f9e252744b5
+RUN apt-get update && apt-get install -y woff2 && \
+    mkdir -p /tmp/tkfonts && cd /tmp/tkfonts && \
+    for weight in Regular Medium SemiBold Bold; do \
+        wget -q --tries=5 --waitretry=5 --retry-connrefused \
+             "https://raw.githubusercontent.com/google/fonts/${POPPINS_COMMIT}/ofl/poppins/Poppins-${weight}.ttf"; \
+    done && \
+    wget -q --tries=5 --waitretry=5 --retry-connrefused \
+         https://github.com/ryanoasis/nerd-fonts/releases/download/v3.1.1/Noto.zip && \
+    unzip -q Noto.zip NotoSansMNerdFont-Regular.ttf NotoSansMNerdFont-Bold.ttf && \
+    for ttf in Poppins-*.ttf NotoSansMNerdFont-*.ttf; do \
+        woff2_compress "$ttf" && \
+        cp "${ttf%.ttf}.woff2" /usr/lib/code-server/src/browser/media/fonts/; \
+    done && \
+    apt-get remove -y woff2 && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* /tmp/tkfonts
+
+# VS Code sets the interface font on .monaco-workbench, one rule per operating
+# system. The Thinkube rule replaces all of them; the editor and the terminal
+# set their own fonts from the settings. The build stops if the workbench no
+# longer sets its font that way, because the rule would then miss.
+RUN grep -q '\.monaco-workbench\.linux{font-family:' /usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.css && \
+    for face in 'Poppins Poppins-Regular 400' 'Poppins Poppins-Medium 500' 'Poppins Poppins-SemiBold 600' 'Poppins Poppins-Bold 700' \
+                'NotoSansM_Nerd_Font NotoSansMNerdFont-Regular 400' 'NotoSansM_Nerd_Font NotoSansMNerdFont-Bold 700'; do \
+        set -- $face; \
+        printf '\n@font-face {\n    font-family: "%s";\n    src: url("/_static/src/browser/media/fonts/%s.woff2") format("woff2");\n    font-weight: %s;\n    font-style: normal;\n}\n' \
+            "$(echo "$1" | tr _ ' ')" "$2" "$3" >> /usr/lib/code-server/src/browser/pages/fonts.css; \
+    done && \
+    printf '\n.monaco-workbench {\n    font-family: "Poppins", sans-serif !important;\n}\n' >> /usr/lib/code-server/src/browser/pages/fonts.css && \
+    echo "✅ Thinkube typography: Poppins interface, NotoSansM Nerd Font code"
+
+# Extension panels (webviews) are separate documents that do not load fonts.css.
+# webview-fonts.py adds the same fonts to the default styles VS Code gives every
+# panel, and stops the build if the webview host page has changed shape.
+COPY files/webview-fonts.py /tmp/webview-fonts.py
+RUN python3 /tmp/webview-fonts.py /usr/lib/code-server/lib/vscode/out/vs/workbench/contrib/webview/browser/pre/index.html && \
+    rm /tmp/webview-fonts.py
+
+###############################################################################
+# Custom Favicon - Thinkube Code Icon
+###############################################################################
+# Copy Thinkube code icon from build context
+COPY tk_code.svg /usr/lib/code-server/src/browser/media/favicon.svg
+RUN echo "✅ Custom Thinkube favicon copied"
+
+# The application icon at the left of the title bar is code-icon.svg, loaded by
+# the workbench CSS from out/media. The workbench keeps a second copy under
+# out/vs/workbench/browser/media; both show the Thinkube code icon.
+COPY tk_code.svg /usr/lib/code-server/lib/vscode/out/media/code-icon.svg
+COPY tk_code.svg /usr/lib/code-server/lib/vscode/out/vs/workbench/browser/media/code-icon.svg
+RUN cmp /usr/lib/code-server/src/browser/media/favicon.svg /usr/lib/code-server/lib/vscode/out/media/code-icon.svg && \
+    cmp /usr/lib/code-server/src/browser/media/favicon.svg /usr/lib/code-server/lib/vscode/out/vs/workbench/browser/media/code-icon.svg && \
+    echo "✅ Thinkube code icon in the title bar"
+
+# Inject font CSS and custom favicon into workbench.html (where the actual VS Code UI loads)
+RUN WORKBENCH="/usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.html" && \
+    if [ -f "$WORKBENCH" ]; then \
+        sed -i 's|</head>|<link rel="stylesheet" href="{{ "{{" }}BASE{{ "}}" }}/_static/src/browser/pages/fonts.css"><link rel="icon" type="image/svg+xml" href="{{ "{{" }}BASE{{ "}}" }}/_static/src/browser/media/favicon.svg">&|' "$WORKBENCH" && \
+        if grep -q "favicon.svg" "$WORKBENCH"; then \
+            echo "✅ Injected Nerd Fonts CSS and custom favicon into workbench.html"; \
+        else \
+            echo "❌ ERROR: Failed to inject favicon into workbench.html"; \
+            exit 1; \
+        fi \
+    else \
+        echo "❌ ERROR: workbench.html not found at $WORKBENCH"; \
+        exit 1; \
+    fi
+
+# Set proper ownership for thinkube user
+RUN chown -R thinkube:thinkube /usr/lib/code-server/src/browser/media/fonts && \
+    chown thinkube:thinkube /usr/lib/code-server/src/browser/pages/fonts.css && \
+    chown thinkube:thinkube /usr/lib/code-server/src/browser/media/favicon.svg && \
+    chown thinkube:thinkube /usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.html
+
+# Verification output during build
+RUN echo "✅ Installed Nerd Fonts:" && \
+    ls -lh /usr/lib/code-server/src/browser/media/fonts/*.woff2 | awk '{print "  ", $9, "(" $5 ")"}'
+
+USER thinkube
+
+# Add user bin to PATH for Python tools installed later, and the cargo bin dir so
+# rustup/cargo-installed binaries (notably rtk) are on the PROCESS PATH — not just the
+# interactive-shell PATH set in the rc files. The code-server extension host and the
+# Tandem orchestrator it spawns are NON-interactive children that inherit THIS PATH;
+# without ~/.cargo/bin here the orchestrator aborts with "rtk not found on PATH".
+# The dir is populated later at provisioning (15_configure_environment.yaml) — a PATH
+# entry does not need to exist at image-build time.
+ENV PATH="/home/thinkube/.local/bin:/opt/cargo/bin:/home/thinkube/.cargo/bin:${PATH}"
+
+###############################################################################
+# Configuration and Environment
+###############################################################################
+
+# Create config directories
+RUN mkdir -p /home/thinkube/.config/nats
+
+# Create default ansible.cfg
+RUN mkdir -p /home/thinkube/.ansible && \
+    echo '[defaults]' > /home/thinkube/.ansible.cfg && \
+    echo 'inventory = /home/thinkube/thinkube/inventory/inventory.yaml' >> /home/thinkube/.ansible.cfg && \
+    echo 'host_key_checking = False' >> /home/thinkube/.ansible.cfg && \
+    echo 'remote_user = thinkube' >> /home/thinkube/.ansible.cfg && \
+    echo 'inject_facts_as_vars = False' >> /home/thinkube/.ansible.cfg && \
+    echo '' >> /home/thinkube/.ansible.cfg && \
+    echo '[ssh_connection]' >> /home/thinkube/.ansible.cfg && \
+    echo 'ssh_args = -o ForwardAgent=yes' >> /home/thinkube/.ansible.cfg && \
+    echo 'pipelining = True' >> /home/thinkube/.ansible.cfg
+
+###############################################################################
+# Labels and Metadata
+###############################################################################
+LABEL maintainer="Thinkube Project"
+LABEL description="code-server development environment for Thinkube platform"
+LABEL version="2.0"
+LABEL thinkube.component="code-server-dev"
+LABEL thinkube.python="3.12"
+LABEL thinkube.nodejs="24.x"
+LABEL thinkube.ansible="system-wide"
+LABEL thinkube.tools.kubectl="v1.36.4"
+LABEL thinkube.tools.hydrophone="v0.8.0"
+LABEL thinkube.tools.helm="installed"
+LABEL thinkube.tools.argo="v3.5.5"
+LABEL thinkube.tools.argocd="v2.10.0"
+LABEL thinkube.tools.podman="installed"
+
+###############################################################################
+# Health check
+###############################################################################
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/ || exit 1
+
+WORKDIR /home/thinkube
+
+# Expose code-server port
+EXPOSE 8080
+
+# Start code-server
+CMD ["code-server", "--bind-addr", "0.0.0.0:8080", "."]

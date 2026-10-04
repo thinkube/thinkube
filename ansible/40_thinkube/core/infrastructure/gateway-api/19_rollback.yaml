@@ -1,0 +1,101 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/gateway-api/19_rollback.yaml
+# Description:
+#   Removes Envoy Gateway and all associated Gateway API resources.
+#
+# Usage:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/gateway-api/19_rollback.yaml
+#
+# 🤖 [AI-assisted]
+
+- name: Rollback Envoy Gateway Infrastructure
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+  vars:
+    eg_namespace: "envoy-gateway-system"
+    gateway_namespace: "gateway-system"
+
+  tasks:
+    - name: Delete TCPRoutes in gateway-system
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete tcproute --all -n {{ gateway_namespace }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Delete HTTPRoutes in gateway-system
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete httproute --all -n {{ gateway_namespace }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Delete Gateways in gateway-system
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete gateway --all -n {{ gateway_namespace }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Delete ReferenceGrants for TCP services
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete referencegrant allow-gateway-tcp -n {{ item }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop:
+        - postgres
+        - gitea
+        - nats
+        - valkey
+        - clickhouse
+      changed_when: true
+      failed_when: false
+
+    - name: Delete GatewayClass eg
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete gatewayclass eg --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Delete EnvoyProxy resource
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete envoyproxy thinkube-proxy -n {{ eg_namespace }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Uninstall Envoy Gateway Helm release
+      ansible.builtin.shell: |
+        {{ helm_bin }} uninstall eg -n {{ eg_namespace }} --kubeconfig {{ kubeconfig }} 2>/dev/null || true
+      changed_when: true
+      failed_when: false
+
+    - name: Delete envoy-gateway-system namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete namespace {{ eg_namespace }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Delete gateway-system namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete namespace {{ gateway_namespace }} --ignore-not-found=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Display rollback status
+      ansible.builtin.debug:
+        msg: "Envoy Gateway infrastructure has been removed"

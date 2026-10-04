@@ -1,0 +1,146 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/devpi/19_rollback.yaml
+# Description:
+#   Rollback DevPi deployment, removing all resources
+#
+# Requirements:
+#   - Kubernetes cluster must be running
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/devpi/19_rollback.yaml
+#
+# Variables from inventory:
+#   - devpi_namespace: DevPi namespace
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Rollback DevPi deployment
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: true
+
+  vars:
+    # Variables for Keycloak cleanup
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    keycloak_ui_client_id: "oauth2-proxy-devpi"
+
+  tasks:
+    - name: Check if DevPi namespace exists
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} get namespace {{ devpi_namespace }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: namespace_check
+      failed_when: false
+      changed_when: false
+
+    - name: Delete the Keycloak client of the devpi web UI
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_client_delete
+      vars:
+        keycloak_client_id: "{{ keycloak_ui_client_id }}"
+
+    - name: Delete DevPi HTTPRoutes
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete httproute -n {{ devpi_namespace }} --all"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: namespace_check.rc == 0
+      failed_when: false
+
+    - name: Delete DevPi deployment and services
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete deployment,service,pvc -n {{ devpi_namespace }} --all"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: namespace_check.rc == 0
+      failed_when: false
+
+    - name: Delete secrets
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete secret -n {{ devpi_namespace }} --all"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: namespace_check.rc == 0
+      failed_when: false
+
+    - name: Delete configmaps
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete configmap -n {{ devpi_namespace }} --all"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: namespace_check.rc == 0
+      failed_when: false
+
+    - name: Delete Argo Workflows
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete workflow -n {{ argo_namespace }} -l app=devpi"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      failed_when: false
+
+    - name: Delete ArgoCD Application
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete application -n {{ argocd_namespace }} devpi"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      failed_when: false
+
+    - name: Delete GitHub SSH secrets
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete secret github-devpi-deployment-ssh -n {{ item }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop:
+        - "{{ argo_namespace }}"
+        - "{{ argocd_namespace }}"
+      failed_when: false
+
+    - name: Delete namespace
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} delete namespace {{ devpi_namespace }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: namespace_check.rc == 0
+      register: delete_namespace
+      failed_when: false
+
+    - name: Wait for namespace to be deleted
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} get namespace {{ devpi_namespace }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: namespace_deleted
+      until: namespace_deleted.rc != 0
+      retries: 30
+      delay: 10
+      when: 
+        - namespace_check.rc == 0
+        - delete_namespace.rc == 0
+      failed_when: false
+
+    - name: Clean up local DevPi scripts
+      ansible.builtin.file:
+        path: "/home/{{ admin_username }}/devpi-scripts"
+        state: absent
+      become: true
+
+    - name: Remove fish configuration
+      ansible.builtin.file:
+        path: "/home/{{ admin_username }}/.config/fish/conf.d/devpi.fish"
+        state: absent
+      become: true
+
+    - name: Display rollback summary
+      ansible.builtin.debug:
+        msg:
+          - "DevPi rollback completed"
+          - "Removed namespace: {{ devpi_namespace }}"
+          - "Removed CLI tools and scripts"
+          - "Removed fish shell configuration"

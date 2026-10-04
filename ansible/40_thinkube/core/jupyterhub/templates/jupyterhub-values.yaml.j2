@@ -1,0 +1,1343 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# JupyterHub Helm chart values with dynamic image discovery
+# Images discovered at runtime from thinkube-control API
+# No fallbacks - fails if dependencies unavailable
+
+hub:
+  extraPodSpec:
+    priorityClassName: thinkube-workload
+  # Service API token for thinkube-control to proxy Jupyter notebook tool calls
+  services:
+    thinkube-control:
+      api_token: "{{ jupyterhub_service_token }}"
+      admin: true
+  config:
+    JupyterHub:
+      # MANDATORY: Keycloak authentication only - no fallbacks
+      authenticator_class: generic-oauth
+      admin_access: true
+      admin_users:
+        - {{ admin_username }}
+      # Named servers carry the interactive notebook servers, one per node and
+      # named after it, and the unattended notebook runs started by
+      # thinkube-control (run_notebook_job), each on its own server stopped when
+      # the run ends. The limit is one per node plus three runs. The Server
+      # Options form starts the chosen node's server; the default server is
+      # not used.
+      allow_named_servers: true
+      named_server_limit_per_user: {{ jupyterhub_named_server_limit }}
+      shutdown_on_logout: true
+
+    # The Hub goes straight to Keycloak instead of showing its own sign-in page.
+    # A notebook framed in Thinkube IDE passes through the Hub to authorize a
+    # server; with a Keycloak session that is redirects only, while a page of
+    # the Hub's would be refused inside the frame.
+    Authenticator:
+      auto_login: true
+
+    # Keycloak authentication is mandatory
+    GenericOAuthenticator:
+      client_id: jupyterhub
+      client_secret: "{{ jupyterhub_client_secret }}"
+      oauth_callback_url: "https://notebooks.{{ domain_name }}/hub/oauth_callback"
+      authorize_url: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/auth"
+      token_url: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
+      userdata_url: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/userinfo"
+      logout_redirect_url: "https://auth.{{ domain_name }}/realms/{{ keycloak_realm }}/protocol/openid-connect/logout?redirect_uri=https://control.{{ domain_name }}"
+      login_service: "Keycloak"
+      username_claim: "preferred_username"
+      scope:
+        - "openid"
+        - "profile"
+        - "email"
+      allow_all: true
+
+  extraConfig:
+    00-spawner-config: |
+      # Set default URL to JupyterLab opening in notebooks folder
+      c.Spawner.default_url = '/lab/tree/thinkube/notebooks'
+
+      # The "presented" notebooks dir (preferred_dir) is a single-user SERVER
+      # setting, so it is passed on the jupyterhub-singleuser command below --
+      # hub config here does not reach the spawned server (cf. the duplicated
+      # KernelSpecManager.ensure_native_kernel arg on the cmd).
+
+      # Assign priority class so user pods are not evicted before lower-priority workloads
+      c.KubeSpawner.priority_class_name = 'thinkube-workload'
+
+      # Configure KubeSpawner for faster pod deletion
+      # Based on official KubeSpawner documentation
+      c.KubeSpawner.delete_grace_period = 1  # Grace period for pod deletion
+      c.KubeSpawner.delete_stopped_pods = True  # Delete pods when stopped (default)
+
+      # Set terminationGracePeriodSeconds via extra_pod_config
+      # This controls how long Kubernetes waits before forcefully killing the pod
+      c.KubeSpawner.extra_pod_config = {
+          'terminationGracePeriodSeconds': 1
+      }
+
+      # Reduce spawn/stop timeouts
+      c.Spawner.http_timeout = 30  # Reduce from default 60
+      c.Spawner.start_timeout = 120  # Reduce from default 300
+      c.Spawner.stop_timeout = 10  # Reduce from default 60 - time to wait for stop
+
+      # Set KUBECONFIG as environment variable for notebook kernels
+      # Use update() to merge with extraEnv rather than overwriting
+      c.KubeSpawner.environment.update({
+        'KUBECONFIG': '/home/thinkube/.config/thinkube/kube-config'
+      })
+
+      # Disable the native python3 kernel - we provide our own venv kernels
+      c.KernelSpecManager.ensure_native_kernel = False
+
+      # Override command to source service discovery environment
+      import textwrap
+      c.KubeSpawner.cmd = ['bash', '-c', textwrap.dedent("""
+      if [ -f /home/thinkube/.config/thinkube/service-env-jh.sh ]; then
+        echo "Loading service environment variables..."
+        source /home/thinkube/.config/thinkube/service-env-jh.sh
+      fi
+      # The notebooks the installation provides are trusted on every start: the
+      # trust signatures and their key live in the home folder, which starts
+      # empty with each server.
+      trusted=""
+      for location in /home/thinkube/thinkube/notebooks/examples /home/thinkube/thinkube/templates /home/thinkube/thinkube/notebooks/test-thinkube-services.ipynb; do
+        if [ -e "$location" ]; then trusted="$trusted $location"; fi
+      done
+      if [ -n "$trusted" ]; then
+        find $trusted -name '*.ipynb' -not -path '*/.ipynb_checkpoints/*' -print0 | xargs -0 -r jupyter trust > /tmp/trust.log 2>&1           && echo "Installation notebooks trusted"           || { echo "Trusting the installation notebooks failed; they open untrusted:"; cat /tmp/trust.log; }
+      fi
+      exec jupyterhub-singleuser --ServerApp.trust_xheaders=True --KernelSpecManager.ensure_native_kernel=False --FileContentsManager.preferred_dir=thinkube/notebooks
+      """).strip()]
+
+    01-dynamic-profile-generator: |
+      # Dynamic profile generation with flexible resource selection
+      import requests
+      import sys
+      import logging
+
+      def parse_memory_to_gb(memory_str):
+          """Convert memory string to GB for comparison"""
+          if memory_str.endswith('Gi'):
+              return int(memory_str[:-2])
+          elif memory_str.endswith('G'):
+              return int(memory_str[:-1])
+          elif memory_str.endswith('Mi'):
+              return int(memory_str[:-2]) / 1024
+          elif memory_str.endswith('M'):
+              return int(memory_str[:-1]) / 1024
+          return 0
+
+      def get_profile_list(spawner):
+          """Generate profiles with flexible resource selection forms"""
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+
+          try:
+              # Query thinkube-control for available resources
+              logger.info("Querying thinkube-control for cluster resources...")
+              resources_response = requests.get(
+                  'http://backend.thinkube-control.svc.cluster.local:8000/api/v1/cluster/resources',
+                  headers={'Accept': 'application/json'},
+                  timeout=10
+              )
+
+              if resources_response.status_code != 200:
+                  logger.error(f"Failed to get cluster resources: {resources_response.status_code}")
+                  sys.exit(1)
+
+              resources = resources_response.json()
+
+              # Query for JupyterHub configuration (defaults)
+              logger.info("Querying thinkube-control for JupyterHub configuration...")
+              config_response = requests.get(
+                  'http://backend.thinkube-control.svc.cluster.local:8000/api/v1/jupyterhub/config',
+                  headers={'Accept': 'application/json'},
+                  timeout=10
+              )
+
+              if config_response.status_code != 200:
+                  logger.error(f"Failed to get JupyterHub config: {config_response.status_code}")
+                  logger.error("Cannot proceed without JupyterHub configuration from thinkube-control")
+                  sys.exit(1)
+
+              jupyterhub_config = config_response.json()
+              # Each node's defaults for its notebook server; the form opens on the
+              # first node with its defaults and switches to a node's defaults
+              # when that node is chosen.
+              node_defaults = {n['node']: n for n in jupyterhub_config.get('nodes', [])}
+              first_node = sorted(node['name'] for node in resources)[0]
+              opening = node_defaults.get(first_node, {
+                  'cpu_cores': jupyterhub_config['default_cpu_cores'],
+                  'memory_gb': jupyterhub_config['default_memory_gb'],
+                  'gpus': jupyterhub_config['default_gpu_count'],
+              })
+              logger.info(f"Loaded notebook server defaults per node: {({k: (v['cpu_cores'], v['memory_gb'], v['gpus']) for k, v in node_defaults.items()})}")
+
+              profiles = []
+
+              # Find max capacity across all nodes (users should see full capacity, not just available)
+              max_cpu = max(node['capacity']['cpu'] for node in resources)
+              max_memory_gb = max(parse_memory_to_gb(node['capacity']['memory']) for node in resources)
+              has_gpu = any(node['available']['gpu'] > 0 for node in resources)
+
+              # Build dynamic CPU choices based on capacity
+              cpu_choices = {}
+              cpu_options = [1, 2, 4, 6, 8, 12, 16, 24, 32]
+
+              # Ensure default is an integer and add if not in standard options
+              default_cpu = int(opening['cpu_cores'])
+              if default_cpu not in cpu_options:
+                  cpu_options.append(default_cpu)
+                  cpu_options.sort()
+
+              # Find best default if configured default exceeds capacity
+              actual_default = default_cpu if default_cpu <= max_cpu else max(c for c in cpu_options if c <= max_cpu)
+              logger.info(f"CPU: configured default={default_cpu}, max_cpu={max_cpu}, actual_default={actual_default}")
+
+              for cores in cpu_options:
+                  if cores <= max_cpu:
+                      cpu_choices[str(cores)] = {
+                          'display_name': f"{cores} core{'s' if cores > 1 else ''}",
+                          'default': (cores == actual_default)
+                      }
+
+              # Build dynamic memory choices based on capacity
+              memory_choices = {}
+              memory_options = [2, 4, 8, 16, 32, 48, 64, 96, 128]
+
+              # Ensure default is an integer and add if not in standard options
+              default_memory = int(opening['memory_gb'])
+              if default_memory not in memory_options:
+                  memory_options.append(default_memory)
+                  memory_options.sort()
+
+              # Find best default if configured default exceeds capacity
+              actual_default_memory = default_memory if default_memory <= max_memory_gb else max(m for m in memory_options if m <= max_memory_gb)
+              logger.info(f"Memory: configured default={default_memory}GB, max_memory={max_memory_gb}GB, actual_default={actual_default_memory}GB")
+
+              for gb in memory_options:
+                  if gb <= max_memory_gb:
+                      memory_choices[f"{gb}G"] = {
+                          'display_name': f"{gb} GB",
+                          'default': (gb == actual_default_memory)
+                      }
+
+              # Build node choices with resource info (shared across all profiles)
+              node_choices = {}
+              for node in resources:
+                  node_label = (f"{node['name']} "
+                              f"({node['available']['cpu']:.1f}/{node['capacity']['cpu']} CPUs, "
+                              f"{node['available']['memory']}/{node['capacity']['memory']}")
+
+                  # Add GPU info if available
+                  if node['gpu_details']:
+                      available_gpus = [g for g in node['gpu_details'] if g['available']]
+                      if available_gpus:
+                          gpu = available_gpus[0]
+                          node_label += f", GPU: {gpu['model']} {gpu['memory_total']}"
+                      else:
+                          node_label += ", GPU: In use"
+                  elif node['capacity']['gpu'] > 0:
+                      node_label += f", GPU details unavailable: {node['gpu_error']}"
+                  else:
+                      node_label += ", No GPU"
+
+                  node_label += ")"
+                  node_choices[node['name']] = {
+                      'display_name': node_label,
+                      'default': (node['name'] == first_node)
+                  }
+
+              # Build GPU choices based on max available GPUs across nodes
+              max_gpus = max(node['available']['gpu'] for node in resources)
+              gpu_choices = {}
+              for i in range(0, max_gpus + 1):
+                  gpu_choices[str(i)] = {
+                      'display_name': f'{i} GPU{"s" if i > 1 else ""}' if i > 0 else 'No GPU',
+                      'default': (i == int(opening['gpus']))
+                  }
+
+              # Build per-node resource limits for the dynamic form.
+              # effective_gpu is thinkube-control's limit: one GPU on a
+              # time-sliced node.
+              import json
+              node_limits = {}
+              for node in resources:
+                  node_limits[node['name']] = {
+                      'cpu': int(node['capacity']['cpu']),
+                      'memory': parse_memory_to_gb(node['capacity']['memory']),
+                      'gpu': node['capacity']['effective_gpu'],
+                      'defaults': node_defaults.get(node['name'])
+                  }
+              logger.info(f"Node limits for form: {node_limits}")
+
+              # Create a single "Resource Selection" profile
+              # Image is fixed to tk-jupyter-base (venvs provide different Python environments)
+              # The slug is what thinkube-control names when it starts a server;
+              # it is fixed so the display name can change on its own.
+              profile = {
+                  'display_name': 'Thinkube Notebooks',
+                  'slug': 'thinkube-notebooks',
+                  'description': 'Select compute resources (Python environments available via kernel selection)',
+                  'node_limits': node_limits,
+                  'default': True,
+                  'profile_options': {
+                      'node': {
+                          'display_name': 'Select Node',
+                          'choices': node_choices
+                      },
+                      'cpu': {
+                          'display_name': 'CPU Cores',
+                          'choices': cpu_choices
+                      },
+                      'memory': {
+                          'display_name': 'Memory',
+                          'choices': memory_choices
+                      },
+                      'enable_gpu': {
+                          'display_name': 'Number of GPUs',
+                          'choices': gpu_choices
+                      }
+                  },
+                  'kubespawner_override': {
+                      'image': '{{ harbor_registry }}/library/tk-jupyter-base:latest',
+                      'image_pull_policy': 'Always'
+                  }
+              }
+              profiles.append(profile)
+
+              # Debug logging to verify defaults
+              default_node = next((k for k, v in node_choices.items() if v.get('default')), None)
+              default_cpu = next((k for k, v in cpu_choices.items() if v.get('default')), None)
+              default_memory = next((k for k, v in memory_choices.items() if v.get('default')), None)
+              default_gpu = next((k for k, v in gpu_choices.items() if v.get('default')), None)
+              logger.info(f"Profile defaults set to:")
+              logger.info(f"  image: tk-jupyter-base (fixed)")
+              logger.info(f"  node: {default_node}")
+              logger.info(f"  cpu: {default_cpu}")
+              logger.info(f"  memory: {default_memory}")
+              logger.info(f"  gpu: {default_gpu}")
+
+              if not profiles:
+                  logger.error("No profiles could be generated")
+                  sys.exit(1)
+
+              logger.info(f"Successfully generated {len(profiles)} profiles with resource options")
+              return profiles
+
+          except Exception as e:
+              logger.error(f"Failed to generate profiles: {e}")
+              sys.exit(1)
+
+      # Apply resource selections using pre_spawn_hook
+      async def resource_selector_hook(spawner):
+          """Apply resource selections from profile_options"""
+          import logging
+          import requests
+          logger = logging.getLogger(__name__)
+
+          # Load user options first as per documentation
+          await spawner.load_user_options()
+
+          user_options = spawner.user_options
+          logger.info(f"Pre-spawn hook - user_options: {user_options}")
+
+          # Log the exact structure we're getting
+          if isinstance(user_options, dict):
+              logger.info(f"user_options keys: {user_options.keys()}")
+              if 'profile' in user_options:
+                  logger.info(f"profile value type: {type(user_options['profile'])}")
+                  logger.info(f"profile value: {user_options['profile']}")
+
+          # Get defaults from thinkube-control config
+          defaults = {'cpu': '4', 'memory': '8G', 'gpu': '0'}
+          try:
+              config_response = requests.get(
+                  'http://backend.thinkube-control.svc.cluster.local:8000/api/v1/jupyterhub/config',
+                  timeout=5
+              )
+              if config_response.status_code == 200:
+                  config = config_response.json()
+                  defaults['cpu'] = str(config['default_cpu_cores'])
+                  defaults['memory'] = f"{config['default_memory_gb']}G"
+                  defaults['gpu'] = str(config['default_gpu_count'])
+                  logger.info(f"Loaded defaults from thinkube-control: CPU={defaults['cpu']}, Memory={defaults['memory']}, GPU={defaults['gpu']}")
+          except Exception as e:
+              logger.warning(f"Could not load defaults from thinkube-control, using fallbacks: {e}")
+
+          # When using profile_options, the selected values are directly in user_options
+          if user_options:
+              # Apply node selection
+              node = user_options.get('node')
+              if node:
+                  spawner.node_selector = {"kubernetes.io/hostname": node}
+                  logger.info(f"Set node selector: {node}")
+
+              # Apply CPU and memory (use thinkube-control defaults as fallback)
+              cpu = user_options.get('cpu', defaults['cpu'])
+              spawner.cpu_limit = float(cpu)
+              spawner.cpu_guarantee = float(cpu) * 0.5
+              logger.info(f"Set CPU: {cpu}")
+
+              memory = user_options.get('memory', defaults['memory'])
+              spawner.mem_limit = memory
+              # Request 25% of the limit (matching the default guarantee/limit ratio of 2G/8G).
+              # This avoids hitting the namespace ResourceQuota while still allowing
+              # the pod to burst up to the full limit when memory is available.
+              mem_bytes = int(float(memory.replace('G', '')) * 1073741824)
+              spawner.mem_guarantee = int(mem_bytes * 0.25)
+              logger.info(f"Set memory: limit={memory}, guarantee={int(mem_bytes * 0.25)}")
+
+              # Apply GPU allocation
+              gpu_count = user_options.get('enable_gpu', defaults['gpu'])
+              if gpu_count != '0':
+                  spawner.extra_resource_limits = {"nvidia.com/gpu": gpu_count}
+                  spawner.extra_resource_guarantees = {"nvidia.com/gpu": gpu_count}
+                  logger.info(f"Set GPU count: {gpu_count}")
+
+      c.KubeSpawner.profile_list = get_profile_list
+      c.KubeSpawner.pre_spawn_hook = resource_selector_hook
+
+    02-thinkube-branding: |
+      # Thinkube branding - logo and custom templates
+      c.JupyterHub.logo_file = '/usr/local/share/jupyterhub/static/images/notebook-text.svg'
+
+      # Custom template directory (searched before default templates)
+      c.JupyterHub.template_paths = ['/usr/local/share/jupyterhub/custom-templates']
+      # Custom spawner form template (node-aware resource filtering)
+      c.KubeSpawner.additional_profile_form_template_paths = ['/usr/local/share/jupyterhub/custom-templates']
+
+  # Network policy configuration
+  # Disable default network policy - we'll create a custom one that allows ingress controller access
+  networkPolicy:
+    enabled: false
+
+  # Thinkube Notebooks branding assets
+  extraFiles:
+    notebook-logo:
+      mountPath: /usr/local/share/jupyterhub/static/images/notebook-text.svg
+      stringData: |
+        {{ lookup('file', playbook_dir + '/templates/notebook-text.svg') | indent(8) }}
+
+    thinkube-page-template:
+      mountPath: /usr/local/share/jupyterhub/custom-templates/page.html
+      stringData: |
+        {% raw %}{% extends "templates/page.html" %}
+
+        {% block favicon %}
+        <link rel="icon" type="image/svg+xml" href="{{ static_url('images/notebook-text.svg') }}">
+        {% endblock %}
+
+        {% block logo %}
+        <div class="tk-brand">
+          <img src="{{ static_url('images/notebook-text.svg') }}" alt="Thinkube Notebooks" id="jupyterhub-logo" />
+          <span class="tk-brand-text">Thinkube Notebooks</span>
+        </div>
+        {% endblock %}
+
+        {% block stylesheet %}
+        {{ super() }}
+        <link rel="stylesheet" href="{{ static_url('css/thinkube.css') }}" type="text/css"/>
+        {% endblock %}{% endraw %}
+
+    thinkube-spawn-form:
+      mountPath: /usr/local/share/jupyterhub/custom-templates/form.html
+      stringData: |
+        {% raw %}<style>{% include 'style.css' %}</style>
+        {%- for profile in profile_list %}
+          {%- if profile.node_limits %}
+            <script type="application/json" id="thinkube-node-limits">{{ profile.node_limits | tojson }}</script>
+          {%- endif %}
+        {%- endfor %}
+        <style>
+          .tk-node-servers-list { list-style: none; padding: 0; margin: 0 0 20px; }
+          .tk-node-servers-list li { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #d1cdc7; }
+          .tk-node-name { font-weight: 600; min-width: 90px; }
+          .tk-node-state { flex: 1; }
+          .tk-node-state::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #9a948c; }
+          .tk-node-state.tk-running::before { background: #16a34a; }
+          .tk-node-state.tk-starting::before { background: #eab308; }
+        </style>
+        <div id="thinkube-node-servers"></div>
+        <div class="form-group" id="kubespawner-profiles-list">
+          {%- for profile in profile_list %}
+            <label for="profile-item-{{ profile.slug }}"
+                   class="profile js-profile-label">
+              <div class="radio">
+                <input type="radio"
+                       name="profile"
+                       id="profile-item-{{ profile.slug }}"
+                       value="{{ profile.slug }}"
+                       {% if profile.default %}checked{% endif %} />
+              </div>
+              <div>
+                <h3>{{ profile.display_name }}</h3>
+                {%- if profile.description %}<p>{{ profile.description }}</p>{%- endif %}
+                {%- if profile.profile_options %}
+                  <div>
+                    {%- for k, option in profile.profile_options.items() %}
+                      <div class="js-options-container">
+                        <div class="option">
+                          <label for="profile-option-{{ profile.slug }}--{{ k }}"
+                                 class="js-profile-option-label">{{ option.display_name }}</label>
+                          <select name="profile-option-{{ profile.slug }}--{{ k }}"
+                                  class="form-control js-profile-option-select"
+                                  data-option-key="{{ k }}">
+                            {%- for k, choice in option['choices'].items() %}
+                              <option value="{{ k }}" {% if choice.default %}selected{% endif %}>{{ choice.display_name }}</option>
+                            {%- endfor %}
+                            {%- if option['unlisted_choice']['enabled'] %}
+                              <option value="unlisted-choice">{{ option['unlisted_choice']['display_name_in_choices'] }}</option>
+                            {%- endif %}
+                          </select>
+                        </div>
+                        {%- if option['unlisted_choice']['enabled'] %}
+                          <div class="option hidden js-other-input-container">
+                            <label for="profile-option-{{ profile.slug }}--{{ k }}--unlisted-choice">
+                              {{ option['unlisted_choice']['display_name'] }}
+                            </label>
+                            <input data-name="profile-option-{{ profile.slug }}--{{ k }}--unlisted-choice"
+                                   {%- if option['unlisted_choice']['validation_regex'] %}
+                                   pattern="{{ option['unlisted_choice']['validation_regex'] }}"
+                                   {%- endif %}
+                                   title="{{ option['unlisted_choice']['validation_message'] }}"
+                                   class="form-control js-other-input" />
+                          </div>
+                        {%- endif %}
+                      </div>
+                    {%- endfor %}
+                  </div>
+                {%- endif %}
+              </div>
+            </label>
+          {%- endfor %}
+        </div>
+        <script>
+          // Standard KubeSpawner form behavior
+          $('.js-profile-option-select, .js-profile-option-label').click(function() {
+            $(this).parents('.js-profile-label')
+              .find('input[type=radio]')
+              .prop('checked', true);
+          });
+
+          $('.js-profile-option-select').change(function() {
+            const selectionValue = $(this).val();
+            const $otherInputContainer = $(this).parents('.js-options-container').find('.js-other-input-container');
+            const $otherInput = $(this).parents('.js-options-container').find('.js-other-input');
+            if (selectionValue === 'unlisted-choice') {
+              $(this).data('name', $(this).attr('name'));
+              $(this).removeAttr('name');
+              $otherInput.attr('name', $otherInput.data('name'));
+              $otherInputContainer.removeClass('hidden');
+            } else {
+              $otherInput.removeAttr('name');
+              $(this).attr('name', $(this).data('name'));
+              $otherInputContainer.addClass('hidden');
+            }
+          });
+
+          // Thinkube: node-aware resource filtering
+          $(document).ready(function() {
+            var nodeLimits = {};
+            try {
+              nodeLimits = JSON.parse($('#thinkube-node-limits').text());
+            } catch(e) {}
+
+            var $nodeSelect = $('select[data-option-key="node"]');
+            var $gpuSelect = $('select[data-option-key="enable_gpu"]');
+            var $cpuSelect = $('select[data-option-key="cpu"]');
+            var $memSelect = $('select[data-option-key="memory"]');
+
+            // Store all original options
+            var allGpuOptions = $gpuSelect.find('option').clone();
+            var allCpuOptions = $cpuSelect.find('option').clone();
+            var allMemOptions = $memSelect.find('option').clone();
+
+            function updateOptionsForNode() {
+              var node = $nodeSelect.val();
+              var limits = nodeLimits[node];
+              if (!limits) return;
+
+              // Filter GPU options
+              var currentGpu = $gpuSelect.val();
+              $gpuSelect.empty();
+              allGpuOptions.each(function() {
+                if (parseInt($(this).val()) <= limits.gpu) {
+                  $gpuSelect.append($(this).clone());
+                }
+              });
+              if (parseInt(currentGpu) > limits.gpu) {
+                $gpuSelect.val(String(limits.gpu));
+              } else {
+                $gpuSelect.val(currentGpu);
+              }
+
+              // Filter CPU options
+              var currentCpu = $cpuSelect.val();
+              $cpuSelect.empty();
+              allCpuOptions.each(function() {
+                if (parseInt($(this).val()) <= limits.cpu) {
+                  $cpuSelect.append($(this).clone());
+                }
+              });
+              if (parseInt(currentCpu) > limits.cpu) {
+                $cpuSelect.val(String(limits.cpu));
+              } else {
+                $cpuSelect.val(currentCpu);
+              }
+
+              // Filter memory options
+              var currentMem = parseInt($memSelect.val());
+              $memSelect.empty();
+              allMemOptions.each(function() {
+                if (parseInt($(this).val()) <= limits.memory) {
+                  $memSelect.append($(this).clone());
+                }
+              });
+              if (currentMem > limits.memory) {
+                $memSelect.val(limits.memory + 'G');
+              } else {
+                $memSelect.val(currentMem + 'G');
+              }
+            }
+
+            // A chosen node brings its own defaults for its notebook server.
+            function applyNodeDefaults() {
+              var limits = nodeLimits[$nodeSelect.val()];
+              if (!limits || !limits.defaults) return;
+              $cpuSelect.val(String(limits.defaults.cpu_cores));
+              $memSelect.val(limits.defaults.memory_gb + 'G');
+              $gpuSelect.val(String(limits.defaults.gpus));
+            }
+
+            // The form starts the chosen node's named server, the one Thinkube IDE
+            // and thinkube-control start on that node. The Hub renders the form's
+            // address with its _xsrf token in the query; the node server's address
+            // carries the same query, with "next" set to that server, so the Hub
+            // opens it once it is ready (the page's own "next" names the default
+            // server, which does not exist). Without the user, a node, the token
+            // or the Hub's prefix the address cannot be formed, and the form is
+            // not sent.
+            function nodeServerAction(current) {
+              var node = $nodeSelect.val();
+              var queryAt = current.indexOf('?');
+              var params = new URLSearchParams(queryAt >= 0 ? current.slice(queryAt + 1) : '');
+              var jh = window.jhdata;
+              if (!node || !jh || !jh.user || !jh.prefix || !params.get('_xsrf')) return null;
+              var user = encodeURIComponent(jh.user), server = encodeURIComponent(node);
+              params.set('next', jh.prefix + 'user/' + user + '/' + server + '/');
+              return jh.base_url + 'spawn/' + user + '/' + server + '?' + params.toString();
+            }
+            // The state of each node's server, read from the Hub API with this
+            // page's login. A running server is opened instead of started again,
+            // and a starting one shows its progress page.
+            var serverState = {};
+            var $servers = $('#thinkube-node-servers');
+            var $submit = $('#spawn_form button[type="submit"]');
+            function serverUrl(node) {
+              return window.jhdata.prefix + 'user/' + encodeURIComponent(window.jhdata.user) + '/' + encodeURIComponent(node) + '/';
+            }
+            function pendingUrl(node) {
+              return window.jhdata.base_url + 'spawn-pending/' + encodeURIComponent(window.jhdata.user) + '/' + encodeURIComponent(node);
+            }
+            function stateOf(node) {
+              var server = serverState[node];
+              if (!server) return 'stopped';
+              if (server.ready) return 'running';
+              if (server.pending) return 'starting';
+              return 'stopped';
+            }
+            function updateSubmit() {
+              var state = stateOf($nodeSelect.val());
+              $submit.text(state === 'running' ? 'Open' : state === 'starting' ? 'Show progress' : 'Start');
+            }
+            function renderServers() {
+              var $list = $('<ul class="tk-node-servers-list"></ul>');
+              Object.keys(nodeLimits).sort().forEach(function(node) {
+                var state = stateOf(node);
+                var label = state === 'running' ? 'running' : state === 'starting' ? 'starting' : 'not running';
+                var $row = $('<li></li>')
+                  .append($('<span class="tk-node-name"></span>').text(node))
+                  .append($('<span class="tk-node-state"></span>').addClass('tk-' + state).text(label));
+                if (state === 'running') {
+                  $row.append($('<a class="btn btn-jupyter btn-xs"></a>').attr('href', serverUrl(node)).text('Open'));
+                } else if (state === 'starting') {
+                  $row.append($('<a class="btn btn-default btn-xs"></a>').attr('href', pendingUrl(node)).text('Show progress'));
+                } else {
+                  $row.append($('<button type="button" class="btn btn-default btn-xs"></button>').text('Choose to start').click(function() {
+                    $nodeSelect.val(node).trigger('change');
+                  }));
+                }
+                $list.append($row);
+              });
+              $servers.empty().append($('<h3>Your notebook servers</h3>'), $list);
+              updateSubmit();
+            }
+            fetch(window.jhdata.base_url + 'api/user', {
+              credentials: 'same-origin',
+              headers: { 'X-XSRFToken': window.jhdata.xsrf_token }
+            })
+              .then(function(response) {
+                if (!response.ok) throw new Error('the Hub answered ' + response.status);
+                return response.json();
+              })
+              .then(function(user) {
+                if (!user.servers) throw new Error('the Hub did not list your servers');
+                serverState = user.servers;
+                renderServers();
+              })
+              .catch(function(err) {
+                $servers.empty().append($('<p></p>').text(
+                  'The state of your notebook servers cannot be read: ' + err.message + '. Starting a server on a free node still works.'));
+              });
+
+            $('#spawn_form').submit(function(e) {
+              var chosen = $nodeSelect.val();
+              var state = stateOf(chosen);
+              if (state === 'running' || state === 'starting') {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                window.location.href = state === 'running' ? serverUrl(chosen) : pendingUrl(chosen);
+                return false;
+              }
+              var action = nodeServerAction($(this).attr('action') || '');
+              if (!action) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                alert('The notebook server cannot be started: the page does not give the user, the node, its security token or the Hub prefix. Reload the page and choose a node.');
+                return false;
+              }
+              $(this).attr('action', action);
+            });
+
+            $nodeSelect.change(function() {
+              updateOptionsForNode();
+              applyNodeDefaults();
+              updateSubmit();
+            });
+
+            // Trigger on page load
+            $('.js-profile-option-select').trigger('change');
+            updateOptionsForNode();
+          });
+        </script>{% endraw %}
+
+    thinkube-css:
+      mountPath: /usr/local/share/jupyterhub/static/css/thinkube.css
+      stringData: |
+        /* Thinkube Notebooks branding - Thinkube colors */
+        :root {
+          --tk-teal: #006680;
+          --tk-teal-light: #008bad;
+          --tk-teal-dark: #004d5c;
+        }
+
+        /* Navbar styling - warm off-white background, logo only */
+        .navbar-default {
+          background-color: #FEFDFB !important; /* Warm off-white from thinkube-style */
+          border-color: #e8e6e3 !important;
+          box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        }
+
+        #thenavbar {
+          background-color: #FEFDFB !important;
+        }
+
+        /* Hide navbar text links - keep only logo */
+        .navbar-default .navbar-nav {
+          display: none !important;
+        }
+
+        .navbar-default .navbar-brand {
+          color: var(--tk-teal) !important;
+          font-weight: 600;
+        }
+
+        /* Brand container - logo + text */
+        .tk-brand {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+        }
+
+        .tk-brand-text {
+          font-size: 18px;
+          font-weight: 700;
+          color: var(--tk-teal);
+          letter-spacing: -0.02em;
+        }
+
+        /* Logo styling */
+        #jupyterhub-logo {
+          height: 40px;
+          width: auto;
+        }
+
+        /* Primary buttons - teal theme */
+        .btn-primary, .btn-jupyter {
+          background-color: var(--tk-teal) !important;
+          border-color: var(--tk-teal) !important;
+        }
+
+        .btn-primary:hover, .btn-jupyter:hover {
+          background-color: var(--tk-teal-light) !important;
+          border-color: var(--tk-teal-light) !important;
+        }
+
+        .btn-primary:active, .btn-jupyter:active {
+          background-color: var(--tk-teal-dark) !important;
+          border-color: var(--tk-teal-dark) !important;
+        }
+
+        /* Login page styling */
+        #login-main .service-login {
+          border-color: var(--tk-teal);
+        }
+
+        /* Announcement banner - teal background with white text */
+        #announcement-banner {
+          background-color: var(--tk-teal) !important;
+          color: white !important;
+          padding: 12px 20px;
+          font-weight: 500;
+          border-bottom: 2px solid var(--tk-teal-dark);
+        }
+
+proxy:
+  secretToken: "{{ jupyterhub_proxy_token | default(lookup('password', '/dev/null chars=hex_digits length=64')) }}"
+  service:
+    type: ClusterIP
+  https:
+    enabled: false
+  chp:
+    image:
+      name: quay.io/jupyterhub/configurable-http-proxy
+      tag: "5.0.0"  # Use 5.0+ for websocket options support
+    pdb:
+      enabled: false
+    extraPodSpec:
+      priorityClassName: thinkube-workload
+
+singleuser:
+  defaultUrl: "/lab"
+
+  # User ID configuration
+  uid: 1000
+  fsGid: 100  # Group ID for filesystem access
+
+  # Init containers to fix permissions on JuiceFS volumes
+  initContainers:
+    - name: fix-permissions
+      image: {{ harbor_registry }}/library/busybox:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - |
+          # First time setup - check marker in persistent area
+          if [ ! -f "/home/thinkube/thinkube/.thinkube-initialized" ]; then
+            echo "First time setup - creating examples directory..."
+
+            # Create examples directory for editable copies of templates
+            mkdir -p /home/thinkube/thinkube/notebooks/examples
+
+            # Mark as initialized
+            touch /home/thinkube/thinkube/.thinkube-initialized
+            echo "First time setup complete"
+          else
+            echo "Already initialized"
+          fi
+
+          # Always fix permissions for persistent areas
+          echo "Fixing permissions..."
+          chown -R 1000:100 /home/thinkube/thinkube
+          chmod -R 755 /home/thinkube/thinkube
+          chown -R 1000:100 /home/thinkube/scratch 2>/dev/null || true
+          chmod -R 755 /home/thinkube/scratch 2>/dev/null || true
+          echo "Permissions fixed"
+      securityContext:
+        runAsUser: 0  # Run as root to fix permissions
+      volumeMounts:
+        - name: notebooks
+          mountPath: /home/thinkube/thinkube/notebooks
+        - name: datasets
+          mountPath: /home/thinkube/thinkube/datasets
+        - name: models
+          mountPath: /home/thinkube/thinkube/models
+        - name: scratch
+          mountPath: /home/thinkube/scratch
+
+    # Clone templates repository on each pod start (directly to templates mount - NO symlinks!)
+    - name: clone-templates
+      image: {{ harbor_registry }}/library/alpine-git:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          echo "Cloning templates repository..."
+
+          # Clone directly into the templates mount (emptyDir - fresh each pod start)
+          git clone --branch {{ thinkube_ref }} https://github.com/thinkube/thinkube-notebooks-examples.git /home/thinkube/thinkube/templates/thinkube-notebooks-examples
+
+          # Flatten structure: /templates/thinkube-notebooks-examples/* → /templates/*
+          mv /home/thinkube/thinkube/templates/thinkube-notebooks-examples/* /home/thinkube/thinkube/templates/
+          rm -rf /home/thinkube/thinkube/templates/thinkube-notebooks-examples
+
+          # Fix ownership
+          chown -R 1000:100 /home/thinkube/thinkube/templates
+          chmod -R 755 /home/thinkube/thinkube/templates
+
+          # First time: copy example notebooks to editable working directory
+          if [ ! -f "/home/thinkube/thinkube/notebooks/examples/.copied" ]; then
+            echo "First time setup - copying examples to notebooks..."
+            cp -r /home/thinkube/thinkube/templates/examples/* /home/thinkube/thinkube/notebooks/examples/
+            touch /home/thinkube/thinkube/notebooks/examples/.copied
+            chown -R 1000:100 /home/thinkube/thinkube/notebooks/examples
+            chmod -R 755 /home/thinkube/thinkube/notebooks/examples
+            echo "Examples copied to notebooks/examples/"
+          fi
+
+          echo "Templates ready at /home/thinkube/thinkube/templates/"
+      securityContext:
+        runAsUser: 0  # Run as root to clone and set permissions
+      volumeMounts:
+        - name: templates
+          mountPath: /home/thinkube/thinkube/templates
+        - name: notebooks
+          mountPath: /home/thinkube/thinkube/notebooks
+
+    # Query service discovery and generate environment file
+    - name: service-discovery
+      image: {{ harbor_registry }}/library/tk-service-discovery:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - /scripts/service-discovery-init.sh
+      volumeMounts:
+        - name: service-discovery-script
+          mountPath: /scripts
+        - name: service-config
+          mountPath: /service-config
+      securityContext:
+        runAsUser: 0  # Need root to create config directory and fix permissions
+
+    # Setup venvs: download from GitHub if needed (local disk - fast!), then register Jupyter kernels
+    - name: setup-venvs
+      image: {{ harbor_registry }}/library/tk-jupyter-base:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - bash
+        - -c
+        - |
+          set -e
+          echo "Setting up virtualenv kernels (local storage - fast I/O)..."
+
+          # Configuration
+          VENVS_VERSION="{{ jupyter_venvs_version }}"
+          GITHUB_REPO="thinkube/thinkube-venvs"
+          GITHUB_RELEASE_URL="https://github.com/$GITHUB_REPO/releases/download/$VENVS_VERSION"
+
+          # Detect architecture
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ]; then
+            ARCH_DIR="arm64"
+          else
+            ARCH_DIR="amd64"
+          fi
+          echo "Detected architecture: $ARCH_DIR"
+          echo "Venvs version: $VENVS_VERSION"
+
+          VENVS_BASE="/home/thinkube/venvs"
+          VENVS_ARCH_DIR="$VENVS_BASE/$ARCH_DIR"
+
+          # Check if venvs already exist and are the correct version
+          VERSION_FILE="$VENVS_ARCH_DIR/.version"
+          if [ -f "$VERSION_FILE" ] && [ "$(cat $VERSION_FILE)" = "$VENVS_VERSION" ]; then
+            echo "Venvs $VENVS_VERSION already installed for $ARCH_DIR"
+          else
+            echo "Downloading venvs $VENVS_VERSION for $ARCH_DIR..."
+            mkdir -p "$VENVS_ARCH_DIR"
+
+            # Download and extract each system venv directly to local storage (fast!)
+            for venv in fine-tuning agent-dev; do
+              TARBALL_URL="$GITHUB_RELEASE_URL/$ARCH_DIR-$venv.tar.gz"
+              echo "  Downloading $venv..."
+
+              # Remove any existing incomplete venv first
+              rm -rf "$VENVS_ARCH_DIR/$venv" 2>/dev/null || true
+
+              # Extract directly to local storage (hostPath = fast local disk)
+              # A failed download stops the server start; the version file is
+              # written only after both venvs are in place, so the next start
+              # tries again.
+              if ! curl -fsSL "$TARBALL_URL" | tar -xzf - -C "$VENVS_ARCH_DIR/"; then
+                echo "ERROR: could not download and extract $venv from $TARBALL_URL" >&2
+                exit 1
+              fi
+              echo "    ✓ $venv downloaded and extracted"
+            done
+
+            # Record installed version
+            echo "$VENVS_VERSION" > "$VERSION_FILE"
+            echo "Venvs $VENVS_VERSION installed for $ARCH_DIR"
+          fi
+
+          # Create symlink to current architecture
+          ln -sfn "$VENVS_ARCH_DIR" "$VENVS_BASE/current"
+          echo "Created symlink: $VENVS_BASE/current -> $ARCH_DIR"
+
+          # Register each venv as a Jupyter kernel (system venvs + custom venvs)
+          # Use --prefix to install kernels to shared venvs volume (accessible by main container)
+          KERNELS_DIR="$VENVS_BASE/kernels"
+          mkdir -p "$KERNELS_DIR"
+
+          # Register system venvs (downloaded from GitHub)
+          for venv in "$VENVS_ARCH_DIR"/*/; do
+            if [ -d "$venv" ] && [ -f "$venv/bin/python" ]; then
+              VENV_NAME=$(basename "$venv")
+              echo "Registering kernel: $VENV_NAME"
+              "$venv/bin/python" -m ipykernel install \
+                --prefix="$VENVS_BASE" \
+                --name="$VENV_NAME" \
+                --display-name="$VENV_NAME ($ARCH_DIR)" \
+                2>/dev/null || echo "  Note: kernel may already be registered"
+            fi
+          done
+
+          # Register custom venvs (built via thinkube-control, synced to all GPU nodes)
+          # Venvs are stored at custom/<name>/<arch>/ for multi-arch support
+          # Falls back to custom/<name>/ (legacy flat layout) if no arch subdir exists
+          CUSTOM_VENVS_DIR="$VENVS_BASE/custom"
+          if [ -d "$CUSTOM_VENVS_DIR" ]; then
+            for venv_dir in "$CUSTOM_VENVS_DIR"/*/; do
+              [ -d "$venv_dir" ] || continue
+              VENV_NAME=$(basename "$venv_dir")
+
+              # New layout: custom/<name>/<arch>/
+              ARCH_VENV="$venv_dir/$ARCH_DIR"
+              if [ -d "$ARCH_VENV" ] && [ -f "$ARCH_VENV/bin/python" ]; then
+                DISPLAY_NAME="$VENV_NAME (custom, $ARCH_DIR)"
+                echo "Registering custom kernel: $VENV_NAME as '$DISPLAY_NAME'"
+                "$ARCH_VENV/bin/python" -m ipykernel install \
+                  --prefix="$VENVS_BASE" \
+                  --name="$VENV_NAME" \
+                  --display-name="$DISPLAY_NAME" \
+                  2>/dev/null || echo "  Note: kernel may already be registered"
+                continue
+              fi
+
+              # Legacy layout: custom/<name>/ with .arch file
+              if [ -f "$venv_dir/bin/python" ]; then
+                VENV_ARCH=""
+                if [ -f "$venv_dir/.arch" ]; then
+                  VENV_ARCH=$(cat "$venv_dir/.arch" 2>/dev/null || echo "")
+                fi
+                if [ -n "$VENV_ARCH" ] && [ "$VENV_ARCH" != "$ARCH_DIR" ]; then
+                  echo "Skipping custom kernel $VENV_NAME - built for $VENV_ARCH, current arch is $ARCH_DIR"
+                  continue
+                fi
+                if [ -n "$VENV_ARCH" ]; then
+                  DISPLAY_NAME="$VENV_NAME (custom, $VENV_ARCH)"
+                else
+                  DISPLAY_NAME="$VENV_NAME (custom)"
+                fi
+                echo "Registering custom kernel: $VENV_NAME as '$DISPLAY_NAME'"
+                "$venv_dir/bin/python" -m ipykernel install \
+                  --prefix="$VENVS_BASE" \
+                  --name="$VENV_NAME" \
+                  --display-name="$DISPLAY_NAME" \
+                  2>/dev/null || echo "  Note: kernel may already be registered"
+              fi
+            done
+          fi
+
+          # Fix ownership for venvs (includes kernels now)
+          chown -R 1000:100 "$VENVS_BASE" 2>/dev/null || true
+
+          # Jupyter looks for kernels at $JUPYTER_PATH/kernels, but ipykernel install --prefix
+          # creates them at $JUPYTER_PATH/share/jupyter/kernels. Create symlink to fix this.
+          if [ -d "$VENVS_BASE/share/jupyter/kernels" ] && [ ! -L "$VENVS_BASE/kernels" ]; then
+            rm -rf "$VENVS_BASE/kernels" 2>/dev/null || true
+            ln -sf share/jupyter/kernels "$VENVS_BASE/kernels"
+            echo "Created symlink: $VENVS_BASE/kernels -> share/jupyter/kernels"
+          fi
+
+          echo "Kernels registered to: $VENVS_BASE/share/jupyter/kernels"
+          ls -la "$VENVS_BASE/share/jupyter/kernels/" 2>/dev/null || echo "  (no kernels yet)"
+
+          # JupyterLab prefix extensions have the same mismatch as kernels: pip
+          # installs them under <venv>/share/jupyter/labextensions, while Lab
+          # searches $JUPYTER_PATH/labextensions. Without this, an extension a
+          # venv provides is silently absent — the kernel emits its mime type
+          # and the cell renders blank, with no error anywhere.
+          LABEXT_DIR="$VENVS_BASE/labextensions"
+          rm -rf "$LABEXT_DIR"
+          mkdir -p "$LABEXT_DIR"
+          # KubeSpawner renders these commands through str.format, so a brace
+          # anywhere in this script — comments included — is read as a format
+          # field and raises KeyError at spawn time, and no server starts.
+          # Hence the glob without a trailing slash instead of a suffix-stripping
+          # parameter expansion, which would need braces.
+          for venv_labext in "$VENVS_ARCH_DIR"/*/share/jupyter/labextensions/*; do
+            if [ -d "$venv_labext" ]; then
+              ext_name=$(basename "$venv_labext")
+              ln -sfn "$venv_labext" "$LABEXT_DIR/$ext_name"
+              echo "Linked lab extension: $ext_name"
+            fi
+          done
+          chown -R 1000:100 "$LABEXT_DIR" 2>/dev/null || true
+
+          # Add the Thinkube Notebooks icon to all kernels (both 32x32 and 64x64 PNG required by JupyterLab)
+          # Base64-encoded PNGs of the notebook-text hexagon from thinkube-style
+          TK_ICON_64_B64="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"
+          TK_ICON_32_B64="iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAADdElEQVR4nMRXSWgUQRR9NYtb1KsaUDEu6EkQVPSgguBBBS8BlyDEaGY0EbJANIlmpmeSqEkO0RiXmYiaxYPLRQQ38GAuohDRq0uMiImI3rLPpMvXnXV6tp6xIQ+66lf9X/1//6r6/7cD6cLlKwHkGVISEA0IehuRBgRShdu3G1LeILXWwPkMIU4h4H2FFGDegDwlC3Zc4Yr9SSSfIIxi3Fa6YYkBRxsyMH/AS0cXUXoOzEBilO1lDGf40V42gPQMkAJufy5UeZFSS5AeflFFOYKeNvbSvAEu/1ZADZDaCCsg0QVpc+OWpyuxAa7aZZChBlJHyDEa950v+gYzEMhiu8JghOaBdp6jMtxUfk+LTin37aPUQ1LzDa8bpdQBBJTnSAVuZS9VPiblMHAGubvZaPE+QyRTXo+hXMN9XXmuMg9O21aYQUh9yzVP4VIecXTIwF3A49DMfrXBAIPLJiEm3D4XHki1AmbgRA3bKj7xrmLWJGFDfIQA+xp+iVcfBZRK2GyboEe+JBDI0HuJkWSijgQ8iTERjsPrJfeTQek6tplIEYkMmAN7uIeH08M4X839bISqFuucMDYz0vVGSOcpmXzbT1hogHZxTkC1T8R2ezOE2s080ASHyEG+/51BfLuZ3UnFgAFelTtTESxY9RV5dXfhGGLWk/VxApulBiyk+79AKD4ewDbShcBQOeft3O+dnOuMWlGgLOX2fIBFBsSCqrdjerKxBAkMkMximesRcIf0YdB7Da5LHcDwX17eNzyU0UvCSBkJ4oBgxOo7jOM1K/Whq3o15EgutC2QopLJZdfUI8QeznciDSTaAsFD3Qr7mId0Nf1+mjPj11DIFnrkT4R0vrKN/B2w0AAtEm7QT7+GoFKCk/42xgItpX6kwpmByEnlW5AG0o2EmVSYctSLhUS5YDwSunkNNbiUWn79e5irIwcnemcywZke+MFneZSExCq9z1hcg/7+lzADLR1rEFgTR6In2gCJAi54gOia4CDyfffQWPqC9GuYxXhBkh2DM8RoUjg5iC7JEKrnwpwYJVkP53tgBkL32sqIufGSrAPCeRbBc33TorEwa0Vp5CpB1x8jceG/ynKJCia11tTK8pnIq1sE+5CHkkUwcap1WPNjYjRE/zW7yhV7k0ha/GtmxKz9nBqRr5SyVSbecp6huglp4B8AAAD//w/0lVYAAAAGSURBVAMAohMihXUAlkYAAAAASUVORK5CYII="
+          for kernel_dir in "$VENVS_BASE/share/jupyter/kernels"/*/; do
+            if [ -d "$kernel_dir" ]; then
+              # Replace kernel icons with the Thinkube Notebooks icon (both sizes required by JupyterLab)
+              echo "$TK_ICON_64_B64" | base64 -d > "$kernel_dir/logo-64x64.png"
+              echo "$TK_ICON_32_B64" | base64 -d > "$kernel_dir/logo-32x32.png"
+              # Remove old SVG to avoid conflicts
+              rm -f "$kernel_dir/logo-svg.svg"
+              echo "Added Thinkube icons to $(basename "$kernel_dir")"
+            fi
+          done
+
+          echo "Venv setup complete!"
+      volumeMounts:
+        - name: venvs
+          mountPath: /home/thinkube/venvs
+      securityContext:
+        runAsUser: 0  # Need root to create symlinks and fix permissions
+
+  # ServiceAccount for querying ConfigMaps
+  serviceAccountName: jupyter-service-discovery
+
+  # MANDATORY: JuiceFS storage - no fallbacks
+  extraFiles:
+    # The single-user server refuses to be framed by default: JupyterHub sets
+    # frame-ancestors 'none' unless a policy is already configured. Thinkube IDE
+    # shows a notebook in an editor tab, so the IDE's origin is allowed.
+    # A settings file, not a jupyter_server_config.d entry: the server reads
+    # that directory only to enable extensions.
+    frame-ancestors:
+      mountPath: /etc/jupyter/jupyter_server_config.py
+      stringData: |
+        c.ServerApp.tornado_settings = {
+            "headers": {"Content-Security-Policy": "frame-ancestors 'self' https://ide.{{ domain_name }}"}
+        }
+  storage:
+    type: none  # We define volumes manually
+    # Hybrid storage approach: JuiceFS (persistent) + local scratch (performance)
+    extraVolumes:
+    # JuiceFS for persistent notebooks (MANDATORY)
+    - name: notebooks
+      persistentVolumeClaim:
+        claimName: jupyterhub-notebooks-pvc
+
+    # JuiceFS for datasets (MANDATORY)
+    - name: datasets
+      persistentVolumeClaim:
+        claimName: jupyterhub-datasets-pvc
+
+    # JuiceFS for user models (MANDATORY)
+    - name: models
+      persistentVolumeClaim:
+        claimName: jupyterhub-models-pvc
+
+    # MLflow artifacts - SHARED with MLflow (same JuiceFS volume, zero duplication!)
+    # Users can access MLflow models via POSIX at /home/thinkube/thinkube/mlflow/
+    - name: mlflow-artifacts
+      persistentVolumeClaim:
+        claimName: jupyterhub-mlflow-artifacts-pvc
+
+    # Local node storage for venvs (fast I/O - no JuiceFS small file bottleneck)
+    # Each GPU node has its own copy, synced via rsync after custom venv builds
+    - name: venvs
+      hostPath:
+        path: /var/lib/jupyterhub-venvs
+        type: DirectoryOrCreate
+
+    # Local scratch for fast I/O (per-pod temporary)
+    - name: scratch
+      emptyDir:
+        sizeLimit: 100Gi
+
+    # Templates repository (cloned fresh on each pod start - NO symlinks!)
+    - name: templates
+      emptyDir:
+        sizeLimit: 1Gi
+
+    # Service discovery script (from ConfigMap)
+    - name: service-discovery-script
+      configMap:
+        name: jupyter-service-discovery-script
+        defaultMode: 0755
+
+    # Service config output (shared between init container and main container)
+    - name: service-config
+      emptyDir: {}
+
+    extraVolumeMounts:
+    # Primary notebook storage (JuiceFS - persistent across nodes)
+    - name: notebooks
+      mountPath: /home/thinkube/thinkube/notebooks
+
+    # Datasets directory (JuiceFS - persistent across nodes)
+    - name: datasets
+      mountPath: /home/thinkube/thinkube/datasets
+
+    # User models directory (JuiceFS - persistent across nodes)
+    - name: models
+      mountPath: /home/thinkube/thinkube/models
+
+    # MLflow artifacts (JuiceFS - SHARED with MLflow, zero duplication!)
+    # Access MLflow models directly: /home/thinkube/thinkube/mlflow/artifacts/
+    - name: mlflow-artifacts
+      mountPath: /home/thinkube/thinkube/mlflow
+
+    # Fast local scratch space (emptyDir - temporary)
+    - name: scratch
+      mountPath: /home/thinkube/scratch
+
+    # Templates repository (emptyDir - cloned on pod start, NO symlinks!)
+    # Read-only examples - users should copy to notebooks/ to edit
+    - name: templates
+      mountPath: /home/thinkube/thinkube/templates
+
+    # Service discovery environment file (generated by init container)
+    - name: service-config
+      mountPath: /home/thinkube/.config/thinkube
+
+    # Local node venvs (fast I/O - hostPath on each GPU node)
+    # Init container downloads system venvs from GitHub releases
+    - name: venvs
+      mountPath: /home/thinkube/venvs
+
+  # Image configuration
+  image:
+    pullPolicy: Always
+
+  # Remove all node restrictions to allow scheduling on any GPU node
+  nodeSelector: {}
+  extraNodeAffinity: {}
+
+  # Enable GPU support and AI capabilities
+  extraEnv:
+    # NVIDIA GPU support
+    # NVIDIA_VISIBLE_DEVICES automatically set by NVIDIA device plugin based on GPU resource request
+    NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+
+    # JupyterLab configuration
+    JUPYTER_ENABLE_LAB: "yes"
+    GRANT_SUDO: "yes"
+
+    # Include venvs directory in Jupyter's search path for kernels
+    # Kernels are installed to /home/thinkube/venvs/share/jupyter/kernels by init container
+    JUPYTER_PATH: "/home/thinkube/venvs"
+
+    # Enable collaborative mode for YDoc/RTC integration (JupyterLab >= 4.1)
+    JUPYTER_LAB_ENABLE_COLLABORATION: "true"
+
+    # Matplotlib's font cache, on a volume that survives the pod.
+    # Its default is ~/.config/matplotlib, and it rebuilds the cache and warns
+    # on every import when it cannot write there. Pointing it at scratch also
+    # keeps the cache between sessions, so the first plot is not slower.
+    MPLCONFIGDIR: "/home/thinkube/scratch/.matplotlib"
+
+    # AI API keys - managed by thinkube-control secrets
+    # Users should create ANTHROPIC_API_KEY secret in thinkube-control
+    ANTHROPIC_API_KEY:
+      valueFrom:
+        secretKeyRef:
+          name: anthropic-api-key
+          key: value
+          optional: true  # Don't fail pod startup if secret doesn't exist
+
+  # Default resource limits (overridden by dynamic profiles)
+  cpu:
+    limit: 4
+    guarantee: 1
+  memory:
+    limit: 8G
+    guarantee: 2G
+
+  # Allow privilege escalation for sudo
+  allowPrivilegeEscalation: true
+
+  # Network policy
+  networkPolicy:
+    enabled: false
+
+  # Start timeout (20 minutes for image pull + venv download/extraction)
+  startTimeout: 1200
+
+  # Lifecycle hooks - add environment sourcing to shell configs
+  lifecycleHooks:
+    postStart:
+      exec:
+        command:
+          - "bash"
+          - "-c"
+          - |
+            # Add service-env-jh.sh to bashrc for interactive shells
+            # (kernels get it via cmd override, but terminals need it too)
+            if [ -f /home/thinkube/.config/thinkube/service-env-jh.sh ]; then
+              if ! grep -q "service-env-jh.sh" /home/thinkube/.bashrc 2>/dev/null; then
+                echo "" >> /home/thinkube/.bashrc
+                echo "# Thinkube service discovery (auto-generated)" >> /home/thinkube/.bashrc
+                echo "if [ -f ~/.config/thinkube/service-env-jh.sh ]; then" >> /home/thinkube/.bashrc
+                echo "  source ~/.config/thinkube/service-env-jh.sh" >> /home/thinkube/.bashrc
+                echo "fi" >> /home/thinkube/.bashrc
+              fi
+            fi
+
+            # Add .secrets.env to bashrc for thinkube-control API keys
+            if [ -f /home/thinkube/thinkube/notebooks/.secrets.env ]; then
+              if ! grep -q "\.secrets\.env" /home/thinkube/.bashrc 2>/dev/null; then
+                echo "" >> /home/thinkube/.bashrc
+                echo "# Thinkube secrets (exported from thinkube-control)" >> /home/thinkube/.bashrc
+                echo "if [ -f /home/thinkube/thinkube/notebooks/.secrets.env ]; then" >> /home/thinkube/.bashrc
+                echo "  source /home/thinkube/thinkube/notebooks/.secrets.env" >> /home/thinkube/.bashrc
+                echo "fi" >> /home/thinkube/.bashrc
+              fi
+            fi
+
+# Ingress is handled separately in the deployment playbook
+ingress:
+  enabled: false
+
+# Scheduling configuration (disabled for simplicity)
+scheduling:
+  userScheduler:
+    enabled: false
+  podPriority:
+    enabled: false
+  userPlaceholder:
+    enabled: false
+
+# Pre-puller configuration (disabled - images pulled on demand)
+prePuller:
+  hook:
+    enabled: false
+  continuous:
+    enabled: false
+
+# Culling configuration
+cull:
+  enabled: true
+  timeout: 3600  # 1 hour idle timeout
+  every: 600  # Check every 10 minutes
+  maxAge: 0  # Don't cull based on age
+
+# Debug mode (disable in production)
+debug:
+  enabled: false
+
+# Global configuration
+global:
+  safeToShowValues: false

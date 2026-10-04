@@ -1,0 +1,252 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/seaweedfs/18_test.yaml
+# Description:
+#   Test SeaweedFS deployment and S3 functionality
+#
+# Requirements:
+#   - SeaweedFS must be deployed and configured
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/seaweedfs/18_test.yaml
+
+- name: Test SeaweedFS deployment
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: true
+  
+  vars:
+    test_results: []
+
+  tasks:
+    - name: Check if namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ seaweedfs_namespace }}"
+      register: namespace_check
+      failed_when: false
+
+    - name: Record namespace test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Namespace exists: ' + (namespace_check.resources | length > 0) | string] }}"
+
+    # Test Master components
+    - name: Check SeaweedFS Master StatefulSet
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        name: seaweedfs-master
+        namespace: "{{ seaweedfs_namespace }}"
+      register: master_check
+      failed_when: false
+
+    - name: Record master test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Master StatefulSet exists: ' + (master_check.resources | length > 0) | string] }}"
+
+    - name: Check master readiness
+      ansible.builtin.set_fact:
+        master_ready: "{{ master_check.resources[0].status.readyReplicas == master_check.resources[0].spec.replicas }}"
+      when: master_check.resources | length > 0
+
+    - name: Record master readiness
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Master ready: ' + (master_ready | default(false)) | string] }}"
+
+    # Test Volume components
+    - name: Check SeaweedFS Volume StatefulSet
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        name: seaweedfs-volume
+        namespace: "{{ seaweedfs_namespace }}"
+      register: volume_check
+      failed_when: false
+
+    - name: Record volume test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Volume StatefulSet exists: ' + (volume_check.resources | length > 0) | string] }}"
+
+    - name: Check volume readiness
+      ansible.builtin.set_fact:
+        volume_ready: "{{ volume_check.resources[0].status.readyReplicas == volume_check.resources[0].spec.replicas }}"
+      when: volume_check.resources | length > 0
+
+    - name: Record volume readiness
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Volume ready: ' + (volume_ready | default(false)) | string] }}"
+
+    # Test Filer components
+    - name: Check SeaweedFS Filer StatefulSet
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        name: seaweedfs-filer
+        namespace: "{{ seaweedfs_namespace }}"
+      register: filer_check
+      failed_when: false
+
+    - name: Record filer test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Filer StatefulSet exists: ' + (filer_check.resources | length > 0) | string] }}"
+
+    - name: Check filer readiness
+      ansible.builtin.set_fact:
+        filer_ready: "{{ filer_check.resources[0].status.readyReplicas == filer_check.resources[0].spec.replicas }}"
+      when: filer_check.resources | length > 0
+
+    - name: Record filer readiness
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Filer ready: ' + (filer_ready | default(false)) | string] }}"
+
+    # Test Services
+    - name: Check services
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Service
+        namespace: "{{ seaweedfs_namespace }}"
+      register: services_check
+      failed_when: false
+
+    - name: Count services
+      ansible.builtin.set_fact:
+        service_count: "{{ services_check.resources | selectattr('metadata.labels.app', 'defined') | selectattr('metadata.labels.app', 'equalto', 'seaweedfs') | list | length }}"
+
+    - name: Record services test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['SeaweedFS services count: ' + service_count | string] }}"
+
+    # Test HTTPRoutes
+    - name: Check HTTPRoutes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        namespace: "{{ seaweedfs_namespace }}"
+      register: httproute_check
+      failed_when: false
+
+    - name: Extract HTTPRoute names
+      ansible.builtin.set_fact:
+        httproute_names: "{{ httproute_check.resources | map(attribute='metadata.name') | list }}"
+      when: httproute_check.resources is defined
+
+    - name: Check for UI HTTPRoute
+      ansible.builtin.set_fact:
+        ui_httproute_exists: "{{ 'seaweedfs-ui-httproute' in httproute_names }}"
+      when: httproute_names is defined
+
+    - name: Check for S3 HTTPRoute
+      ansible.builtin.set_fact:
+        s3_httproute_exists: "{{ 'seaweedfs-s3-httproute' in httproute_names }}"
+      when: httproute_names is defined
+
+    - name: Record HTTPRoute test results
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['UI HTTPRoute exists: ' + (ui_httproute_exists | default(false)) | string, 'S3 HTTPRoute exists: ' + (s3_httproute_exists | default(false)) | string] }}"
+
+    # Test PVCs
+    - name: Check PVCs
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ seaweedfs_namespace }}"
+      register: pvc_check
+      failed_when: false
+
+    - name: Count bound PVCs
+      ansible.builtin.set_fact:
+        bound_pvcs: "{{ pvc_check.resources | selectattr('status.phase', 'equalto', 'Bound') | list | length }}"
+      when: pvc_check.resources is defined
+
+    - name: Record PVC test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Bound PVCs: ' + (bound_pvcs | default(0)) | string + '/3'] }}"
+
+    # Test S3 API endpoint
+    - name: Test S3 API endpoint connectivity
+      ansible.builtin.uri:
+        url: "https://{{ object_storage_s3_hostname }}"
+        validate_certs: false
+        status_code: [200, 403]
+      register: s3_test
+      failed_when: false
+      delegate_to: localhost
+
+    - name: Record S3 API test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['S3 API accessible: ' + (s3_test.status in [200, 403]) | string] }}"
+
+    # The web UI must send a request without a login to Keycloak
+    - name: Test UI endpoint without a login
+      ansible.builtin.uri:
+        url: "https://{{ object_storage_ui_hostname }}/"
+        status_code: [200, 302, 303]
+        follow_redirects: none
+      register: ui_test
+      failed_when: false
+      delegate_to: localhost
+
+    - name: Record UI login test result
+      ansible.builtin.set_fact:
+        test_results: >-
+          {{ test_results + ['UI requires Keycloak login: ' ~
+             (ui_test.status in [302, 303] and (ui_test.location | default('')).startswith(
+               keycloak_url ~ '/realms/' ~ keycloak_realm ~ '/protocol/openid-connect/auth')) | string] }}
+
+    - name: Check the gateway login policy on the UI route
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: gateway.envoyproxy.io/v1alpha1
+        kind: SecurityPolicy
+        name: oauth2-proxy-seaweedfs-oidc
+        namespace: "{{ seaweedfs_namespace }}"
+      register: oidc_policy_check
+      failed_when: false
+
+    - name: Record login policy test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['Gateway login policy present: ' + (oidc_policy_check.resources | length > 0) | string] }}"
+
+    # Test S3 credentials secret
+    - name: Check S3 credentials secret
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        name: seaweedfs-s3-credentials
+        namespace: "{{ seaweedfs_namespace }}"
+      register: s3_secret_check
+      failed_when: false
+
+    - name: Record S3 credentials test result
+      ansible.builtin.set_fact:
+        test_results: "{{ test_results + ['S3 credentials configured: ' + (s3_secret_check.resources | length > 0) | string] }}"
+
+    # Display test results
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg:
+          - "SeaweedFS Test Results"
+          - "====================="
+          - "{{ test_results }}"
+
+    - name: Determine overall test status
+      ansible.builtin.set_fact:
+        all_tests_passed: "{{ test_results | select('search', ': False$') | list | length == 0 }}"
+
+    - name: Final test result
+      ansible.builtin.debug:
+        msg: "All tests passed: {{ all_tests_passed }}"
+      failed_when: not all_tests_passed

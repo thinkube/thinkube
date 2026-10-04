@@ -1,0 +1,1187 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/code-server/10_deploy.yaml
+# Description:
+#   Deploy Code Server on Kubernetes with a Keycloak login at the gateway
+#
+# Requirements:
+#   - Kubernetes (kubeadm) must be installed
+#   - Keycloak instance running and accessible
+#   - ADMIN_PASSWORD environment variable set
+#   - Wildcard TLS certificate in default namespace
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/code-server/10_deploy.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to kubectl configuration
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to helm binary
+#   - domain_name: Base domain for all services
+#   - harbor_registry: Harbor registry URL
+#   - keycloak_url: URL to Keycloak instance
+#   - keycloak_realm: Keycloak realm name
+#   - admin_username: Admin username
+#   - primary_gateway_ip: Primary ingress IP address
+#
+# Dependencies:
+#   - CORE-002: Keycloak must be deployed
+#   - CORE-003: TLS certificates must be configured (wildcard cert via acme.sh)
+#   - CORE-004: Harbor registry must be configured
+#
+# 🤖 [AI-generated]
+
+- name: Deploy Code Server secured with a Keycloak login
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    # Namespace settings
+    code_server_namespace: "code-server"
+
+    # Where the installer keeps the secrets it was given, on this host.
+    env_file_path: "{{ ansible_facts.env.HOME }}/.env"
+    
+    # Code Server settings
+    code_server_hostname: "ide.{{ domain_name }}"
+    code_server_tls_secret_name: "code-server-tls-secret"
+    
+    # Kubernetes configuration from inventory
+    # kubectl_bin is provided by inventory.yaml
+    
+    # Keycloak connection info
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+    # Code Server client details (Keycloak)
+    code_server_client_id: "code-server"
+    code_server_redirect_uri: "https://{{ code_server_hostname }}/oauth2/callback"
+    code_server_web_origins: "https://{{ code_server_hostname }}"
+    code_server_lifespan: "3600"
+    
+    # Control hub configuration - following thinkube-control pattern
+    control_host: "control.{{ domain_name }}"
+    control_hub_url: "https://{{ control_host }}"
+    
+    # Shared code directory (accessible from code-server and jupyterhub)
+    shared_code_path: "/home/{{ system_username }}/shared-code"
+    code_source_path: "{{ shared_code_path }}"
+
+  pre_tasks:
+    # Who is at the keyboard, learned from the token when nothing else says.
+    - name: Set github_token from environment
+      ansible.builtin.set_fact:
+        github_token: "{{ github_token | default(lookup('env', 'GITHUB_TOKEN'), true) }}"
+
+    - name: Resolve the GitHub username from the token
+      ansible.builtin.include_role:
+        name: common/github_username
+
+    - name: Get Kubernetes node name for current host
+      ansible.builtin.shell: |
+        # Get all node names and find the one that matches our hostname
+        HOSTNAME=$(hostname)
+        for node in $({{ kubectl_bin }} get nodes -o jsonpath='{.items[*].metadata.name}'); do
+          if echo "$node" | grep -q "$HOSTNAME"; then
+            echo "$node"
+            exit 0
+          fi
+        done
+        # This should not happen - fail loudly
+        echo "ERROR: Could not find node matching hostname $HOSTNAME" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: k8s_node_result
+      changed_when: false
+      failed_when: k8s_node_result.rc != 0
+      
+    - name: Set k8s_controller_node fact
+      ansible.builtin.set_fact:
+        k8s_controller_node: "{{ k8s_node_result.stdout }}"
+        
+    - name: Debug node name
+      ansible.builtin.debug:
+        msg: "Kubernetes node name: {{ k8s_controller_node }}"
+
+  tasks:
+    ###################################################################
+    # 0) Ensure shared code directory exists
+    ###################################################################
+    - name: Show source path and user info
+      ansible.builtin.debug:
+        msg: 
+          - "Using shared code path: {{ code_source_path }}"
+          - "Running as UID: 1000, GID: 1000"
+        
+    - name: Ensure source code directory exists with proper permissions
+      ansible.builtin.file:
+        path: "{{ code_source_path }}"
+        state: directory
+        mode: '0775'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+      become: true
+
+    - name: Fix permissions on any existing ansible directories created by thinkube-control
+      ansible.builtin.shell: |
+        # Fix any root-owned directories that may have been created by thinkube-control
+        if [ -d "{{ code_source_path }}/ansible" ]; then
+          echo "Fixing permissions on ansible directory..."
+          chown -R {{ system_username }}:{{ system_username }} "{{ code_source_path }}/ansible"
+          chmod -R 755 "{{ code_source_path }}/ansible"
+        fi
+        # Also check for .ansible directory
+        if [ -d "{{ code_source_path }}/.ansible" ]; then
+          echo "Fixing permissions on .ansible directory..."
+          chown -R {{ system_username }}:{{ system_username }} "{{ code_source_path }}/.ansible"
+          chmod -R 755 "{{ code_source_path }}/.ansible"
+        fi
+      become: true
+      register: permission_fix
+
+    - name: Show permission fix results
+      ansible.builtin.debug:
+        msg: "{{ permission_fix.stdout_lines }}"
+      when: permission_fix.stdout_lines | length > 0
+
+    ###################################################################
+    # 1) Keycloak client setup for code‑server
+    ###################################################################
+    - name: Debug Keycloak URL
+      ansible.builtin.debug:
+        msg: "Attempting to connect to Keycloak at: {{ keycloak_url }}"
+
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "admin-cli"
+          username: "{{ admin_username }}"
+          password: "{{ keycloak_admin_password }}"
+          grant_type: "password"
+        validate_certs: false
+        status_code: 200
+      register: keycloak_token
+
+    - name: Debug admin token length
+      ansible.builtin.debug:
+        msg: "Admin token length={{ keycloak_token.json.access_token | length }}"
+      when: keycloak_token is succeeded
+
+    - name: GET existing code-server client from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ code_server_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: existing_code_server_client
+      failed_when: false
+
+    - name: Create "code-server" client if missing
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          clientId: "{{ code_server_client_id }}"
+          enabled: true
+          protocol: "openid-connect"
+          standardFlowEnabled: true
+          implicitFlowEnabled: false
+          directAccessGrantsEnabled: true
+          publicClient: false
+          redirectUris:
+            - "{{ code_server_redirect_uri }}"
+            - "https://{{ code_server_hostname }}/*"
+          webOrigins:
+            - "{{ code_server_web_origins }}"
+            - "+"
+          attributes:
+            "access.token.lifespan": "{{ code_server_lifespan }}"
+            "post.logout.redirect.uris": "+"
+          defaultClientScopes:
+            - "email"
+            - "offline_access"
+            - "profile"
+            - "roles"
+          optionalClientScopes:
+            - "address"
+            - "phone"
+        status_code: [200, 201]
+        validate_certs: false
+      register: create_code_server_client_result
+      when: existing_code_server_client.json | length == 0
+      failed_when: false
+
+    - name: GET final code-server client from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ code_server_client_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: final_code_server_client
+      failed_when: false
+
+    - name: Fail if code-server client not found in Keycloak
+      ansible.builtin.fail:
+        msg: "Client '{{ code_server_client_id }}' not found in realm '{{ keycloak_realm }}'!"
+      when: final_code_server_client.json | length == 0
+      failed_when: false
+
+    - name: Set fact for code-server client UUID
+      ansible.builtin.set_fact:
+        code_server_client_uuid: "{{ final_code_server_client.json[0].id }}"
+      when: final_code_server_client.json | length > 0
+
+    - name: Debug code-server client UUID
+      ansible.builtin.debug:
+        msg: "code-server client UUID => {{ code_server_client_uuid }}"
+      when: code_server_client_uuid is defined
+
+    - name: Get client secret for code-server from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ code_server_client_uuid }}/client-secret"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: client_secret_response
+      when: code_server_client_uuid is defined
+      failed_when: false
+
+    - name: Set fact for code-server client secret
+      ansible.builtin.set_fact:
+        code_server_client_secret: "{{ client_secret_response.json.value }}"
+      when: client_secret_response is defined and client_secret_response.json is defined
+
+    - name: Create audience mapper for code-server client
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ code_server_client_uuid }}/protocol-mappers/models"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "audience-mapper-code-server"
+          protocol: "openid-connect"
+          protocolMapper: "oidc-audience-mapper"
+          config:
+            "included.client.audience": "{{ code_server_client_id }}"
+            "id.token.claim": "true"
+            "access.token.claim": "true"
+        status_code: [201, 409]
+        validate_certs: false
+      register: audience_mapper_result
+      when: code_server_client_uuid is defined
+      failed_when: false
+
+    ###################################################################
+    # 2) Create realm roles and assign admin role
+    ###################################################################
+    - name: Check if realm role "code-server-admin" exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles/code-server-admin"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+      register: code_server_admin_role_check
+      failed_when: false
+
+    - name: Create realm role "code-server-admin" if missing
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "code-server-admin"
+          description: "code-server admin realm role"
+        validate_certs: false
+        status_code: 201
+      when: code_server_admin_role_check.status == 404
+      failed_when: false
+
+    - name: Check if realm role "code-server-user" exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles/code-server-user"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+      register: code_server_user_role_check
+      failed_when: false
+
+    - name: Create realm role "code-server-user" if missing
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "code-server-user"
+          description: "code-server regular user realm role"
+        validate_certs: false
+        status_code: 201
+      when: code_server_user_role_check.status == 404
+      failed_when: false
+
+    - name: GET user "{{ admin_username }}" from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users?username={{ admin_username }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: user_search
+      failed_when: false
+
+    - name: Fail if user "{{ admin_username }}" not found
+      ansible.builtin.fail:
+        msg: "User {{ admin_username }} not found in realm '{{ keycloak_realm }}'"
+      when: user_search.json | length == 0
+      failed_when: false
+
+    - name: Get realm role "code-server-admin" details from Keycloak
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/roles/code-server-admin"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: code_server_admin_realm_role
+      failed_when: false
+
+    - name: Assign realm role "code-server-admin" to user
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/{{ user_search.json[0].id }}/role-mappings/realm"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: "[{{ code_server_admin_realm_role.json }}]"
+        validate_certs: false
+        status_code: [204, 409]
+      when: code_server_admin_realm_role.json is defined and user_search.json is defined and user_search.json | length > 0
+      failed_when: false
+
+    ###################################################################
+    # 3) Create Namespace, TLS Secret and code-server OAuth secret
+    ###################################################################
+    - name: Create namespace for code-server and apply resource policies
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ code_server_namespace }}"
+        tier: "workload"
+
+    - name: Create code-server OAuth client secret in Kubernetes
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: code-server-oauth-secret
+        type: Opaque
+        stringData:
+          client_id: "{{ code_server_client_id }}"
+          client_secret: "{{ code_server_client_secret }}"
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: code_server_client_secret is defined
+      changed_when: false
+
+    - name: Get wildcard certificate from default namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wildcard_cert_json
+      failed_when: wildcard_cert_json.rc != 0
+      changed_when: false
+
+    - name: Parse wildcard certificate JSON
+      ansible.builtin.set_fact:
+        wildcard_cert: "{{ wildcard_cert_json.stdout | from_json }}"
+
+    - name: Copy wildcard certificate to code-server namespace
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: {{ code_server_tls_secret_name }}
+        type: kubernetes.io/tls
+        data:
+          tls.crt: {{ wildcard_cert.data['tls.crt'] }}
+          tls.key: {{ wildcard_cert.data['tls.key'] }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    ###################################################################
+    # 4) Setup SSH keys and config on the host (will be available in container via mount)
+    ###################################################################
+    - name: Ensure SSH directory exists in shared code path
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/.ssh"
+        state: directory
+        mode: '0700'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Generate SSH key for Thinkube nodes if it doesn't exist
+      community.crypto.openssh_keypair:
+        path: "{{ code_source_path }}/.ssh/id_ed25519"
+        type: ed25519
+        comment: "coder@code-server"
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        mode: '0600'
+        regenerate: full_idempotence
+      register: thinkube_key
+
+    - name: Generate GitHub SSH key if it doesn't exist
+      community.crypto.openssh_keypair:
+        path: "{{ code_source_path }}/.ssh/github_ed25519"
+        type: ed25519
+        comment: "coder@code-server-github"
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+        mode: '0600'
+        regenerate: full_idempotence
+      register: github_key
+
+    - name: Ensure SSH config file exists
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/.ssh/config"
+        state: touch
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Add Thinkube nodes to SSH config
+      tags: [ssh_config]
+      vars:
+        # ZeroTier emits a static overlay_ip per host, used directly as
+        # HostName. Otherwise nodes are reached on the LAN, where addresses
+        # are DHCP-assigned and move: the connection goes through
+        # thinkube-node-ip, which asks the cluster for the node's current
+        # address at connect time and falls back to lan_ip.
+        host_ip_key: "{{ 'overlay_ip' if overlay_provider == 'zerotier' else 'lan_ip' }}"
+      ansible.builtin.blockinfile:
+        path: "{{ code_source_path }}/.ssh/config"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - THINKUBE NODES"
+        block: |
+          # SSH Configuration for Code-Server
+          # This configuration enables SSH access to control plane nodes
+
+          # Ansible controller (management node)
+          {% for host in groups['management'] %}
+          Host ansible-controller {{ host }} {{ host }}.{{ domain_name }}
+              HostName {{ hostvars[host][host_ip_key] }}
+              User {{ system_username }}
+              StrictHostKeyChecking no
+              UserKnownHostsFile /dev/null
+              LogLevel ERROR
+              IdentityFile ~/.ssh/thinkube_cluster_key
+          {% endfor %}
+
+          # Kubernetes Control Plane
+          {% for host in groups['k8s_control_plane'] %}
+          Host {{ host }} {{ host }}.{{ domain_name }}
+          {% if overlay_provider == 'zerotier' %}
+              HostName {{ hostvars[host][host_ip_key] }}
+          {% else %}
+              ProxyCommand /home/{{ system_username }}/.local/bin/thinkube-node-ip --connect {{ host }} 22 {{ hostvars[host][host_ip_key] }}
+          {% endif %}
+              User {{ system_username }}
+              StrictHostKeyChecking no
+              UserKnownHostsFile /dev/null
+              LogLevel ERROR
+              IdentityFile ~/.ssh/thinkube_cluster_key
+          {% endfor %}
+
+          # Kubernetes Workers
+          {% for host in groups.get('k8s_workers', []) %}
+          Host {{ host }} {{ host }}.{{ domain_name }}
+          {% if overlay_provider == 'zerotier' %}
+              HostName {{ hostvars[host][host_ip_key] }}
+          {% else %}
+              ProxyCommand /home/{{ system_username }}/.local/bin/thinkube-node-ip --connect {{ host }} 22 {{ hostvars[host][host_ip_key] }}
+          {% endif %}
+              User {{ system_username }}
+              StrictHostKeyChecking no
+              UserKnownHostsFile /dev/null
+              LogLevel ERROR
+              IdentityFile ~/.ssh/thinkube_cluster_key
+          {% endfor %}
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Add GitHub configuration to SSH config
+      ansible.builtin.blockinfile:
+        path: "{{ code_source_path }}/.ssh/config"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - GITHUB"
+        block: |
+          # GitHub SSH Configuration
+          Host github.com
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/github_ed25519
+              StrictHostKeyChecking no
+              AddKeysToAgent yes
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Add default SSH options
+      ansible.builtin.blockinfile:
+        path: "{{ code_source_path }}/.ssh/config"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - DEFAULTS"
+        block: |
+          # Default for all hosts
+          Host *
+              ForwardAgent yes
+              ServerAliveInterval 60
+              ServerAliveCountMax 3
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Check if SSH key exists on ansible controller
+      ansible.builtin.stat:
+        path: "/home/{{ system_username }}/.ssh/thinkube_cluster_key"
+      delegate_to: "{{ groups['management'][0] }}"
+      register: ansible_controller_key
+
+    - name: Verify ansible controller has SSH key
+      ansible.builtin.assert:
+        that:
+          - ansible_controller_key.stat.exists
+        fail_msg: |
+          ERROR: SSH key not found on ansible controller
+          
+          DETAILS:
+          - Expected SSH key at: {{ groups['management'][0] }}:/home/{{ system_username }}/.ssh/thinkube_cluster_key
+          - The ansible controller should have SSH keys for accessing cluster nodes
+          
+          REQUIRED ACTION:
+          - Run the initial setup playbooks to generate SSH keys
+          - Or manually create SSH keys on the ansible controller
+
+    - name: Fetch thinkube SSH private key from ansible controller
+      ansible.builtin.slurp:
+        src: "/home/{{ system_username }}/.ssh/thinkube_cluster_key"
+      delegate_to: "{{ groups['management'][0] }}"
+      register: ssh_key_content
+
+    - name: Copy thinkube SSH private key to shared directory
+      ansible.builtin.copy:
+        content: "{{ ssh_key_content.content | b64decode }}"
+        dest: "{{ code_source_path }}/.ssh/thinkube_cluster_key"
+        mode: '0600'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Check if GitHub token is available
+      ansible.builtin.set_fact:
+        github_token: "{{ github_token | default(lookup('env', 'GITHUB_TOKEN'), true) }}"
+
+    - name: Verify GitHub token is set
+      ansible.builtin.assert:
+        that:
+          - github_token is defined
+          - github_token | length > 0
+        fail_msg: |
+          ERROR: GitHub Token Not Found
+          
+          DETAILS:
+          - GITHUB_TOKEN environment variable is required for code-server
+          - This token is needed to automatically configure GitHub SSH access
+          
+          REQUIRED ACTION:
+          1. Add GITHUB_TOKEN to your ~/.env file:
+             echo "GITHUB_TOKEN=your_github_token" >> ~/.env
+          2. Source the environment file:
+             source ~/.env
+          3. Re-run this playbook
+          
+          To create a GitHub token:
+          1. Go to https://github.com/settings/tokens
+          2. Click "Generate new token (classic)"
+          3. Select scopes: repo, write:public_key
+          4. Copy the token and add it to your .env file
+
+    ###################################################################
+    # 5) Create ConfigMap for code‑server (we'll use hostPath instead of PVC)
+    ###################################################################
+    - name: Create ConfigMap for code-server configuration
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: code-server-config
+        data:
+          config.yaml: |
+            auth: none
+            bind-addr: 0.0.0.0:8080
+            disable-telemetry: true
+            cert: false
+            # The proposed chat APIs (session types, questions, edit tracking)
+            # of Thinkube Tandem Chat; VS Code grants proposed APIs only to
+            # built-in extensions and those named here.
+            enable-proposed-api:
+              - thinkube.thinkube-tandem-chat
+            # The product name code-server shows in its own strings: the welcome
+            # page, title bar, login page and web app manifest.
+            app-name: "Thinkube IDE"
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    - name: Create code-server default settings ConfigMap
+      ansible.builtin.shell: |
+        cat <<'EOF' | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: code-server-default-settings
+        data:
+          settings.json: |
+            {
+              "workbench.startupEditor": "none",
+              "terminal.integrated.fontFamily": "'NotoSansM Nerd Font', monospace",
+              "terminal.integrated.fontSize": 14,
+              "terminal.integrated.fontWeight": "400",
+              "terminal.integrated.letterSpacing": 0,
+              "editor.fontFamily": "'NotoSansM Nerd Font', monospace",
+              "editor.fontSize": 14,
+              "editor.fontLigatures": true,
+              "markdown.preview.fontFamily": "'Poppins', sans-serif",
+              "chat.fontFamily": "'Poppins', sans-serif",
+              "chat.editor.fontFamily": "'NotoSansM Nerd Font', monospace",
+              "markdown.styles": ["https://{{ code_server_hostname }}/_static/src/browser/pages/fonts.css"],
+              "chat.disableAIFeatures": true,
+              "chat.commandCenter.enabled": false
+            }
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    ###################################################################
+    # 5a) Create ServiceAccount and RBAC for CI/CD monitoring
+    ###################################################################
+    - name: Create ServiceAccount for code-server
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: code-server
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    - name: Create ClusterRole for CI/CD monitoring
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: thinkube-cicd-monitor
+        rules:
+          # Read ConfigMaps in any namespace for pipeline events
+          - apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "list", "watch"]
+          # Read pods and deployments for monitoring
+          - apiGroups: [""]
+            resources: ["pods", "services"]
+            verbs: ["get", "list"]
+          - apiGroups: ["apps"]
+            resources: ["deployments", "replicasets"]
+            verbs: ["get", "list"]
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    - name: Create ClusterRoleBinding for code-server
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: code-server-cicd-monitor
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: thinkube-cicd-monitor
+        subjects:
+          - kind: ServiceAccount
+            name: code-server
+            namespace: {{ code_server_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+
+    ###################################################################
+    # 5a.5) CI/CD token will be configured later by thinkube-control
+    ###################################################################
+    # NOTE: Removed thinkube-control dependency as it's deployed after code-server
+    # The CI/CD monitoring token will be injected by thinkube-control post-deployment
+
+
+    ###################################################################
+    # 5b) Deploy code-server with hostPath volume and node affinity
+    ###################################################################
+    - name: Deploy code-server Deployment with hostPath and node affinity
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: code-server
+          labels:
+            app: code-server
+        spec:
+          replicas: 1
+          # Recreate (not RollingUpdate): per-pod limits for code-server
+          # (4 CPU / 8Gi) are most of the namespace ResourceQuota, so a
+          # surge pod would push the namespace over quota and deadlock
+          # the rollout. Single-replica + Recreate trades ~10s of
+          # downtime during redeploys for guaranteed rollout success.
+          strategy:
+            type: Recreate
+          selector:
+            matchLabels:
+              app: code-server
+          template:
+            metadata:
+              labels:
+                app: code-server
+            spec:
+              priorityClassName: thinkube-workload
+              serviceAccountName: code-server
+              # Schedule pod on the control node
+              nodeSelector:
+                kubernetes.io/hostname: "{{ k8s_controller_node }}"
+              # Ensure the pod is scheduled on the control node (required)
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                    - matchExpressions:
+                      - key: kubernetes.io/hostname
+                        operator: In
+                        values:
+                        - "{{ k8s_controller_node }}"
+              securityContext:
+                fsGroup: 1000
+                runAsUser: 1000
+                runAsGroup: 1000
+              containers:
+                - name: code-server
+                  image: "{{ harbor_registry }}/library/code-server-dev:latest"
+                  imagePullPolicy: Always
+                  ports:
+                    - name: http
+                      containerPort: 8080
+                      protocol: TCP
+                  env:
+                    - name: TZ
+                      value: UTC
+                    - name: CS_DISABLE_GETTING_STARTED_OVERRIDE
+                      value: "true"
+                    # Who is at the keyboard. Tools that keep per-author
+                    # records need a value that differs between people;
+                    # the machine user is the same on every installation.
+                    - name: GITHUB_USERNAME
+                      value: "{{ github_username }}"
+                    # The branch every Thinkube repository is fetched from,
+                    # so tk_ansible and tk_clone_dev in the IDE follow the
+                    # same release as the install.
+                    - name: THINKUBE_BRANCH
+                      value: "{{ thinkube_ref }}"
+                  command: ["code-server"]
+                  args:
+                    - "--auth=none"
+                    - "--config=/config/config.yaml"
+                    - "--proxy-domain={{ code_server_hostname }}"
+                    - "/home/thinkube/thinkube.code-workspace"
+                  resources:
+                    requests:
+                      cpu: 100m
+                      memory: 512Mi
+                    limits:
+                      cpu: 4
+                      memory: 8Gi
+                  readinessProbe:
+                    httpGet:
+                      path: /
+                      port: http
+                    initialDelaySeconds: 30
+                    periodSeconds: 5
+                  volumeMounts:
+                    - name: host-data
+                      mountPath: /home/thinkube
+                    - name: config
+                      mountPath: /config
+                    - name: thinkube-ssh
+                      mountPath: /host-ssh
+                      readOnly: true
+              volumes:
+                - name: host-data
+                  hostPath:
+                    path: "{{ code_source_path }}"
+                    type: Directory
+                - name: config
+                  configMap:
+                    name: code-server-config
+                    defaultMode: 0755
+                - name: thinkube-ssh
+                  hostPath:
+                    path: "{{ ansible_facts.env.HOME }}/.ssh"
+                    type: Directory
+                - name: vscode-settings
+                  configMap:
+                    name: code-server-default-settings
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    ###################################################################
+    # 6) Create code‑server Service and HTTPRoute
+    ###################################################################
+    - name: Create code-server Service
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: code-server
+          labels:
+            app: code-server
+        spec:
+          type: ClusterIP
+          ports:
+            - port: 8080
+              targetPort: http
+              protocol: TCP
+              name: http
+          selector:
+            app: code-server
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    - name: Create code-server HTTPRoute
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -n {{ code_server_namespace }} -f -
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: code-server
+        spec:
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ code_server_hostname }}"
+          rules:
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: code-server
+                  port: 8080
+              timeouts:
+                request: "3600s"
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    ###################################################################
+    # 7) Require a Keycloak login at the gateway
+    ###################################################################
+    # The gateway handles the login itself. An oauth2-proxy route for
+    # /oauth2 on this host would take the gateway's /oauth2/callback, so any
+    # oauth2-proxy route, release and session store is removed.
+    - name: Remove the oauth2-proxy route, release and session store
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete httproute oauth2-proxy -n {{ code_server_namespace }} --ignore-not-found
+        {{ kubectl_bin }} delete deployment,service ephemeral-valkey -n {{ code_server_namespace }} --ignore-not-found
+        if {{ helm_bin }} status oauth2-proxy -n {{ code_server_namespace }} >/dev/null 2>&1; then
+          {{ helm_bin }} uninstall oauth2-proxy -n {{ code_server_namespace }}
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: oauth2_proxy_removal
+      changed_when: "'deleted' in oauth2_proxy_removal.stdout or 'uninstalled' in oauth2_proxy_removal.stdout"
+
+    - name: Require a Keycloak login on the code-server route
+      ansible.builtin.include_role:
+        name: gateway_oidc
+      vars:
+        gateway_oidc_namespace: "{{ code_server_namespace }}"
+        gateway_oidc_route_names: ["code-server"]
+        gateway_oidc_hostname: "{{ code_server_hostname }}"
+        gateway_oidc_client_id: "{{ code_server_client_id }}"
+        gateway_oidc_client_secret: "{{ code_server_client_secret }}"
+
+    ###################################################################
+    # 8) Force restart: Verify ConfigMap and delete code-server pods
+    ###################################################################
+    - name: Verify code-server ConfigMap (ensure auth is set to "none")
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get configmap code-server-config -n {{ code_server_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: configmap_info_json
+      failed_when: false
+      changed_when: false
+
+    - name: Parse ConfigMap JSON
+      ansible.builtin.set_fact:
+        configmap_info: "{{ configmap_info_json.stdout | from_json }}"
+      when: configmap_info_json.rc == 0
+
+    - name: Debug ConfigMap content
+      ansible.builtin.debug:
+        msg: "{{ configmap_info.data['config.yaml'] }}"
+      when: configmap_info is defined and configmap_info.data is defined
+
+    - name: Get code-server pods to force restart
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} -l app=code-server -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: code_server_pods_json
+      failed_when: false
+      changed_when: false
+
+    - name: Parse code-server pods JSON
+      ansible.builtin.set_fact:
+        code_server_pods: "{{ code_server_pods_json.stdout | from_json }}"
+      when: code_server_pods_json.rc == 0
+
+    - name: Delete code-server pods to force restart with updated configuration
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete pod {{ item.metadata.name }} -n {{ code_server_namespace }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ code_server_pods['items'] | default([]) }}"
+      when: code_server_pods is defined and code_server_pods['items'] is defined and code_server_pods['items'] | length > 0
+      changed_when: false
+
+    ###################################################################
+    # 9) GitHub access for code-server
+    ###################################################################
+    # gh runs inside the code-server pod: the image provides it, and the login
+    # it stores lands in the workspace home, wherever this playbook runs from.
+    # The token goes in on stdin so it never appears on a command line.
+    # 13_clone_repositories.yaml clones over SSH with this key, so it runs here.
+    - name: Wait for a running code-server pod and take its name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ code_server_namespace }} \
+          -l app=code-server \
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[*].metadata.name}' | awk '{print $1}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: code_server_pod
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: code_server_pod.stdout != ""
+      tags: [github_access]
+
+    - name: Wait for the code-server pod to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        name: "{{ code_server_pod.stdout }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+      tags: [github_access]
+
+    - name: Check GitHub CLI login in code-server
+      ansible.builtin.command:
+        argv:
+          - "{{ kubectl_bin }}"
+          - exec
+          - -n
+          - "{{ code_server_namespace }}"
+          - "{{ code_server_pod.stdout }}"
+          - --
+          - gh
+          - auth
+          - status
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gh_auth_status
+      failed_when: false
+      changed_when: false
+      tags: [github_access]
+
+    - name: Log in the GitHub CLI in code-server
+      ansible.builtin.command:
+        argv:
+          - "{{ kubectl_bin }}"
+          - exec
+          - -i
+          - -n
+          - "{{ code_server_namespace }}"
+          - "{{ code_server_pod.stdout }}"
+          - --
+          - gh
+          - auth
+          - login
+          - --with-token
+        stdin: "{{ github_token }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: gh_auth_status.rc != 0
+      tags: [github_access]
+
+    - name: Add the code-server GitHub SSH key to the GitHub account
+      ansible.builtin.command:
+        argv:
+          - "{{ kubectl_bin }}"
+          - exec
+          - -i
+          - -n
+          - "{{ code_server_namespace }}"
+          - "{{ code_server_pod.stdout }}"
+          - --
+          - sh
+          - -c
+          - GH_TOKEN="$(cat)" gh ssh-key add "$HOME/.ssh/github_ed25519.pub" --title "$1"
+          - sh
+          - "code-server@{{ domain_name }}-{{ ansible_facts.date_time.date }}"
+        stdin: "{{ github_token }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gh_key_result
+      failed_when:
+        - gh_key_result.rc != 0
+        - "'already exists' not in gh_key_result.stderr"
+        - "'key is already in use' not in gh_key_result.stderr"
+      changed_when:
+        - gh_key_result.rc == 0
+        - "'added to your account' in gh_key_result.stdout"
+      tags: [github_access]
+
+    ###################################################################
+    # 10) Configure VS Code tasks for Claude Code
+    ###################################################################
+    # Create VS Code tasks configuration for Claude Code
+    - name: Ensure .vscode directory exists in shared code directory
+      ansible.builtin.file:
+        path: "{{ code_source_path }}/.vscode"
+        state: directory
+        mode: '0755'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+    
+    - name: Create VS Code tasks.json for Claude Code integration
+      ansible.builtin.template:
+        src: templates/vscode-tasks.json.j2
+        dest: "{{ code_source_path }}/.vscode/tasks.json"
+        mode: '0644'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+    
+    - name: Create VS Code settings.json to disable auto port forwarding
+      ansible.builtin.copy:
+        content: |
+          {
+            "remote.autoForwardPorts": false,
+            "remote.autoForwardPortsSource": "output"
+          }
+        dest: "{{ code_source_path }}/.vscode/settings.json"
+        mode: '0644'
+        owner: "{{ system_username }}"
+        group: "{{ system_username }}"
+
+    - name: Display extension status
+      ansible.builtin.debug:
+        msg:
+          - "code-server Extensions Status:"
+          - "- thinkube-tandem: Provides Claude Code integration"
+          - "- thinkube-cicd-monitor: Provides CI/CD pipeline monitoring"
+          - ""
+          - "Extensions are automatically installed from:"
+          - "- GitHub repositories (if available)"
+          - "- Local development copies (if present)"
+          - ""
+          - "To reload extensions: Press Ctrl+R in code-server"
+
+    ###################################################################
+    # 11) Final information
+    ###################################################################
+    - name: Final info for code-server setup
+      ansible.builtin.debug:
+        msg:
+          - "code-server deployed in namespace '{{ code_server_namespace }}'."
+          - "Access it at: https://{{ code_server_hostname }}/"
+          - "Client: '{{ code_server_client_id }}' (ID: {{ code_server_client_uuid | default('not set') }})"
+          - "Keycloak Realm: {{ keycloak_realm }}"
+          - "User '{{ admin_username }}' assigned role code-server-admin"
+          - "Using hostPath volume from: {{ code_source_path }}"
+          - "Running as UID:GID 1000:1000"
+          - "TLS status: Using wildcard certificate from default namespace"
+          - ""
+          - "Platform Repositories:"
+          - "  - Location: ~/thinkube-platform/"
+          - "  - Workspace: ~/thinkube-platform/thinkube-platform.code-workspace"
+          - ""
+          - "code-server Extensions:"
+          - "  - Claude Code: Right-click folders → Claude Code submenu"
+          - "  - CI/CD Monitor: View pipelines in sidebar activity bar"
+          - "    (API token auto-configured)"
+          - ""
+          - "Keyboard Shortcuts:"
+          - "  - Ctrl+Shift+C: Open Claude in current directory"
+          - "  - Ctrl+Shift+Alt+C: Continue Claude session"

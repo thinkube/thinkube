@@ -1,0 +1,525 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/seaweedfs/10_deploy.yaml
+# Description:
+#   Deploy SeaweedFS using official Helm chart
+#   Provides S3-compatible distributed storage system
+#
+# Requirements:
+#   - Kubernetes (kubeadm) cluster must be running
+#   - Helm must be installed
+#   - kubectl access configured
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/seaweedfs/10_deploy.yaml
+#
+# Variables from inventory:
+#   - seaweedfs_namespace: SeaweedFS namespace (default: seaweedfs)
+#   - domain_name: Base domain for ingress
+#   - admin_username: Admin username for initial setup
+#   - kubectl_bin: Path to kubectl binary
+#   - kubeconfig: Path to kubeconfig file
+#   - helm_bin: Path to helm binary
+
+- name: Deploy SeaweedFS using Helm chart
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: true
+  
+  vars:
+    # Application settings
+    app_name: seaweedfs
+    seaweedfs_chart_version: "4.0.0"  # Latest stable chart version
+    
+    # Keycloak client for the web UI login at the gateway
+    seaweedfs_ui_client_id: "oauth2-proxy-{{ app_name }}"
+
+    # Keycloak admin credentials (needed by the keycloak_client role)
+    keycloak_admin_username: "{{ admin_username }}"
+    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+    
+    # TLS settings
+    tls_secret_name: "{{ seaweedfs_namespace }}-tls-secret"
+
+  tasks:
+    # GUARDRAIL: Prevent accidental redeploy on a running system.
+    # SeaweedFS uses hostPath volumes — redeploying can wipe data that
+    # JuiceFS, MLflow, and Jupyter depend on. Require force_redeploy=true
+    # to proceed if SeaweedFS is already running.
+    - name: Check if SeaweedFS is already deployed
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get statefulset seaweedfs-master -n {{ seaweedfs_namespace }} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: seaweedfs_running
+      changed_when: false
+
+    - name: ABORT — SeaweedFS is already running (use -e force_redeploy=true to override)
+      ansible.builtin.fail:
+        msg: |
+          SeaweedFS is already running with {{ seaweedfs_running.stdout }} ready replica(s).
+          Redeploying can cause DATA LOSS for JuiceFS, MLflow models, and Jupyter data.
+          If you are sure, re-run with: -e force_redeploy=true
+      when:
+        - seaweedfs_running.stdout | int > 0
+        - not (force_redeploy | default(false) | bool)
+
+    - name: Ensure application namespace exists and apply resource policies
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ seaweedfs_namespace }}"
+        tier: "platform"
+
+    - name: Get wildcard certificate from default namespace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret {{ domain_name.replace('.', '-') }}-tls -n default -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wildcard_cert_raw
+      failed_when: wildcard_cert_raw.rc != 0
+
+    - name: Parse wildcard certificate JSON
+      ansible.builtin.set_fact:
+        wildcard_cert: "{{ wildcard_cert_raw.stdout | from_json }}"
+
+    - name: Copy wildcard certificate to SeaweedFS namespace
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: {{ tls_secret_name }}
+          namespace: {{ seaweedfs_namespace }}
+        type: kubernetes.io/tls
+        data:
+          tls.crt: {{ wildcard_cert.data['tls.crt'] }}
+          tls.key: {{ wildcard_cert.data['tls.key'] }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: cert_copy_result
+      changed_when: "'created' in cert_copy_result.stdout or 'configured' in cert_copy_result.stdout"
+
+    - name: Add SeaweedFS Helm repository
+      ansible.builtin.command:
+        cmd: "{{ helm_bin }} repo add seaweedfs https://seaweedfs.github.io/seaweedfs/helm"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+      failed_when:
+        - helm_repo_add.rc != 0
+        - "'already exists' not in helm_repo_add.stderr"
+      retries: 5
+      delay: 10
+      until: helm_repo_add.rc == 0 or 'already exists' in helm_repo_add.stderr
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: "{{ helm_bin }} repo update"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: helm_repo_update
+      retries: 5
+      delay: 10
+      until: helm_repo_update.rc == 0
+
+    - name: Check for existing S3 credentials
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get secret seaweedfs-s3-config -n {{ seaweedfs_namespace }} -o jsonpath='{.data.secret_key}' 2>/dev/null | base64 -d
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: existing_s3_key
+      failed_when: false
+      changed_when: false
+
+    - name: Generate S3 credentials (preserve existing key on redeploy)
+      ansible.builtin.set_fact:
+        s3_access_key: "{{ seaweedfs_s3_access_key | default('seaweedfs') }}"
+        s3_secret_key: "{{ existing_s3_key.stdout | default('', true) | ternary(existing_s3_key.stdout, lookup('password', '/dev/null length=32 chars=ascii_letters,digits')) }}"
+
+    - name: Create S3 auth configuration
+      ansible.builtin.set_fact:
+        s3_auth_config:
+          identities:
+            - name: admin
+              credentials:
+                - accessKey: "{{ s3_access_key }}"
+                  secretKey: "{{ s3_secret_key }}"
+              actions:
+                - Admin
+                - Read
+                - Write
+                - List
+                - Tagging
+
+    - name: Create S3 configuration secret
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: seaweedfs-s3-config
+          namespace: {{ seaweedfs_namespace }}
+        type: Opaque
+        stringData:
+          s3-config.json: |
+            {{ s3_auth_config | to_nice_json | indent(8) }}
+          access_key: {{ s3_access_key }}
+          secret_key: {{ s3_secret_key }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: s3_config_result
+      changed_when: "'created' in s3_config_result.stdout or 'configured' in s3_config_result.stdout"
+
+    - name: Get node architecture
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get nodes -o jsonpath='{.items[0].metadata.labels.kubernetes\.io/arch}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: node_arch_result
+
+    - name: Set node architecture variable
+      ansible.builtin.set_fact:
+        node_architecture: "{{ node_arch_result.stdout }}"
+
+    - name: Create Helm values for SeaweedFS
+      ansible.builtin.set_fact:
+        seaweedfs_values:
+          global:
+            priorityClassName: thinkube-platform
+          master:
+            enabled: true
+            replicas: 1
+            port: 9333
+            grpcPort: 19333
+            nodeSelector: "kubernetes.io/hostname: {{ inventory_hostname }}"
+            persistence:
+              enabled: true
+              size: 10Gi
+
+          volume:
+            enabled: true
+            replicas: 1
+            port: 8080
+            grpcPort: 18080
+            nodeSelector: "kubernetes.io/hostname: {{ inventory_hostname }}"
+            persistence:
+              enabled: true
+              size: 100Gi
+
+          filer:
+            enabled: true
+            replicas: 1
+            port: 8888
+            grpcPort: 18888
+            nodeSelector: "kubernetes.io/hostname: {{ inventory_hostname }}"
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "200m"
+              limits:
+                memory: "2Gi"
+                cpu: "1"
+            s3:
+              enabled: true
+              port: 8333
+              domainName: "{{ object_storage_s3_hostname }}"
+            persistence:
+              enabled: true
+              size: 10Gi
+            config: |
+              [leveldb2]
+              enabled = true
+              dir = "/data/filerldb2"
+
+          s3:
+            enabled: false  # S3 is integrated in filer
+
+          ingress:
+            enabled: false  # We'll create our own ingress with OAuth2
+
+    - name: Write Helm values to temporary file
+      ansible.builtin.copy:
+        content: "{{ seaweedfs_values | to_nice_yaml }}"
+        dest: /tmp/seaweedfs-values.yaml
+        mode: '0600'
+
+    # Fetched before the install so a transient upstream failure costs a retry
+    # on the download rather than on the cluster operation.
+    - name: Pre-fetch SeaweedFS chart tarball (retries on transient network errors)
+      ansible.builtin.command:
+        cmd: >-
+          {{ helm_bin }} pull seaweedfs/seaweedfs
+          --version {{ seaweedfs_chart_version }}
+          --destination /tmp
+      register: seaweedfs_chart_pull
+      retries: 5
+      delay: 30
+      until: seaweedfs_chart_pull.rc == 0
+      changed_when: seaweedfs_chart_pull.rc == 0
+
+    - name: Deploy SeaweedFS using Helm
+      ansible.builtin.command:
+        cmd: >
+          {{ helm_bin }} upgrade --install seaweedfs
+          /tmp/seaweedfs-{{ seaweedfs_chart_version }}.tgz
+          --namespace {{ seaweedfs_namespace }}
+          --values /tmp/seaweedfs-values.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: helm_deploy
+      changed_when: true
+
+    - name: Clean up temporary values file
+      ansible.builtin.file:
+        path: /tmp/seaweedfs-values.yaml
+        state: absent
+
+    - name: Wait for SeaweedFS components to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} wait --for=condition=Ready pod -l app.kubernetes.io/name=seaweedfs -n {{ seaweedfs_namespace }} --timeout=600s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wait_result
+      failed_when: false
+
+    - name: Get current filer command
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get statefulset seaweedfs-filer -n {{ seaweedfs_namespace }} -o jsonpath='{.spec.template.spec.containers[0].command[2]}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: original_command
+
+    - name: Debug original command
+      ansible.builtin.debug:
+        msg: "Original command: {{ original_command.stdout }}"
+
+    - name: Create modified command with S3 config
+      ansible.builtin.set_fact:
+        modified_command: "{{ original_command.stdout | regex_replace('(-master=[^\\s]+)', '-s3.config=/etc/seaweedfs/s3-config.json \\1') }}"
+
+    - name: Debug modified command
+      ansible.builtin.debug:
+        msg: "Modified command: {{ modified_command }}"
+
+    - name: Check if s3-config volume already exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get statefulset seaweedfs-filer -n {{ seaweedfs_namespace }} -o json | jq '.spec.template.spec.volumes[] | select(.name == "s3-config")' | wc -l
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: volume_exists
+
+    - name: Check if s3-config volumeMount already exists
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get statefulset seaweedfs-filer -n {{ seaweedfs_namespace }} -o json | jq '.spec.template.spec.containers[0].volumeMounts[] | select(.name == "s3-config")' | wc -l
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: mount_exists
+
+    - name: Apply patch to add S3 config volume
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch statefulset seaweedfs-filer -n {{ seaweedfs_namespace }} --type=json -p='[
+          {
+            "op": "add",
+            "path": "/spec/template/spec/volumes/-",
+            "value": {
+              "name": "s3-config",
+              "secret": {
+                "secretName": "seaweedfs-s3-config",
+                "items": [
+                  {
+                    "key": "s3-config.json",
+                    "path": "s3-config.json"
+                  }
+                ]
+              }
+            }
+          }
+        ]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: volume_patch_result
+      changed_when: "'patched' in volume_patch_result.stdout"
+      when: volume_exists.stdout | int == 0
+
+    - name: Apply patch to add volume mount
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch statefulset seaweedfs-filer -n {{ seaweedfs_namespace }} --type=json -p='[
+          {
+            "op": "add",
+            "path": "/spec/template/spec/containers/0/volumeMounts/-",
+            "value": {
+              "name": "s3-config",
+              "mountPath": "/etc/seaweedfs",
+              "readOnly": true
+            }
+          }
+        ]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: mount_patch_result
+      changed_when: "'patched' in mount_patch_result.stdout"
+      when: mount_exists.stdout | int == 0
+
+    - name: Apply patch to update command
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} patch statefulset seaweedfs-filer -n {{ seaweedfs_namespace }} --type=json -p='[
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/containers/0/command/2",
+            "value": "{{ modified_command }}"
+          }
+        ]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: command_patch_result
+      changed_when: "'patched' in command_patch_result.stdout"
+
+    - name: Wait for filer rollout to complete
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} rollout status statefulset/seaweedfs-filer -n {{ seaweedfs_namespace }} --timeout=300s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: rollout_status
+      failed_when: false
+
+    - name: Check if patching succeeded
+      ansible.builtin.fail:
+        msg: "Rollout of StatefulSet seaweedfs-filer did not complete after the S3 config patch: {{ rollout_status.stderr }}"
+      when: rollout_status.rc != 0
+
+    - name: Create SeaweedFS UI HTTPRoute
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: seaweedfs-ui-httproute
+          namespace: {{ seaweedfs_namespace }}
+        spec:
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ object_storage_ui_hostname }}"
+          rules:
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: seaweedfs-filer
+                  port: 8888
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: ui_httproute_result
+      changed_when: "'created' in ui_httproute_result.stdout or 'configured' in ui_httproute_result.stdout"
+
+    # --- Keycloak login for the web UI ---
+    # The gateway handles the login itself. An oauth2-proxy route for
+    # /oauth2 on this host would take the gateway's /oauth2/callback, so any
+    # oauth2-proxy route, release and session store is removed.
+    - name: Remove the oauth2-proxy route, release and session store
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} delete httproute oauth2-proxy-ingress -n {{ seaweedfs_namespace }} --ignore-not-found
+        {{ kubectl_bin }} delete deployment,service ephemeral-redis -n {{ seaweedfs_namespace }} --ignore-not-found
+        if {{ helm_bin }} status oauth2-proxy -n {{ seaweedfs_namespace }} >/dev/null 2>&1; then
+          {{ helm_bin }} uninstall oauth2-proxy -n {{ seaweedfs_namespace }}
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: oauth2_proxy_removal
+      changed_when: "'deleted' in oauth2_proxy_removal.stdout or 'uninstalled' in oauth2_proxy_removal.stdout"
+
+    - name: Create or update the Keycloak client for the web UI
+      ansible.builtin.include_role:
+        name: keycloak/keycloak_client
+      vars:
+        keycloak_client_id: "{{ seaweedfs_ui_client_id }}"
+        keycloak_client_body:
+          clientId: "{{ seaweedfs_ui_client_id }}"
+          enabled: true
+          protocol: openid-connect
+          publicClient: false
+          standardFlowEnabled: true
+          redirectUris:
+            - "https://{{ object_storage_ui_hostname }}/oauth2/callback"
+          webOrigins:
+            - "https://{{ object_storage_ui_hostname }}"
+          baseUrl: "https://{{ object_storage_ui_hostname }}"
+          attributes:
+            post.logout.redirect.uris: "+"
+
+    - name: Require a Keycloak login on the web UI route
+      ansible.builtin.include_role:
+        name: gateway_oidc
+      vars:
+        gateway_oidc_namespace: "{{ seaweedfs_namespace }}"
+        gateway_oidc_route_names: ["seaweedfs-ui-httproute"]
+        gateway_oidc_hostname: "{{ object_storage_ui_hostname }}"
+        gateway_oidc_client_id: "{{ seaweedfs_ui_client_id }}"
+        gateway_oidc_client_secret: "{{ keycloak_client_secret }}"
+    # --- end Keycloak login for the web UI ---
+
+    - name: Create S3 API HTTPRoute (without auth)
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: seaweedfs-s3-httproute
+          namespace: {{ seaweedfs_namespace }}
+        spec:
+          parentRefs:
+            - name: "{{ gateway_name }}"
+              namespace: "{{ gateway_namespace }}"
+              sectionName: https
+          hostnames:
+            - "{{ object_storage_s3_hostname }}"
+          rules:
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: seaweedfs-s3
+                  port: 8333
+        EOF
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: s3_httproute_result
+      changed_when: "'created' in s3_httproute_result.stdout or 'configured' in s3_httproute_result.stdout"
+
+    - name: Verify all HTTPRoutes are created
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get httproutes -n {{ seaweedfs_namespace }} -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: httproute_check_raw
+
+    - name: Parse and verify HTTPRoute count
+      ansible.builtin.set_fact:
+        httproute_count: "{{ (httproute_check_raw.stdout | from_json)['items'] | length }}"
+
+    - name: Fail if expected HTTPRoutes not created
+      ansible.builtin.fail:
+        msg: "Expected HTTPRoutes not found. Found {{ httproute_count }}, expected 2 (UI, S3)"
+      when: httproute_count | int < 2
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "SeaweedFS deployment complete"
+          - "-----------------------------------"
+          - "Web UI (Keycloak protected): https://{{ object_storage_ui_hostname }}"
+          - "S3 API endpoint: https://{{ object_storage_s3_hostname }}"
+          - "-----------------------------------"
+          - "To configure S3 access, use 15_configure.yaml"

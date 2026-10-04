@@ -1,0 +1,739 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/gpu_operator/10_deploy.yaml
+# Description:
+#   Installs and configures NVIDIA GPU Operator on Kubernetes cluster.
+#   Supports multi-node: host-level setup runs on all baremetal_gpus nodes,
+#   cluster-wide helm install runs once on the control plane.
+#
+# Requirements:
+#   - Thinkube Kubernetes Cluster (kubeadm) >= 1.34
+#   - NVIDIA-compatible GPU (Volta or newer)
+#   - No active display on nouveau (will block installation)
+#   - kubectl CLI at {{ kubectl_bin }} (installed by 10_install_k8s.yaml)
+#   - Helm >= 3.7.0
+#   - jq (for JSON parsing)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/gpu_operator/10_deploy.yaml
+#
+# Variables from inventory:
+#   - kubeconfig: Path to Kubernetes configuration file
+#   - kubectl_bin: Path to kubectl binary
+#   - helm_bin: Path to Helm binary
+#
+# 🤖 [AI-assisted]
+
+# ===========================
+# Play 1: Per-node host-level GPU setup
+# ===========================
+- name: Configure GPU host prerequisites
+  hosts: baremetal_gpus
+  become: false
+  any_errors_fatal: true
+
+  tasks:
+    # DGX OS ships docker, and its NVIDIA runtime is registered in
+    # /etc/docker/daemon.json. A DGX Spark without docker (removed by the
+    # user, or by a rollback that used to purge containerd.io) is not an
+    # error: Kubernetes uses containerd, so the two docker tasks are skipped.
+    - name: Check whether a docker service exists
+      ansible.builtin.command: systemctl list-unit-files docker.service --no-legend
+      register: docker_unit
+      changed_when: false
+      failed_when: false
+
+    - name: Record whether docker is installed
+      ansible.builtin.set_fact:
+        docker_present: "{{ (docker_unit.stdout | default('') | trim) != '' }}"
+        dgx_spark: "{{ gpu_model is defined and ('DGX Spark' in gpu_model or 'GB10' in gpu_model) }}"
+
+    - name: Say when a DGX Spark has no docker to configure
+      ansible.builtin.debug:
+        msg: "No docker service on {{ inventory_hostname }}: the NVIDIA runtime for docker is not configured; Kubernetes does not need it."
+      when: dgx_spark and not docker_present
+
+    - name: Configure Docker daemon for NVIDIA runtime (DGX Spark only)
+      ansible.builtin.copy:
+        content: |
+          {
+              "runtimes": {
+                  "nvidia": {
+                      "path": "nvidia-container-runtime",
+                      "runtimeArgs": []
+                  }
+              }
+          }
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+      become: true
+      when: dgx_spark and docker_present
+
+    - name: Restart Docker to load NVIDIA runtime (DGX Spark only)
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+      become: true
+      when: dgx_spark and docker_present
+
+    - name: Check if NVIDIA driver is already installed
+      ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+      register: nvidia_smi_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install NVIDIA driver (non-DGX nodes only)
+      when:
+        - nvidia_smi_check.rc != 0
+        - gpu_model is not defined or ('DGX Spark' not in gpu_model and 'GB10' not in gpu_model)
+      become: true
+      block:
+        - name: Install ubuntu-drivers-common
+          ansible.builtin.apt:
+            name: ubuntu-drivers-common
+            state: present
+            update_cache: true
+
+        - name: Blacklist nouveau driver
+          ansible.builtin.copy:
+            content: |
+              blacklist nouveau
+              options nouveau modeset=0
+            dest: /etc/modprobe.d/blacklist-nouveau.conf
+            mode: '0644'
+
+        - name: Unload nouveau if loaded and not in use
+          ansible.builtin.shell: |
+            if lsmod | grep -q '^nouveau '; then
+              refcnt=$(lsmod | awk '/^nouveau / {print $3}')
+              if [ "$refcnt" -gt 0 ] 2>/dev/null; then
+                echo "NOUVEAU_IN_USE"
+                exit 1
+              fi
+              modprobe -r nouveau
+              echo "NOUVEAU_UNLOADED"
+            else
+              echo "NOUVEAU_NOT_LOADED"
+            fi
+          register: nouveau_result
+          changed_when: "'NOUVEAU_UNLOADED' in nouveau_result.stdout"
+          failed_when: "'NOUVEAU_IN_USE' in nouveau_result.stdout"
+
+        - name: Update initramfs
+          ansible.builtin.command: update-initramfs -u
+          changed_when: false
+
+        - name: Detect recommended NVIDIA driver package
+          ansible.builtin.shell: |
+            ubuntu-drivers devices 2>/dev/null | grep 'recommended' | grep -oP 'nvidia-driver-\S+'
+          register: nvidia_driver_pkg
+          changed_when: false
+          failed_when: nvidia_driver_pkg.stdout | trim | length == 0
+
+        - name: Install NVIDIA driver
+          ansible.builtin.apt:
+            name: "{{ nvidia_driver_pkg.stdout | trim }}"
+            state: present
+          register: nvidia_driver_install
+
+        - name: Unload stale NVIDIA kernel modules
+          ansible.builtin.shell: |
+            for mod in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do
+              rmmod $mod 2>/dev/null || true
+            done
+          become: true
+          changed_when: true
+
+        - name: Load NVIDIA kernel module
+          community.general.modprobe:
+            name: nvidia
+            state: present
+
+        - name: Verify NVIDIA driver is working
+          ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+          register: nvidia_verify
+          changed_when: false
+
+        - name: Display installed driver version
+          ansible.builtin.debug:
+            msg: "NVIDIA driver {{ nvidia_verify.stdout | trim }} installed successfully"
+
+    # When driver.enabled=false, GPU operator components wait for
+    # /run/nvidia/validations/host-driver-ready. Since /run is tmpfs,
+    # a systemd service creates this on every boot.
+    - name: Create systemd service for NVIDIA host driver validation marker
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Create NVIDIA host driver validation marker
+          After=local-fs.target
+          Before=kubelet.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/bash -c 'mkdir -p /run/nvidia/validations && touch /run/nvidia/validations/host-driver-ready'
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/nvidia-host-driver-validation.service
+        mode: '0644'
+      become: true
+
+    - name: Enable and restart NVIDIA host driver validation service
+      ansible.builtin.systemd:
+        name: nvidia-host-driver-validation
+        enabled: true
+        state: restarted
+        daemon_reload: true
+      become: true
+
+    - name: Verify host driver validation marker exists
+      ansible.builtin.stat:
+        path: /run/nvidia/validations/host-driver-ready
+      become: true
+      register: validation_marker
+
+    - name: Fail if validation marker was not created
+      ansible.builtin.fail:
+        msg: "Failed to create /run/nvidia/validations/host-driver-ready"
+      when: not validation_marker.stat.exists
+
+# ===========================
+# Play 1.5: Remove stale gpu.deploy override labels from GPU nodes
+# ===========================
+# Previous add-node runs may have set gpu.deploy.*=false on nodes with
+# compatible GPUs. The operator's own validator (host-driver-ready marker)
+# handles DaemonSet sequencing — explicit false labels are only needed on
+# nodes WITHOUT compatible GPUs (set by add-node for incompatible/no-GPU
+# nodes). This play cleans up stale overrides so DaemonSets can schedule.
+- name: Clean stale GPU operator override labels
+  hosts: k8s_control_plane
+  become: false
+
+  tasks:
+    - name: Remove gpu.deploy override labels from GPU nodes
+      ansible.builtin.command: >
+        {{ kubectl_bin }} label node {{ item }}
+        nvidia.com/gpu.deploy.container-toolkit-
+        nvidia.com/gpu.deploy.dcgm-
+        nvidia.com/gpu.deploy.dcgm-exporter-
+        nvidia.com/gpu.deploy.device-plugin-
+        nvidia.com/gpu.deploy.driver-
+        nvidia.com/gpu.deploy.gpu-feature-discovery-
+        nvidia.com/gpu.deploy.node-status-exporter-
+        nvidia.com/gpu.deploy.operator-validator-
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ groups['baremetal_gpus'] | default([]) }}"
+      changed_when: true
+      failed_when: false
+
+# ===========================
+# Detect GPU compute capability and disable operator on pre-Volta nodes
+# ===========================
+# Project policy: only Volta+ (compute capability >= 7.0) is supported.
+# NFD detects any NVIDIA GPU regardless of compatibility, so we need to
+# explicitly tag pre-Volta nodes with `nvidia.com/gpu.deploy.*=false`
+# labels to prevent the operator's DaemonSets (NFD worker, driver,
+# toolkit, device-plugin, DCGM, GFD, validator) from scheduling on them.
+# Mirrors thinkube-control's disable_gpu_operator_on_node logic so both
+# add-node paths converge on the same end state.
+- name: Detect GPU compute capability on baremetal GPU nodes
+  hosts: baremetal_gpus
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Query GPU compute capability via nvidia-smi
+      ansible.builtin.command:
+        cmd: nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+      register: compute_cap_result
+      changed_when: false
+      failed_when: false
+
+    - name: Set fact for highest compute capability on this node
+      ansible.builtin.set_fact:
+        gpu_compute_cap: "{{ (compute_cap_result.stdout_lines | default([]) | map('trim') | map('float') | list | max | default(0.0)) if compute_cap_result.rc == 0 else 0.0 }}"
+        gpu_supported: "{{ (compute_cap_result.rc == 0) and ((compute_cap_result.stdout_lines | default([]) | map('trim') | map('float') | list | max | default(0.0)) >= 7.0) }}"
+
+    - name: Show compute capability and support status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: compute_cap={{ gpu_compute_cap }},
+          supported={{ gpu_supported }}
+          (policy: Volta+, compute_cap >= 7.0)
+
+- name: Disable GPU operator on pre-Volta nodes
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Build list of supported GPU nodes (compute_cap >= 7.0)
+      ansible.builtin.set_fact:
+        supported_gpu_nodes: >-
+          {{
+            groups['baremetal_gpus'] | default([])
+            | map('extract', hostvars)
+            | selectattr('gpu_supported', 'equalto', true)
+            | map(attribute='inventory_hostname')
+            | list
+          }}
+
+    - name: Build list of unsupported GPU nodes
+      ansible.builtin.set_fact:
+        unsupported_gpu_nodes: "{{ (groups['baremetal_gpus'] | default([])) | difference(supported_gpu_nodes) }}"
+
+    - name: Display unsupported nodes (will be excluded from GPU operator)
+      ansible.builtin.debug:
+        msg: >-
+          Pre-Volta / unsupported GPU nodes (operator will skip):
+          {{ unsupported_gpu_nodes | default([]) | join(', ') | default('none', true) }}
+
+    - name: Apply gpu.deploy=false labels on unsupported nodes
+      ansible.builtin.command: >
+        {{ kubectl_bin }} label node {{ item }} --overwrite
+        nvidia.com/gpu.deploy.container-toolkit=false
+        nvidia.com/gpu.deploy.dcgm=false
+        nvidia.com/gpu.deploy.dcgm-exporter=false
+        nvidia.com/gpu.deploy.device-plugin=false
+        nvidia.com/gpu.deploy.driver=false
+        nvidia.com/gpu.deploy.gpu-feature-discovery=false
+        nvidia.com/gpu.deploy.node-status-exporter=false
+        nvidia.com/gpu.deploy.operator-validator=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      loop: "{{ unsupported_gpu_nodes | default([]) }}"
+      changed_when: true
+
+# ===========================
+# Play 2: Cluster-wide GPU Operator install
+# ===========================
+- name: Install NVIDIA GPU Operator
+  hosts: k8s_control_plane
+  become: false
+
+  vars:
+    cuda_test_namespace: default
+    cuda_test_manifest: /tmp/cuda-vectoradd.yaml
+    cuda_test_pod: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: cuda-vectoradd
+        namespace: {{ cuda_test_namespace }}
+      spec:
+        restartPolicy: OnFailure
+        runtimeClassName: nvidia
+        # New nodes are cordoned by the add-node flow until arch-specific
+        # images are rebuilt; this validation pod must still run there, so
+        # it alone tolerates the cordon taint (the nvcr image is multi-arch).
+        tolerations:
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
+        containers:
+        - name: cuda-vectoradd
+          image: "nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0-ubuntu22.04"
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+            requests:
+              nvidia.com/gpu: 1
+
+  pre_tasks:
+    - name: Verify required variables exist
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: item is not defined
+      loop:
+        - kubeconfig
+        - kubectl_bin
+        - helm_bin
+
+  tasks:
+    - name: Add NVIDIA Helm repository
+      ansible.builtin.command: "{{ helm_bin }} repo add nvidia https://nvidia.github.io/gpu-operator --force-update"
+      changed_when: false
+      register: helm_repo_add
+      retries: 5
+      delay: 10
+      until: helm_repo_add.rc == 0
+
+    - name: Update Helm repositories
+      ansible.builtin.command: "{{ helm_bin }} repo update"
+      changed_when: false
+      register: helm_repo_update
+      retries: 3
+      delay: 10
+      until: helm_repo_update.rc == 0
+
+    # GPU operator is system-level infrastructure: it manages DaemonSets that
+    # scale with cluster size (NFD worker / driver-toolkit / device-plugin /
+    # DCGM / GFD / validator on every supported node). A per-namespace
+    # ResourceQuota would block legitimate scheduling as the cluster grows
+    # — DaemonSets aren't per-tenant workloads. Create the namespace without
+    # the thinkube_namespace LimitRange/ResourceQuota policy.
+    - name: Create GPU Operator namespace (no quota — system infrastructure)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ gpu_operator_namespace }}"
+
+    # Under kubeadm we use the standard containerd paths. The toolkit env vars and the
+    # daemonset volumes reference /etc/containerd and /run/containerd
+    # directly. The 99-nvidia.toml drop-in lands under /etc/containerd/conf.d/
+    # which our base config.toml imports — see ansible/roles/containerd_install/.
+    # Fetched before the install so a transient upstream failure costs a retry
+    # on the download rather than on the cluster operation. This step runs
+    # before Harbor exists, so the chart can only come from upstream.
+    - name: Pre-fetch GPU Operator chart tarball (retries on transient network errors)
+      ansible.builtin.command: >-
+        {{ helm_bin }} pull nvidia/gpu-operator
+        --version v26.3.1
+        --destination /tmp
+      register: gpu_operator_chart_pull
+      retries: 5
+      delay: 30
+      until: gpu_operator_chart_pull.rc == 0
+      changed_when: gpu_operator_chart_pull.rc == 0
+
+    - name: Install GPU Operator
+      ansible.builtin.shell: |
+        {{ helm_bin }} upgrade --install gpu-operator \
+          /tmp/gpu-operator-v26.3.1.tgz \
+          --namespace {{ gpu_operator_namespace }} \
+          --wait \
+          --timeout 15m \
+          --set driver.enabled=false \
+          --set toolkit.env[0].name=CONTAINERD_CONFIG \
+          --set toolkit.env[0].value=/etc/containerd/config.toml \
+          --set toolkit.env[1].name=CONTAINERD_SOCKET \
+          --set toolkit.env[1].value=/run/containerd/containerd.sock \
+          --set toolkit.env[2].name=CONTAINERD_SET_AS_DEFAULT \
+          --set-string toolkit.env[2].value=true \
+          --set toolkit.env[3].name=RUNTIME_DROP_IN_CONFIG_HOST_PATH \
+          --set toolkit.env[3].value=/etc/containerd/conf.d/99-nvidia.toml \
+          --set-json 'daemonsets.toolkit.volumes=[{"name":"containerd-config","hostPath":{"path":"/etc/containerd","type":"DirectoryOrCreate"}},{"name":"containerd-drop-in-config","hostPath":{"path":"/etc/containerd/conf.d","type":"DirectoryOrCreate"}},{"name":"containerd-socket","hostPath":{"path":"/run/containerd"}}]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: gpu_operator_install
+      changed_when: "'STATUS: deployed' in gpu_operator_install.stdout or 'has been upgraded' in gpu_operator_install.stdout"
+      retries: 3
+      delay: 15
+      until: gpu_operator_install.rc == 0
+
+    - name: Skip GPU-specific waits (no supported GPU nodes in cluster)
+      ansible.builtin.debug:
+        msg: >-
+          GPU operator installed (helm). No supported GPU nodes
+          (compute_cap >= 7.0) in the cluster yet — skipping toolkit
+          and device-plugin waits. The operator will auto-configure
+          when GPU nodes are added via thinkube-control.
+      when: supported_gpu_nodes | default([]) | length == 0
+
+    - name: Wait for GPU operator namespace to be ready
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting for GPU operator to initialize pods..."
+      when: supported_gpu_nodes | default([]) | length > 0
+
+    - name: Wait for nvidia-container-toolkit daemonset on all GPU nodes
+      when: supported_gpu_nodes | default([]) | length > 0
+      ansible.builtin.shell: |
+        expected={{ supported_gpu_nodes | length }}
+        i=1
+        while [ $i -le 90 ]; do
+          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} \
+            -l app=nvidia-container-toolkit-daemonset \
+            --field-selector=status.phase=Running -o json | jq '.items | length')
+          if [ "$count" -ge "$expected" ]; then
+            echo "✓ All $count/$expected nvidia-container-toolkit pods running"
+            exit 0
+          fi
+          echo "Waiting for nvidia-container-toolkit... $count/$expected (attempt $i/90)"
+          sleep 5
+          i=$((i + 1))
+        done
+        echo "ERROR: Only $count/$expected toolkit pods running after timeout"
+        exit 1
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: toolkit_wait
+      changed_when: false
+
+# ===========================
+# Play 3: Per-node containerd restart after toolkit deploys
+# ===========================
+- name: Restart containerd on GPU nodes after toolkit configuration
+  hosts: baremetal_gpus
+  become: false
+  any_errors_fatal: true
+
+  tasks:
+    # Skip pre-Volta / unsupported nodes — the toolkit DaemonSet is
+    # disabled there (gpu.deploy.container-toolkit=false), so the drop-in
+    # config will never be written and there's no nvidia runtime to load
+    # into containerd.
+    - name: Wait for nvidia-container-toolkit to create drop-in config
+      ansible.builtin.wait_for:
+        path: /etc/containerd/conf.d/99-nvidia.toml
+        state: present
+        timeout: 300
+      become: true
+      when: gpu_supported | default(false) | bool
+
+    - name: Restart containerd to pick up nvidia runtime configuration
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+      become: true
+      when: gpu_supported | default(false) | bool
+
+    - name: Wait for containerd to be ready after restart
+      ansible.builtin.pause:
+        seconds: 10
+        prompt: "Waiting for containerd to restart..."
+      when: gpu_supported | default(false) | bool
+
+# ===========================
+# Play 4: Verify GPU availability
+# ===========================
+- name: Verify GPU Operator deployment
+  hosts: k8s_control_plane
+  become: false
+
+  vars:
+    cuda_test_namespace: default
+    cuda_test_manifest: /tmp/cuda-vectoradd.yaml
+    cuda_test_pod: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: cuda-vectoradd
+        namespace: {{ cuda_test_namespace }}
+      spec:
+        restartPolicy: OnFailure
+        runtimeClassName: nvidia
+        # New nodes are cordoned by the add-node flow until arch-specific
+        # images are rebuilt; this validation pod must still run there, so
+        # it alone tolerates the cordon taint (the nvcr image is multi-arch).
+        tolerations:
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
+        containers:
+        - name: cuda-vectoradd
+          image: "nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0-ubuntu22.04"
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+            requests:
+              nvidia.com/gpu: 1
+
+  tasks:
+    - name: Skip GPU verification (no supported GPU nodes)
+      ansible.builtin.meta: end_play
+      when: supported_gpu_nodes | default([]) | length == 0
+
+    - name: Wait for critical GPU operator pods on all GPU nodes
+      ansible.builtin.shell: |
+        expected={{ supported_gpu_nodes | length }}
+
+        device_ready=false
+        i=1
+        while [ $i -le 60 ]; do
+          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} \
+            -l app=nvidia-device-plugin-daemonset \
+            --field-selector=status.phase=Running -o json | jq '.items | length')
+          if [ "$count" -ge "$expected" ]; then
+            device_ready=true
+            break
+          fi
+          echo "Waiting for device-plugin... $count/$expected (attempt $i/60)"
+          sleep 5
+          i=$((i + 1))
+        done
+
+        toolkit_ready=false
+        i=1
+        while [ $i -le 60 ]; do
+          count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} \
+            -l app=nvidia-container-toolkit-daemonset \
+            --field-selector=status.phase=Running -o json | jq '.items | length')
+          if [ "$count" -ge "$expected" ]; then
+            toolkit_ready=true
+            break
+          fi
+          echo "Waiting for toolkit... $count/$expected (attempt $i/60)"
+          sleep 5
+          i=$((i + 1))
+        done
+
+        if [ "$device_ready" = "true" ] && [ "$toolkit_ready" = "true" ]; then
+          echo "✓ All critical GPU operator pods running on $expected node(s)"
+          exit 0
+        else
+          echo "ERROR: GPU operator pods not ready on all $expected node(s)"
+          exit 1
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: wait_result
+      changed_when: false
+
+    - name: Wait for GPUs to become available in cluster
+      ansible.builtin.shell: |
+        echo "Waiting for GPUs to become available in the cluster..."
+        i=1
+        max_attempts=60
+        while [ $i -le $max_attempts ]; do
+          gpu_count=$({{ kubectl_bin }} get nodes -o json | jq '[.items[].status.allocatable."nvidia.com/gpu" // "0" | tonumber] | add')
+
+          if [ "$gpu_count" -gt 0 ]; then
+            echo "✓ GPUs are now available in the cluster (count: $gpu_count)"
+            echo "GPU-enabled nodes:"
+            {{ kubectl_bin }} get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu | grep -v "<none>" || true
+            exit 0
+          fi
+
+          running_pods=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} --field-selector=status.phase=Running -o json | jq '.items | length')
+          total_pods=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} -o json | jq '.items | length')
+
+          echo "Waiting for GPUs... (attempt $i/$max_attempts, $running_pods/$total_pods pods running)"
+
+          if [ $((i % 10)) -eq 0 ]; then
+            echo "Current GPU operator pod status:"
+            {{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} --no-headers | awk '{print "  " $1 ": " $3}'
+          fi
+
+          sleep 10
+          i=$((i + 1))
+        done
+
+        echo "ERROR: No GPUs detected after waiting 10 minutes."
+        echo "Current node status:"
+        {{ kubectl_bin }} get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu
+        echo ""
+        echo "GPU operator pod status:"
+        {{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} --no-headers
+        exit 1
+      register: gpu_wait_result
+      changed_when: false
+      failed_when: gpu_wait_result.rc != 0
+
+    - name: Check if we should run CUDA test
+      ansible.builtin.shell: |
+        gpu_count=$({{ kubectl_bin }} get nodes -o json | jq '[.items[].status.allocatable."nvidia.com/gpu" // "0" | tonumber] | add')
+        existing_pod=$({{ kubectl_bin }} get pod cuda-vectoradd -n {{ cuda_test_namespace }} 2>/dev/null || echo "not found")
+
+        if [ "$gpu_count" -eq 0 ]; then
+          echo "skip_test=true"
+          echo "reason=No GPUs available"
+        elif echo "$existing_pod" | grep -q "cuda-vectoradd"; then
+          echo "skip_test=true"
+          echo "reason=Test pod already exists"
+        else
+          echo "skip_test=false"
+          echo "reason=Ready to test"
+        fi
+      register: test_check
+      changed_when: false
+
+    - name: Run CUDA test
+      block:
+        - name: Create CUDA test manifest
+          ansible.builtin.copy:
+            content: "{{ cuda_test_pod }}"
+            dest: "{{ cuda_test_manifest }}"
+            mode: '0600'
+
+        - name: Deploy CUDA test pod
+          ansible.builtin.command: "{{ kubectl_bin }} apply -f {{ cuda_test_manifest }}"
+          register: deploy_result
+          changed_when: "'created' in deploy_result.stdout"
+
+        - name: Wait for CUDA test pod completion
+          ansible.builtin.shell: |
+            i=1
+            while [ $i -le 60 ]; do
+              phase=$({{ kubectl_bin }} get pod cuda-vectoradd -n {{ cuda_test_namespace }} -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+
+              if [ "$phase" = "Succeeded" ]; then
+                echo "✓ CUDA test completed successfully"
+                exit 0
+              elif [ "$phase" = "Failed" ] || [ "$phase" = "Error" ]; then
+                echo "✗ CUDA test failed with status: $phase"
+                echo "Pod events:"
+                {{ kubectl_bin }} describe pod cuda-vectoradd -n {{ cuda_test_namespace }} | grep -A5 Events || true
+                exit 1
+              fi
+
+              echo "Waiting for CUDA test pod... (attempt $i/60, status: $phase)"
+              sleep 5
+              i=$((i + 1))
+            done
+
+            echo "✗ CUDA test pod did not complete in time"
+            echo "Final pod status:"
+            {{ kubectl_bin }} describe pod cuda-vectoradd -n {{ cuda_test_namespace }} || true
+            exit 1
+          register: cuda_test
+          changed_when: false
+          failed_when: cuda_test.rc != 0
+
+        - name: Get CUDA test pod logs
+          ansible.builtin.command: "{{ kubectl_bin }} logs cuda-vectoradd -n {{ cuda_test_namespace }}"
+          register: cuda_logs
+          changed_when: false
+
+        - name: Display CUDA test results
+          ansible.builtin.debug:
+            var: cuda_logs.stdout_lines
+
+        - name: Clean up CUDA test pod
+          ansible.builtin.command: "{{ kubectl_bin }} delete -f {{ cuda_test_manifest }}"
+          register: delete_result
+          changed_when: "'deleted' in delete_result.stdout"
+          failed_when: false
+
+        - name: Remove temporary files
+          ansible.builtin.file:
+            path: "{{ cuda_test_manifest }}"
+            state: absent
+      when: "'skip_test=false' in test_check.stdout"
+
+  post_tasks:
+    - name: Verify GPU operator status
+      ansible.builtin.shell: |
+        echo "=== GPU Operator Deployment Summary ==="
+        echo ""
+        echo "GPU-enabled nodes:"
+        {{ kubectl_bin }} get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu,GPU-PRODUCT:.metadata.labels.nvidia\\.com/gpu\\.product
+        echo ""
+        echo "GPU operator pods:"
+        {{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} --no-headers | awk '{print $1 "\t" $3}' | column -t
+        echo ""
+        gpu_count=$({{ kubectl_bin }} get nodes -o json | jq '[.items[].status.allocatable."nvidia.com/gpu" // "0" | tonumber] | add')
+        if [ "$gpu_count" -gt 0 ]; then
+          echo "✓ Total GPUs available in cluster: $gpu_count"
+          exit 0
+        else
+          echo "✗ No GPUs detected in cluster"
+          exit 1
+        fi
+      register: gpu_summary
+      changed_when: false
+      failed_when: gpu_summary.rc != 0
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        var: gpu_summary.stdout_lines

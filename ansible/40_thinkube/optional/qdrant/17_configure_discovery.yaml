@@ -1,0 +1,109 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/qdrant/17_configure_discovery.yaml
+# Description:
+#   Configure service discovery for Qdrant by creating a ConfigMap
+#   that describes the service endpoints and metadata
+#
+# Requirements:
+#   - Qdrant must be deployed
+#   - Kubernetes (kubeadm) kubectl access
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/qdrant/17_configure_discovery.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for the cluster
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Configure Qdrant service discovery
+  hosts: k8s_control_plane
+  gather_facts: true
+
+  vars:
+    component_version: "{{ lookup('file', playbook_dir + '/VERSION') }}"
+
+  tasks:
+    - name: Create service discovery ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thinkube-service-config
+            namespace: qdrant
+            labels:
+              thinkube.io/managed: "true"
+              thinkube.io/service-type: "optional"
+              thinkube.io/service-name: "qdrant"
+              thinkube.io/component-version: "{{ component_version }}"
+          data:
+            service.yaml: |
+              service:
+                name: qdrant
+                display_name: "Qdrant"
+                description: "Vector database for AI applications"
+                type: optional
+                category: ai
+                icon: /icons/tk_vector.svg
+                component_version: "{{ component_version }}"
+
+                endpoints:
+                  - name: dashboard
+                    type: http
+                    url: "https://qdrant-dashboard.{{ domain_name }}"
+                    health_url: "https://qdrant-dashboard.{{ domain_name }}/"
+                    description: "Web dashboard (Keycloak login)"
+                    primary: true
+
+                  - name: api
+                    type: http
+                    url: "https://qdrant.{{ domain_name }}"
+                    health_url: "https://qdrant.{{ domain_name }}/healthz"
+                    description: "REST API (api-key header required)"
+                    primary: false
+                    
+                dependencies: []
+                  
+                scaling:
+                  resource_type: statefulset
+                  resource_name: qdrant
+                  namespace: qdrant
+                  min_replicas: 1
+                  can_disable: true
+
+                metadata:
+                  authentication: api_key
+
+                environment_variables:
+                  - name: QDRANT_URL
+                    value: "https://qdrant.{{ domain_name }}"
+                  - name: QDRANT_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        namespace: qdrant
+                        name: qdrant-auth
+                        key: api-key
+
+    - name: Verify ConfigMap creation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: ConfigMap
+        name: thinkube-service-config
+        namespace: qdrant
+      register: configmap_info
+      
+    - name: Display ConfigMap status
+      ansible.builtin.debug:
+        msg: "Service discovery ConfigMap created for Qdrant"
+      when: configmap_info.resources | length > 0
+
+    - name: Update code-server environment variables
+      include_role:
+        name: code_server_env_update

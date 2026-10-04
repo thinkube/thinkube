@@ -1,0 +1,613 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/dns-server/10_deploy.yaml
+# Description:
+#   Deploy BIND9 DNS server for network-wide DNS resolution
+#   Handles domain resolution for *.thinkube.com and forwards external queries
+#   Separate from Kubernetes CoreDNS which handles cluster.local
+#
+# Requirements:
+#   - Kubernetes must be installed and running (kubeadm, from
+#     40_thinkube/core/infrastructure/k8s/10_install_k8s.yaml)
+#   - Cilium's layer-2 load balancer must be configured, from the same
+#     playbook (cilium-l2-lb.yaml.j2)
+#   - DNS external IP must be configured on control plane node
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/core/infrastructure/dns-server/10_deploy.yaml
+#
+# Variables from inventory:
+#   - domain_name: Base domain for all services
+#   - dns_external_ip_octet: Last octet for DNS external IP
+#   - primary_gateway_ip_octet: Last octet for primary ingress (ZeroTier mode)
+#   - overlay_provider: 'tailscale' or 'zerotier'. The playbook requires it to
+#     be set and has no default; the installer writes 'tailscale'
+#   - gateway_namespace, gateway_name (group_vars/k8s.yml): identify the
+#     Envoy Gateway Service whose LoadBalancer IP the operator populates
+#     when overlay_provider == 'tailscale'.
+#   (secondary_ingress_ip_octet removed — kn subdomain eliminated)
+#
+# Dependencies:
+#   - Networking and ZeroTier must be configured
+#   - IPs must be assigned to control plane node
+#
+# 🤖 [AI-assisted]
+
+- name: Deploy BIND9 DNS Server for Network DNS
+  hosts: k8s_control_plane
+  gather_facts: true
+  become: false
+
+  vars:
+    dns_namespace: "dns-system"
+    bind9_image_name: "localhost/thinkube-bind9:latest"
+    bind9_build_dir: "/tmp/thinkube-bind9-build"
+    # Determine subnet prefix based on network mode
+    # Subnet prefix and the static IPs derived from it are only meaningful
+    # in ZeroTier mode (Cilium L2 LB pre-pins these from the overlay
+    # subnet). In Tailscale mode the operator assigns each Service's IP
+    # at runtime and we discover them via Service.status.loadBalancer.ingress.
+    subnet_prefix: "{{ overlay_subnet_prefix if overlay_provider == 'zerotier' else network_cidr.split('/')[0] | regex_replace('\\.[0-9]+$', '.') }}"
+    dns_external_ip: "{{ subnet_prefix }}{{ dns_external_ip_octet }}"
+    primary_gateway_ip: "{{ subnet_prefix }}{{ primary_gateway_ip_octet }}"
+    control_plane_hostname: "{{ inventory_hostname }}"
+    bind9_containerfile: |
+      FROM ubuntu:24.04
+
+      # Install bind9 and dependencies
+      RUN apt-get update && \
+          apt-get install -y --no-install-recommends \
+            bind9 \
+            bind9-utils \
+            dnsutils && \
+          apt-get clean && \
+          rm -rf /var/lib/apt/lists/*
+
+      # Expose DNS ports
+      EXPOSE 53/tcp 53/udp
+
+      # Run named in foreground
+      CMD ["/usr/sbin/named", "-g", "-c", "/etc/bind/named.conf", "-u", "bind"]
+
+  pre_tasks:
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - domain_name is defined
+          - network_mode is defined
+          - overlay_provider is defined
+        fail_msg: "Required inventory variables are not defined"
+
+    - name: Verify ZeroTier-specific variables are defined (ZeroTier mode only)
+      ansible.builtin.assert:
+        that:
+          - dns_external_ip_octet is defined
+          - primary_gateway_ip_octet is defined
+          - overlay_subnet_prefix is defined
+        fail_msg: "ZeroTier-mode inventory variables are missing"
+      when: overlay_provider == 'zerotier'
+
+    # The wildcard A record in the BIND9 zone needs the IP that external
+    # clients should hit for *.{{ domain_name }}. In ZeroTier mode that's
+    # the static primary_gateway_ip the user picked. In Tailscale mode the
+    # Tailscale Operator provisions a tailnet IP for the Envoy Gateway
+    # Service after gateway-api/10_deploy.yaml runs — so we have to
+    # discover it dynamically before templating the zone.
+    # The Tailscale operator writes BOTH a hostname entry and an IP
+    # entry into status.loadBalancer.ingress, but it puts the hostname
+    # first — so `ingress[0].ip` is empty. Use `ingress[*].ip` so
+    # kubectl walks the array and yields whichever entries have a
+    # non-empty .ip field.
+    - name: Discover Envoy Gateway Service tailnet IP (Tailscale mode)
+      ansible.builtin.command: >
+        {{ kubectl_bin }} get svc -n envoy-gateway-system
+        -l gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }},gateway.envoyproxy.io/owning-gateway-namespace={{ gateway_namespace }}
+        -o jsonpath={.items[0].status.loadBalancer.ingress[*].ip}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: tailnet_gateway_ip_lookup
+      changed_when: false
+      retries: 30
+      delay: 10
+      until:
+        - tailnet_gateway_ip_lookup.rc == 0
+        - tailnet_gateway_ip_lookup.stdout | length > 0
+      failed_when: false
+      when: overlay_provider == 'tailscale'
+
+    - name: Fail with actionable message if the operator did not assign a tailnet IP
+      ansible.builtin.fail:
+        msg: |
+          The Tailscale Operator did not populate
+          Service.status.loadBalancer.ingress on the Envoy Gateway Service
+          (label selector
+            gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }},
+            gateway.envoyproxy.io/owning-gateway-namespace={{ gateway_namespace }})
+          within the timeout. Likely causes:
+
+            1. The Tailscale Operator pods aren't running. Check:
+                 {{ kubectl_bin }} get pods -n tailscale
+                 {{ kubectl_bin }} logs -n tailscale deployment/operator
+
+            2. The OAuth client lacks the required scopes (Devices/Core
+               write + Keys/Auth Keys write) or the tag tag:k8s-operator.
+               Re-create it in Tailscale Admin → Trust credentials and
+               re-run the configuration step in the installer.
+
+            3. The tagOwners are missing from your tailnet policy file.
+               The installer's verify-API-token step adds them via the
+               ACL API; re-run that step to re-apply.
+      when:
+        - overlay_provider == 'tailscale'
+        - tailnet_gateway_ip_lookup.stdout | length == 0
+
+    - name: Set effective gateway IP for the BIND9 wildcard
+      ansible.builtin.set_fact:
+        effective_gateway_ip: >-
+          {{ tailnet_gateway_ip_lookup.stdout
+             if overlay_provider == 'tailscale'
+             else primary_gateway_ip }}
+
+  tasks:
+    - name: Create DNS namespace and apply resource policies
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ dns_namespace }}"
+        tier: "critical"
+
+    # Build BIND9 container image
+    - name: Install podman
+      ansible.builtin.apt:
+        name: podman
+        state: present
+        update_cache: yes
+      become: true
+
+    - name: Create build directory
+      ansible.builtin.file:
+        path: "{{ bind9_build_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create Containerfile
+      ansible.builtin.copy:
+        content: "{{ bind9_containerfile }}"
+        dest: "{{ bind9_build_dir }}/Containerfile"
+        mode: '0644'
+
+    - name: Build BIND9 image with podman
+      ansible.builtin.command:
+        cmd: podman build -t {{ bind9_image_name }} {{ bind9_build_dir }}
+      register: podman_build
+      changed_when: true
+
+    - name: Remove existing tar file if present
+      ansible.builtin.file:
+        path: "{{ bind9_build_dir }}/thinkube-bind9.tar"
+        state: absent
+
+    - name: Export image from podman
+      ansible.builtin.command:
+        cmd: podman save -o {{ bind9_build_dir }}/thinkube-bind9.tar {{ bind9_image_name }}
+      changed_when: true
+
+    - name: Import image into containerd
+      ansible.builtin.shell: |
+        sudo ctr --address /run/containerd/containerd.sock --namespace k8s.io images import {{ bind9_build_dir }}/thinkube-bind9.tar
+      changed_when: true
+
+    - name: Clean up build artifacts
+      ansible.builtin.file:
+        path: "{{ bind9_build_dir }}"
+        state: absent
+
+    # Create BIND9 configuration files
+    - name: Create BIND9 named.conf configuration
+      ansible.builtin.set_fact:
+        named_conf: |
+          options {
+              directory "/var/cache/bind";
+
+              // Forwarders for external DNS resolution
+              forwarders {
+                  8.8.8.8;
+                  8.8.4.4;
+              };
+
+              // DNS Security
+              dnssec-validation no;
+
+              // Allow queries from any source
+              allow-query { any; };
+
+              // Enable recursion for all clients
+              recursion yes;
+              allow-recursion { any; };
+
+              // Listen on all interfaces
+              listen-on { any; };
+              listen-on-v6 { any; };
+
+              // Hide version
+              version "DNS Server";
+          };
+
+          // Include zone configurations
+          include "/etc/bind/zones.conf";
+
+    - name: Create zones configuration
+      ansible.builtin.set_fact:
+        zones_conf: |
+          // Zone for {{ domain_name }}
+          zone "{{ domain_name }}" {
+              type master;
+              file "/etc/bind/zones/db.{{ domain_name }}";
+          };
+
+    # Create the named.conf + zones.conf ConfigMap (no IP-dependent content)
+    # so it can be mounted by the Deployment later.
+    - name: Create temporary named.conf file
+      ansible.builtin.copy:
+        content: "{{ named_conf }}"
+        dest: "/tmp/bind9-named.conf"
+        mode: '0644'
+
+    - name: Create temporary zones.conf file
+      ansible.builtin.copy:
+        content: "{{ zones_conf }}"
+        dest: "/tmp/bind9-zones.conf"
+        mode: '0644'
+
+    - name: Create ConfigMap for BIND9 configuration
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} create configmap bind9-config \
+          --from-file=named.conf=/tmp/bind9-named.conf \
+          --from-file=zones.conf=/tmp/bind9-zones.conf \
+          -n {{ dns_namespace }} \
+          --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
+      register: create_bind9_config
+      changed_when: "'created' in create_bind9_config.stdout or 'configured' in create_bind9_config.stdout"
+
+    # Create the bind9-external Service before the Deployment so we can
+    # discover the IP it will be reachable on (Cilium L2 LB or the Tailscale
+    # operator) and template the zone file with the correct ns1 / dns A
+    # records before BIND9 starts serving them.
+    - name: Create bind9-external Service (ZeroTier mode — Cilium L2 LB)
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: bind9-external
+          namespace: {{ dns_namespace }}
+          labels:
+            app: bind9
+        spec:
+          type: LoadBalancer
+          loadBalancerIP: {{ dns_external_ip }}
+          selector:
+            app: bind9
+          ports:
+          - name: dns-udp
+            port: 53
+            targetPort: 53
+            protocol: UDP
+          - name: dns-tcp
+            port: 53
+            targetPort: 53
+            protocol: TCP
+        EOF
+      register: create_lb_service
+      changed_when: "'created' in create_lb_service.stdout or 'configured' in create_lb_service.stdout"
+      when: overlay_provider == 'zerotier'
+
+    # Use `spec.loadBalancerClass: tailscale` (not `tailscale.com/expose`)
+    # so the operator writes the assigned tailnet IP back into
+    # Service.status.loadBalancer.ingress[]. The hostname annotation
+    # pins the device's tailnet name.
+    - name: Create bind9-external Service (Tailscale mode — operator-exposed)
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: bind9-external
+          namespace: {{ dns_namespace }}
+          labels:
+            app: bind9
+          annotations:
+            tailscale.com/hostname: "{{ cluster_name }}-dns"
+        spec:
+          type: LoadBalancer
+          loadBalancerClass: tailscale
+          selector:
+            app: bind9
+          ports:
+          - name: dns-udp
+            port: 53
+            targetPort: 53
+            protocol: UDP
+          - name: dns-tcp
+            port: 53
+            targetPort: 53
+            protocol: TCP
+        EOF
+      register: create_lb_service_tailscale
+      changed_when: "'created' in create_lb_service_tailscale.stdout or 'configured' in create_lb_service_tailscale.stdout"
+      when: overlay_provider == 'tailscale'
+
+    - name: Create bind9-internal ClusterIP Service
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: bind9-internal
+          namespace: {{ dns_namespace }}
+          labels:
+            app: bind9
+        spec:
+          type: ClusterIP
+          selector:
+            app: bind9
+          ports:
+          - name: dns-udp
+            port: 53
+            targetPort: 53
+            protocol: UDP
+          - name: dns-tcp
+            port: 53
+            targetPort: 53
+            protocol: TCP
+        EOF
+      register: create_clusterip_service
+      changed_when: "'created' in create_clusterip_service.stdout or 'configured' in create_clusterip_service.stdout"
+
+    # Wait for at least one ingress entry to have an .ip field. In
+    # Tailscale mode the operator emits both a hostname entry and an
+    # IP entry, and the hostname entry usually shows up first — so
+    # `ingress is defined` is true before the IP is actually populated.
+    - name: Wait for bind9-external LoadBalancer IP to be assigned
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get service bind9-external -n {{ dns_namespace }} -o json
+      register: lb_service_json
+      until: >-
+        (lb_service_json.stdout | from_json).status.loadBalancer.ingress
+        | default([])
+        | selectattr('ip', 'defined')
+        | list
+        | length > 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Capture the IP that bind9-external is reachable on
+      ansible.builtin.set_fact:
+        bind9_advertised_ip: >-
+          {{ ((lb_service_json.stdout | from_json).status.loadBalancer.ingress
+              | selectattr('ip', 'defined')
+              | map(attribute='ip')
+              | list)[0] }}
+
+    - name: Configure Tailscale split DNS to route domain queries to BIND9
+      ansible.builtin.uri:
+        url: "https://api.tailscale.com/api/v2/tailnet/-/dns/split-dns"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ tailscale_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        # Ansible does not template mapping keys, so the body is built as one expression.
+        body: "{{ {domain_name: [bind9_advertised_ip]} }}"
+        status_code: [200]
+      when:
+        - overlay_provider == 'tailscale'
+        - tailscale_api_token is defined
+        - tailscale_api_token | length > 0
+
+    # Now that we know the IP that ns1 / dns will resolve to, build the zone
+    # file. ZeroTier mode: bind9_advertised_ip == dns_external_ip. Tailscale
+    # mode: bind9_advertised_ip is the operator-assigned tailnet IP.
+    #
+    # Per-host A records map <hostname>.<domain> to:
+    #   - ZeroTier mode: the node's overlay_ip (static, picked by user)
+    #   - Tailscale mode: the node's lan_ip — Tailscale's MagicDNS already
+    #     covers <hostname>.<tailnet>.ts.net for tailnet-side clients, so
+    #     in-domain records here serve LAN-side clients (and the LAN IP is
+    #     what every node sets ansible_host to in TS mode anyway).
+    - name: Create main domain zone file
+      ansible.builtin.set_fact:
+        zone_main: |
+          $TTL    604800
+          @       IN      SOA     ns1.{{ domain_name }}. admin.{{ domain_name }}. (
+                                  {{ ansible_facts.date_time.epoch }}  ; Serial
+                                  604800          ; Refresh
+                                  86400           ; Retry
+                                  2419200         ; Expire
+                                  604800 )        ; Negative Cache TTL
+          ;
+          @       IN      NS      ns1.{{ domain_name }}.
+          ns1     IN      A       {{ bind9_advertised_ip }}
+
+          ; Wildcard for all subdomains
+          *       IN      A       {{ effective_gateway_ip }}
+
+          ; Specific entries for infrastructure
+          dns     IN      A       {{ bind9_advertised_ip }}
+          {% set host_ip_key = 'overlay_ip' if overlay_provider == 'zerotier' else 'lan_ip' %}
+          {{ control_plane_hostname }}  IN  A  {{ hostvars[control_plane_hostname][host_ip_key] }}
+          {% for host in groups['k8s_workers'] | default([]) %}
+          {{ host }}  IN  A  {{ hostvars[host][host_ip_key] }}
+          {% endfor %}
+
+    - name: Set zone file names
+      ansible.builtin.set_fact:
+        zone_file_main: "db.{{ domain_name }}"
+
+    - name: Create temporary zone file for main domain
+      ansible.builtin.copy:
+        content: "{{ zone_main }}"
+        dest: "/tmp/{{ zone_file_main }}"
+        mode: '0644'
+
+    - name: Create ConfigMap for zone files
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} create configmap bind9-zones \
+          --from-file={{ zone_file_main }}=/tmp/{{ zone_file_main }} \
+          -n {{ dns_namespace }} \
+          --dry-run=client -o yaml | {{ kubectl_bin }} apply -f -
+      register: create_bind9_zones
+      changed_when: "'created' in create_bind9_zones.stdout or 'configured' in create_bind9_zones.stdout"
+
+    # Deploy BIND9 as a Deployment
+    - name: Deploy BIND9 DNS server
+      ansible.builtin.shell: |
+        cat <<EOF | {{ kubectl_bin }} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: bind9
+          namespace: {{ dns_namespace }}
+          labels:
+            app: bind9
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: bind9
+          template:
+            metadata:
+              labels:
+                app: bind9
+            spec:
+              priorityClassName: thinkube-critical
+              # Pin to control plane node where IPs are configured
+              nodeSelector:
+                kubernetes.io/hostname: {{ control_plane_hostname }}
+              containers:
+              - name: bind9
+                image: {{ bind9_image_name }}
+                imagePullPolicy: Never
+                ports:
+                - containerPort: 53
+                  name: dns-tcp
+                  protocol: TCP
+                - containerPort: 53
+                  name: dns-udp
+                  protocol: UDP
+                volumeMounts:
+                - name: bind9-config
+                  mountPath: /etc/bind/named.conf
+                  subPath: named.conf
+                - name: bind9-config
+                  mountPath: /etc/bind/zones.conf
+                  subPath: zones.conf
+                - name: bind9-zones
+                  mountPath: /etc/bind/zones
+                - name: cache
+                  mountPath: /var/cache/bind
+                resources:
+                  requests:
+                    memory: "256Mi"
+                    cpu: "100m"
+                  limits:
+                    memory: "512Mi"
+                    cpu: "500m"
+                livenessProbe:
+                  exec:
+                    command:
+                    - /usr/bin/dig
+                    - "@127.0.0.1"
+                    - "+tcp"
+                    - "dns.{{ domain_name }}"
+                  initialDelaySeconds: 30
+                  periodSeconds: 30
+                readinessProbe:
+                  exec:
+                    command:
+                    - /usr/bin/dig
+                    - "@127.0.0.1"
+                    - "+tcp"
+                    - "dns.{{ domain_name }}"
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+              volumes:
+              - name: bind9-config
+                configMap:
+                  name: bind9-config
+              - name: bind9-zones
+                configMap:
+                  name: bind9-zones
+              - name: cache
+                emptyDir: {}
+        EOF
+      register: deploy_bind9
+      changed_when: "'created' in deploy_bind9.stdout or 'configured' in deploy_bind9.stdout"
+
+    - name: Wait for BIND9 deployment to be ready
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get deployment bind9 -n {{ dns_namespace }} -o json
+      register: bind9_deployment_json
+      until: (bind9_deployment_json.stdout | from_json).status.readyReplicas | default(0) == 1
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Wait for BIND9 pod to be ready
+      ansible.builtin.command: >
+        {{ kubectl_bin }} wait --for=condition=Ready pod -l app=bind9 -n {{ dns_namespace }} --timeout=60s
+      changed_when: false
+
+    - name: Get BIND9 pod name
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} get pods -n {{ dns_namespace }} -l app=bind9 -o jsonpath='{.items[0].metadata.name}'
+      register: bind9_pod_name_result
+      changed_when: false
+
+    - name: Set BIND9 pod name
+      ansible.builtin.set_fact:
+        bind9_pod_name: "{{ bind9_pod_name_result.stdout }}"
+
+    - name: Test DNS resolution from BIND9 pod
+      ansible.builtin.command: >
+        {{ kubectl_bin }} exec -n {{ dns_namespace }} {{ bind9_pod_name }}
+        -- dig @127.0.0.1 google.com +short
+      register: dns_test
+      changed_when: false
+      failed_when: dns_test.rc != 0 or dns_test.stdout == ""
+
+    - name: Display DNS test result
+      ansible.builtin.debug:
+        msg: "DNS resolution test for google.com: {{ dns_test.stdout }}"
+
+    - name: Clean up temporary configuration files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/bind9-named.conf"
+        - "/tmp/bind9-zones.conf"
+        - "/tmp/{{ zone_file_main }}"
+
+    - name: Display summary message
+      ansible.builtin.debug:
+        msg: |
+          BIND9 DNS Server has been successfully deployed!
+
+          External DNS Service: {{ bind9_advertised_ip }}:53
+          Internal Service: bind9-internal.{{ dns_namespace }}.svc.cluster.local
+
+          Configured zones:
+          - {{ domain_name }} (wildcard → {{ effective_gateway_ip }})
+
+          External forwarding to: 8.8.8.8, 8.8.4.4
+
+          To test DNS resolution:
+          dig @{{ bind9_advertised_ip }} test.{{ domain_name }}
+          dig @{{ bind9_advertised_ip }} google.com
+
+          Next step: Update nodes to use this DNS server
