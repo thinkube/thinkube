@@ -59,6 +59,11 @@ The rules are `thinkube-release/VERSIONING.md` and the README of
   repository's CLAUDE.md names run where it says (for thinkube-control
   and thinkube.org: in thinkube-control's backend pod, which mounts the
   home and has the dependencies).
+- A model mirror on a fresh install fails at the MLflow step with
+  `unknown_user` until the user has opened MLflow once. This is accepted
+  and has no fix; Thinkube Control's Models page tells the user and links
+  to MLflow. Sign in once (Playwright, as `thinkube`) and submit the
+  mirror again. Do not report it or propose a fix.
 - Memory of an agent is not a record. What must be kept goes into a
   repository: a rule here, a note in the project's own repository, or
   VERSIONING.md.
