@@ -13,10 +13,29 @@
 # clone_for_development: true. Each goes to ~/thinkube-platform/<category>/<name>.
 # A repository that is already there is left as it is, so local work is never
 # touched. THINKUBE_BRANCH selects the branch to clone (default: main).
+#
+# It also installs the developer add-on to the agents' instructions:
+# ~/.claude/THINKUBE-DEVELOPER.md, imported by ~/.claude/CLAUDE.md, from
+# ansible/roles/agent_clients/files/developer/ in the thinkube checkout. The
+# platform's base instructions stay as they are; a user's cluster, which never
+# runs this script, does not get the add-on. `tk_clone_dev --remove-addon`
+# removes it.
 
 set -e
 
 PLATFORM_DIR="/home/thinkube/thinkube-platform"
+ADDON_NAME="THINKUBE-DEVELOPER.md"
+ADDON_SRC="$PLATFORM_DIR/core/thinkube/ansible/roles/agent_clients/files/developer/$ADDON_NAME"
+CLAUDE_DIR="/home/thinkube/.claude"
+
+if [ "${1:-}" = "--remove-addon" ]; then
+  rm -f "$CLAUDE_DIR/$ADDON_NAME"
+  if [ -f "$CLAUDE_DIR/CLAUDE.md" ]; then
+    grep -vxF "@$ADDON_NAME" "$CLAUDE_DIR/CLAUDE.md" > "$CLAUDE_DIR/CLAUDE.md.tmp" && mv "$CLAUDE_DIR/CLAUDE.md.tmp" "$CLAUDE_DIR/CLAUDE.md"
+  fi
+  echo "Developer add-on removed from $CLAUDE_DIR"
+  exit 0
+fi
 BRANCH="${THINKUBE_BRANCH:-main}"
 METADATA_URL="https://raw.githubusercontent.com/thinkube/thinkube-metadata/${BRANCH}/repositories.json"
 SSH_KEY="/home/thinkube/.ssh/github_ed25519"
@@ -50,3 +69,16 @@ while read -r category name full_name; do
 done <<< "$REPOS"
 
 echo "Development repositories are in $PLATFORM_DIR"
+
+# The add-on comes from the thinkube checkout just cloned (or already present).
+if [ ! -f "$ADDON_SRC" ]; then
+  echo "ERROR: $ADDON_SRC is missing: the thinkube checkout at $PLATFORM_DIR/core/thinkube has no developer add-on"
+  exit 1
+fi
+mkdir -p "$CLAUDE_DIR"
+cp "$ADDON_SRC" "$CLAUDE_DIR/$ADDON_NAME"
+touch "$CLAUDE_DIR/CLAUDE.md"
+if ! grep -qxF "@$ADDON_NAME" "$CLAUDE_DIR/CLAUDE.md"; then
+  printf '@%s\n' "$ADDON_NAME" >> "$CLAUDE_DIR/CLAUDE.md"
+fi
+echo "Developer add-on installed: $CLAUDE_DIR/$ADDON_NAME, imported by $CLAUDE_DIR/CLAUDE.md"
