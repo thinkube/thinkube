@@ -13,6 +13,10 @@ differs from what runs, so it is never the check.
   Then look at the deployed result, or read the build log.
 - Each repository's AGENTS.md or CLAUDE.md names its deploy. For an
   app, the push to its Gitea repository is the deploy.
+- An instruction file says what a deploy is meant to be, not what
+  exists. Before a deploy or a redeploy, check that its target exists on
+  this cluster: the app, its namespace, its repository. If it does not,
+  stop and say so: a deploy of a missing app creates it.
 - Allowed locally: the tests a repository's AGENTS.md, CLAUDE.md or
   README asks for, and reproducing a failed cluster build step when its
   log does not show the cause. Say which of the two it is before running

@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Thinkube is a collection of Ansible playbooks for deploying a complete Kubernetes platform on Ubuntu servers. The playbooks provision bare-metal hosts, install Kubernetes with kubeadm, and deploy 17 core services plus 17+ optional services (AI tools, databases, monitoring).
+Thinkube is a collection of Ansible playbooks for deploying a complete Kubernetes platform on Ubuntu servers. The playbooks provision bare-metal hosts, install Kubernetes with kubeadm, and deploy 15 core components (`ansible/40_thinkube/core/`) plus 17 optional ones (AI tools, databases, monitoring).
 
-**Version**: 0.1.0 (under active development)
+**Version**: 0.1.0, released. `thinkube-release/VERSIONING.md` says how a fix is numbered and published; the README of `thinkube-fixes` says how a cluster hears about it.
 
 ## Running Playbooks
 
