@@ -16,6 +16,13 @@ user's cluster does not have this file.
   Control is pushed before it is deployed.
 - Apps deployed from templates (`~/apps/<app>`) are not part of the
   platform; a push to their Gitea repository is their deploy.
+- Components built from a template (`~/components/<name>`: vLLM,
+  TensorRT-LLM, text-embeddings) are deployed copies. Their source is the
+  template repository named in `thinkube-metadata/optional_components.json`
+  (`~/thinkube-platform/templates/tkt-*`). Change the template, push it to
+  GitHub, then redeploy the component from it (`redeploy_template`); this
+  cluster renders a platform template from the head of its branch. Never
+  commit a change to the copy in `~/components/` or its Gitea repository.
 
 ## How a platform change travels
 
