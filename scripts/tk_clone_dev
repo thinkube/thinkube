@@ -20,20 +20,53 @@
 # platform's base instructions stay as they are; a user's cluster, which never
 # runs this script, does not get the add-on. `tk_clone_dev --remove-addon`
 # removes it.
+#
+# The add-on also widens Claude Code's permissions for developing the
+# platform (claude-permissions.json next to the add-on): every tool is
+# allowed, and destructive git and GitHub actions still ask. The rules are
+# merged into ~/.claude/settings.json and taken out again by --remove-addon.
 
 set -e
 
 PLATFORM_DIR="/home/thinkube/thinkube-platform"
+ADDON_DIR="$PLATFORM_DIR/core/thinkube/ansible/roles/agent_clients/files/developer"
 ADDON_NAME="THINKUBE-DEVELOPER.md"
-ADDON_SRC="$PLATFORM_DIR/core/thinkube/ansible/roles/agent_clients/files/developer/$ADDON_NAME"
+ADDON_SRC="$ADDON_DIR/$ADDON_NAME"
+PERMISSIONS_SRC="$ADDON_DIR/claude-permissions.json"
 CLAUDE_DIR="/home/thinkube/.claude"
+
+# Adds (add) or removes (remove) the developer permission rules in
+# ~/.claude/settings.json; every other setting is kept.
+developer_permissions() {
+  python3 - "$1" "$PERMISSIONS_SRC" "$CLAUDE_DIR/settings.json" <<'EOF'
+import json, os, sys
+action, rules_path, settings_path = sys.argv[1:4]
+rules = json.load(open(rules_path))
+settings = json.load(open(settings_path)) if os.path.exists(settings_path) else {}
+perms = settings.setdefault("permissions", {})
+for kind in ("allow", "ask"):
+    current = perms.setdefault(kind, [])
+    if action == "add":
+        current.extend(r for r in rules[kind] if r not in current)
+    else:
+        perms[kind] = [r for r in current if r not in rules[kind]]
+with open(settings_path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+EOF
+}
 
 if [ "${1:-}" = "--remove-addon" ]; then
   rm -f "$CLAUDE_DIR/$ADDON_NAME"
   if [ -f "$CLAUDE_DIR/CLAUDE.md" ]; then
     grep -vxF "@$ADDON_NAME" "$CLAUDE_DIR/CLAUDE.md" > "$CLAUDE_DIR/CLAUDE.md.tmp" && mv "$CLAUDE_DIR/CLAUDE.md.tmp" "$CLAUDE_DIR/CLAUDE.md"
   fi
-  echo "Developer add-on removed from $CLAUDE_DIR"
+  if [ ! -f "$PERMISSIONS_SRC" ]; then
+    echo "ERROR: $PERMISSIONS_SRC is missing: the developer permissions cannot be removed from $CLAUDE_DIR/settings.json"
+    exit 1
+  fi
+  developer_permissions remove
+  echo "Developer add-on and its permissions removed from $CLAUDE_DIR"
   exit 0
 fi
 BRANCH="${THINKUBE_BRANCH:-main}"
@@ -82,3 +115,10 @@ if ! grep -qxF "@$ADDON_NAME" "$CLAUDE_DIR/CLAUDE.md"; then
   printf '@%s\n' "$ADDON_NAME" >> "$CLAUDE_DIR/CLAUDE.md"
 fi
 echo "Developer add-on installed: $CLAUDE_DIR/$ADDON_NAME, imported by $CLAUDE_DIR/CLAUDE.md"
+
+if [ ! -f "$PERMISSIONS_SRC" ]; then
+  echo "ERROR: $PERMISSIONS_SRC is missing: the thinkube checkout has no developer permissions"
+  exit 1
+fi
+developer_permissions add
+echo "Developer permissions merged into $CLAUDE_DIR/settings.json: every tool allowed, destructive git and GitHub actions ask"
