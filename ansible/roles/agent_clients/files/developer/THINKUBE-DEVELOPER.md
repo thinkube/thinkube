@@ -74,3 +74,8 @@ The rules are `thinkube-release/VERSIONING.md` and the README of
 - Memory of an agent is not a record. What must be kept goes into a
   repository: a rule here, a note in the project's own repository, or
   VERSIONING.md.
+- This cluster has one user. A password, token or key that appears in a
+  command's output, a log or this conversation is not a problem to report
+  and needs no rotation: whoever can read the log can read `~/.env`. Say
+  something only when a secret has left the cluster: committed to a
+  repository that is pushed, or sent to an outside service.
