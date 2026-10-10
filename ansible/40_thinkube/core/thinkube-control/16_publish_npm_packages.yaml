@@ -1,0 +1,204 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/16_publish_npm_packages.yaml
+# Description:
+#   Build Thinkube's npm packages and publish them to this cluster's Gitea
+#   npm registry, the npm twin of 16_publish_packages.yaml (Python, DevPI).
+#   Each package is built from its GitHub repository at the branch the
+#   cluster follows (thinkube_ref), so a cluster publishes exactly what its
+#   branch holds: a release cluster its release branch, a development
+#   cluster main. Builds then install the packages from Gitea, inside the
+#   cluster. The package's own pipeline tests it; this playbook only builds
+#   and publishes.
+#
+#   A version already in the registry is left as it is, so a second run
+#   changes nothing. A new version of a package is published by raising its
+#   version on the branch and running this playbook again.
+#
+#   The build runs as a Kubernetes Job on the platform's node-base image,
+#   which carries git and npm.
+#
+# Requirements:
+#   - Gitea deployed and configured (gitea/10_deploy.yaml, gitea/15_configure.yaml),
+#     which keeps the admin token in the secret gitea-admin-token
+#   - Harbor holding node-base:22-alpine (harbor-images/14_build_base_images.yaml)
+#   - Environment variable GITHUB_TOKEN when a package's repository is private
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/thinkube-control/16_publish_npm_packages.yaml
+#
+# Variables from inventory:
+#   - domain_name, harbor_registry, kubeconfig, kubectl_bin
+
+- name: Build and publish Thinkube npm packages to Gitea
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    gitea_namespace: gitea
+    gitea_host: "git.{{ domain_name }}"
+    # The Gitea owner whose npm registry the builds of apps read (their .npmrc).
+    npm_owner: thinkube-deployments
+    npm_registry: "https://{{ gitea_host }}/api/packages/{{ npm_owner }}/npm/"
+    job_namespace: thinkube-control
+    job_name: publish-npm-packages
+    github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+    packages:
+      # private: the repository needs GITHUB_TOKEN to be cloned.
+      - name: thinkube-flows
+        repo: thinkube/thinkube-flows
+        branch: "{{ thinkube_ref }}"
+        private: true
+
+  tasks:
+    - name: Refuse a private package without GITHUB_TOKEN
+      ansible.builtin.fail:
+        msg: >-
+          {{ packages | selectattr('private') | map(attribute='repo') | join(', ') }} is private on GitHub,
+          and GITHUB_TOKEN is not set. Set it in ~/.env to a token that can read the repository.
+      when: packages | selectattr('private') | list | length > 0 and github_token == ""
+
+    - name: Read the Gitea admin token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ gitea_namespace }}"
+        name: gitea-admin-token
+      register: gitea_admin_token
+
+    - name: Refuse to go on without the Gitea admin token
+      ansible.builtin.fail:
+        msg: "The secret {{ gitea_namespace }}/gitea-admin-token does not exist; gitea/15_configure.yaml creates it."
+      when: gitea_admin_token.resources | length == 0
+
+    - name: Give the job its credentials
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ job_name }}"
+            namespace: "{{ job_namespace }}"
+          type: Opaque
+          stringData:
+            GITEA_TOKEN: "{{ gitea_admin_token.resources[0].data.token | b64decode }}"
+            GITHUB_TOKEN: "{{ github_token }}"
+      no_log: true
+
+    - name: Remove a job left by an earlier run
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ job_namespace }}"
+        name: "{{ job_name }}"
+        delete_options:
+          propagationPolicy: Background
+        wait: true
+
+    - name: Build and publish each package
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "{{ job_name }}"
+            namespace: "{{ job_namespace }}"
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: publish
+                    image: "{{ harbor_registry }}/library/node-base:22-alpine"
+                    envFrom:
+                      - secretRef:
+                          name: "{{ job_name }}"
+                    env:
+                      - name: PACKAGES
+                        value: "{% for p in packages %}{{ p.repo }}@{{ p.branch }} {% endfor %}"
+                      - name: REGISTRY
+                        value: "{{ npm_registry }}"
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -e
+                        registry_path="${REGISTRY#https:}"
+                        printf '@thinkube:registry=%s\n%s:_authToken=%s\n' "$REGISTRY" "$registry_path" "$GITEA_TOKEN" > "$HOME/.npmrc"
+                        for spec in $PACKAGES; do
+                          repo="${spec%@*}"; branch="${spec#*@}"
+                          dir="/tmp/$(basename "$repo")"
+                          echo "== $repo at $branch"
+                          if [ -n "$GITHUB_TOKEN" ]; then url="https://x-access-token:${GITHUB_TOKEN}@github.com/${repo}.git"; else url="https://github.com/${repo}.git"; fi
+                          git clone --quiet --depth 1 --branch "$branch" "$url" "$dir"
+                          echo "commit $(git -C "$dir" rev-parse HEAD)"
+                          cd "$dir"
+                          npm ci --no-audit --no-fund
+                          npm run build
+                          # Every published package of the repository: the root's workspaces, or the root itself.
+                          for pkg in $(node -e 'const p=require("./package.json"); const w=p.workspaces; console.log((Array.isArray(w)?w:["."]).join(" "))'); do
+                            name=$(node -p "require('./$pkg/package.json').name")
+                            version=$(node -p "require('./$pkg/package.json').version")
+                            if [ "$(node -p "require('./$pkg/package.json').private === true")" = "true" ]; then continue; fi
+                            if npm view "$name@$version" version --registry "$REGISTRY" >/dev/null 2>&1; then
+                              echo "unchanged $name@$version"
+                              continue
+                            fi
+                            # A pre-release goes under the tag 'next', so 'latest' stays a release.
+                            case "$version" in *-*) tag=next ;; *) tag=latest ;; esac
+                            (cd "$pkg" && npm publish --tag "$tag" --registry "$REGISTRY")
+                            echo "published $name@$version ($tag)"
+                          done
+                          cd /
+                        done
+
+    - name: Wait for the job to finish
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ job_namespace }}"
+        name: "{{ job_name }}"
+      register: publish_job
+      until: >-
+        publish_job.resources | length > 0 and
+        ((publish_job.resources[0].status.succeeded | default(0)) > 0 or (publish_job.resources[0].status.failed | default(0)) > 0)
+      retries: 60
+      delay: 10
+
+    - name: Read the job's log
+      ansible.builtin.command:
+        cmd: "{{ kubectl_bin }} logs -n {{ job_namespace }} job/{{ job_name }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: publish_log
+      changed_when: "'published ' in publish_log.stdout"
+
+    - name: Remove the job's credentials
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Secret
+        namespace: "{{ job_namespace }}"
+        name: "{{ job_name }}"
+
+    - name: Report what was published
+      ansible.builtin.debug:
+        msg: "{{ publish_log.stdout_lines | select('match', '^(== |commit |published |unchanged )') | list }}"
+
+    - name: Fail when the job failed
+      ansible.builtin.fail:
+        msg: "Publishing failed. The job's log:\n{{ publish_log.stdout }}"
+      when: (publish_job.resources[0].status.failed | default(0)) > 0
