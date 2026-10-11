@@ -44,6 +44,11 @@ The rules are `thinkube-release/VERSIONING.md` and the README of
 
 ## Rules learned the hard way
 
+- A version tag raises only the last number. `MAJOR.MINOR` is the
+  platform's release (0.1 today), in every repository: the platform's,
+  templates, and the user's own. A repository's first tag is `v0.1.0`, the
+  next `v0.1.1`, then `v0.1.2`; never `v0.2.0` while the platform is 0.1.
+  `metadata.version` in `thinkube.yaml` says the same number as the tag.
 - `release-*` is what every new install reads. Never push to it; never
   tag a commit as a fix before it was seen running here.
 - `thinkube-control/12_deploy.yaml` drops the component's databases. It
