@@ -55,8 +55,9 @@ The rules are `thinkube-release/VERSIONING.md` and the README of
   runs on a first install or after `19_rollback.yaml`, never to update.
   A fix of thinkube-control names `12_deploy_dev.yaml`.
 - An instruction file says what a deploy is meant to be, not what exists.
-  Check the target exists before a deploy or redeploy; a deploy of a
-  missing app creates it.
+  Check the target exists before a deploy or redeploy an instruction file
+  describes; a deploy of a missing app creates an app nobody asked for.
+  A new app the person asked for is deployed without asking.
 - The public documentation, https://thinkube.org, is GitHub Pages,
   published only by running `pages.yml` of `thinkube.org` by hand from
   `main`: `gh workflow run pages.yml -R thinkube/thinkube.org --ref main`.

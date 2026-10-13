@@ -19,9 +19,12 @@ runs. So the IDE is never where a change is checked.
 - Each repository's AGENTS.md or CLAUDE.md names its deploy. For an
   app, the push to its Gitea repository is the deploy.
 - An instruction file says what a deploy is meant to be, not what
-  exists. Before a deploy or a redeploy, check that its target exists on
-  this cluster: the app, its namespace, its repository. If it does not,
-  stop and say so: a deploy of a missing app creates it.
+  exists. Before a deploy or a redeploy that an instruction file
+  describes, check that its target exists on this cluster: the app, its
+  namespace, its repository. If it does not, stop and say so: a deploy of
+  a missing app creates it, and nobody asked for that app. Creating an
+  app the person asked for, such as a new service of the work in hand,
+  is the work itself: deploy it without asking.
 - Allowed locally: reproducing a failed cluster build step when its log
   does not show the cause. Say so before running it.
 - Work that no pipeline does is not a check, and this policy does not
