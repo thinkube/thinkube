@@ -30,17 +30,13 @@ user's cluster does not have this file.
 2. Deploy it here and look at it running. Thinkube Control:
    `12_deploy_dev.yaml`; other components: their own playbook. A change
    that was not seen running is not verified.
-3. When verified: cherry-pick to `release-<MAJOR.MINOR>` through a pull
-   request (`release-*` branches refuse direct pushes), raise the
-   component's `PATCH` (`ansible/40_thinkube/<core|optional>/<component>/VERSION`
-   in `thinkube`; the bump is part of the fix commit on `main`), tag the
-   component's repository `vMAJOR.MINOR.PATCH` on the release-branch
-   commit, and add the entry to `thinkube-fixes/releases/<MAJOR.MINOR>.json`
-   (check it with its `scripts/check_feed.py`).
-4. Other clusters apply it from News & Fixes; this one already runs it.
 
-The rules are `thinkube-release/VERSIONING.md` and the README of
-`thinkube-fixes`. Read both before a platform change.
+A development change is finished there. Releasing is a separate process,
+started on its own when someone asks for a release: it cherry-picks to
+`release-<MAJOR.MINOR>`, raises versions, tags, and adds the fixes entry,
+as `thinkube-release/VERSIONING.md` and the README of `thinkube-fixes`
+describe. A development change does none of that and does not raise a
+`VERSION`; read those two files when a release is asked for.
 
 ## Rules learned the hard way
 
