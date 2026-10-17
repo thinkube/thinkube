@@ -412,6 +412,22 @@ hub:
                       "key": "thinkube.io/training", "operator": "Equal",
                       "value": "true", "effect": "NoSchedule"}]
                   logger.info("Tolerates training mode on its node")
+                  # A training's checkpoints must outlive the job's pod: the
+                  # node's own disk, kept across sessions, at /home/thinkube/training
+                  # (the pod's scratch is an emptyDir, deleted with the pod).
+                  spawner.volumes = list(spawner.volumes or []) + [{
+                      "name": "training",
+                      "hostPath": {"path": "/var/lib/thinkube-training", "type": "DirectoryOrCreate"}}]
+                  spawner.volume_mounts = list(spawner.volume_mounts or []) + [{
+                      "name": "training", "mountPath": "/home/thinkube/training"}]
+                  spawner.init_containers = list(spawner.init_containers or []) + [{
+                      "name": "training-permissions",
+                      "image": "{{ harbor_registry }}/library/busybox:latest",
+                      "imagePullPolicy": "IfNotPresent",
+                      "command": ["sh", "-c", "chown 1000:100 /home/thinkube/training && chmod 755 /home/thinkube/training"],
+                      "securityContext": {"runAsUser": 0},
+                      "volumeMounts": [{"name": "training", "mountPath": "/home/thinkube/training"}]}]
+                  logger.info("Mounts the node's training folder at /home/thinkube/training")
 
       c.KubeSpawner.profile_list = get_profile_list
       c.KubeSpawner.pre_spawn_hook = resource_selector_hook
