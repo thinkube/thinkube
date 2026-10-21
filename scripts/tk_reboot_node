@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Reboot one cluster node, moving what can move first.
+
+Usage: tk_reboot_node <node> [--dry-run]
+
+1. Lists the workloads whose ready pods all run on the node, and splits
+   them into those that can run elsewhere and those that cannot (a volume
+   bound to the node's disk, or a node selector for it).
+2. Asks once, naming the node and what will be unavailable. The control
+   plane is asked a second time: the API server and the platform's
+   databases stop with it.
+3. Cordons the node and restarts the movable workloads, so they start on
+   other nodes.
+4. Reboots the node with tk_ssh and waits until it is Ready again.
+5. Waits until the node's CSI drivers are registered, then deletes the pods
+   with node-local volumes that are stuck: a volume mounted before its CSI
+   driver registered is never retried.
+6. Uncordons the node and reports every listed workload.
+
+--dry-run lists and plans, prints the question it would ask, and changes
+nothing.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+KUBECTL = shutil.which("kubectl")
+TK_SSH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tk_ssh")
+CONTROL_PLANE_LABEL = "node-role.kubernetes.io/control-plane"
+READY_TIMEOUT = 20 * 60
+ROLLOUT_TIMEOUT = "300s"
+
+
+def kubectl_json(*args):
+    out = subprocess.run([KUBECTL, *args, "-o", "json"], capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit(f"ERROR: kubectl {' '.join(args)}: {out.stderr.strip()}")
+    return json.loads(out.stdout)
+
+
+def kubectl(*args):
+    out = subprocess.run([KUBECTL, *args], capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit(f"ERROR: kubectl {' '.join(args)}: {out.stderr.strip()}")
+    return out.stdout.strip()
+
+
+def node_ready(node):
+    conditions = kubectl_json("get", "node", node)["status"]["conditions"]
+    return any(c["type"] == "Ready" and c["status"] == "True" for c in conditions)
+
+
+def workload_of(pod, replica_sets):
+    """(kind, namespace, name) of the controller that owns the pod."""
+    ns = pod["metadata"]["namespace"]
+    for ref in pod["metadata"].get("ownerReferences", []):
+        if ref["kind"] == "ReplicaSet":
+            rs = replica_sets.get((ns, ref["name"]))
+            for rs_ref in (rs or {}).get("metadata", {}).get("ownerReferences", []):
+                if rs_ref["kind"] == "Deployment":
+                    return ("Deployment", ns, rs_ref["name"])
+            return ("ReplicaSet", ns, ref["name"])
+        return (ref["kind"], ns, ref["name"])
+    return ("Pod", ns, pod["metadata"]["name"])
+
+
+def pod_is_ready(pod):
+    return any(c["type"] == "Ready" and c["status"] == "True"
+               for c in pod.get("status", {}).get("conditions", []))
+
+
+def node_matches(pod, labels):
+    """Whether a node with these labels satisfies the pod's node selector and
+    required node affinity (In, NotIn, Exists, DoesNotExist)."""
+    for key, value in pod["spec"].get("nodeSelector", {}).items():
+        if labels.get(key) != value:
+            return False
+    required = (pod["spec"].get("affinity", {}).get("nodeAffinity", {})
+                .get("requiredDuringSchedulingIgnoredDuringExecution", {}))
+    terms = required.get("nodeSelectorTerms", [])
+    if not terms:
+        return True
+
+    def expr_ok(e):
+        op, key, values = e["operator"], e["key"], e.get("values", [])
+        if op == "In":
+            return labels.get(key) in values
+        if op == "NotIn":
+            return labels.get(key) not in values
+        if op == "Exists":
+            return key in labels
+        if op == "DoesNotExist":
+            return key not in labels
+        return False
+
+    return any(all(expr_ok(e) for e in t.get("matchExpressions", [])) for t in terms)
+
+
+def local_volume_reason(pod, node, pvcs, pvs, other_nodes):
+    """Why the pod cannot run elsewhere, or None. other_nodes maps each Ready,
+    schedulable node except this one to its labels."""
+    if not any(node_matches(pod, labels) for labels in other_nodes.values()):
+        return "no other node matches its node selector"
+    ns = pod["metadata"]["namespace"]
+    for vol in pod["spec"].get("volumes", []):
+        claim = vol.get("persistentVolumeClaim", {}).get("claimName")
+        if not claim:
+            continue
+        pv_name = pvcs.get((ns, claim), {}).get("spec", {}).get("volumeName")
+        pv = pvs.get(pv_name, {})
+        affinity = pv.get("spec", {}).get("nodeAffinity", {}).get("required", {})
+        for term in affinity.get("nodeSelectorTerms", []):
+            for expr in term.get("matchExpressions", []):
+                if node in expr.get("values", []):
+                    return f"volume {claim} is on this node's disk"
+    return None
+
+
+def plan(node):
+    pods = kubectl_json("get", "pods", "-A")["items"]
+    replica_sets = {(r["metadata"]["namespace"], r["metadata"]["name"]): r
+                    for r in kubectl_json("get", "replicasets", "-A")["items"]}
+    pvcs = {(c["metadata"]["namespace"], c["metadata"]["name"]): c
+            for c in kubectl_json("get", "pvc", "-A")["items"]}
+    pvs = {v["metadata"]["name"]: v for v in kubectl_json("get", "pv")["items"]}
+    other_nodes = {
+        n["metadata"]["name"]: n["metadata"].get("labels", {})
+        for n in kubectl_json("get", "nodes")["items"]
+        if n["metadata"]["name"] != node and not n["spec"].get("unschedulable")
+        and any(c["type"] == "Ready" and c["status"] == "True" for c in n["status"]["conditions"])
+    }
+
+    ready_nodes = {}
+    on_node = {}
+    for pod in pods:
+        if pod.get("status", {}).get("phase") in ("Succeeded", "Failed"):
+            continue
+        # JuiceFS mount pods belong to the CSI driver on their node and come
+        # back with it.
+        if pod["metadata"].get("labels", {}).get("app.kubernetes.io/name") == "juicefs-mount":
+            continue
+        key = workload_of(pod, replica_sets)
+        if key[0] in ("DaemonSet", "Job", "Node"):
+            continue
+        if pod_is_ready(pod):
+            ready_nodes.setdefault(key, set()).add(pod["spec"].get("nodeName"))
+        if pod["spec"].get("nodeName") == node:
+            on_node.setdefault(key, []).append(pod)
+
+    movable, unmovable, shared = [], [], []
+    for key, node_pods in sorted(on_node.items()):
+        if ready_nodes.get(key, set()) - {node}:
+            shared.append(key)
+            continue
+        reasons = {r for r in (local_volume_reason(p, node, pvcs, pvs, other_nodes) for p in node_pods) if r}
+        if reasons or key[0] in ("Pod", "ReplicaSet"):
+            unmovable.append((key, "; ".join(sorted(reasons)) or "no controller to start it elsewhere"))
+        else:
+            movable.append(key)
+    return movable, unmovable, shared
+
+
+def name(key):
+    return f"{key[0]} {key[1]}/{key[2]}"
+
+
+def ask(question, expected):
+    answer = input(f"{question}\nType {expected} to continue: ").strip()
+    if answer != expected:
+        sys.exit("Stopped: nothing was changed.")
+
+
+def wait_ready(node, ready):
+    deadline = time.time() + READY_TIMEOUT
+    while time.time() < deadline:
+        if node_ready(node) == ready:
+            return
+        time.sleep(10)
+    sys.exit(f"ERROR: {node} did not become {'Ready' if ready else 'NotReady'} "
+             f"within {READY_TIMEOUT // 60} minutes; it is still cordoned.")
+
+
+def needed_csi_drivers(node, pvs):
+    return {pv["spec"]["csi"]["driver"] for pv in pvs.values()
+            if "csi" in pv.get("spec", {}) and node in json.dumps(pv["spec"].get("nodeAffinity", {}))}
+
+
+def wait_csi(node, drivers):
+    deadline = time.time() + READY_TIMEOUT
+    while time.time() < deadline:
+        registered = {d["name"] for d in kubectl_json("get", "csinode", node)["spec"].get("drivers") or []}
+        if drivers <= registered:
+            return
+        time.sleep(10)
+    sys.exit(f"ERROR: CSI drivers {sorted(drivers - registered)} did not register on {node}; "
+             f"it is still cordoned.")
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--dry-run"]
+    dry_run = "--dry-run" in sys.argv[1:]
+    if len(args) != 1:
+        sys.exit("Usage: tk_reboot_node <node> [--dry-run]")
+    node = args[0]
+    if not KUBECTL:
+        sys.exit("ERROR: kubectl is not on the PATH; run tk_reboot_node from the Thinkube IDE terminal")
+    node_obj = kubectl_json("get", "node", node)
+    is_control_plane = CONTROL_PLANE_LABEL in node_obj["metadata"].get("labels", {})
+
+    movable, unmovable, shared = plan(node)
+    print(f"Node {node}{' (control plane)' if is_control_plane else ''}")
+    print(f"\nMoved to other nodes before the reboot ({len(movable)}):")
+    for key in movable:
+        print(f"  {name(key)}")
+    print(f"\nUnavailable until {node} is back ({len(unmovable)}):")
+    for key, reason in unmovable:
+        print(f"  {name(key)}: {reason}")
+    print(f"\nKeep serving from other nodes ({len(shared)}):")
+    for key in shared:
+        print(f"  {name(key)}")
+    print("\nDaemonSet pods and JuiceFS mount pods on the node stop and start again with it.")
+
+    question = (f"Reboot {node}? {len(unmovable)} workload(s) above are unavailable "
+                f"until it is back.")
+    if dry_run:
+        print(f"\nThe question it would ask: {question}")
+        if is_control_plane:
+            print(f"And: {node} is the control plane: the API server, PostgreSQL and "
+                  f"Thinkube Control stop until it is back.")
+        print("Dry run: nothing was changed.")
+        return
+
+    ask(question, node)
+    if is_control_plane:
+        ask(f"{node} is the control plane: the API server, PostgreSQL and Thinkube "
+            f"Control stop until it is back.", f"reboot {node}")
+
+    pvs = {v["metadata"]["name"]: v for v in kubectl_json("get", "pv")["items"]}
+    drivers = needed_csi_drivers(node, pvs)
+
+    print(kubectl("cordon", node))
+    for kind, ns, wl in movable:
+        kubectl("rollout", "restart", f"{kind.lower()}/{wl}", "-n", ns)
+    for kind, ns, wl in movable:
+        print(kubectl("rollout", "status", f"{kind.lower()}/{wl}", "-n", ns, f"--timeout={ROLLOUT_TIMEOUT}"))
+
+    reboot = subprocess.run([TK_SSH, node, "sudo systemctl reboot"], capture_output=True, text=True)
+    print(f"Reboot requested ({reboot.returncode}): {reboot.stdout.strip()[-200:]}")
+    wait_ready(node, False)
+    wait_ready(node, True)
+    print(f"{node} is Ready.")
+    if drivers:
+        wait_csi(node, drivers)
+        print(f"CSI drivers registered: {', '.join(sorted(drivers))}")
+
+    for pod in kubectl_json("get", "pods", "-A", "--field-selector", f"spec.nodeName={node}")["items"]:
+        phase = pod.get("status", {}).get("phase")
+        if phase == "Unknown" or (phase == "Pending" and pod["metadata"].get("deletionTimestamp")):
+            ns, pod_name = pod["metadata"]["namespace"], pod["metadata"]["name"]
+            print(f"Deleting stuck pod {ns}/{pod_name} ({phase})")
+            kubectl("delete", "pod", pod_name, "-n", ns, "--force", "--grace-period=0")
+
+    print(kubectl("uncordon", node))
+    time.sleep(30)
+    print("\nWorkloads after the reboot:")
+    for kind, ns, wl in movable + [k for k, _ in unmovable]:
+        if kind in ("Pod", "ReplicaSet"):
+            continue
+        status = kubectl_json("get", kind.lower(), wl, "-n", ns)["status"]
+        print(f"  {kind} {ns}/{wl}: {status.get('readyReplicas', 0)}/{status.get('replicas', 0)} ready")
+
+
+if __name__ == "__main__":
+    main()
