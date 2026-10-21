@@ -35,6 +35,7 @@
     container_registry: "registry.{{ domain_name }}"
     container_image: "{{ container_registry }}/library/tk-package-version:latest"
     service_port: 18080
+    harbor_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
   tasks:
     - name: Ensure namespace exists
@@ -67,6 +68,18 @@
                 name: http
             type: ClusterIP
 
+    # The image is tagged latest, so a rebuilt image leaves the Deployment's
+    # spec unchanged. Its digest goes into a pod annotation: a new image
+    # rolls the pod, an unchanged one leaves it running.
+    - name: Read the digest of the image in Harbor
+      ansible.builtin.uri:
+        url: "https://{{ container_registry }}/api/v2.0/projects/library/repositories/tk-package-version/artifacts/latest"
+        headers:
+          Authorization: "Basic {{ ('admin:' + harbor_admin_password) | b64encode }}"
+        status_code: 200
+      register: image_artifact
+      no_log: true
+
     - name: Deploy MCP Package Version deployment
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -86,6 +99,8 @@
               metadata:
                 labels:
                   app: "{{ app_name }}"
+                annotations:
+                  thinkube.io/image-digest: "{{ image_artifact.json.digest }}"
               spec:
                 imagePullSecrets:
                   - name: harbor-pull-secret
