@@ -23,7 +23,7 @@
   
   vars:
     code_server_namespace: "code-server"
-    claude_code_version: "2.1.288"
+    claude_code_version: "2.1.301"
     shared_code_path: "/home/{{ system_username }}/shared-code"
     code_source_path: "{{ shared_code_path }}"
     # Where the installer keeps the secrets it was given, on this host.
@@ -492,6 +492,9 @@
           allow:
             - "mcp__thinkube-control"
             - "mcp__thinkube-tandem"
+            # The Tandem server as the plugin registers it (see the plugin
+            # task below): its tools are mcp__plugin_tandem_thinkube-tandem__*.
+            - "mcp__plugin_tandem_thinkube-tandem"
             - "mcp__tk-package-version"
             - "Edit(//home/thinkube/thinkube-platform/**)"
             - "Read(//home/thinkube/**)"
@@ -1258,6 +1261,32 @@
           rm -rf "$BUILD"
           '
       loop: "{{ extension_repos }}"
+
+    # The Tandem extension ships a Claude Code plugin marketplace beside its
+    # code (claude-plugins/): the plugin registers the Tandem MCP server,
+    # offers the Workshop's flows as prompts, and carries the skill that
+    # tells an agent what the two gates are. The marketplace is read from
+    # the version-stable extension-current path, so a redeploy of the
+    # extension is a redeploy of the plugin. Idempotent: a marketplace and
+    # a plugin already present are left as they are.
+    - name: Install the Tandem plugin for Claude Code from the extension's marketplace
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ code_server_namespace }} {{ pod_name.stdout }} -- \
+          bash -lc '
+          set -e
+          MARKET=/home/thinkube/.local/share/code-server/User/globalStorage/thinkube.thinkube-tandem/extension-current/claude-plugins
+          test -f "$MARKET/.claude-plugin/marketplace.json"
+          if ! claude plugin marketplace list 2>/dev/null | grep -qE "^\s*❯ thinkube$"; then
+            claude plugin marketplace add "$MARKET" --scope user
+            echo changed
+          fi
+          if ! claude plugin list 2>/dev/null | grep -q "tandem@thinkube"; then
+            claude plugin install tandem@thinkube --scope user
+            echo changed
+          fi
+          '
+      register: tandem_plugin_result
+      changed_when: "'changed' in tandem_plugin_result.stdout"
       register: extension_installs
 
     - name: Display the extension installations

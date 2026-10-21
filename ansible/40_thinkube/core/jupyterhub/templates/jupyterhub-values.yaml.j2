@@ -387,9 +387,15 @@ hub:
               # Request 25% of the limit (matching the default guarantee/limit ratio of 2G/8G).
               # This avoids hitting the namespace ResourceQuota while still allowing
               # the pod to burst up to the full limit when memory is available.
+              # A run that asks to reserve its memory (reserve_memory: yes, a
+              # notebook job such as a training) is guaranteed all of it, so
+              # the node is not filled under it while it runs.
               mem_bytes = int(float(memory.replace('G', '')) * 1073741824)
-              spawner.mem_guarantee = int(mem_bytes * 0.25)
-              logger.info(f"Set memory: limit={memory}, guarantee={int(mem_bytes * 0.25)}")
+              if user_options.get('reserve_memory') == 'yes':
+                  spawner.mem_guarantee = mem_bytes
+              else:
+                  spawner.mem_guarantee = int(mem_bytes * 0.25)
+              logger.info(f"Set memory: limit={memory}, guarantee={spawner.mem_guarantee}")
 
               # Apply GPU allocation
               gpu_count = user_options.get('enable_gpu', defaults['gpu'])
@@ -397,6 +403,31 @@ hub:
                   spawner.extra_resource_limits = {"nvidia.com/gpu": gpu_count}
                   spawner.extra_resource_guarantees = {"nvidia.com/gpu": gpu_count}
                   logger.info(f"Set GPU count: {gpu_count}")
+
+              # Training mode (Thinkube Control) keeps new pods off its node;
+              # a job Thinkube Control starts for that node is the training's
+              # own and tolerates the mark.
+              if user_options.get('training_node') == 'yes':
+                  spawner.tolerations = list(spawner.tolerations or []) + [{
+                      "key": "thinkube.io/training", "operator": "Equal",
+                      "value": "true", "effect": "NoSchedule"}]
+                  logger.info("Tolerates training mode on its node")
+                  # A training's checkpoints must outlive the job's pod: the
+                  # node's own disk, kept across sessions, at /home/thinkube/training
+                  # (the pod's scratch is an emptyDir, deleted with the pod).
+                  spawner.volumes = list(spawner.volumes or []) + [{
+                      "name": "training",
+                      "hostPath": {"path": "/var/lib/thinkube-training", "type": "DirectoryOrCreate"}}]
+                  spawner.volume_mounts = list(spawner.volume_mounts or []) + [{
+                      "name": "training", "mountPath": "/home/thinkube/training"}]
+                  spawner.init_containers = list(spawner.init_containers or []) + [{
+                      "name": "training-permissions",
+                      "image": "{{ harbor_registry }}/library/busybox:latest",
+                      "imagePullPolicy": "IfNotPresent",
+                      "command": ["sh", "-c", "chown 1000:100 /home/thinkube/training && chmod 755 /home/thinkube/training"],
+                      "securityContext": {"runAsUser": 0},
+                      "volumeMounts": [{"name": "training", "mountPath": "/home/thinkube/training"}]}]
+                  logger.info("Mounts the node's training folder at /home/thinkube/training")
 
       c.KubeSpawner.profile_list = get_profile_list
       c.KubeSpawner.pre_spawn_hook = resource_selector_hook

@@ -39,7 +39,7 @@ never mounted over:
     │   └── examples/            # Editable copies of examples (copied once)
     ├── templates/               # Examples repository (emptyDir, re-cloned on every start)
     ├── datasets/                # Shared datasets (JuiceFS, 500Gi)
-    ├── models/                  # Shared models (JuiceFS, 200Gi)
+    ├── models/                  # Shared models (JuiceFS, 600Gi quota)
     └── mlflow/                  # MLflow artifacts (same JuiceFS volume MLflow writes to)
 ```
 
@@ -166,7 +166,7 @@ This builds and pushes `tk-jupyter-base` to Harbor registry.
 
 `11_deploy.yaml` will:
 - Read the OIDC secret `jupyterhub-oidc-secret` created by `10_configure_keycloak.yaml`
-- Create JuiceFS PVCs for persistent storage (notebooks 100Gi, datasets 500Gi, models 200Gi) and a static PV for the MLflow artifacts volume
+- Create JuiceFS PVCs for persistent storage (notebooks 100Gi, datasets 500Gi, models 200Gi with a 600Gi quota set on its PV) and a static PV for the MLflow artifacts volume
 - Deploy JupyterHub (Helm) with the spawn form that queries thinkube-control
 - Configure volume mounts at `/home/thinkube/thinkube/` to preserve the home folder
 - Create the HTTPRoute `jupyterhub-httproute` for `notebooks.<domain_name>`
@@ -212,7 +212,7 @@ memory in the spawn form, and pick a venv as the kernel in JupyterLab.
 #### Persistent Storage (JuiceFS)
 - `/home/thinkube/thinkube/notebooks` - Your notebooks and work (100Gi)
 - `/home/thinkube/thinkube/datasets` - Shared datasets across all pods (500Gi)
-- `/home/thinkube/thinkube/models` - Saved models accessible from any pod (200Gi)
+- `/home/thinkube/thinkube/models` - Saved models accessible from any pod (600Gi)
 - `/home/thinkube/thinkube/mlflow` - MLflow artifacts, the same files MLflow stores
 
 #### Environment Variables

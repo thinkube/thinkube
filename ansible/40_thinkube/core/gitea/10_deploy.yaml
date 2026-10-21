@@ -290,6 +290,12 @@
             app: gitea
         spec:
           replicas: 1
+          # One Gitea owns the data volume: its queues hold a lock there, so a
+          # new pod can start only after the old one has stopped. The null
+          # removes the default rolling-update settings, which Recreate refuses.
+          strategy:
+            type: Recreate
+            rollingUpdate: null
           selector:
             matchLabels:
               app: gitea
@@ -299,6 +305,11 @@
                 app: gitea
             spec:
               priorityClassName: thinkube-platform
+              # Gitea and its node-local volume stay on the control plane, off
+              # the worker nodes whose GPUs and memory go to served models and
+              # trainings.
+              nodeSelector:
+                node-role.kubernetes.io/control-plane: ""
               initContainers:
               - name: init-directories
                 image: busybox:latest
@@ -370,8 +381,11 @@
                 # Service settings
                 - name: GITEA__service__DISABLE_REGISTRATION
                   value: "true"
+                # Thinkube runs inside the owner's private network, so content is
+                # readable without signing in; this is what lets builds install
+                # packages from Gitea's registries without a token.
                 - name: GITEA__service__REQUIRE_SIGNIN_VIEW
-                  value: "true"
+                  value: "false"
                 - name: GITEA__service__REGISTER_EMAIL_CONFIRM
                   value: "false"
                 - name: GITEA__service__ENABLE_NOTIFY_MAIL
