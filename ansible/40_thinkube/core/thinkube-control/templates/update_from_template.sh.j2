@@ -40,6 +40,19 @@ if [ -f .copier-answers.yml ]; then
     git commit -m "Fix copier answers to use HEAD"
   fi
   
+  # Copier renders the template over the checkout and never deletes a file, so
+  # a file removed from the template would stay and be built. Every tracked
+  # file is removed first and the template renders them again; one it no
+  # longer renders is gone. Kept: the answers, and the files other steps of the
+  # deploy write (the build's record of the deployed image tags, and the files
+  # of tasks/setup_git_hooks.yaml and the git_push role). A failed render
+  # restores the checkout.
+  trap 'git reset -q --hard HEAD' ERR
+  git ls-files -z \
+    | grep -zv -e '^\.copier-answers\.yml$' -e '^k8s/\.argocd-source-' \
+               -e '^process-templates\.sh$' -e '^reprocess-templates\.sh$' -e '^\.git-hooks-README\.md$' \
+    | xargs -0 rm -f
+
   # Use recopy to regenerate all files (including k8s manifests with new image tags)
   # Provide the missing variables that don't have defaults
   # Use --overwrite to handle any conflicts non-interactively
@@ -53,6 +66,7 @@ if [ -f .copier-answers.yml ]; then
     --data "admin_password={{ admin_password }}" \
     --data "auth_realm_username={{ auth_realm_username }}" \
     --data "github_username={{ github_username }}"
+  trap - ERR
 else
   echo "ERROR: .copier-answers.yml not found - cannot update without losing configuration"
   exit 1
