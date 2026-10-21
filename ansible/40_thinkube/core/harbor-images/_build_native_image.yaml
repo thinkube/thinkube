@@ -19,7 +19,14 @@
 # Optional variables:
 #   extra_build_args: Additional --build-arg flags as a string (e.g., "--build-arg FOO=bar")
 #   no_cache: Set to true to add --no-cache flag
-#   force_rebuild: Set to true to rebuild even if image already exists in Harbor
+#   force_rebuild: Set to true to rebuild even when the recipe is unchanged
+#
+# An image is rebuilt when its recipe changes. The recipe hash covers the
+# Containerfile as rendered on the build node, the files its COPY and ADD
+# lines take from the build context, and extra_build_args. Each build is
+# also pushed as build-<hash>-<arch>; an architecture whose tag for the
+# current hash is in Harbor is skipped. Packages a Containerfile installs
+# without a version change only with the recipe, or with force_rebuild.
 #
 # Expected variables from parent playbook:
 #   arch_build_nodes: Dict mapping arch -> hostname (e.g., {"arm64": "tkspark", "amd64": "node-a"})
@@ -31,17 +38,59 @@
 # CHECK EXISTING IMAGES
 # ============================================================================
 
-- name: "Check existing per-arch images in Harbor"
+- name: "Compute the recipe hash per arch"
+  ansible.builtin.shell: |
+    python3 - {{ remote_containerfiles_dir }}/{{ containerfile }} {{ build_context }} <<'PY'
+    import glob, hashlib, json, os, sys
+    containerfile, context = sys.argv[1], sys.argv[2]
+    text = open(containerfile, 'rb').read()
+    digest = hashlib.sha256(text)
+    digest.update({{ (extra_build_args | default('')) | to_json }}.encode())
+    sources = []
+    for line in text.decode().replace('\\\n', ' ').splitlines():
+        words = line.strip().split(None, 1)
+        if len(words) < 2 or words[0].upper() not in ('COPY', 'ADD'):
+            continue
+        rest = words[1].strip()
+        flags = []
+        while rest.startswith('--'):
+            flag, _, rest = rest.partition(' ')
+            flags.append(flag)
+            rest = rest.strip()
+        if any(f.startswith('--from') for f in flags):
+            continue
+        args = json.loads(rest) if rest.startswith('[') else rest.split()
+        sources += args[:-1]
+    files = set()
+    for source in sources:
+        for match in glob.glob(os.path.join(context, source)):
+            if os.path.isdir(match):
+                files.update(os.path.join(r, f) for r, _, fs in os.walk(match) for f in fs)
+            else:
+                files.add(match)
+    for path in sorted(files):
+        digest.update(os.path.relpath(path, context).encode())
+        digest.update(open(path, 'rb').read())
+    print(digest.hexdigest()[:12])
+    PY
+  delegate_to: "{{ item.value }}"
+  loop: "{{ arch_build_nodes | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} on {{ item.value }}"
+  register: _recipe_hash
+  changed_when: false
+
+- name: "Check per-arch builds of this recipe in Harbor"
   ansible.builtin.uri:
-    url: "https://{{ harbor_registry }}/api/v2.0/projects/{{ (image_name | replace(harbor_registry + '/', '')).split('/')[0] }}/repositories/{{ (image_name | replace(harbor_registry + '/', '')).split('/')[1:] | join('/') }}/artifacts/{{ image_tags[0] }}-{{ item.key }}"
+    url: "https://{{ harbor_registry }}/api/v2.0/projects/{{ (image_name | replace(harbor_registry + '/', '')).split('/')[0] }}/repositories/{{ (image_name | replace(harbor_registry + '/', '')).split('/')[1:] | join('/') }}/artifacts/build-{{ item.stdout | trim }}-{{ item.item.key }}"
     method: GET
     headers:
       Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
     validate_certs: true
     status_code: [200, 404]
-  loop: "{{ arch_build_nodes | dict2items }}"
+  loop: "{{ _recipe_hash.results }}"
   loop_control:
-    label: "{{ item.key }}"
+    label: "{{ item.item.key }} build-{{ item.stdout | trim }}"
   register: _arch_exists
   when: not (force_rebuild | default(false))
 
@@ -51,7 +100,7 @@
       {%- if force_rebuild | default(false) -%}
         {{ arch_build_nodes | dict2items }}
       {%- else -%}
-        {{ _arch_exists.results | selectattr('status', 'defined') | selectattr('status', 'equalto', 404) | map(attribute='item') | list }}
+        {{ _arch_exists.results | selectattr('status', 'defined') | selectattr('status', 'equalto', 404) | map(attribute='item') | map(attribute='item') | list }}
       {%- endif -%}
 
 - name: "Record what this image's build does"
@@ -61,7 +110,7 @@
            image_name ~ ': ' ~ (
              ('built for ' ~ (_archs_to_build | map(attribute='key') | list | join(', ')))
              if (_archs_to_build | length) > 0
-             else 'not rebuilt, every architecture is already in Harbor (force_rebuild=true rebuilds)'
+             else 'not rebuilt, this recipe is already built for every architecture (force_rebuild=true rebuilds)'
            )
          ] }}
 
@@ -81,6 +130,10 @@
 # record first (uv among them) wait for a connect timeout and the build
 # fails. With pasta's -4 the container has no IPv6 route and falls back
 # to IPv4 at once. Verified on podman 4.9.3.
+- name: "Recipe hash of each arch"
+  ansible.builtin.set_fact:
+    _recipe_by_arch: "{{ dict(_recipe_hash.results | map(attribute='item.key') | zip(_recipe_hash.results | map(attribute='stdout') | map('trim'))) }}"
+
 - name: "Build image per-arch (parallel)"
   ansible.builtin.shell: |
     podman build {{ '--no-cache' if no_cache | default(false) else '' }} \
@@ -89,6 +142,7 @@
                  --tls-verify=true \
                  {{ extra_build_args | default('') }} \
                  -t {{ image_name }}:{{ image_tags[0] }}-{{ item.key }} \
+                 -t {{ image_name }}:build-{{ _recipe_by_arch[item.key] }}-{{ item.key }} \
                  -f {{ remote_containerfiles_dir }}/{{ containerfile }} \
                  {{ build_context }}
   delegate_to: "{{ item.value }}"
@@ -117,6 +171,7 @@
 - name: "Push image per-arch (parallel)"
   ansible.builtin.shell: |
     podman push --tls-verify=true --creds=admin:{{ admin_password }} {{ image_name }}:{{ image_tags[0] }}-{{ item.key }}
+    podman push --tls-verify=true --creds=admin:{{ admin_password }} {{ image_name }}:build-{{ _recipe_by_arch[item.key] }}-{{ item.key }}
   delegate_to: "{{ item.value }}"
   loop: "{{ _archs_to_build }}"
   loop_control:

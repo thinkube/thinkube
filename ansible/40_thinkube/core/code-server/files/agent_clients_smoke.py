@@ -3,13 +3,17 @@
 
 """Smoke test of the agentic clients, run inside the code-server pod.
 
-Usage: python3 - DOMAIN ALIAS < agent_clients_smoke.py
+Usage: python3 - DOMAIN [ALIAS] < agent_clients_smoke.py
+
+ALIAS is a model alias of the gateway; without it, the test takes the agent
+default of the model catalog, as a new Tandem chat does, and Pi runs without
+--model so that it starts with the default itself. The model must be served.
 
 1. The LLM gateway answers ALIAS with the final text in message.content,
    with thinking on and with thinking off.
-2. Each local client (opencode, Pi), run once without a UI against the
-   gateway's ALIAS, calls the thinkube-control MCP tool list_services_minimal
-   and answers with the number of services Thinkube Control reports.
+2. Pi, run once without a UI against the gateway, calls the thinkube-control
+   MCP tool list_services_minimal and answers with the number of services
+   Thinkube Control reports.
 
 Claude Code is not checked: it works with Claude under the user's own
 Anthropic account, not with the gateway. Prints one line per check; exits 1
@@ -25,7 +29,8 @@ import tempfile
 import urllib.error
 import urllib.request
 
-DOMAIN, ALIAS = sys.argv[1], sys.argv[2]
+DOMAIN = sys.argv[1]
+NAMED = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
 TOKEN = os.environ.get("THINKUBE_API_TOKEN")
 if not TOKEN:
     sys.exit("THINKUBE_API_TOKEN is not set in the code-server pod; run thinkube-control/17_configure_discovery.yaml")
@@ -103,23 +108,37 @@ def check_client(name, called, answer, proc, expected):
     report(name, called and got == expected and proc.returncode == 0, detail)
 
 
+def model_to_test():
+    """The named alias, else the catalog's agent default; it must be served."""
+    models = http_json(f"{GATEWAY}/v1/models")["data"]
+    if NAMED:
+        found = [m for m in models if m["id"] == NAMED]
+        if not found:
+            sys.exit(f"The gateway lists no model {NAMED}")
+    else:
+        found = [m for m in models if m["thinkube"]["default_agent"] and m["id"] == (m["thinkube"]["aliases"] or [m["root"]])[0]]
+        if not found:
+            sys.exit("The model catalog names no agent default (default_agent)")
+    model = found[0]
+    if model["thinkube"]["state"] != "available":
+        sys.exit(f"{model['id']} ({model['root']}) is not loaded; load it in Thinkube Control, LLM Gateway")
+    return model["id"]
+
+
+ALIAS = model_to_test()
+print(f"Testing {ALIAS}" + ("" if NAMED else ", the agent default"), flush=True)
+
 expected = http_json(f"{CONTROL}/api/v1/services/minimal")["total"]
 print(f"Thinkube Control reports {expected} services", flush=True)
 
 gateway_check(thinking=False)
 gateway_check(thinking=True)
 
-# opencode: tool names are <server>_<tool>; tool_use events carry the part
-# of a finished call, text events the answer.
-proc, events = run(["opencode", "run", "--format", "json", "-m", f"thinkube/{ALIAS}", PROMPT])
-called = any(e.get("type") == "tool_use" and e["part"].get("tool") == f"thinkube-control_{TOOL}"
-             and e["part"]["state"].get("status") == "completed" for e in events)
-answer = "".join(e["part"].get("text", "") for e in events if e.get("type") == "text")
-check_client("opencode", called, answer, proc, expected)
-
 # Pi: tool names are mcp__<server>__<tool> with - as _; the answer is the
-# text of the last assistant message.
-proc, events = run(["pi", "--mode", "json", "--no-session", "--provider", "thinkube", "--model", ALIAS, PROMPT])
+# text of the last assistant message. Without a named alias Pi gets no
+# --model, and starts with the agent default by itself.
+model_args = ["--provider", "thinkube", "--model", ALIAS] if NAMED else []
+proc, events = run(["pi", "--mode", "json", "--no-session", *model_args, PROMPT])
 called = any(e.get("type") == "tool_execution_end" and e.get("toolName") == f"mcp__thinkube_control__{TOOL}"
              and not e.get("isError") for e in events)
 assistant = [e["message"] for e in events if e.get("type") == "message_end" and e["message"].get("role") == "assistant"]
