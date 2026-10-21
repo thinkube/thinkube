@@ -1,12 +1,17 @@
-#!/bin/bash
+#!/bin/sh
 # Copyright Alejandro Martínez Corriá and the Thinkube contributors
 # SPDX-License-Identifier: Apache-2.0
 
 # Service Discovery Init Script for Jupyter Pods
 # Queries all service discovery ConfigMaps and generates environment variable file
-# This runs as an init container before the main Jupyter container starts
+# This runs as an init container before the main Jupyter container starts,
+# with the POSIX sh of the tk-service-discovery image: no bash features.
+# A ConfigMap list or a Secret that cannot be read stops the init container
+# with an error that names it: a server started without its variables fails
+# later, far from the cause.
 
 set -e
+set -o pipefail
 
 OUTPUT_DIR="/service-config"
 SERVICE_ENV_FILE="$OUTPUT_DIR/service-env-jh.sh"
@@ -29,7 +34,10 @@ mkdir -p "$OUTPUT_DIR"
 
 # Query all service discovery ConfigMaps
 echo "Querying service discovery ConfigMaps..."
-CONFIGMAPS=$(kubectl get configmaps --all-namespaces -l thinkube.io/managed=true -o json 2>/dev/null || echo '{"items":[]}')
+if ! CONFIGMAPS=$(kubectl get configmaps --all-namespaces -l thinkube.io/managed=true -o json 2>&1); then
+    echo "ERROR: the service discovery ConfigMaps cannot be listed: $CONFIGMAPS"
+    exit 1
+fi
 
 # Count ConfigMaps found
 CONFIGMAP_COUNT=$(echo "$CONFIGMAPS" | jq '.items | length')
@@ -51,15 +59,15 @@ echo "$CONFIGMAPS" | jq -r '.items[] | select(.data."service.yaml" != null) | .d
     service_yaml=$(echo "$encoded_yaml" | base64 -d)
 
     # Get count of environment variables in this ConfigMap
-    var_count=$(echo "$service_yaml" | yq eval '.service.environment_variables | length' - 2>/dev/null || echo "0")
+    var_count=$(echo "$service_yaml" | yq eval '.service.environment_variables | length' -)
 
     if [ "$var_count" -gt 0 ]; then
         # Process each environment variable
         for i in $(seq 0 $((var_count - 1))); do
-            VAR_NAME=$(echo "$service_yaml" | yq eval ".service.environment_variables[$i].name" - 2>/dev/null)
+            VAR_NAME=$(echo "$service_yaml" | yq eval ".service.environment_variables[$i].name" -)
 
             # Check if it has a direct value
-            VAR_VALUE=$(echo "$service_yaml" | yq eval ".service.environment_variables[$i].value" - 2>/dev/null)
+            VAR_VALUE=$(echo "$service_yaml" | yq eval ".service.environment_variables[$i].value" -)
 
             if [ "$VAR_VALUE" != "null" ] && [ -n "$VAR_VALUE" ]; then
                 # Direct value - add to env file
@@ -67,25 +75,29 @@ echo "$CONFIGMAPS" | jq -r '.items[] | select(.data."service.yaml" != null) | .d
                 ENV_VAR_COUNT=$((ENV_VAR_COUNT + 1))
             else
                 # Check if it has valueFrom.secretKeyRef
-                SECRET_NAMESPACE=$(echo "$service_yaml" | yq eval ".service.environment_variables[$i].valueFrom.secretKeyRef.namespace" - 2>/dev/null)
-                SECRET_NAME=$(echo "$service_yaml" | yq eval ".service.environment_variables[$i].valueFrom.secretKeyRef.name" - 2>/dev/null)
-                SECRET_KEY=$(echo "$service_yaml" | yq eval ".service.environment_variables[$i].valueFrom.secretKeyRef.key" - 2>/dev/null)
+                SECRET_NAMESPACE=$(echo "$service_yaml" | yq eval ".service.environment_variables[$i].valueFrom.secretKeyRef.namespace" -)
+                SECRET_NAME=$(echo "$service_yaml" | yq eval ".service.environment_variables[$i].valueFrom.secretKeyRef.name" -)
+                SECRET_KEY=$(echo "$service_yaml" | yq eval ".service.environment_variables[$i].valueFrom.secretKeyRef.key" -)
 
                 if [ "$SECRET_NAME" != "null" ] && [ "$SECRET_KEY" != "null" ]; then
-                    # Fetch from secret
+                    # Fetch from secret; without a namespace, the pod's own
+                    NAMESPACE_FLAG=""
                     if [ "$SECRET_NAMESPACE" != "null" ] && [ -n "$SECRET_NAMESPACE" ]; then
-                        SECRET_VALUE=$(kubectl get secret -n "$SECRET_NAMESPACE" "$SECRET_NAME" -o jsonpath="{.data.$SECRET_KEY}" 2>/dev/null | base64 -d || true)
-                    else
-                        SECRET_VALUE=$(kubectl get secret "$SECRET_NAME" -o jsonpath="{.data.$SECRET_KEY}" 2>/dev/null | base64 -d || true)
+                        NAMESPACE_FLAG="--namespace=$SECRET_NAMESPACE"
                     fi
-
-                    if [ -n "$SECRET_VALUE" ]; then
-                        echo "export $VAR_NAME=\"$SECRET_VALUE\"" >> "$SERVICE_ENV_FILE"
-                        ENV_VAR_COUNT=$((ENV_VAR_COUNT + 1))
-                        echo "✅ Fetched $VAR_NAME from secret $SECRET_NAME"
-                    else
-                        echo "⊘ Skipped $VAR_NAME (secret $SECRET_NAME not found)"
+                    # NAMESPACE_FLAG is unquoted so that an empty one adds no argument
+                    if ! SECRET_DATA=$(kubectl get secret $NAMESPACE_FLAG "$SECRET_NAME" -o jsonpath="{.data.$SECRET_KEY}" 2>&1); then
+                        echo "ERROR: $VAR_NAME: secret $SECRET_NAME cannot be read: $SECRET_DATA"
+                        exit 1
                     fi
+                    if [ -z "$SECRET_DATA" ]; then
+                        echo "ERROR: $VAR_NAME: secret $SECRET_NAME has no key $SECRET_KEY"
+                        exit 1
+                    fi
+                    SECRET_VALUE=$(echo "$SECRET_DATA" | base64 -d)
+                    echo "export $VAR_NAME=\"$SECRET_VALUE\"" >> "$SERVICE_ENV_FILE"
+                    ENV_VAR_COUNT=$((ENV_VAR_COUNT + 1))
+                    echo "✅ Fetched $VAR_NAME from secret $SECRET_NAME"
                 fi
             fi
         done
@@ -127,7 +139,8 @@ if [ -f "$SERVICEACCOUNT/token" ]; then
     # KUBECONFIG is NOT added to SERVICE_ENV_FILE - it's environment-specific
     echo "✅ Created kubeconfig from service account"
 else
-    echo "⊘ Service account token not found, skipping kubeconfig"
+    echo "ERROR: no service account token at $SERVICEACCOUNT/token; the notebook server needs it for Kubernetes access"
+    exit 1
 fi
 
 # Make executable

@@ -136,19 +136,19 @@
             endpoint: "{{ s3_endpoint }}"
             endpoint_internal: "{{ s3_endpoint_internal }}"
 
+    # The S3 steps run on the control plane host, an Ubuntu node with apt,
+    # wherever the playbook is started from (installer, IDE, Thinkube Control).
     - name: Install s3cmd for bucket operations
       ansible.builtin.package:
         name: s3cmd
         state: present
       become: true
-      delegate_to: localhost
 
     - name: Create s3cmd config file
       ansible.builtin.template:
         src: s3cmd.cfg.j2
         dest: "/tmp/s3cmd-{{ seaweedfs_namespace }}.cfg"
         mode: '0600'
-      delegate_to: localhost
 
     - name: Wait for S3 API to be ready
       ansible.builtin.uri:
@@ -157,26 +157,34 @@
         status_code: [200, 403]
       retries: 30
       delay: 5
-      delegate_to: localhost
 
-    - name: Create S3 buckets
-      ansible.builtin.shell: |
-        s3cmd -c /tmp/s3cmd-{{ seaweedfs_namespace }}.cfg mb s3://{{ item.name }} || true
+    - name: List existing buckets
+      ansible.builtin.command: s3cmd -c /tmp/s3cmd-{{ seaweedfs_namespace }}.cfg ls
+      register: existing_buckets
+      changed_when: false
+
+    - name: Create missing S3 buckets
+      ansible.builtin.command: s3cmd -c /tmp/s3cmd-{{ seaweedfs_namespace }}.cfg mb s3://{{ item.name }}
       loop: "{{ s3_buckets }}"
-      delegate_to: localhost
+      when: ("s3://" ~ item.name) not in existing_buckets.stdout_lines | map('split') | map('last') | list
       register: bucket_creation
 
     - name: List created buckets
-      ansible.builtin.shell: |
-        s3cmd -c /tmp/s3cmd-{{ seaweedfs_namespace }}.cfg ls
-      delegate_to: localhost
+      ansible.builtin.command: s3cmd -c /tmp/s3cmd-{{ seaweedfs_namespace }}.cfg ls
       register: bucket_list
+      changed_when: false
+
+    - name: Check every bucket exists
+      ansible.builtin.assert:
+        that: ("s3://" ~ item.name) in bucket_list.stdout_lines | map('split') | map('last') | list
+        fail_msg: "Bucket {{ item.name }} is missing after creation; s3cmd ls says: {{ bucket_list.stdout }}"
+        quiet: true
+      loop: "{{ s3_buckets }}"
 
     - name: Clean up s3cmd config
       ansible.builtin.file:
         path: "/tmp/s3cmd-{{ seaweedfs_namespace }}.cfg"
         state: absent
-      delegate_to: localhost
 
     - name: Display configuration summary
       ansible.builtin.debug:

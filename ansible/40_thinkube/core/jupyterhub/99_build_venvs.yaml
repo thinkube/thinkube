@@ -83,6 +83,24 @@
       changed_when: false
       delegate_to: localhost
 
+    # A notebook server downloads the venvs only when its .version differs
+    # from jupyter_venvs_version, so assets replaced under a published tag
+    # would never reach a cluster that has them. A build publishes a new tag.
+    - name: Check the release {{ jupyter_venvs_version }} is not published yet
+      ansible.builtin.command: gh release view {{ jupyter_venvs_version }} --repo {{ github_repo }}
+      register: release_exists
+      failed_when: false
+      changed_when: false
+      delegate_to: localhost
+
+    - name: Refuse to replace a published release
+      ansible.builtin.fail:
+        msg: >-
+          {{ github_repo }} already has the release {{ jupyter_venvs_version }}.
+          Raise jupyter_venvs_version in ansible/40_thinkube/core/jupyterhub/vars/venvs.yaml
+          (for example to the next PATCH), commit it, and run this playbook again.
+      when: release_exists.rc == 0
+
     - name: Check if GitHub repo exists
       ansible.builtin.command: gh repo view {{ github_repo }}
       register: repo_check
@@ -162,18 +180,6 @@
     - name: Display tarballs found
       ansible.builtin.debug:
         msg: "Found {{ tarballs.files | length }} tarballs: {{ tarballs.files | map(attribute='path') | map('basename') | list }}"
-
-    - name: Check if GitHub release already exists
-      ansible.builtin.command: gh release view {{ jupyter_venvs_version }} --repo {{ github_repo }}
-      register: release_exists
-      failed_when: false
-      changed_when: false
-      delegate_to: localhost
-
-    - name: Delete existing GitHub release to replace assets
-      ansible.builtin.command: gh release delete {{ jupyter_venvs_version }} --repo {{ github_repo }} --yes
-      when: release_exists.rc == 0
-      delegate_to: localhost
 
     - name: Create GitHub release
       ansible.builtin.shell: |

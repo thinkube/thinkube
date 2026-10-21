@@ -20,7 +20,7 @@ Weaviate is an open-source vector database designed for AI applications. It prov
 - **Deployment Type**: StatefulSet (single replica)
 - **Persistence**: PersistentVolumeClaim for data storage
 - **Authentication**: API key authentication using admin credentials
-- **Networking**: HTTPRoute at `weaviate.<domain>` (port 8080) and GRPCRoute at `weaviate-grpc.<domain>` (port 50051)
+- **Networking**: HTTPRoute at `weaviate.<domain>` (port 8080) and GRPCRoute at `weaviate-grpc.<domain>` (port 443, TLS at the gateway; Weaviate listens on 50051 inside the cluster)
 - **Namespace**: `weaviate`
 
 ## Installation
