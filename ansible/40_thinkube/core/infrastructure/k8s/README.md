@@ -143,51 +143,45 @@ Both rollback playbooks delete data. The installer or the person who runs them i
 
 ### `19_rollback_control.yaml`
 
+It removes everything `10_install_k8s.yaml` added, so the node is as it was before the install. SSH keeps working: the SSH rules stay, UFW stays enabled, and only the iptables chains of Kubernetes and Cilium are removed.
+
 It removes:
 
-- The cluster. It stops kubelet, removes the static pod manifests, stops all containers, restarts containerd, then runs `kubeadm reset`.
-- The packages `kubeadm`, `kubelet`, `kubectl` and `containerd.io`. They are unheld and purged.
-- `/etc/kubernetes`, `/etc/cni/net.d`, `/etc/containerd`, `/var/lib/kubelet`, `/var/lib/containerd`, `/var/lib/etcd`, `/var/openebs`, `/var/lib/rawfile-localpv`, `/var/csi`. All volume data on `rawfile-localpv` and `k8s-hostpath` is lost.
-- `~/.kube`, `~/.local/bin/kubectl`, `~/.local/bin/helm` and the k8s alias files.
-- `/etc/modules-load.d/thinkube-k8s.conf` and `/etc/sysctl.d/99-thinkube-k8s.conf`.
-- The Kubernetes and Docker apt sources and keys.
-- Network interfaces whose names contain `cilium` or `lxc`.
-- The UFW rules for 6443, 2379-2380, 10257, 10259, 10250, 4240 and 8472/udp. Then it disables UFW.
-- `/etc/systemd/resolved.conf.d/10-thinkube.conf`.
+- The node-ip sync script, its units and its timer. They are stopped first.
+- The cluster. It stops kubelet, removes the static pod manifests, stops all containers, restarts containerd, then runs `kubeadm reset`. Then it unmounts what pods left under `/run`, and stops `kubepods.slice`.
+- `/etc/kubernetes`, `/etc/cni/net.d`, `/var/lib/kubelet`, `/var/lib/etcd`, `/var/lib/cni`, `/var/openebs`, `/var/lib/rawfile-localpv`, `/var/csi`, `/var/log/pods`, `/var/log/containers`, `/opt/cni/bin/cilium-cni`, and the files the install left in `/tmp`. All volume data on `rawfile-localpv` and `k8s-hostpath` is lost.
+- `~/.kube`, the helm repositories `cilium` and `openebs-rawfile`, `~/.local/bin/kubectl`, `~/.local/bin/helm` and the k8s alias files.
+- `/etc/modules-load.d/thinkube-k8s.conf`, `/etc/sysctl.d/99-thinkube-k8s.conf` and Cilium's `/etc/sysctl.d/99-zzz-override_cilium.conf`. The swap lines in `/etc/fstab` are uncommented and swap is turned on.
+- The packages `kubeadm`, `kubelet`, `kubectl`, `kubernetes-cni` and `cri-tools`, unheld and purged. `containerd.io` is unheld; it is purged with `/etc/containerd` and `/var/lib/containerd` unless another installed package depends on it (Docker). Then only its `k8s.io` images and containers are removed.
+- The Kubernetes apt source and key. The Docker apt source and key, unless `containerd.io` stays or a `docker-*` package is installed.
+- The `k8s0` interface and its files in `/etc/systemd/network/`.
+- Network interfaces whose names contain `cilium` or `lxc`, Cilium's pinned BPF objects, its policy routing rules, and `/run/cilium`.
+- The UFW rules the install added: 6443, 2379-2380, 10257, 10259, 10250, 4240, 9962, 8472/udp, 5355/udp, `cilium_host`, `k8s0`, and in ZeroTier mode `zt+`. `DEFAULT_FORWARD_POLICY` in `/etc/default/ufw` is set back from the install's backup, and UFW is reloaded.
+- `/etc/systemd/resolved.conf.d/10-thinkube-llmnr.conf` and `/etc/systemd/resolved.conf.d/10-thinkube.conf`.
 - In Tailscale mode, when `tailscale_api_token` is set: the Tailscale split DNS entry for `domain_name`.
-- Last, it flushes all iptables and ip6tables rules and sets the default policies to ACCEPT.
+- Last, the iptables and ip6tables chains whose names start with `KUBE-` or `CILIUM_`, and the rules that jump to them.
 
 It leaves in place:
 
-- The `k8s0` interface configuration in `/etc/systemd/network/`.
-- The node-ip sync script, its units and its timer.
-- The LLMNR drop-in `10-thinkube-llmnr.conf`.
-- The UFW rules for 22, 9962, 5355, `cilium_host`, `k8s0` and ZeroTier. UFW itself is disabled.
-- `DEFAULT_FORWARD_POLICY="ACCEPT"` in `/etc/default/ufw`.
-- Swap stays off. The `/etc/fstab` lines stay commented out.
+- The UFW rules for SSH: 22/tcp, and SSH from the ZeroTier subnet. UFW stays enabled.
+- systemd-networkd stays enabled. Disabling it can take the network down.
+- The kernel modules stay loaded and the sysctl values stay set until the next boot.
+- Packages that may be the user's: `ufw`, `curl`, `ca-certificates`, `gnupg`, `gpg`, `apt-transport-https`, and the dependencies apt pulled in for the Kubernetes packages.
+- Empty directories: `/etc/systemd/network`, `/etc/systemd/resolved.conf.d`, `/etc/cni`, `/etc/apt/keyrings`, `~/.local/bin`.
 
 ### `29_rollback_workers.yaml`
 
 On the control plane, it drains each worker (timeout 300 s, `--force`) and deletes the node.
 
-On each worker, it removes:
+On each worker, it removes everything `20_join_workers.yaml` added: the same items as `19_rollback_control.yaml` where the join added them, and also:
 
-- The cluster state, with `kubeadm reset`.
-- The packages `kubeadm`, `kubelet`, `kubectl` and `containerd.io`. They are unheld and purged.
-- `/etc/kubernetes`, `/etc/cni/net.d`, `/etc/containerd`, `/var/lib/kubelet`, `/var/lib/containerd`, `/var/openebs`, `/var/lib/rawfile-localpv`.
-- `~/.local/bin/kubectl` and `~/.local/bin/helm`.
-- The API proxy, node-ip sync and link watchdog units and scripts.
-- The `k8s0` configuration and the `k8s0` interface.
-- The kernel module and sysctl files, and the Kubernetes and Docker apt sources and keys.
-- Network interfaces whose names contain `cilium` or `lxc`.
+- The API proxy and link watchdog units and scripts, and `/run/thinkube-link-watchdog`.
+- The worker UFW rules: 10250, 6443, 5355/udp, 4240, 9962, 8472/udp, `cilium_host`, and in ZeroTier mode `zt+`.
 
-It leaves in place:
+It leaves in place the same items as `19_rollback_control.yaml`, and also:
 
-- All UFW rules. UFW stays enabled.
-- The iptables rules. They are not flushed.
-- The LLMNR drop-in, and the `iw` package if it was installed.
-- The worker entries in the code-server SSH config.
-- Swap stays off.
+- The `iw` package if the join installed it.
+- The worker entries in the code-server SSH config. code-server reaches the worker through them.
 
 It does not reboot the worker.
 

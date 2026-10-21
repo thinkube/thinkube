@@ -5,13 +5,18 @@
 # ansible/40_thinkube/core/infrastructure/k8s/19_rollback_control.yaml
 #
 # Rollback playbook for the Thinkube Kubernetes Cluster control plane
-# (kubeadm-installed).
+# (kubeadm-installed). It removes everything 10_install_k8s.yaml added to
+# the node, so the node is as it was before the install.
 #
 # WARNING: This destroys the Kubernetes cluster and all resources.
 # Volumes provisioned by OpenEBS Rawfile CSI are deleted; their backing
 # raw-file images on disk are removed. JuiceFS data in SeaweedFS is not
 # touched (lives outside the cluster). Harbor / Keycloak / PostgreSQL
 # data backed by rawfile-localpv IS lost.
+#
+# SSH access is kept: the SSH rules stay in UFW, UFW stays enabled (the
+# install requires it enabled), and only the iptables chains Kubernetes
+# and Cilium own are removed.
 #
 # After this runs, the host is ready for a fresh
 # `10_install_k8s.yaml` run.
@@ -32,7 +37,46 @@
     kubectl_path: "{{ user_home }}/.local/bin/kubectl"
     helm_path: "{{ user_home }}/.local/bin/helm"
 
+    # Units the install writes to /etc/systemd/system, timers first so
+    # none of them starts a service again while it is being stopped.
+    node_ip_sync_units:
+      - thinkube-node-ip-sync.timer
+      - thinkube-node-ip-sync-watch.service
+      - thinkube-node-ip-sync.service
+
   tasks:
+    # =====================================================================
+    # Boot-time node-ip sync — stopped first, so its timer cannot restart
+    # kubelet during the reset below
+    # =====================================================================
+    - name: Check which node-ip sync unit files exist
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/{{ item }}"
+      loop: "{{ node_ip_sync_units }}"
+      register: _node_ip_sync_unit_files
+
+    - name: Stop node-ip sync units
+      ansible.builtin.systemd:
+        name: "{{ item.item }}"
+        state: stopped
+      loop: "{{ _node_ip_sync_unit_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists
+
+    # The watch service has no [Install] section; only the timer and the
+    # boot service are enabled by the install.
+    - name: Disable node-ip sync timer and boot unit
+      ansible.builtin.systemd:
+        name: "{{ item.item }}"
+        enabled: false
+      loop: "{{ _node_ip_sync_unit_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - item.stat.exists
+        - item.item != 'thinkube-node-ip-sync-watch.service'
+
     # =====================================================================
     # kubeadm reset — clean shutdown of the cluster
     # =====================================================================
@@ -111,6 +155,52 @@
         mount | awk '/\/var\/lib\/kubelet\/pods/ {print $3}' | xargs -r -I {} umount -l {} 2>/dev/null || true
       changed_when: false
 
+    # Pod sandboxes leave their shm mounts, container rootfs mounts and
+    # network namespaces under /run when containerd could not tear them
+    # down; deepest paths first so a parent is never unmounted before its
+    # children.
+    - name: Unmount pod sandbox, container and pod network namespace mounts
+      ansible.builtin.shell: |
+        set -euo pipefail
+        findmnt -rn -o TARGET \
+          | awk '/^\/run\/containerd\/io\.containerd\.runtime\.v2\.task\/k8s\.io\// ||
+                 /^\/run\/containerd\/io\.containerd\.grpc\.v1\.cri\// ||
+                 /^\/run\/netns\/cni-/' \
+          | sort -r \
+          | while read -r target; do umount -l "$target"; echo "$target"; done
+      args:
+        executable: /bin/bash
+      register: _pod_mounts
+      changed_when: _pod_mounts.stdout | length > 0
+
+    - name: Find pod network namespace files
+      ansible.builtin.find:
+        paths: /run/netns
+        patterns: 'cni-*'
+        file_type: any
+      register: _pod_netns
+
+    - name: Remove pod network namespace files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _pod_netns.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # kubelet's pod cgroup slice outlives kubelet; nothing is left in it
+    # once the containers are gone.
+    - name: Check for kubelet's pod cgroup slice
+      ansible.builtin.command: systemctl list-units --all --plain --no-legend kubepods.slice
+      register: _kubepods_slice
+      changed_when: false
+
+    - name: Stop kubelet's pod cgroup slice
+      ansible.builtin.systemd:
+        name: kubepods.slice
+        state: stopped
+      when: _kubepods_slice.stdout | length > 0
+
     - name: Remove cluster + container runtime state directories
       ansible.builtin.file:
         path: "{{ item }}"
@@ -125,10 +215,80 @@
         - /var/csi               # CSI persistent volume data (rawfile-localpv)
       failed_when: false
 
+    - name: Remove pod logs and the CNI result cache
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/log/pods
+        - /var/log/containers
+        - /var/lib/cni
+
+    # Cilium's agent copies its CNI plugin next to the kubernetes-cni
+    # binaries; removing it first lets the package purge below remove
+    # /opt/cni with the rest of its files.
+    - name: Remove the Cilium CNI plugin binary
+      ansible.builtin.file:
+        path: /opt/cni/bin/cilium-cni
+        state: absent
+
+    - name: Remove the files the install left in /tmp
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/kubeadm-config.yaml
+        - /tmp/get-helm-3.sh
+        - /tmp/cilium-values.yaml
+        - /tmp/cilium-l2-lb.yaml
+        - /tmp/k8s-hostpath-storageclass.yaml
+
+    - name: Find the chart tarballs the install fetched to /tmp
+      ansible.builtin.find:
+        paths: /tmp
+        patterns:
+          - 'cilium-*.tgz'
+          - 'rawfile-localpv-*.tgz'
+      register: _chart_tarballs
+
+    - name: Remove the chart tarballs the install fetched to /tmp
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _chart_tarballs.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
     - name: Remove user kubeconfig
       ansible.builtin.file:
         path: "{{ user_home }}/.kube"
         state: absent
+
+    # helm's own command removes a repository and its cached index, so it
+    # runs before the helm binary is removed. Only the two repositories
+    # the install added are removed; any other stays.
+    - name: Check for the user's helm repository list
+      ansible.builtin.stat:
+        path: "{{ user_home }}/.config/helm/repositories.yaml"
+      register: _helm_repo_file
+
+    - name: Read the user's helm repository list
+      ansible.builtin.slurp:
+        src: "{{ user_home }}/.config/helm/repositories.yaml"
+      register: _helm_repo_content
+      when: _helm_repo_file.stat.exists
+
+    - name: Remove the helm repositories the install added
+      ansible.builtin.command: "{{ helm_path }} repo remove {{ item }}"
+      become: true
+      become_user: "{{ user }}"
+      loop:
+        - cilium
+        - openebs-rawfile
+      when:
+        - _helm_repo_file.stat.exists
+        - item in ((_helm_repo_content.content | b64decode | from_yaml).repositories or []) | map(attribute='name') | list
+      changed_when: true
 
     - name: Remove vanilla kubectl / helm binaries from ~/.local/bin
       ansible.builtin.file:
@@ -138,6 +298,14 @@
         - "{{ kubectl_path }}"
         - "{{ helm_path }}"
 
+    # =====================================================================
+    # Kernel modules, sysctls and swap (kubeadm_install role)
+    # =====================================================================
+    # The modules stay loaded and the sysctl values stay set until the
+    # next boot: unloading overlay or br_netfilter, or turning
+    # ip_forward off, breaks any other container runtime or overlay
+    # network on the host. sysctl --system re-applies every value the
+    # remaining files set.
     - name: Remove Thinkube-owned kernel module and sysctl drop-ins
       ansible.builtin.file:
         path: "{{ item }}"
@@ -145,19 +313,165 @@
       loop:
         - /etc/modules-load.d/thinkube-k8s.conf
         - /etc/sysctl.d/99-thinkube-k8s.conf
+      register: _thinkube_sysctl_files
 
-    # The apt sources and packages Thinkube added stay: they may be the
-    # user's as much as ours (DGX OS ships docker from docker's own
-    # repository), and the next install is idempotent over them. The
-    # commands below remove them when the user wants that.
-    - name: Say which apt sources and packages were left in place
+    # Cilium's apply-sysctl-overwrites init container writes this file on
+    # the host.
+    - name: Remove Cilium's sysctl override drop-in
+      ansible.builtin.file:
+        path: /etc/sysctl.d/99-zzz-override_cilium.conf
+        state: absent
+      register: _cilium_sysctl_file
+
+    - name: Re-apply the remaining sysctl files
+      ansible.builtin.command: sysctl --system
+      when: _thinkube_sysctl_files is changed or _cilium_sysctl_file is changed
+      changed_when: true
+
+    # kubeadm_install comments swap lines out with this exact suffix.
+    - name: Restore the swap entries the install commented out in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^# (.*)  # disabled by Thinkube \(kubeadm requirement\)$'
+        replace: '\1'
+      register: _fstab_swap
+
+    - name: Turn swap back on
+      ansible.builtin.command: swapon -a
+      when: _fstab_swap is changed
+      changed_when: true
+
+    # =====================================================================
+    # Packages, apt sources and containerd (kubeadm_install and
+    # containerd_install roles)
+    # =====================================================================
+    - name: Gather installed packages
+      ansible.builtin.package_facts:
+        manager: apt
+
+    - name: Unhold kubeadm / kubelet / kubectl
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop:
+        - kubeadm
+        - kubelet
+        - kubectl
+      when: item in ansible_facts.packages
+
+    # kubernetes-cni and cri-tools come in as dependencies of kubeadm and
+    # kubelet. Other dependencies apt pulled in stay: apt autoremove would
+    # take them, but also every other package already waiting for it.
+    - name: Purge kubeadm / kubelet / kubectl / kubernetes-cni / cri-tools
+      ansible.builtin.apt:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+          - kubernetes-cni
+          - cri-tools
+        state: absent
+        purge: true
+
+    # containerd.io is also Docker's runtime. When an installed package
+    # depends on it (docker-ce, or anything needing the containerd or runc
+    # it provides), containerd.io, its config and its image store stay,
+    # and only the Kubernetes namespace is emptied.
+    - name: List installed packages that depend on containerd.io
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-cache rdepends --installed --no-recommends --no-suggests \
+          --no-conflicts --no-breaks --no-replaces --no-enhances \
+          containerd.io containerd runc \
+          | awk '/^[^ ]/ {next} {sub(/^[ |]+/, ""); if ($0 != "containerd.io" && $0 != "containerd" && $0 != "runc") print}' \
+          | sort -u
+      args:
+        executable: /bin/bash
+      register: _containerd_dependents
+      when: "'containerd.io' in ansible_facts.packages"
+      changed_when: false
+
+    - name: Decide whether containerd.io stays
+      ansible.builtin.set_fact:
+        _containerd_kept: "{{ 'containerd.io' in ansible_facts.packages and (_containerd_dependents.stdout_lines | length > 0) }}"
+
+    - name: Say why containerd.io stays
       ansible.builtin.debug:
-        msg:
-          - "Left in place: the apt sources and packages Thinkube added."
-          - "To remove the sources and keys:"
-          - "  sudo rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/docker.asc /etc/apt/keyrings/kubernetes-apt-keyring.gpg && sudo apt-get update"
-          - "To remove the packages (containerd.io is also docker's: keep it where docker is installed):"
-          - "  sudo apt-mark unhold kubeadm kubelet kubectl containerd.io && sudo apt-get purge kubeadm kubelet kubectl kubernetes-cni containerd.io"
+        msg: >-
+          containerd.io stays: {{ _containerd_dependents.stdout_lines | join(', ') }}
+          depend on it. /etc/containerd/config.toml keeps the Thinkube settings;
+          the images and containers of the k8s.io namespace are removed.
+      when: _containerd_kept
+
+    - name: Unhold containerd.io
+      ansible.builtin.dpkg_selections:
+        name: containerd.io
+        selection: install
+      when: "'containerd.io' in ansible_facts.packages"
+
+    - name: Remove the Kubernetes namespace's containers and images from the kept containerd
+      ansible.builtin.shell: |
+        set -o pipefail
+        ctr -n k8s.io containers ls -q | xargs -r ctr -n k8s.io containers rm
+        ctr -n k8s.io images ls -q | xargs -r ctr -n k8s.io images rm
+      args:
+        executable: /bin/bash
+      register: _k8s_namespace_cleanup
+      when: _containerd_kept
+      changed_when: _k8s_namespace_cleanup.stdout | length > 0
+
+    - name: Purge containerd.io
+      ansible.builtin.apt:
+        name: containerd.io
+        state: absent
+        purge: true
+      when: not _containerd_kept
+
+    # Ubuntu's own containerd package, when installed, uses the same
+    # paths and is not the install's.
+    - name: Remove containerd config, image store and runtime state
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/containerd
+        - /var/lib/containerd
+        - /run/containerd
+      when:
+        - not _containerd_kept
+        - "'containerd' not in ansible_facts.packages"
+
+    - name: Remove the Kubernetes apt source and key
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      register: _k8s_apt_source
+
+    # The Docker source stays with containerd.io, and with any other
+    # package from Docker's repository (all named docker-*).
+    - name: Remove the Docker apt source and key
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/docker.list
+        - /etc/apt/keyrings/docker.asc
+      when:
+        - not _containerd_kept
+        - ansible_facts.packages.keys() | select('match', '^docker-') | list | length == 0
+      register: _docker_apt_source
+
+    - name: Update apt cache after removing the sources
+      ansible.builtin.apt:
+        update_cache: true
+      when: _k8s_apt_source is changed or _docker_apt_source is changed
+      register: _apt_update
+      retries: 3
+      delay: 10
+      until: _apt_update is succeeded
 
     # =====================================================================
     # Shell alias cleanup
@@ -177,6 +491,57 @@
       when: _shared_shell_dir.stat.exists
 
     # =====================================================================
+    # Boot-time node-ip sync files (units stopped at the start)
+    # =====================================================================
+    - name: Remove node-ip sync script and units
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/thinkube-node-ip-sync.timer
+        - /etc/systemd/system/thinkube-node-ip-sync-watch.service
+        - /etc/systemd/system/thinkube-node-ip-sync.service
+        - /usr/local/bin/thinkube-node-ip-sync
+      register: _node_ip_sync_files
+
+    - name: Reload systemd after node-ip sync unit removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: _node_ip_sync_files is changed
+
+    # =====================================================================
+    # k8s0 dummy interface
+    # =====================================================================
+    # systemd-networkd stays enabled: on a host whose netplan renders to
+    # networkd, disabling it takes the network, and SSH, down.
+    - name: Remove k8s0 dummy interface netdev and network files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/network/10-k8s-dummy.netdev
+        - /etc/systemd/network/10-k8s-dummy.network
+      register: _k8s_dummy_files
+
+    # A reload re-reads the files without touching the other links, so
+    # the network carrying SSH is not reconfigured. networkd does not
+    # delete a netdev whose file is gone; the next task does.
+    - name: Reload systemd-networkd after k8s0 file removal
+      ansible.builtin.command: networkctl reload
+      when: _k8s_dummy_files is changed
+      changed_when: true
+
+    - name: Check whether the k8s0 dummy interface exists
+      ansible.builtin.stat:
+        path: /sys/class/net/k8s0
+      register: _k8s0_link
+
+    - name: Delete k8s0 dummy interface
+      ansible.builtin.command: ip link delete k8s0
+      when: _k8s0_link.stat.exists
+      changed_when: true
+
+    # =====================================================================
     # Cilium / kubelet network interfaces
     # =====================================================================
     - name: Enumerate Cilium-created interfaces
@@ -192,9 +557,52 @@
       failed_when: false
       changed_when: true
 
+    # Cilium attaches its BPF programs to the host interfaces through
+    # links pinned under /sys/fs/bpf/cilium; removing the pins detaches
+    # them, so the host interfaces carry traffic without Cilium again.
+    - name: Remove Cilium's pinned BPF programs, links and maps
+      ansible.builtin.file:
+        path: /sys/fs/bpf/cilium
+        state: absent
+
+    - name: Find Cilium's maps pinned in the tc globals directory
+      ansible.builtin.find:
+        paths: /sys/fs/bpf/tc/globals
+        patterns: 'cilium_*'
+        file_type: any
+      register: _cilium_tc_maps
+
+    - name: Remove Cilium's maps pinned in the tc globals directory
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _cilium_tc_maps.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Remove Cilium's policy routing rules and route tables
+      ansible.builtin.script: files/cilium-ip-rules-cleanup.sh
+      register: _cilium_ip_rules
+      changed_when: _cilium_ip_rules.stdout | length > 0
+
+    - name: Unmount Cilium's cgroup2 mount
+      ansible.builtin.command: umount /run/cilium/cgroupv2
+      when: ansible_facts.mounts | selectattr('mount', 'equalto', '/run/cilium/cgroupv2') | list | length > 0
+      changed_when: true
+
+    - name: Remove Cilium's runtime state directory
+      ansible.builtin.file:
+        path: /run/cilium
+        state: absent
+
     # =====================================================================
-    # UFW rule cleanup (kubeadm-specific port set)
+    # UFW rule cleanup
     # =====================================================================
+    # Each rule is deleted by the spec the install added it with; ufw
+    # reports a rule that is already gone and exits 0. UFW stays enabled:
+    # the install requires it enabled, so that state predates the
+    # install. Kept: 22/tcp and SSH from the ZeroTier subnet, so SSH keeps
+    # working, and every rule the install did not add.
     - name: Remove kubeadm UFW rules
       block:
         - name: Remove k8s API server port rule (6443/tcp)
@@ -203,7 +611,6 @@
             port: '6443'
             proto: tcp
             delete: true
-          failed_when: false
 
         - name: Remove etcd client + peer rule (2379:2380/tcp)
           community.general.ufw:
@@ -211,7 +618,6 @@
             port: '2379:2380'
             proto: tcp
             delete: true
-          failed_when: false
 
         - name: Remove controller-manager rule (10257/tcp)
           community.general.ufw:
@@ -219,7 +625,6 @@
             port: '10257'
             proto: tcp
             delete: true
-          failed_when: false
 
         - name: Remove scheduler rule (10259/tcp)
           community.general.ufw:
@@ -227,7 +632,6 @@
             port: '10259'
             proto: tcp
             delete: true
-          failed_when: false
 
         - name: Remove kubelet API rule (10250/tcp)
           community.general.ufw:
@@ -235,7 +639,6 @@
             port: '10250'
             proto: tcp
             delete: true
-          failed_when: false
 
         - name: Remove Cilium health rule (4240/tcp)
           community.general.ufw:
@@ -243,7 +646,6 @@
             port: '4240'
             proto: tcp
             delete: true
-          failed_when: false
 
         - name: Remove Cilium VXLAN rule (8472/udp)
           community.general.ufw:
@@ -251,19 +653,134 @@
             port: '8472'
             proto: udp
             delete: true
-          failed_when: false
 
-        # Disable UFW BEFORE the iptables flush below. If UFW config says
-        # enabled but the iptables flush wipes its chains, the next install
-        # will hit "ERROR: problem running" on UFW's reload.
-        - name: Disable UFW so its config matches the post-flush reality
+        - name: Remove Cilium agent metrics rule (9962/tcp)
           community.general.ufw:
-            state: disabled
-          failed_when: false
+            rule: allow
+            port: '9962'
+            proto: tcp
+            delete: true
+
+        - name: Remove inbound cilium_host interface rule
+          community.general.ufw:
+            rule: allow
+            interface: cilium_host
+            direction: in
+            delete: true
+
+        - name: Remove outbound cilium_host interface rule
+          community.general.ufw:
+            rule: allow
+            interface: cilium_host
+            direction: out
+            delete: true
+
+        - name: Remove inbound k8s0 interface rule
+          community.general.ufw:
+            rule: allow
+            interface: k8s0
+            direction: in
+            delete: true
+
+        - name: Remove outbound k8s0 interface rule
+          community.general.ufw:
+            rule: allow
+            interface: k8s0
+            direction: out
+            delete: true
+
+        - name: Remove LLMNR rule (5355/udp)
+          community.general.ufw:
+            rule: allow
+            port: '5355'
+            proto: udp
+            delete: true
+
+        # The SSH-over-ZeroTier rule (port 22 from the ZeroTier subnet)
+        # stays; port 22 stays open on every interface.
+        - name: Remove inbound ZeroTier interface rule
+          community.general.ufw:
+            rule: allow
+            interface: "zt+"
+            direction: in
+            delete: true
+          when: overlay_provider == 'zerotier'
+
+        - name: Remove outbound ZeroTier interface rule
+          community.general.ufw:
+            rule: allow
+            interface: "zt+"
+            direction: out
+            delete: true
+          when: overlay_provider == 'zerotier'
+
+    # The install's lineinfile keeps a backup of /etc/default/ufw only
+    # when it changes the file, named ufw.<pid>.<date>@<time>~. The newest
+    # one holds the line as it was before this install; no backup means
+    # the install found the line already set to ACCEPT.
+    - name: Find the install's backups of /etc/default/ufw
+      ansible.builtin.find:
+        paths: /etc/default
+        patterns: 'ufw.*~'
+      register: _ufw_default_backups
+
+    - name: Read the forward policy line from the newest backup
+      ansible.builtin.shell: |
+        set -o pipefail
+        printf '%s\n' {{ _ufw_default_backups.files | map(attribute='path') | map('quote') | join(' ') }} \
+          | sort -t. -k3 | tail -n 1 \
+          | xargs awk '/^DEFAULT_FORWARD_POLICY=/'
+      args:
+        executable: /bin/bash
+      register: _ufw_forward_policy_before
+      when: _ufw_default_backups.matched > 0
+      changed_when: false
+
+    - name: Restore the UFW forward policy from before the install
+      ansible.builtin.lineinfile:
+        path: /etc/default/ufw
+        regexp: '^DEFAULT_FORWARD_POLICY='
+        line: "{{ _ufw_forward_policy_before.stdout_lines | last }}"
+      when:
+        - _ufw_default_backups.matched > 0
+        - _ufw_forward_policy_before.stdout_lines | length > 0
+      register: _ufw_forward_restored
+
+    # The install appends the line when the file had none.
+    - name: Remove the UFW forward policy line the install appended
+      ansible.builtin.lineinfile:
+        path: /etc/default/ufw
+        regexp: '^DEFAULT_FORWARD_POLICY='
+        state: absent
+      when:
+        - _ufw_default_backups.matched > 0
+        - _ufw_forward_policy_before.stdout_lines | length == 0
+      register: _ufw_forward_removed
+
+    # ufw reload re-applies the rules without disabling the firewall;
+    # established connections, the SSH session among them, continue.
+    - name: Reload UFW to apply the restored forward policy
+      ansible.builtin.command: ufw reload
+      when: _ufw_forward_restored is changed or _ufw_forward_removed is changed
+      changed_when: true
+
+    - name: Remove the install's backups of /etc/default/ufw
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _ufw_default_backups.files }}"
+      loop_control:
+        label: "{{ item.path }}"
 
     # =====================================================================
-    # DNS: remove stale BIND9 config so host falls back to ISP DNS
+    # DNS: LLMNR drop-in, and stale BIND9 config so host falls back to ISP DNS
     # =====================================================================
+    - name: Remove the LLMNR drop-in for systemd-resolved
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d/10-thinkube-llmnr.conf
+        state: absent
+      register: _llmnr_cleanup
+
     - name: Remove Thinkube DNS config (BIND9 IP becomes stale after rollback)
       ansible.builtin.file:
         path: /etc/systemd/resolved.conf.d/10-thinkube.conf
@@ -274,7 +791,7 @@
       ansible.builtin.systemd:
         name: systemd-resolved
         state: restarted
-      when: _dns_cleanup.changed
+      when: _dns_cleanup.changed or _llmnr_cleanup.changed
 
     # =====================================================================
     # Tailscale: remove split DNS (stale entry breaks tailnet-wide DNS)
@@ -297,25 +814,14 @@
       become: false
 
     # =====================================================================
-    # iptables reset (last step — anything that follows must re-add rules)
+    # iptables: only the chains kubelet and Cilium own
     # =====================================================================
-    - name: Flush iptables and reset default policies
-      ansible.builtin.shell: |
-        iptables -F
-        iptables -X
-        iptables -t nat -F
-        iptables -t nat -X
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-        ip6tables -F
-        ip6tables -X
-        ip6tables -t nat -F 2>/dev/null || true
-        ip6tables -t nat -X 2>/dev/null || true
-        ip6tables -P INPUT ACCEPT
-        ip6tables -P FORWARD ACCEPT
-        ip6tables -P OUTPUT ACCEPT
-      changed_when: true
+    # UFW's chains, Docker's chains and the built-in chains' policies are
+    # not touched, so the firewall and the SSH session stay as they are.
+    - name: Remove the KUBE-* and CILIUM_* iptables chains and the jumps to them
+      ansible.builtin.script: files/k8s-iptables-cleanup.sh
+      register: _k8s_iptables_cleanup
+      changed_when: _k8s_iptables_cleanup.stdout | length > 0
 
   post_tasks:
     - name: Display rollback summary
@@ -326,15 +832,20 @@
           - "==============================================="
           - "Removed:"
           - "  - Cluster state via kubeadm reset"
-          - "  - apt packages: left installed; the install moves them to its pinned versions"
-          - "  - apt sources and keys: left in place (the task above prints the removal command)"
+          - "  - kubeadm, kubelet, kubectl, kubernetes-cni, cri-tools (unheld, purged)"
+          - "  - containerd.io, /etc/containerd, /var/lib/containerd, unless another package depends on it"
+          - "  - Kubernetes apt source and key; Docker apt source and key unless Docker packages remain"
           - "  - State directories: /etc/kubernetes, /etc/cni/net.d,"
-          - "    /var/lib/{kubelet,etcd,openebs}, /var/lib/rawfile-localpv"
-          - "  - Vanilla kubectl/helm from ~/.local/bin"
-          - "  - Kernel module + sysctl drop-ins under /etc/{modules-load,sysctl}.d/"
-          - "  - Cilium-created network interfaces"
-          - "  - kubeadm UFW rules; UFW disabled before iptables flush"
-          - "  - All iptables rules (filter + nat)"
+          - "    /var/lib/{kubelet,etcd,cni}, /var/openebs, /var/lib/rawfile-localpv, /var/csi,"
+          - "    /var/log/{pods,containers}, /run/cilium"
+          - "  - Vanilla kubectl/helm from ~/.local/bin, the helm repositories cilium and openebs-rawfile"
+          - "  - Kernel module + sysctl drop-ins; swap entries restored in /etc/fstab"
+          - "  - node-ip sync script, units and timer; LLMNR drop-in"
+          - "  - k8s0 dummy interface and its networkd files"
+          - "  - Cilium-created network interfaces, pinned BPF objects, ip rules"
+          - "  - The UFW rules the install added, except SSH; UFW forward policy restored"
+          - "  - KUBE-* and CILIUM_* iptables chains"
+          - "Kept: SSH rules, UFW enabled, systemd-networkd enabled"
           - "==============================================="
           - "Next steps:"
           - "  - Run 10_install_k8s.yaml for a fresh install"
