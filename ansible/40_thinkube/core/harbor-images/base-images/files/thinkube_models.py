@@ -72,7 +72,6 @@ def get_mlflow_token():
             'password': config['password'],
             'scope': 'openid'
         },
-        verify=False,
         timeout=30
     )
     response.raise_for_status()
@@ -102,9 +101,6 @@ def load_model_for_finetuning(model_id: str, device_map: str = "auto"):
         # Then fine-tune with Unsloth as usual
         model = FastLanguageModel.get_peft_model(model, ...)
     """
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
     # Convert model_id to MLflow model name (replace / with -)
     model_name = model_id.replace('/', '-')
 
@@ -124,7 +120,6 @@ def load_model_for_finetuning(model_id: str, device_map: str = "auto"):
         f"{mlflow_url}/api/2.0/mlflow/model-versions/search",
         params={'filter': f"name='{model_name}'"},
         headers=headers,
-        verify=False,
         timeout=30
     )
     response.raise_for_status()
@@ -146,69 +141,42 @@ def load_model_for_finetuning(model_id: str, device_map: str = "auto"):
         f"{mlflow_url}/api/2.0/mlflow/runs/get",
         params={'run_id': run_id},
         headers=headers,
-        verify=False,
         timeout=30
     )
     run_response.raise_for_status()
     experiment_id = run_response.json()['run']['info']['experiment_id']
 
-    # Construct model path on JuiceFS
-    # Try multiple possible mount points for different environments:
-    # - JupyterHub: /home/jovyan/thinkube/mlflow/artifacts/...
-    # - TensorRT-LLM pods: /mlflow-models/artifacts/...
-    possible_base_paths = [
-        Path('/home/jovyan/thinkube/mlflow'),  # JupyterHub mount
-        Path('/mlflow-models'),                 # GPU pod mount
-        Path.home() / 'thinkube' / 'mlflow',    # Generic home-based path
-    ]
-
-    model_path = None
-    for base_path in possible_base_paths:
-        candidate = base_path / 'artifacts' / experiment_id / run_id / 'artifacts' / 'model'
-        if candidate.exists():
-            model_path = candidate
-            break
-
-    if model_path is None:
-        tried_paths = [str(p / 'artifacts' / experiment_id / run_id / 'artifacts' / 'model')
-                       for p in possible_base_paths]
+    # The notebook server mounts the MLflow artifacts (JuiceFS) at
+    # ~/thinkube/mlflow; this module ships only in the Jupyter images.
+    model_path = (Path.home() / 'thinkube' / 'mlflow' / 'artifacts'
+                  / experiment_id / run_id / 'artifacts' / 'model')
+    if not model_path.exists():
         raise FileNotFoundError(
-            f"Model not found. Tried paths:\n" +
-            "\n".join(f"  - {p}" for p in tried_paths) +
-            f"\nThe model may not have been mirrored correctly."
+            f"Model {model_id} is registered in MLflow, but its files are not at "
+            f"{model_path}. The mirror may not have finished; mirror the model again "
+            f"from Thinkube Control's Models page."
         )
 
     print(f"  Model path: {model_path}")
 
-    # Load with Unsloth for efficient fine-tuning
-    # Unsloth handles MXFP4 models internally - it converts MXFP4 to NF4 for training
-    # when load_in_4bit=True. This is their "magic" for gpt-oss models.
+    # Unsloth converts MXFP4 weights (gpt-oss) to trainable NF4 when
+    # load_in_4bit=True; the model it returns is ready for QLoRA.
     try:
         from unsloth import FastLanguageModel
+    except ImportError as e:
+        raise ImportError(
+            "load_model_for_finetuning loads models with Unsloth, which this kernel "
+            "does not have. Run the notebook with the fine-tuning kernel."
+        ) from e
 
-        print(f"  Loading with Unsloth FastLanguageModel from: {model_path}")
-        print(f"  Using load_in_4bit=True (Unsloth handles MXFP4→NF4 conversion)")
-
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=str(model_path),
-            dtype=None,
-            load_in_4bit=True,  # Unsloth converts MXFP4 to trainable NF4 internally
-            device_map=device_map,
-        )
-        print(f"  ✓ Model loaded with Unsloth (ready for QLoRA fine-tuning)")
-
-    except ImportError:
-        # Fallback to standard transformers if Unsloth not available
-        print(f"  Unsloth not available, loading with transformers...")
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(str(model_path))
-        model = AutoModelForCausalLM.from_pretrained(
-            str(model_path),
-            device_map=device_map,
-            torch_dtype="auto",
-        )
-        print(f"  ✓ Model loaded successfully with transformers")
+    print(f"  Loading with Unsloth FastLanguageModel from: {model_path}")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=str(model_path),
+        dtype=None,
+        load_in_4bit=True,
+        device_map=device_map,
+    )
+    print(f"  ✓ Model loaded with Unsloth (ready for QLoRA fine-tuning)")
 
     return model, tokenizer
 
