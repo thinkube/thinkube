@@ -115,6 +115,52 @@
       ansible.builtin.debug:
         var: existing_robot_list
 
+    # The robot's token is in every build secret, pull secret and .env of
+    # the cluster. A new token would leave all of them refused, so an
+    # existing robot is kept with the token the cluster already has.
+    - name: Read the robot token the cluster has
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: kube-system
+        name: harbor-robot-credentials
+      register: robot_credentials_secret
+      no_log: true
+      when: existing_robot_list | length > 0
+
+    - name: Check Harbor accepts the cluster's robot token
+      ansible.builtin.uri:
+        url: "https://{{ harbor_registry }}/v2/"
+        headers:
+          Authorization: "Basic {{ ('robot$' + harbor_robot_name + ':' + (robot_credentials_secret.resources[0].data['robot-token'] | b64decode)) | b64encode }}"
+        status_code: [200, 401]
+      register: robot_token_check
+      no_log: true
+      when:
+        - existing_robot_list | length > 0
+        - robot_credentials_secret.resources | length > 0
+
+    - name: Stop when the existing robot has no working token on the cluster
+      ansible.builtin.fail:
+        msg: >-
+          Harbor has the robot robot${{ harbor_robot_name }}, but the token in
+          kube-system/harbor-robot-credentials is missing or refused by Harbor.
+          This playbook does not make a new token: every build and pull secret of
+          the cluster holds the current one. Put the current token in that Secret
+          (key robot-token), or set the robot's secret in Harbor to the token the
+          cluster holds, and run this playbook again.
+      when:
+        - existing_robot_list | length > 0
+        - robot_credentials_secret.resources | length == 0
+          or robot_token_check.status != 200
+
+    - name: Keep the cluster's robot token
+      ansible.builtin.set_fact:
+        harbor_robot_token: "{{ robot_credentials_secret.resources[0].data['robot-token'] | b64decode }}"
+      no_log: true
+      when: existing_robot_list | length > 0
+
     - name: Create system-level robot account
       ansible.builtin.uri:
         url: "https://{{ harbor_registry }}/api/v2.0/robots"
@@ -147,77 +193,15 @@
                   resource: "repository"
                 - action: "list"
                   resource: "repository"
-        status_code: [201, 409]
+        status_code: 201
       register: robot_creation
+      when: existing_robot_list | length == 0
 
     - name: Extract robot credentials from creation response
       ansible.builtin.set_fact:
         harbor_robot_token: "{{ robot_creation.json.secret }}"
-      when: robot_creation.status == 201
-
-    - name: Get robot token if already exists
-      block:
-        - name: Delete existing robot account
-          ansible.builtin.uri:
-            url: "https://{{ harbor_registry }}/api/v2.0/robots/{{ existing_robot_list[0].id }}"
-            method: DELETE
-            headers:
-              Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
-            status_code: 200
-          register: robot_delete
-          when: existing_robot_list | length > 0
-        
-        - name: Debug robot delete
-          ansible.builtin.debug:
-            var: robot_delete
-          when: robot_delete is defined
-          
-        - name: Create new robot account after deletion
-          ansible.builtin.uri:
-            url: "https://{{ harbor_registry }}/api/v2.0/robots"
-            method: POST
-            headers:
-              Authorization: "Basic {{ (harbor_admin_user + ':' + admin_password) | b64encode }}"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              level: "system"
-              name: "{{ harbor_robot_name }}"
-              duration: "{{ robot_duration }}"
-              description: "System robot for Kubernetes deployments"
-              permissions:
-                - kind: "project"
-                  namespace: "{{ harbor_project }}"
-                  access:
-                    - action: "pull"
-                      resource: "repository"
-                    - action: "push"
-                      resource: "repository"
-                    - action: "list"
-                      resource: "repository"
-                - kind: "project"
-                  namespace: "library"
-                  access:
-                    - action: "pull"
-                      resource: "repository"
-                    - action: "push"
-                      resource: "repository"
-                    - action: "list"
-                      resource: "repository"
-            status_code: 201
-          register: robot_recreate
-          when: robot_delete is defined and robot_delete.status == 200
-          
-        - name: Debug robot recreate
-          ansible.builtin.debug:
-            var: robot_recreate
-          when: robot_recreate is defined
-          
-        - name: Set robot token from recreate
-          ansible.builtin.set_fact:
-            harbor_robot_token: "{{ robot_recreate.json.secret }}"
-          when: robot_recreate is defined and robot_recreate.status == 201
-      when: robot_creation.status != 201 and existing_robot_list | length > 0
+      no_log: true
+      when: existing_robot_list | length == 0
 
     - name: Get remote home directory
       ansible.builtin.shell: echo $HOME
