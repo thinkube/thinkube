@@ -1,0 +1,93 @@
+// Copyright Alejandro Martínez Corriá and the Thinkube contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Written by Thinkube (ansible/roles/agent_clients); a configuration run
+// replaces this file.
+//
+// The "thinkube" provider: the models of the LLM gateway that can drive an
+// agent. The gateway's /v1/models describes every mirrored model; the
+// ones marked "agent" that are served are offered, and the catalog's agent
+// default even when it is not loaded, so a new session starts with it and a
+// call to it says what to load. Each model is named by its first alias. A Pi
+// started without --model starts its session with the agent default.
+
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+const GATEWAY = {{ agent_gateway_url | to_json }};
+
+interface GatewayModel {
+	id: string;
+	root: string;
+	thinkube: {
+		name: string;
+		state: string;
+		aliases: string[];
+		capabilities: string[];
+		default_agent: boolean;
+		input: ("text" | "image")[];
+		reasoning_format: string | null;
+		context_window: number | null;
+		context_length: number | null;
+		max_output: number | null;
+	};
+}
+
+async function agentModels(signal?: AbortSignal): Promise<GatewayModel[]> {
+	const token = process.env.THINKUBE_API_TOKEN;
+	if (!token) {
+		throw new Error("THINKUBE_API_TOKEN is not set; Thinkube IDE sets it for the agents");
+	}
+	const url = `${GATEWAY}/models`;
+	const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal });
+	if (!resp.ok) {
+		throw new Error(`The LLM gateway answered HTTP ${resp.status} for ${url}: ${await resp.text()}`);
+	}
+	const entries = (await resp.json()).data as GatewayModel[];
+	return entries.filter((m) => {
+		const t = m.thinkube;
+		if (!t.capabilities.includes("agent")) return false;
+		if (t.state !== "available" && !t.default_agent) return false;
+		return m.id === (t.aliases[0] ?? m.root);
+	});
+}
+
+// A model that is not served has no served context; its catalog length stands
+// for it until it is, as no call to it can succeed before then.
+function toConfig(m: GatewayModel) {
+	const t = m.thinkube;
+	const contextWindow = t.context_window ?? t.context_length;
+	if (contextWindow === null || t.max_output === null) {
+		throw new Error(`Model ${m.root} is marked agent in the catalog but has no context_length or max_output`);
+	}
+	return {
+		id: m.id,
+		name: t.name,
+		reasoning: t.reasoning_format !== null,
+		input: t.input,
+		contextWindow,
+		maxTokens: t.max_output,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		// Qwen models take thinking on or off as chat_template_kwargs.enable_thinking.
+		...(t.reasoning_format?.startsWith("qwen") ? { compat: { thinkingFormat: "qwen-chat-template" } } : {}),
+	};
+}
+
+export default async function (pi: ExtensionAPI) {
+	const models = await agentModels();
+	pi.registerProvider("thinkube", {
+		name: "Thinkube",
+		baseUrl: GATEWAY,
+		api: "openai-completions",
+		apiKey: "${THINKUBE_API_TOKEN}",
+		models: models.map(toConfig),
+		refreshModels: async (context) => (await agentModels(context.signal)).map(toConfig),
+	});
+
+	const named = process.argv.some((a) => a === "--model" || a.startsWith("--model="));
+	const preferred = models.find((m) => m.thinkube.default_agent);
+	pi.on("session_start", async (event, ctx) => {
+		if (event.reason !== "startup" || named || !preferred) return;
+		const model = ctx.modelRegistry.find("thinkube", preferred.id);
+		if (model) await pi.setModel(model);
+	});
+}
