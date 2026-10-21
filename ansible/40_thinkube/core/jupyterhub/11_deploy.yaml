@@ -36,6 +36,9 @@
   vars:
     jupyterhub_namespace: jupyterhub
     jupyterhub_version: "4.2.0"
+    # Quota of the shared models folder. The JuiceFS CSI driver sets the
+    # folder quota from the bound PV's capacity at every mount.
+    jupyterhub_models_capacity: 600Gi
     helm_repo_name: jupyterhub
     helm_repo_url: https://hub.jupyter.org/helm-chart/
     # Network configuration for hub network policy
@@ -123,6 +126,32 @@
             resources:
               requests:
                 storage: 200Gi
+
+    # juicefs-rwx does not allow volume expansion, so the claim keeps the size
+    # it was created with; the quota follows the PV capacity set here.
+    - name: Wait for the models PVC to be bound
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ jupyterhub_namespace }}"
+        name: jupyterhub-models-pvc
+      register: models_pvc
+      until: models_pvc.resources | length == 1 and models_pvc.resources[0].status.phase == 'Bound'
+      retries: 30
+      delay: 5
+
+    - name: Set the models PV capacity, which the JuiceFS driver applies as the folder quota
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: patched
+        api_version: v1
+        kind: PersistentVolume
+        name: "{{ models_pvc.resources[0].spec.volumeName }}"
+        definition:
+          spec:
+            capacity:
+              storage: "{{ jupyterhub_models_capacity }}"
 
     # Venvs use local hostPath storage on each GPU node (fast I/O)
     # Directory created automatically by DirectoryOrCreate in the values template
