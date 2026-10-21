@@ -62,8 +62,8 @@
     force_knative_validation: true
     knative_enabled: true
 
-    # Harbor configuration
-    harbor_robot_name: "kaniko"
+    # Harbor's robot is the inventory's harbor_robot_name, the one
+    # HARBOR_ROBOT_TOKEN belongs to.
 
     # Gateway API references (Envoy Gateway class is 'eg')
     gateway_name: "thinkube-gateway"
@@ -645,10 +645,12 @@
       ansible.builtin.set_fact:
         harbor_robot_token: "{{ robot_token_result.stdout.strip() }}"
       
-    - name: Set Harbor robot name variable
-      ansible.builtin.set_fact:
-        harbor_robot_name: "kaniko"
-      
+    - name: Check the Harbor robot token was found
+      ansible.builtin.assert:
+        that: harbor_robot_token | length > 0
+        fail_msg: "HARBOR_ROBOT_TOKEN is not set in {{ ansible_facts.env.HOME }}/.env; the Harbor playbook writes it"
+        quiet: true
+
     - name: Ensure Harbor registry secret exists in Knative namespace
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -662,16 +664,13 @@
           type: kubernetes.io/dockerconfigjson
           data:
             .dockerconfigjson: >-
-              {{ '{\"auths\":{\"%s\":{\"username\":\"%s\",\"password\":\"%s\",\"auth\":\"%s\"}}}' 
-              | format(
-                harbor_registry, 
-                'robot$' + harbor_robot_name, 
-                harbor_robot_token, 
-                ('robot$' + harbor_robot_name + ':' + harbor_robot_token) | b64encode
-              ) | b64encode }}
+              {{ {'auths': {harbor_registry: {
+                   'username': 'robot$' + harbor_robot_name,
+                   'password': harbor_robot_token,
+                   'auth': ('robot$' + harbor_robot_name + ':' + harbor_robot_token) | b64encode}}}
+                 | to_json | b64encode }}
       register: harbor_secret
-      # Fail if auth isn't available
-      failed_when: harbor_robot_token is not defined or harbor_robot_token == ""
+      no_log: true
 
     - name: Create Knative service (using Harbor registry)
       kubernetes.core.k8s:
