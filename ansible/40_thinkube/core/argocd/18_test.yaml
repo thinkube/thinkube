@@ -51,12 +51,15 @@
       changed_when: false
       failed_when: pods_check.rc != 0
       
-    - name: Verify ArgoCD TLSRoute exists
-      ansible.builtin.shell: |
-        {{ kubectl_bin }} get tlsroute -n {{ argocd_namespace }} | grep -E 'argocd-tls-route'
-      register: tlsroute_check
-      changed_when: false
-      failed_when: tlsroute_check.rc != 0
+    - name: Verify ArgoCD HTTPRoute exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        namespace: "{{ argocd_namespace }}"
+        name: argocd-httproute
+      register: httproute_check
+      failed_when: httproute_check.resources | length == 0
       
     ###################################################################
     # 2) TLS certificate verification
@@ -109,9 +112,9 @@
       changed_when: false
       failed_when: token_check.rc != 0
       
+    # 13_setup_serviceaccount.yaml installs the CLI beside kubectl and helm.
     - name: Verify ArgoCD CLI is installed
-      ansible.builtin.shell: |
-        which argocd && argocd version
+      ansible.builtin.command: /home/{{ system_username }}/.local/bin/argocd version --client
       register: cli_check
       changed_when: false
       failed_when: cli_check.rc != 0
@@ -162,7 +165,6 @@
       ansible.builtin.uri:
         url: "https://harbor-webhook-adapter.{{ domain_name }}/"
         method: GET
-        validate_certs: false
         status_code: 200
       register: webhook_health_check
 
@@ -174,7 +176,7 @@
         msg:
           - "✅ ArgoCD namespace: {{ argocd_namespace }} exists"
           - "✅ ArgoCD pods are running"
-          - "✅ ArgoCD TLSRoute exists"
+          - "✅ ArgoCD HTTPRoute exists"
           - "✅ TLS certificate for UI endpoint is valid"
           - "✅ TLS certificate for gRPC endpoint is valid"
           - "✅ ArgoCD admin user ({{ admin_username }}) is properly configured"

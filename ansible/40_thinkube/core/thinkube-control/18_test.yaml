@@ -37,9 +37,6 @@
       - frontend
     argocd_namespace: "argocd"
     argo_workflows_namespace: "argo"
-    keycloak_url: "https://auth.{{ domain_name }}"
-    keycloak_realm: "thinkube"
-    keycloak_admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
 
   tasks:
     - name: Verify required variables
@@ -200,48 +197,45 @@
       ansible.builtin.uri:
         url: "https://{{ control_host }}/"
         method: GET
-        validate_certs: false
         follow_redirects: none
         status_code: [200, 302]  # May redirect to auth
       register: https_test
 
-    # Test backend API endpoints
+    # The backend serves /health at its own root; through the gateway that
+    # path belongs to the frontend, so the backend is asked through the
+    # Kubernetes API's service proxy.
     - name: Test backend health endpoint
-      ansible.builtin.uri:
-        url: "{{ control_url }}/health"
-        method: GET
-        validate_certs: false
-        status_code: 200
+      ansible.builtin.command: >-
+        {{ kubectl_bin }} get --raw
+        /api/v1/namespaces/{{ control_namespace }}/services/http:backend:8000/proxy/health
       register: health_test
+      changed_when: false
 
     - name: Verify health response
       ansible.builtin.assert:
         that:
-          - health_test.json.status == "ok"
-        fail_msg: "Backend health check failed"
+          - (health_test.stdout | from_json).status == "ok"
+        fail_msg: "Backend health check failed: {{ health_test.stdout }}"
 
-    - name: Test API root endpoint
+    - name: Test the API through the gateway
       ansible.builtin.uri:
-        url: "{{ control_url }}/api/v1/"
+        url: "{{ control_url }}/api/v1/openapi.json"
         method: GET
-        validate_certs: false
         status_code: 200
       register: api_test
 
-    # Test authentication flow
-    - name: Get Keycloak token for testing
-      ansible.builtin.uri:
-        url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
-        method: POST
-        body_format: form-urlencoded
-        body:
-          client_id: "admin-cli"
-          username: "{{ admin_username }}"
-          password: "{{ keycloak_admin_password }}"
-          grant_type: "password"
-        validate_certs: false
-        status_code: 200
-      register: keycloak_token
+    # Thinkube Control's own API token, the one discovery gives notebooks
+    # and code-server as THINKUBE_API_TOKEN.
+    - name: Read Thinkube Control's API token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ control_namespace }}"
+        name: mcp-default-token
+      register: api_token_secret
+      failed_when: api_token_secret.resources | length == 0
+      no_log: true
 
     # Test authenticated API access
     - name: Test dashboards endpoint with authentication
@@ -249,8 +243,7 @@
         url: "{{ control_url }}/api/v1/dashboards"
         method: GET
         headers:
-          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
-        validate_certs: false
+          Authorization: "Bearer {{ api_token_secret.resources[0].data.token | b64decode }}"
         status_code: 200
       register: dashboards_test
 
@@ -266,25 +259,24 @@
       ansible.builtin.uri:
         url: "{{ control_url }}/api/v1/tokens"
         method: GET
-        validate_certs: false
         status_code: 401
       register: tokens_unauth_test
 
-    - name: Test token API - List tokens with authentication
+    # Tokens are managed by a signed-in user only: an API token cannot list,
+    # create or revoke API tokens.
+    - name: Test token API - an API token cannot list tokens
       ansible.builtin.uri:
-        url: "{{ control_url }}/api/v1/tokens"
+        url: "{{ control_url }}/api/v1/tokens/"
         method: GET
         headers:
-          Authorization: "Bearer {{ keycloak_token.json.access_token }}"
-        validate_certs: false
-        status_code: 200
+          Authorization: "Bearer {{ api_token_secret.resources[0].data.token | b64decode }}"
+        status_code: 401
       register: tokens_auth_test
 
     - name: Test CI/CD API endpoints
       ansible.builtin.uri:
         url: "{{ control_url }}/api/v1/cicd/health"
         method: GET
-        validate_certs: false
         status_code: 200
       register: cicd_health_test
 

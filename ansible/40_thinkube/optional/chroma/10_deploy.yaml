@@ -162,19 +162,9 @@
                     ports:
                       - containerPort: 8000
                         name: http
+                    # The Chroma 1.x server has no authentication of its own;
+                    # the gateway requires the token (SecurityPolicy below).
                     env:
-                      # Enable authentication with token
-                      - name: CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER
-                        value: "chromadb.auth.token.TokenConfigServerAuthCredentialsProvider"
-                      - name: CHROMA_SERVER_AUTH_PROVIDER
-                        value: "chromadb.auth.token.TokenAuthServerProvider"
-                      - name: CHROMA_SERVER_AUTH_TOKEN_TRANSPORT_HEADER
-                        value: "X-Chroma-Token"
-                      - name: CHROMA_SERVER_AUTH_CREDENTIALS
-                        valueFrom:
-                          secretKeyRef:
-                            name: chroma-auth
-                            key: auth-token
                       # Anonymized telemetry disabled for privacy
                       - name: ANONYMIZED_TELEMETRY
                         value: "FALSE"
@@ -274,6 +264,48 @@
                 backendRefs:
                   - name: chromadb-svc
                     port: 80
+
+    # Envoy Gateway refuses every request to chroma.<domain> that does not
+    # carry the token in X-Chroma-Token, the header Chroma's clients send.
+    # Each key of the Secret is a client ID, its value the client's token.
+    - name: Create the Chroma API key Secret for the gateway
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: chroma-gateway-api-keys
+            namespace: "{{ chroma_namespace }}"
+          type: Opaque
+          stringData:
+            thinkube: "{{ admin_password }}"
+      no_log: true
+
+    - name: Require the Chroma token at the gateway
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: gateway.envoyproxy.io/v1alpha1
+          kind: SecurityPolicy
+          metadata:
+            name: chroma-api-key
+            namespace: "{{ chroma_namespace }}"
+          spec:
+            targetRefs:
+              - group: gateway.networking.k8s.io
+                kind: HTTPRoute
+                name: chroma-route
+            apiKeyAuth:
+              credentialRefs:
+                - group: ""
+                  kind: Secret
+                  name: chroma-gateway-api-keys
+              extractFrom:
+                - headers:
+                    - X-Chroma-Token
 
     - name: Wait for Chroma StatefulSet to be ready
       kubernetes.core.k8s_info:

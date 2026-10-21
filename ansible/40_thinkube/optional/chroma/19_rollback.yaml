@@ -45,43 +45,19 @@
           - Remove persistent data: {{ remove_data }}
           - Force namespace deletion: {{ force_namespace_deletion }}
 
-    - name: Scale down Chroma StatefulSet
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
-        definition:
-          apiVersion: apps/v1
-          kind: StatefulSet
-          metadata:
-            name: chroma
-            namespace: "{{ chroma_namespace }}"
-          spec:
-            replicas: 0
-      ignore_errors: true
-
-    - name: Wait for pods to terminate
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: Pod
-        namespace: "{{ chroma_namespace }}"
-        label_selectors:
-          - app=chroma
-      register: pod_check
-      until: pod_check.resources | length == 0
-      retries: 30
-      delay: 2
-      ignore_errors: true
-
-    - name: Delete Chroma HTTPRoute
+    # Each name is the one 10_deploy.yaml creates. Deleting an object that
+    # is already gone succeeds, so any error here is a real one.
+    - name: Delete the Chroma gateway policy and route
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: absent
-        api_version: gateway.networking.k8s.io/v1
-        kind: HTTPRoute
-        name: chroma-httproute
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.name }}"
         namespace: "{{ chroma_namespace }}"
-      ignore_errors: true
+      loop:
+        - { api_version: gateway.envoyproxy.io/v1alpha1, kind: SecurityPolicy, name: chroma-api-key }
+        - { api_version: gateway.networking.k8s.io/v1, kind: HTTPRoute, name: chroma-route }
 
     - name: Delete Chroma services
       kubernetes.core.k8s:
@@ -92,11 +68,10 @@
         name: "{{ item }}"
         namespace: "{{ chroma_namespace }}"
       loop:
-        - chroma
-        - chroma-headless
-      ignore_errors: true
+        - chromadb-svc
+        - chromadb-headless
 
-    - name: Delete Chroma StatefulSet
+    - name: Delete the Chroma StatefulSet and wait for its pods to end
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
         state: absent
@@ -104,7 +79,8 @@
         kind: StatefulSet
         name: chroma
         namespace: "{{ chroma_namespace }}"
-      ignore_errors: true
+        wait: true
+        wait_timeout: 120
 
     - name: Delete ConfigMaps
       kubernetes.core.k8s:
@@ -116,7 +92,6 @@
         namespace: "{{ chroma_namespace }}"
       loop:
         - thinkube-service-config
-      ignore_errors: true
 
     - name: Delete secrets
       kubernetes.core.k8s:
@@ -128,8 +103,8 @@
         namespace: "{{ chroma_namespace }}"
       loop:
         - chroma-auth
+        - chroma-gateway-api-keys
         - chroma-tls-secret
-      ignore_errors: true
 
     - name: Delete PersistentVolumeClaim if remove_data is true
       kubernetes.core.k8s:
@@ -140,25 +115,28 @@
         name: chroma-data-pvc
         namespace: "{{ chroma_namespace }}"
       when: remove_data | bool
-      ignore_errors: true
 
     - name: Get remaining resources in namespace
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
-        api_version: v1
-        kind: all
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
         namespace: "{{ chroma_namespace }}"
+      loop:
+        - { api_version: v1, kind: Pod }
+        - { api_version: v1, kind: Service }
+        - { api_version: v1, kind: PersistentVolumeClaim }
+        - { api_version: gateway.networking.k8s.io/v1, kind: HTTPRoute }
       register: remaining_resources
-      ignore_errors: true
 
     - name: Display remaining resources
       ansible.builtin.debug:
-        msg: |
-          Remaining resources in namespace:
-          {% for resource in remaining_resources.resources %}
-          - {{ resource.kind }}: {{ resource.metadata.name }}
-          {% endfor %}
-      when: remaining_resources.resources is defined and remaining_resources.resources | length > 0
+        msg: >-
+          Remaining in {{ chroma_namespace }}:
+          {{ remaining_resources.results | map(attribute='resources') | flatten
+             | map(attribute='kind') | zip(remaining_resources.results | map(attribute='resources')
+             | flatten | map(attribute='metadata.name')) | map('join', ' ') | list }}
+      when: remaining_resources.results | map(attribute='resources') | flatten | length > 0
 
     - name: Delete namespace if force_namespace_deletion is true
       kubernetes.core.k8s:
@@ -168,7 +146,6 @@
         kind: Namespace
         name: "{{ chroma_namespace }}"
       when: force_namespace_deletion | bool
-      ignore_errors: true
 
     - name: Display rollback summary
       ansible.builtin.debug:
@@ -176,7 +153,6 @@
           ========================================
           Chroma Rollback Summary
           ========================================
-          ✓ Scaled down StatefulSet
           ✓ Deleted HTTPRoute
           ✓ Deleted Services
           ✓ Deleted ConfigMaps
