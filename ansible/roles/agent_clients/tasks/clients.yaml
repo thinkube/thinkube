@@ -2,79 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-# Configures opencode, Pi and Claude Code from vars/main.yaml (the MCP
-# servers) and thinkube_model_aliases (the gateway's models). Each client's
-# files are merged: the keys Thinkube manages are replaced, the user's own are
-# kept.
+# Configures Pi and Claude Code from vars/main.yaml (the MCP servers). Pi's
+# models come from the LLM gateway at run time (the thinkube-models
+# extension). Each client's files are merged: the keys Thinkube manages are
+# replaced, the user's own are kept.
 #
 # Inputs:
-#   thinkube_model_aliases  40_thinkube/core/thinkube-control/vars/model_aliases.yaml
 #   agent_bearer_tokens     {env var name: token}, the value of every
 #                           bearer_token_env; Claude Code is given the value,
-#                           the other clients read the variable at run time
+#                           Pi reads the variable at run time
 #   agent_code_server_pod   name of a running code-server pod (Claude CLI)
 
 - name: Check the inputs of the client configuration
   ansible.builtin.assert:
     that:
-      - thinkube_model_aliases is mapping
-      - thinkube_model_aliases | length > 0
       - agent_bearer_tokens is mapping
       - agent_code_server_pod | length > 0
       - agent_mcp_servers | selectattr('bearer_token_env', 'defined') | map(attribute='bearer_token_env') | difference(agent_bearer_tokens.keys() | list) | length == 0
-    fail_msg: "thinkube_model_aliases, agent_bearer_tokens (one token per bearer_token_env) and agent_code_server_pod are required"
+    fail_msg: "agent_bearer_tokens (one token per bearer_token_env) and agent_code_server_pod are required"
     quiet: true
-
-# opencode -------------------------------------------------------------------
-
-- name: Render opencode's managed configuration
-  ansible.builtin.set_fact:
-    agent_opencode: "{{ lookup('template', 'opencode-managed.json.j2') | from_json }}"
-
-- name: Update opencode.json
-  ansible.builtin.include_tasks: json_file.yaml
-  vars:
-    json_file: "{{ agent_opencode_dir }}/opencode.json"
-    json_changes:
-      merge:
-        - ["{{ agent_opencode | dict2items | rejectattr('key', 'in', ['provider', 'mcp', 'permission']) | items2dict }}"]
-        - ["provider", "{{ agent_opencode.provider }}"]
-        - ["mcp", "{{ agent_opencode.mcp }}"]
-        - ["permission", "{{ agent_opencode.permission }}"]
-
-# opencode installs @opencode-ai/plugin into each configuration directory at
-# start unless the directory already has it installed and locked. The image
-# carries it at opencode's version in /opt/agent-clients; linking that tree
-# here means opencode finds it and never fetches it.
-- name: Link the image's opencode plugin package into ~/.config/opencode
-  ansible.builtin.file:
-    src: "/opt/agent-clients/{{ item }}"
-    dest: "{{ agent_home_host_path }}/{{ agent_opencode_dir }}/{{ item }}"
-    state: link
-    force: true
-    follow: false
-  become: true
-  become_user: "{{ system_username }}"
-  loop:
-    - package.json
-    - package-lock.json
-    - node_modules
-
-- name: Ensure opencode's plugin directory exists
-  ansible.builtin.file:
-    path: "{{ agent_home_host_path }}/{{ agent_opencode_dir }}/plugin"
-    state: directory
-    mode: '0755'
-  become: true
-  become_user: "{{ system_username }}"
-
-- name: Write the opencode plugin that keeps Playwright screenshots as images
-  ansible.builtin.copy:
-    src: opencode/thinkube-screenshot.ts
-    dest: "{{ agent_home_host_path }}/{{ agent_opencode_dir }}/plugin/thinkube-screenshot.ts"
-    mode: '0644'
-  become: true
-  become_user: "{{ system_username }}"
 
 # Pi --------------------------------------------------------------------------
 
