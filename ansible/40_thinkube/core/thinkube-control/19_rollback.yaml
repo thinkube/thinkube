@@ -37,6 +37,30 @@
         msg: "kubeconfig is not defined. Please set it in inventory."
       when: kubeconfig is not defined or kubeconfig == ""
 
+    # Extensions run in Control's namespace, which this playbook deletes; their
+    # Argo CD applications, databases and repositories would be left behind.
+    - name: Find extensions deployed in Control's namespace
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ argocd_namespace }}"
+      register: argocd_applications
+
+    - name: Refuse while extensions are deployed
+      vars:
+        extensions: >-
+          {{ argocd_applications.resources
+             | selectattr('spec.destination.namespace', 'equalto', control_namespace)
+             | rejectattr('metadata.name', 'equalto', app_name)
+             | map(attribute='metadata.name') | list }}
+      ansible.builtin.fail:
+        msg: >-
+          Extensions are deployed in {{ control_namespace }}: {{ extensions | join(', ') }}.
+          Remove each one first with delete_app (Thinkube Control's delete of the app),
+          then run this rollback.
+      when: extensions | length > 0
+
     # Remove ArgoCD application
     - name: Delete Control Hub ArgoCD application
       kubernetes.core.k8s:
