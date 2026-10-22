@@ -8,7 +8,7 @@
 # that inherit PyTorch from the base image via --system-site-packages.
 #
 # TWO venvs are built:
-# - fine-tuning: Base ML packages + fine-tuning specific (bitsandbytes, peft, trl, unsloth)
+# - fine-tuning: Base ML packages + fine-tuning specific (bitsandbytes, peft, trl)
 # - agent-dev: Base ML packages + agent frameworks (langchain, crewai, etc.)
 #
 # Users who only need basic ML (PyTorch, transformers) use the system Python
@@ -247,39 +247,6 @@ MAX_JOBS="${MAX_JOBS:-8}" \
 "$BUILD_DIR/fine-tuning/bin/pip" install \
   --no-binary causal_conv1d --no-cache-dir --no-build-isolation --no-deps \
   causal-conv1d
-
-# Install Unsloth
-#
-# --no-deps is mandatory, for two independent reasons:
-#
-# 1. Unsloth's dependency chain resolves torch, which would shadow the base
-#    image build. See the PyTorch note at the top of this file.
-#
-# 2. Unsloth's declared ranges lag its own code. Released versions still
-#    declare torch<2.12.0, transformers<=5.5.0 and trl<=0.24.0, while the
-#    code targets newer ones - the torch 2.12 support below ships in a
-#    version whose metadata still excludes torch 2.12. Resolving those
-#    ranges pins the venv to versions Unsloth itself has moved past.
-#
-# Minimum version: Unsloth 2026.7.x.
-#   torch 2.12 made torch._dynamo.config overrides thread-local, so a
-#   recompile limit raised on the main thread never reaches the autograd
-#   worker threads that run backward under gradient checkpointing. Those
-#   threads recompile fullgraph kernels against the default limit of 8.
-#   Against torch 2.12, earlier Unsloth dies at training step 0 with
-#   "FailOnRecompileLimitHit: Hard failure due to fullgraph=True", and
-#   raising torch._dynamo.config.recompile_limit does NOT help - that
-#   symptom pair is the signature of an Unsloth too old for the torch here.
-#   Restored to process-global by unslothai/unsloth#7019.
-#   https://github.com/unslothai/unsloth/issues/6825
-#
-# Installing from git HEAD satisfies the floor, and keeps whatever GB10 /
-# sm_121 support has landed upstream. Pin a tag here only alongside a
-# recorded reason, and never below 2026.7.x while the base image ships
-# torch 2.12 or newer.
-echo "Installing Unsloth..."
-"$BUILD_DIR/fine-tuning/bin/pip" install "git+https://github.com/unslothai/unsloth-zoo.git" --no-deps
-"$BUILD_DIR/fine-tuning/bin/pip" install "unsloth[cu130onlytorch291] @ git+https://github.com/unslothai/unsloth.git" --no-build-isolation --no-deps
 
 verify_torch_inheritance "fine-tuning"
 package_venv "fine-tuning"

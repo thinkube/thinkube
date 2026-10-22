@@ -27,7 +27,7 @@ FLAVOR_FILE = Path.home() / '.jupyter_flavor'
 FLAVOR_DESCRIPTIONS = {
     'ml-gpu': 'Base ML/GPU environment (PyTorch, transformers, all service clients)',
     'agent-dev': 'Agent Development (LangChain, CrewAI, FAISS + ml-gpu)',
-    'fine-tuning': 'Fine-Tuning Lab (Unsloth, QLoRA, PEFT, TRL + ml-gpu)',
+    'fine-tuning': 'Fine-Tuning Lab (QLoRA, PEFT, TRL + ml-gpu)',
 }
 
 

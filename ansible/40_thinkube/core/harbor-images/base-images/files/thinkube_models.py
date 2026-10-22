@@ -4,16 +4,13 @@
 """
 Thinkube model helpers for notebooks.
 
-- load_model_for_finetuning: load a mirrored model from the MLflow Model
-  Registry for fine-tuning.
 - register_finetuned_model: publish a LoRA fine-tune so the LLM Gateway can
   load it on vLLM.
 
 Usage:
     import thinkube_models as tkm
 
-    model, tokenizer = tkm.load_model_for_finetuning("unsloth/Qwen3.5-4B")
-    # ... fine-tune with Unsloth, logging to the MLflow run `run_id` ...
+    # ... fine-tune, logging to the MLflow run `run_id` ...
     tkm.register_finetuned_model(model, tokenizer, catalog_entry, run_id)
 """
 
@@ -73,109 +70,6 @@ def get_mlflow_token():
     )
     response.raise_for_status()
     return response.json()['access_token']
-
-
-def load_model_for_finetuning(model_id: str, device_map: str = "auto"):
-    """
-    Load a model from MLflow Model Registry for fine-tuning.
-
-    This loads models that have been mirrored from HuggingFace to MLflow,
-    using local JuiceFS storage instead of downloading from the internet.
-
-    Args:
-        model_id: HuggingFace model ID (e.g., "unsloth/Qwen3.5-4B")
-        device_map: Device mapping for model loading (default: "auto")
-
-    Returns:
-        tuple: (model, tokenizer) ready for fine-tuning with Unsloth
-
-    Example:
-        from thinkube_models import load_model_for_finetuning
-
-        # Load from MLflow (uses local JuiceFS, no HuggingFace download)
-        model, tokenizer = load_model_for_finetuning("unsloth/Qwen3.5-4B")
-
-        # Then fine-tune with Unsloth as usual
-        model = FastLanguageModel.get_peft_model(model, ...)
-    """
-    # Convert model_id to MLflow model name (replace / with -)
-    model_name = model_id.replace('/', '-')
-
-    print(f"Loading model from MLflow: {model_id}")
-    print(f"  MLflow model name: {model_name}")
-
-    # Get MLflow configuration and token
-    config = get_mlflow_config()
-    token = get_mlflow_token()
-
-    headers = {'Authorization': f'Bearer {token}'}
-    mlflow_url = config['tracking_uri']
-
-    # Query MLflow for model versions
-    print(f"  Querying MLflow for model versions...")
-    response = requests.get(
-        f"{mlflow_url}/api/2.0/mlflow/model-versions/search",
-        params={'filter': f"name='{model_name}'"},
-        headers=headers,
-        timeout=30
-    )
-    response.raise_for_status()
-
-    versions = response.json().get('model_versions', [])
-    if not versions:
-        raise ValueError(
-            f"Model '{model_name}' not found in MLflow registry. "
-            f"Please mirror the model first using thinkube-control."
-        )
-
-    # Get latest version
-    latest = max(versions, key=lambda v: int(v['version']))
-    run_id = latest['run_id']
-    print(f"  Found version {latest['version']} (run_id: {run_id})")
-
-    # Get run details to retrieve experiment_id
-    run_response = requests.get(
-        f"{mlflow_url}/api/2.0/mlflow/runs/get",
-        params={'run_id': run_id},
-        headers=headers,
-        timeout=30
-    )
-    run_response.raise_for_status()
-    experiment_id = run_response.json()['run']['info']['experiment_id']
-
-    # The notebook server mounts the MLflow artifacts (JuiceFS) at
-    # ~/thinkube/mlflow; this module ships only in the Jupyter images.
-    model_path = (Path.home() / 'thinkube' / 'mlflow' / 'artifacts'
-                  / experiment_id / run_id / 'artifacts' / 'model')
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"Model {model_id} is registered in MLflow, but its files are not at "
-            f"{model_path}. The mirror may not have finished; mirror the model again "
-            f"from Thinkube Control's Models page."
-        )
-
-    print(f"  Model path: {model_path}")
-
-    # Unsloth converts MXFP4 weights (gpt-oss) to trainable NF4 when
-    # load_in_4bit=True; the model it returns is ready for QLoRA.
-    try:
-        from unsloth import FastLanguageModel
-    except ImportError as e:
-        raise ImportError(
-            "load_model_for_finetuning loads models with Unsloth, which this kernel "
-            "does not have. Run the notebook with the fine-tuning kernel."
-        ) from e
-
-    print(f"  Loading with Unsloth FastLanguageModel from: {model_path}")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=str(model_path),
-        dtype=None,
-        load_in_4bit=True,
-        device_map=device_map,
-    )
-    print(f"  ✓ Model loaded with Unsloth (ready for QLoRA fine-tuning)")
-
-    return model, tokenizer
 
 
 # The fields of a fine-tune's catalogue entry, the same as a platform entry's
