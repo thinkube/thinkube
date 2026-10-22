@@ -1,0 +1,175 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/unsloth/00_install.yaml
+# Description:
+#   Installs Unsloth for notebooks: builds the custom venv "unsloth" from the
+#   fine-tuning-unsloth template through Thinkube Control, copies the
+#   notebooks of thinkube-unsloth to notebooks/unsloth/, and marks the
+#   component installed.
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/unsloth/00_install.yaml
+#
+# Variables from inventory:
+#   - domain_name, harbor_registry, kubeconfig, thinkube_ref
+
+- name: Unsloth - Install
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    unsloth_namespace: unsloth
+    venv_name: unsloth
+    venv_template: fine-tuning-unsloth
+    control_api: "https://control.{{ domain_name }}/api/v1"
+    notebooks_namespace: jupyterhub
+    notebooks_claim: jupyterhub-notebooks-pvc
+    notebooks_folder: unsloth
+    plugin_repo: https://github.com/thinkube/thinkube-unsloth.git
+
+  tasks:
+    - name: Read the API token of Thinkube Control
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: thinkube-control
+        name: mcp-default-token
+      register: token_secret
+      failed_when: token_secret.resources | length == 0
+      no_log: true
+
+    - name: Keep the token
+      ansible.builtin.set_fact:
+        control_headers:
+          Authorization: "Bearer {{ token_secret.resources[0].data.token | b64decode }}"
+      no_log: true
+
+    - name: List the venvs
+      ansible.builtin.uri:
+        url: "{{ control_api }}/jupyter-venvs?limit=500"
+        headers: "{{ control_headers }}"
+      register: venvs
+
+    - name: Create the venv {{ venv_name }} from {{ venv_template }}
+      ansible.builtin.uri:
+        url: "{{ control_api }}/jupyter-venvs"
+        method: POST
+        headers: "{{ control_headers }}"
+        body_format: json
+        body:
+          name: "{{ venv_name }}"
+          parent_template: "{{ venv_template }}"
+      register: created
+      when: venvs.json.venvs | selectattr('name', 'equalto', venv_name) | list | length == 0
+
+    - name: Find the venv
+      ansible.builtin.set_fact:
+        venv: "{{ created.json if created.json is defined else (venvs.json.venvs | selectattr('name', 'equalto', venv_name) | first) }}"
+
+    - name: Build the venv
+      ansible.builtin.uri:
+        url: "{{ control_api }}/jupyter-venvs/{{ venv.id }}/build"
+        method: POST
+        headers: "{{ control_headers }}"
+        body_format: json
+        body: {}
+      when: venv.status != 'success'
+
+    - name: Wait for the venv build
+      ansible.builtin.uri:
+        url: "{{ control_api }}/jupyter-venvs/{{ venv.id }}"
+        headers: "{{ control_headers }}"
+      register: built
+      until: built.json.status in ['success', 'failed']
+      retries: 120
+      delay: 15
+      when: venv.status != 'success'
+
+    - name: Stop when the venv build failed
+      ansible.builtin.fail:
+        msg: "The venv {{ venv_name }} did not build: {{ built.json.output }}"
+      when: venv.status != 'success' and built.json.status == 'failed'
+
+    - name: Remove an earlier copy Job
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ notebooks_namespace }}"
+        name: unsloth-notebooks
+        delete_options:
+          propagationPolicy: Foreground
+        wait: true
+
+    - name: Copy the notebooks to {{ notebooks_folder }}/
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        wait: true
+        wait_condition:
+          type: Complete
+          status: "True"
+        wait_timeout: 300
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: unsloth-notebooks
+            namespace: "{{ notebooks_namespace }}"
+          spec:
+            backoffLimit: 2
+            ttlSecondsAfterFinished: 600
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: copy
+                    image: "{{ harbor_registry }}/library/alpine-git:latest"
+                    command: ["sh", "-c"]
+                    args:
+                      - |
+                        set -e
+                        rm -rf /notebooks/{{ notebooks_folder }}
+                        git clone --depth 1 --branch {{ thinkube_ref }} {{ plugin_repo }} /notebooks/{{ notebooks_folder }}
+                        rm -rf /notebooks/{{ notebooks_folder }}/.git
+                        chown -R 1000:100 /notebooks/{{ notebooks_folder }}
+                    securityContext:
+                      runAsUser: 0
+                    volumeMounts:
+                      - name: notebooks
+                        mountPath: /notebooks
+                volumes:
+                  - name: notebooks
+                    persistentVolumeClaim:
+                      claimName: "{{ notebooks_claim }}"
+
+    - name: Create the {{ unsloth_namespace }} namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ unsloth_namespace }}"
+
+    - name: Mark Unsloth installed
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: unsloth
+            namespace: "{{ unsloth_namespace }}"
+            labels:
+              thinkube.io/component: unsloth
+          data:
+            venv: "{{ venv_name }}"
+            notebooks: "{{ notebooks_folder }}"

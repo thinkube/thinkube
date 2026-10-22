@@ -1,0 +1,134 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/optional/unsloth/19_rollback.yaml
+# Description:
+#   Uninstalls Unsloth: deletes the venv "unsloth" through Thinkube Control,
+#   removes notebooks/unsloth/, and removes the unsloth namespace.
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/run_ansible.sh ansible/40_thinkube/optional/unsloth/19_rollback.yaml
+#
+# Variables from inventory:
+#   - domain_name, harbor_registry, kubeconfig
+
+- name: Unsloth - Uninstall
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    unsloth_namespace: unsloth
+    venv_name: unsloth
+    control_api: "https://control.{{ domain_name }}/api/v1"
+    notebooks_namespace: jupyterhub
+    notebooks_claim: jupyterhub-notebooks-pvc
+    notebooks_folder: unsloth
+
+  tasks:
+    - name: Read the API token of Thinkube Control
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: thinkube-control
+        name: mcp-default-token
+      register: token_secret
+      failed_when: token_secret.resources | length == 0
+      no_log: true
+
+    - name: Keep the token
+      ansible.builtin.set_fact:
+        control_headers:
+          Authorization: "Bearer {{ token_secret.resources[0].data.token | b64decode }}"
+      no_log: true
+
+    - name: List the venvs
+      ansible.builtin.uri:
+        url: "{{ control_api }}/jupyter-venvs?limit=500"
+        headers: "{{ control_headers }}"
+      register: venvs
+
+    - name: Find the venv
+      ansible.builtin.set_fact:
+        found: "{{ venvs.json.venvs | selectattr('name', 'equalto', venv_name) | list }}"
+
+    - name: Delete the venv {{ venv_name }}
+      ansible.builtin.uri:
+        url: "{{ control_api }}/jupyter-venvs/{{ found[0].id }}"
+        method: DELETE
+        headers: "{{ control_headers }}"
+      when: found | length > 0
+
+    - name: Wait until the venv is gone from every node
+      ansible.builtin.uri:
+        url: "{{ control_api }}/jupyter-venvs/{{ found[0].id }}"
+        headers: "{{ control_headers }}"
+        status_code: [200, 404]
+      register: gone
+      until: gone.status == 404 or gone.json.status == 'delete_failed'
+      retries: 40
+      delay: 5
+      when: found | length > 0
+
+    - name: Stop when the venv could not be removed
+      ansible.builtin.fail:
+        msg: "The venv {{ venv_name }} was not removed: {{ gone.json.output }}"
+      when: found | length > 0 and gone.status == 200
+
+    - name: Remove an earlier Job
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ notebooks_namespace }}"
+        name: unsloth-notebooks
+        delete_options:
+          propagationPolicy: Foreground
+        wait: true
+
+    - name: Remove {{ notebooks_folder }}/
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        wait: true
+        wait_condition:
+          type: Complete
+          status: "True"
+        wait_timeout: 120
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: unsloth-notebooks
+            namespace: "{{ notebooks_namespace }}"
+          spec:
+            backoffLimit: 2
+            ttlSecondsAfterFinished: 600
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: remove
+                    image: "{{ harbor_registry }}/library/alpine-git:latest"
+                    command: ["sh", "-c", "rm -rf /notebooks/{{ notebooks_folder }}"]
+                    securityContext:
+                      runAsUser: 0
+                    volumeMounts:
+                      - name: notebooks
+                        mountPath: /notebooks
+                volumes:
+                  - name: notebooks
+                    persistentVolumeClaim:
+                      claimName: "{{ notebooks_claim }}"
+
+    - name: Remove the {{ unsloth_namespace }} namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ unsloth_namespace }}"
+        wait: true
