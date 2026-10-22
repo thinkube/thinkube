@@ -18,11 +18,8 @@ Usage:
 """
 
 import base64
-import json
 import os
 import shutil
-import time
-import uuid
 import requests
 from pathlib import Path
 
@@ -280,80 +277,29 @@ def _upload_checkpoint(staging_dir: Path, artifact_uri: str) -> str:
     return f"s3://{bucket}/{prefix}"
 
 
-def _write_catalog_entry(entry: dict) -> str:
-    """Write the entry to models.json of <GitHub user>/<GitHub user>-metadata.
-
-    thinkube-control merges that file over the platform catalogue, so the
-    entry is what makes the model known to the LLM Gateway.
-    """
-    github = requests.Session()
-    github.headers.update({
-        "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
-        "Accept": "application/vnd.github+json",
-    })
-    user = github.get("https://api.github.com/user", timeout=30)
-    user.raise_for_status()
-    login = user.json()["login"]
-    repo = f"{login}/{login}-metadata"
-    found = github.get(f"https://api.github.com/repos/{repo}", timeout=30)
-    if found.status_code == 404:
-        raise RuntimeError(f"{repo} does not exist; create it as a private repository on GitHub, then call this again")
-    found.raise_for_status()
-
-    contents_url = f"https://api.github.com/repos/{repo}/contents/models.json"
-    current = github.get(contents_url, timeout=30)
-    if current.status_code == 404:
-        catalog, sha = {"models": []}, None
-    else:
-        current.raise_for_status()
-        catalog = json.loads(base64.b64decode(current.json()["content"]))
-        sha = current.json()["sha"]
-
-    others = [m for m in catalog["models"] if m["id"] != entry["id"]]
-    if others + [entry] == catalog["models"]:
-        print(f"Catalogue entry already in {repo}/models.json")
-        return repo
-    body = {
-        "message": f"Add {entry['id']} to the model catalogue",
-        "content": base64.b64encode(
-            (json.dumps({**catalog, "models": others + [entry]}, indent=2) + "\n").encode()
-        ).decode(),
-    }
-    if sha:
-        body["sha"] = sha
-    github.put(contents_url, json=body, timeout=30).raise_for_status()
-    print(f"Catalogue entry written to {repo}/models.json")
-    return repo
-
-
-def _record_registration(name: str) -> None:
-    """Mark the model's weights as in place in thinkube-control's database."""
-    import psycopg2
-
-    conn = psycopg2.connect(
-        host=os.environ["POSTGRES_HOST"],
-        port=int(os.environ["POSTGRES_PORT"]),
-        user=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        dbname="thinkube_control",
+def _publish_through_control(entry: dict) -> dict:
+    """Ask thinkube-control to publish the model: it writes the entry to
+    models.json of <GitHub user>/<GitHub user>-metadata, records the weights
+    as in place and reads the catalogue again, so the gateway lists the model.
+    The notebook server has its address and API token from service discovery."""
+    missing = [name for name in ("THINKUBE_CONTROL_URL", "THINKUBE_API_TOKEN") if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError(
+            f"{', '.join(missing)} missing from the environment; the notebook server sets them "
+            "from service discovery. Restart it if they are absent."
+        )
+    response = requests.post(
+        f"{os.environ['THINKUBE_CONTROL_URL']}/api/v1/models/finetuned",
+        json={"catalog_entry": entry},
+        headers={"Authorization": f"Bearer {os.environ['THINKUBE_API_TOKEN']}"},
+        timeout=120,
     )
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO model_mirror_jobs (id, model_id, status, workflow_name, error_message)
-                VALUES (%s, %s, 'succeeded', NULL, NULL)
-                ON CONFLICT (model_id) DO UPDATE
-                SET status = 'succeeded', error_message = NULL, updated_at = CURRENT_TIMESTAMP
-                """,
-                (str(uuid.uuid4()), name),
-            )
-    finally:
-        conn.close()
-    print(f"Registration recorded for {name}")
+    if response.status_code >= 400:
+        raise RuntimeError(f"thinkube-control did not publish {entry['id']}: {response.status_code} {response.text}")
+    return response.json()
 
 
-def register_finetuned_model(model, tokenizer, catalog_entry: dict, run_id: str, timeout: int = 600) -> str:
+def register_finetuned_model(model, tokenizer, catalog_entry: dict, run_id: str) -> str:
     """Publish a LoRA fine-tune so the LLM Gateway can load it on vLLM.
 
     Steps:
@@ -363,10 +309,10 @@ def register_finetuned_model(model, tokenizer, catalog_entry: dict, run_id: str,
        S3 gateway that holds MLflow's artifacts.
     3. Register a model version linked to that run, so the model can be traced
        back to the experiment that produced it.
-    4. Write `catalog_entry` to models.json in the private repository
-       <GitHub user>/<GitHub user>-metadata.
-    5. Record the registration in thinkube-control's database, and wait until
-       the gateway lists the model.
+    4. Ask thinkube-control to publish it: Control writes `catalog_entry` to
+       models.json in the private repository <GitHub user>/<GitHub user>-metadata
+       with its own GitHub token, records the weights as in place, and reads the
+       catalogue again, so the gateway lists the model at once.
 
     Args:
         model: The Unsloth model with its trained LoRA adapter.
@@ -375,13 +321,11 @@ def register_finetuned_model(model, tokenizer, catalog_entry: dict, run_id: str,
             CATALOG_FIELDS; server_type ["vllm"], quantization "BF16" and
             is_finetuned true.
         run_id: The MLflow run of the training.
-        timeout: Seconds to wait for the gateway to list the model.
 
     Returns:
         The model's state in the gateway, normally "deployable".
     """
     from mlflow.exceptions import RestException
-    from tk_llm import LLMClient
 
     _check_catalog_entry(catalog_entry)
     name = catalog_entry["id"]
@@ -402,17 +346,8 @@ def register_finetuned_model(model, tokenizer, catalog_entry: dict, run_id: str,
     version = client.create_model_version(name=registered_name, source=source, run_id=run_id)
     print(f"Registered {registered_name} version {version.version}, linked to run {run_id}")
 
-    _write_catalog_entry(catalog_entry)
-    _record_registration(name)
-
-    # The gateway reads the catalogue again within 5 minutes
-    llm = LLMClient()
-    deadline = time.time() + timeout
-    while True:
-        listed = {m.id: m for m in llm.list_models().models}
-        if name in listed:
-            print(f"{name}: {listed[name].state}")
-            return listed[name].state
-        if time.time() > deadline:
-            raise RuntimeError(f"{name} is not listed by the gateway after {timeout} seconds")
-        time.sleep(15)
+    published = _publish_through_control(catalog_entry)
+    if published["state"] is None:
+        raise RuntimeError(f"thinkube-control wrote {name} to {published['repository']}, but the gateway does not list it")
+    print(f"{name}: {published['state']}, catalogue entry in {published['repository']}/models.json")
+    return published["state"]
