@@ -90,6 +90,8 @@
               import hmac
               import hashlib
               import time
+              import queue
+              import re
               import threading
               from http.server import HTTPServer, BaseHTTPRequestHandler
               from urllib.parse import urlparse
@@ -137,44 +139,81 @@
                           logger.warning(f"{what} failed (attempt {attempt}/{ATTEMPTS}): {e}; trying again")
                           time.sleep(PAUSE_SECONDS * attempt)
 
-              def get_app_metadata_from_workflow(workflow_uid):
-                  """App name and namespace from the labels of the workflow whose UID is the tag.
+              # A build tags its images with the UID of its workflow. Per-architecture images
+              # (<uid>-arm64), latest and layer caches are not deployable; the push of the
+              # image or index tagged with the bare UID is the one that completes a build.
+              BUILD_TAG = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+              WORKFLOWS_API = 'https://kubernetes.default.svc/apis/argoproj.io/v1alpha1/namespaces/argo'
+              # The annotation that tells thinkube-control's pipeline view why a build was not deployed
+              SUPERSEDED = 'thinkube.io/deploy-superseded-by'
 
-                  (None, None) when no workflow has that UID or it has no app-name label.
+
+              def k8s_headers():
+                  with open('/var/run/secrets/kubernetes.io/serviceaccount/token') as f:
+                      return {'Authorization': f'Bearer {f.read()}'}
+
+
+              def app_builds(repo_name):
+                  """The build workflows of the app an image repository belongs to, by UID.
+
+                  The repository is thinkube/<app>-<container>, so the app is a part of the
+                  name ending at a dash; the workflows carry it as thinkube.io/app-name.
                   A failed request raises, so the caller can try again.
                   """
-                  import urllib3
-                  urllib3.disable_warnings()
-
-                  token_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
-                  with open(token_path, 'r') as f:
-                      token = f.read()
-                  headers = {'Authorization': f'Bearer {token}'}
-
-                  # fieldSelector does not support metadata.uid for CRDs: list and filter.
-                  url = 'https://kubernetes.default.svc/apis/argoproj.io/v1alpha1/namespaces/argo/workflows'
-                  response = requests.get(url, headers=headers, verify=False, timeout=5)
+                  parts = repo_name.split('/', 1)[-1].split('-')
+                  candidates = ['-'.join(parts[:i]) for i in range(1, len(parts))]
+                  if not candidates:
+                      return {}
+                  response = requests.get(
+                      f'{WORKFLOWS_API}/workflows',
+                      params={'labelSelector': f"thinkube.io/app-name in ({','.join(candidates)})"},
+                      headers=k8s_headers(), verify=False, timeout=10)
                   if response.status_code != 200:
                       raise Retryable(f"listing workflows answered {response.status_code}")
-
+                  builds = {}
                   for wf in response.json().get('items', []):
-                      if wf.get('metadata', {}).get('uid') != workflow_uid:
+                      meta = wf['metadata']
+                      app = meta['labels']['thinkube.io/app-name']
+                      builds[meta['uid']] = {
+                          'name': meta['name'],
+                          'app': app,
+                          'created': meta['creationTimestamp'],
+                      }
+                  return builds
+
+
+              def template_containers(app_name):
+                  """The containers the app's WorkflowTemplate builds. Multi-arch builds have a
+                  task per architecture (build-inference-amd64, build-inference-arm64) sharing
+                  one container_name parameter."""
+                  response = requests.get(f'{WORKFLOWS_API}/workflowtemplates/{app_name}-build',
+                                          headers=k8s_headers(), verify=False, timeout=5)
+                  if response.status_code != 200:
+                      raise Retryable(f"WorkflowTemplate {app_name}-build answered {response.status_code}")
+                  containers = []
+                  for template in response.json().get('spec', {}).get('templates', []):
+                      if template.get('name') not in ('ci-cd-pipeline', 'build-and-push'):
                           continue
-                      labels = wf.get('metadata', {}).get('labels', {})
-                      app_name = labels.get('thinkube.io/app-name')
-                      if not app_name:
-                          logger.warning(f"Workflow {workflow_uid} has no app-name label")
-                          return None, None
-                      # System apps such as thinkube-control carry no namespace label;
-                      # their namespace is named after the app.
-                      namespace = labels.get('thinkube.io/namespace') or app_name
-                      logger.info(f"Found workflow for app '{app_name}' in namespace '{namespace}'")
-                      return app_name, namespace
-
-                  logger.warning(f"No workflow found with UID {workflow_uid}")
-                  return None, None
+                      for task in template.get('dag', {}).get('tasks', []):
+                          task_name = task.get('name', '')
+                          if not task_name.startswith('build-') or task_name in ('build-pipeline', 'build-and-push'):
+                              continue
+                          task_args = {a['name']: a['value'] for a in task.get('arguments', {}).get('parameters', [])}
+                          name = task_args.get('container_name') or task_name.replace('build-', '')
+                          if name not in containers:
+                              containers.append(name)
+                  return containers
 
 
+              def mark_superseded(build, newer):
+                  """Annotate a build that was not deployed because a newer one already was."""
+                  response = requests.patch(
+                      f"{WORKFLOWS_API}/workflows/{build['name']}",
+                      json={'metadata': {'annotations': {SUPERSEDED: newer['name']}}},
+                      headers={**k8s_headers(), 'Content-Type': 'application/merge-patch+json'},
+                      verify=False, timeout=10)
+                  if response.status_code != 200:
+                      raise Retryable(f"annotating {build['name']} answered {response.status_code}")
               def check_harbor_image(project, repo, tag):
                   """True when the image is in Harbor, False when Harbor says it is not; any other answer raises."""
                   url = f"{HARBOR_URL}/api/v2.0/projects/{project}/repositories/{repo}/artifacts/{tag}"
@@ -186,45 +225,24 @@
                   raise Retryable(f"Harbor answered {response.status_code} for {project}/{repo}:{tag}")
 
               def trigger_argocd_sync(app_name):
-                  """Trigger ArgoCD sync via sync webhook"""
-                  try:
-                      payload = {"application": app_name}
-                      payload_json = json.dumps(payload)
-                      headers = {"Content-Type": "application/json"}
-                      
-                      # Add HMAC signature if secret is configured
-                      if SYNC_WEBHOOK_SECRET:
-                          signature = hmac.new(
-                              SYNC_WEBHOOK_SECRET.encode('utf-8'),
-                              payload_json.encode('utf-8'),
-                              hashlib.sha256
-                          ).hexdigest()
-                          headers["X-Webhook-Signature"] = signature
-                      
-                      response = requests.post(
-                          SYNC_WEBHOOK_URL,
-                          data=payload_json,
-                          headers=headers,
-                          timeout=30
-                      )
-                      
-                      if response.status_code == 200:
-                          logger.info(f"Successfully triggered sync for {app_name}")
-                          return True
-                      else:
-                          logger.error(f"Failed to trigger sync for {app_name}: {response.status_code} - {response.text}")
-                          return False
-                          
-                  except Exception as e:
-                      logger.error(f"Error triggering sync: {e}")
-                      return False
+                  """Ask the sync webhook to sync the app's Argo CD application, the only
+                  trigger of a deploy: no application syncs by itself. A refusal raises."""
+                  payload_json = json.dumps({"application": app_name})
+                  headers = {"Content-Type": "application/json"}
+                  if SYNC_WEBHOOK_SECRET:
+                      headers["X-Webhook-Signature"] = hmac.new(
+                          SYNC_WEBHOOK_SECRET.encode('utf-8'), payload_json.encode('utf-8'), hashlib.sha256).hexdigest()
+                  response = requests.post(SYNC_WEBHOOK_URL, data=payload_json, headers=headers, timeout=30)
+                  if response.status_code != 200:
+                      raise Retryable(f"sync of {app_name} answered {response.status_code}: {response.text[:200]}")
+                  logger.info(f"Triggered sync for {app_name}")
+              def update_git_with_images(app_name, tag, containers, build, builds):
+                  """Write the image tags to the app's Gitea repository, push, and sync.
 
-              def update_git_with_images(app_name, tag, containers):
-                  """Write the image tags to the app's Gitea repository and push.
-
-                  A failed clone or push raises Retryable: each try starts from a fresh
-                  clone, so a push rejected because another build pushed first succeeds
-                  on top of that build's commit.
+                  A failed clone, push or sync raises Retryable: each try starts from a
+                  fresh clone, so a push rejected because another build pushed first
+                  succeeds on top of that build's commit. A build older than the one
+                  whose tags are already written is not deployed: returns the newer build.
                   """
                   with tempfile.TemporaryDirectory() as temp_dir:
                       repo_url = f"{GITEA_URL}/thinkube-deployments/{app_name}.git"
@@ -242,6 +260,17 @@
 
                       # Update .argocd-source file
                       argocd_file = os.path.join(repo_dir, 'k8s', f'.argocd-source-{app_name}.yaml')
+
+                      # Builds start in the order of their pushes; a build that
+                      # finishes after a newer one must not replace its images.
+                      # The written tag is the UID of the build that made it.
+                      if os.path.exists(argocd_file):
+                          with open(argocd_file) as f:
+                              written = [line.rsplit(':', 1)[-1].strip() for line in f if line.strip().startswith('- ')]
+                          current = builds.get(written[0]) if written else None
+                          if current and written[0] != tag and current['created'] > build['created']:
+                              logger.info(f"Not deploying {app_name}:{tag}: the newer build {current['name']} is deployed")
+                              return current
 
                       # Create/update the ArgoCD source file with new image tags
                       image_list = []
@@ -271,8 +300,10 @@
 
                       if commit_result.returncode != 0:
                           if "nothing to commit" in commit_result.stdout:
-                              logger.info(f"No changes to commit for {app_name}:{tag}")
-                              return True
+                              # Written already, by a try whose sync failed
+                              logger.info(f"Tags of {app_name}:{tag} already written")
+                              trigger_argocd_sync(app_name)
+                              return None
                           else:
                               raise RuntimeError(f"git commit failed: {commit_result.stderr.strip()}")
 
@@ -283,147 +314,66 @@
                           raise Retryable(f"git push failed: {push_result.stderr.strip()}")
 
                       logger.info(f"Successfully updated git for {app_name} with tag {tag}")
+                      trigger_argocd_sync(app_name)
+                      return None
 
-                      # Trigger ArgoCD sync after Git update
-                      if trigger_argocd_sync(app_name):
-                          logger.info(f"Successfully triggered ArgoCD sync for {app_name}")
-                      else:
-                          logger.warning(f"Failed to trigger ArgoCD sync for {app_name}, but Git update succeeded")
+              def process_event(webhook_data):
+                  """Deploy the build an image push completes, once every container's image
+                  of that build is in Harbor."""
+                  if webhook_data.get('type') != 'PUSH_ARTIFACT':
+                      return
+                  event_data = webhook_data.get('event_data', {})
+                  repo_name = event_data.get('repository', {}).get('repo_full_name', '')
+                  if repo_name.endswith('/cache'):
+                      return
+                  tags = [r.get('tag', '') for r in event_data.get('resources', [])]
+                  tag = next((t for t in tags if BUILD_TAG.match(t)), None)
+                  if tag is None:
+                      return
+                  logger.info(f"Image pushed: {repo_name}:{tag}")
 
-                      return True
+                  builds = with_retries(f"workflows of {repo_name}", lambda: app_builds(repo_name))
+                  build = builds.get(tag)
+                  if build is None:
+                      logger.error(f"IMAGE NOT DEPLOYED: {repo_name}:{tag}: no build workflow has UID {tag}")
+                      return
+                  app_name = build['app']
+                  containers = with_retries(f"WorkflowTemplate {app_name}-build", lambda: template_containers(app_name))
+                  if not containers:
+                      logger.error(f"IMAGE NOT DEPLOYED: {app_name}:{tag}: its WorkflowTemplate builds no container")
+                      return
 
-              def process_webhook_async(webhook_data):
-                  """Process webhook in background thread"""
-                  try:
-                      logger.info(f"Background processing started for webhook: {webhook_data.get('type', 'unknown')}")
-                      
-                      # Process only PUSH_ARTIFACT events
-                      if webhook_data.get('type') == 'PUSH_ARTIFACT':
-                          event_data = webhook_data.get('event_data', {})
-                          repository = event_data.get('repository', {})
-                          resources = event_data.get('resources', [])
-                          
-                          if repository and resources:
-                              repo_name = repository.get('repo_full_name', '')
-                              # Builds push their layer cache to <image>/cache, one
-                              # event per layer; those are never deployable images.
-                              if repo_name.endswith('/cache'):
-                                  return
-                              logger.info(f"Webhook for repo {repo_name} with {len(resources)} resources")
-                              
-                              # Initialize variables
-                              app_name = None
-                              namespace = None
-                              workflow_uid = None
-                              
-                              # Find the workflow UID from the resources (it's the tag)
-                              for resource in resources:
-                                  tag = resource.get('tag', '')
-                                  if tag and tag != 'latest':  # The tag is the workflow UID
-                                      workflow_uid = tag
-                                      break
-                              
-                              if not workflow_uid:
-                                  logger.warning("No workflow UID found in webhook resources")
-                                  return
-                              
-                              # Get app metadata from the workflow
-                              app_name, namespace = with_retries(
-                                  f"workflow lookup for {workflow_uid}",
-                                  lambda: get_app_metadata_from_workflow(workflow_uid))
-                              
-                              if not app_name or not namespace:
-                                  logger.error(f"Failed to find workflow metadata for UID: {workflow_uid}")
-                                  return
-                              
-                              # Get container information from the workflow template
-                              # The workflow knows which containers it's building
-                              containers = []
-                              
-                              # Read service account token
-                              token_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
-                              with open(token_path, 'r') as f:
-                                  token = f.read()
-                              
-                              headers = {'Authorization': f'Bearer {token}'}
-                              
-                              # Get the WorkflowTemplate to see which containers it builds
-                              wft_url = f'https://kubernetes.default.svc/apis/argoproj.io/v1alpha1/namespaces/argo/workflowtemplates/{app_name}-build'
-                              wft_response = with_retries(
-                                  f"WorkflowTemplate {app_name}-build",
-                                  lambda: requests.get(wft_url, headers=headers, verify=False, timeout=5))
-                              
-                              if wft_response.status_code != 200:
-                                  logger.error(f"Failed to get WorkflowTemplate: {wft_response.status_code}")
-                                  return
-                              
-                              wft_data = wft_response.json()
-                              spec = wft_data.get('spec', {})
-                              templates = spec.get('templates', [])
-                              
-                              # Find build tasks to identify unique containers.
-                              # Multi-arch builds have multiple tasks (build-inference-amd64,
-                              # build-inference-arm64) sharing the same container_name param.
-                              seen_containers = set()
-                              for template in templates:
-                                  if template.get('name') in ['ci-cd-pipeline', 'build-and-push']:
-                                      dag = template.get('dag', {})
-                                      tasks = dag.get('tasks', [])
-                                      for task in tasks:
-                                          task_name = task.get('name', '')
-                                          if task_name.startswith('build-') and task_name not in ['build-pipeline', 'build-and-push']:
-                                              task_args = {a['name']: a['value'] for a in task.get('arguments', {}).get('parameters', [])}
-                                              container_name = task_args.get('container_name') or task_name.replace('build-', '')
-                                              if container_name not in seen_containers:
-                                                  seen_containers.add(container_name)
-                                                  containers.append({'name': container_name})
+                  missing = [c for c in containers if not with_retries(
+                      f"Harbor check of {app_name}-{c}:{tag}", lambda c=c: check_harbor_image('thinkube', f'{app_name}-{c}', tag))]
+                  if missing:
+                      logger.info(f"{app_name}:{tag} waits for the images of {missing}")
+                      return
 
-                              if not containers:
-                                  logger.error(f"No container build tasks found in WorkflowTemplate for {app_name}")
-                                  return
+                  newer = with_retries(f"Gitea update of {app_name} to {tag}",
+                                       lambda: update_git_with_images(app_name, tag, [{'name': c} for c in containers], build, builds))
+                  if newer is not None:
+                      with_retries(f"marking {build['name']} as superseded",
+                                   lambda: mark_superseded(build, newer))
 
-                              logger.info(f"Found {len(containers)} containers from WorkflowTemplate: {[c['name'] for c in containers]}")
 
-                              for resource in resources:
-                                  tag = resource.get('tag', '')
-                                  if tag and tag != 'latest':  # Ignore latest tags
-                                      logger.info(f"Received webhook for {app_name} - {repo_name}:{tag}")
+              # Events are handled one at a time, in the order they arrive: two builds of
+              # one app never write their tags at the same time, and the memory used does
+              # not grow with the number of pushes.
+              EVENTS = queue.Queue()
 
-                                      # Smart Detection: Check if all container images exist in Harbor
-                                      try:
-                                          # Check each container image
-                                          image_status = {}
-                                          for container in containers:
-                                              container_name = container['name']
-                                              exists = with_retries(
-                                                  f"Harbor check of {app_name}-{container_name}:{tag}",
-                                                  lambda: check_harbor_image('thinkube', f'{app_name}-{container_name}', tag))
-                                              image_status[container_name] = exists
 
-                                          all_images_exist = all(image_status.values())
-                                          logger.info(f"Image check for {app_name}:{tag} - {image_status}")
-
-                                          if all_images_exist:
-                                              logger.info(f"All {len(containers)} images found for {app_name}:{tag}")
-
-                                              # Update git repository with image tags
-                                              with_retries(
-                                                  f"Gitea update of {app_name} to {tag}",
-                                                  lambda: update_git_with_images(app_name, tag, containers))
-                                          else:
-                                              missing_containers = [name for name, exists in image_status.items() if not exists]
-                                              logger.info(f"Waiting for images: {missing_containers}")
-
-                                      except Exception as e:
-                                          logger.error(f"IMAGE NOT DEPLOYED: {app_name}:{tag}: {e}")
-                      
-                      logger.info("Background processing completed")
-                      
-                  except Exception as e:
-                      logger.error(f"IMAGE NOT DEPLOYED: event for {webhook_data.get('event_data', {}).get('repository', {}).get('repo_full_name', '?')}: {e}")
-                      import traceback
-                      logger.error(traceback.format_exc())
-
+              def handle_events():
+                  while True:
+                      webhook_data = EVENTS.get()
+                      try:
+                          process_event(webhook_data)
+                      except Exception as e:
+                          repo = webhook_data.get('event_data', {}).get('repository', {}).get('repo_full_name', '?')
+                          logger.error(f"IMAGE NOT DEPLOYED: event for {repo}: {e}")
+                          import traceback
+                          logger.error(traceback.format_exc())
+                      finally:
+                          EVENTS.task_done()
               class WebhookHandler(BaseHTTPRequestHandler):
                   def do_GET(self):
                       # Health check endpoint
@@ -450,16 +400,11 @@
                           # Log the webhook for debugging
                           logger.info(f"Received webhook: {webhook_data.get('type', 'unknown')}")
                           
-                          # Start processing in background thread
-                          thread = threading.Thread(target=process_webhook_async, args=(webhook_data,))
-                          thread.daemon = True  # Don't wait for thread to complete on shutdown
-                          thread.start()
-                          
-                          # Immediately respond to Harbor
+                          EVENTS.put(webhook_data)
                           self.send_response(200)
                           self.send_header('Content-type', 'application/json')
                           self.end_headers()
-                          self.wfile.write(json.dumps({"status": "accepted"}).encode())
+                          self.wfile.write(json.dumps({"status": "queued"}).encode())
                           
                       except Exception as e:
                           logger.error(f"Error receiving webhook: {e}")
@@ -478,6 +423,7 @@
                       logger.info(f"Gitea URL: {GITEA_URL}")
                       # Add debug logging
                       logger.info(f"Creating HTTP server on 0.0.0.0:{PORT}")
+                      threading.Thread(target=handle_events, daemon=True).start()
                       httpd = HTTPServer(('0.0.0.0', PORT), WebhookHandler)
                       logger.info("HTTP server created successfully, starting to serve...")
                       httpd.serve_forever()
@@ -512,8 +458,12 @@
             resources: ["configmaps"]
             verbs: ["get", "list"]
           - apiGroups: ["argoproj.io"]
-            resources: ["workflows", "workflowtemplates"]
+            resources: ["workflowtemplates"]
             verbs: ["get", "list"]
+          # patch: a build that is not deployed because a newer one is gets an annotation
+          - apiGroups: ["argoproj.io"]
+            resources: ["workflows"]
+            verbs: ["get", "list", "patch"]
 
     - name: Create ClusterRoleBinding
       kubernetes.core.k8s:
@@ -561,9 +511,9 @@
                   node-role.kubernetes.io/control-plane: ""
                 containers:
                 - name: adapter
-                  image: "{{ harbor_registry }}/library/python:3.12-alpine"
-                  command: ["/bin/sh", "-c"]
-                  args: ["apk add --no-cache git && pip install --no-cache-dir requests pyyaml && python -u /app/adapter.py"]
+                  # python-base carries git, requests and pyyaml: nothing is installed at start
+                  image: "{{ harbor_registry }}/library/python-base:3.12-slim"
+                  command: ["python", "-u", "/app/adapter.py"]
                   env:
                   - name: HARBOR_URL
                     value: "https://registry.{{ domain_name }}"
@@ -591,8 +541,8 @@
                       cpu: 50m
                       memory: 64Mi
                     limits:
-                      cpu: 100m
-                      memory: 128Mi
+                      cpu: 200m
+                      memory: 256Mi
                   livenessProbe:
                     httpGet:
                       path: /
