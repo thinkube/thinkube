@@ -235,17 +235,26 @@ def _merge_to_staging(model, tokenizer, name: str, run_id: str) -> Path:
     return staging_dir
 
 
+# MLflow serves the artifacts (mlflow-artifacts:/...) from this bucket and
+# folder of the JuiceFS S3 gateway: mlflow-artifacts:/<x> is s3://mlflow/artifacts/<x>.
+ARTIFACTS_URI = "mlflow-artifacts:/"
+ARTIFACTS_BUCKET = "mlflow"
+ARTIFACTS_FOLDER = "artifacts"
+
+
 def _upload_checkpoint(staging_dir: Path, artifact_uri: str) -> str:
-    """Upload the checkpoint to the run's model folder; returns its S3 URI."""
+    """Upload the checkpoint to the run's model folder, straight to the S3
+    gateway: a multi-GB checkpoint does not go through the MLflow server.
+    Returns the folder's MLflow URI."""
     import boto3
     from boto3.s3.transfer import TransferConfig
     from botocore.config import Config as BotoConfig
     from kubernetes import client as k8s_client, config as k8s_config
 
-    bucket = "mlflow"
-    if not artifact_uri.startswith(f"s3://{bucket}/"):
-        raise RuntimeError(f"the run's artifacts are at {artifact_uri}, outside the s3://{bucket} bucket")
-    prefix = f"{artifact_uri[len(f's3://{bucket}/'):]}/model"
+    if not artifact_uri.startswith(ARTIFACTS_URI) or artifact_uri.startswith(ARTIFACTS_URI + "/"):
+        raise RuntimeError(f"the run's artifacts are at {artifact_uri}, not under {ARTIFACTS_URI}")
+    folder = f"{artifact_uri[len(ARTIFACTS_URI):]}/model"
+    bucket, prefix = ARTIFACTS_BUCKET, f"{ARTIFACTS_FOLDER}/{folder}"
 
     # The S3 gateway credentials, read with the notebook pod's service account
     k8s_config.load_incluster_config()
@@ -274,7 +283,7 @@ def _upload_checkpoint(staging_dir: Path, artifact_uri: str) -> str:
             print(f"  {path.name} ({size_gb:.1f} GB)...")
         s3.upload_file(str(path), bucket, f"{prefix}/{path.relative_to(staging_dir)}", Config=transfer)
     print("Upload complete")
-    return f"s3://{bucket}/{prefix}"
+    return f"{ARTIFACTS_URI}{folder}"
 
 
 def _publish_through_control(entry: dict) -> dict:
@@ -305,8 +314,8 @@ def register_finetuned_model(model, tokenizer, catalog_entry: dict, run_id: str)
     Steps:
     1. Merge the adapter into the base weights and write a 16-bit Hugging Face
        checkpoint to the staging folder.
-    2. Upload it to the model folder of the training run `run_id`, through the
-       S3 gateway that holds MLflow's artifacts.
+    2. Upload it to the model folder of the training run `run_id`, straight to
+       the S3 gateway that holds MLflow's artifacts.
     3. Register a model version linked to that run, so the model can be traced
        back to the experiment that produced it.
     4. Ask thinkube-control to publish it: Control writes `catalog_entry` to

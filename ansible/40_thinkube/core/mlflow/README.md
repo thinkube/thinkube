@@ -84,6 +84,7 @@ The database is created in the existing PostgreSQL instance deployed as a core c
 
 MLflow artifact storage:
 - **Endpoint**: The JuiceFS S3 gateway, `http://juicefs-mlflow-gateway.juicefs.svc.cluster.local:9001` (`MLFLOW_S3_ENDPOINT_URL`)
+- **Served by MLflow** (`--serve-artifacts`): clients send and read artifacts through MLflow with their Keycloak token and need no S3 credentials. A run's artifacts are `mlflow-artifacts:/<experiment>/<run>/artifacts`, stored at `s3://mlflow/artifacts/<experiment>/<run>/artifacts`. Model mirrors and fine-tune registrations write multi-GB weights straight to the gateway, under the same path.
 - **Backend**: The JuiceFS `mlflow` volume, whose data lives in the SeaweedFS (Apache 2.0 licensed) bucket `mlflow`
 - **Why**: MLflow writes through S3; inference workloads and JupyterHub read the same files through a POSIX mount, without a second copy
 - **Location**: The bucket is created during deployment
