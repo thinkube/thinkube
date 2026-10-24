@@ -73,6 +73,13 @@ describe. A development change does none of that and does not raise a
   and has no fix; Thinkube Control's Models page tells the user and links
   to MLflow. Sign in once (Playwright, as `thinkube`) and submit the
   mirror again. Do not report it or propose a fix.
+- Every model a piece of work uses goes through the platform: a model
+  missing from the catalogue is missing because nobody tested it yet, so
+  each new one widens it. Add its entry to `thinkube-metadata/models.json`
+  on `main`, push, mirror it through Thinkube Control (`submit_model_mirror`)
+  and use it from the mirror. Never download a model to a folder of its
+  own, and never leave it in a user's catalogue. The entry reaches
+  `release-*` with the next release, like any other change.
 - Memory of an agent is not a record. What must be kept goes into a
   repository: a rule here, a note in the project's own repository, or
   VERSIONING.md.
