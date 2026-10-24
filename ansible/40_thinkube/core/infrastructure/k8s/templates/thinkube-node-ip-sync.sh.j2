@@ -20,15 +20,32 @@ FLAGS=/var/lib/kubelet/kubeadm-flags.env
 CILIUM_DELETE_QUEUE=/var/run/cilium/deleteQueue
 CILIUM_DELETE_QUEUE_LIMIT=200
 
+# A node-ip change owed to the running Cilium agent. Kept on tmpfs: after a
+# reboot the agent starts fresh and reads the current address by itself.
+STATE_DIR=/run/thinkube-node-ip-sync
+CILIUM_RESTART_PENDING="${STATE_DIR}/cilium-restart"
+# How long kubelet must have run on the new --node-ip before the agent is
+# restarted. kubelet publishes node status every 10s; the agent reads the
+# address from the Node object, so restarting it earlier can re-read the old
+# one.
+CILIUM_SETTLE_SECONDS=30
+
+uptime_seconds() {
+    cut -d. -f1 /proc/uptime
+}
+
 primary_ip() {
     ip -4 route get 1.1.1.1 2>/dev/null \
         | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}'
 }
 
 # --- kubelet --node-ip --------------------------------------------------
-# Node InternalIP is the target for Cilium VXLAN node-to-node traffic and
-# apiserver→kubelet (exec/logs/metrics); it must be a real address on the
-# current network. Missing flags file = node not initialised/joined yet.
+# Node InternalIP is the target for apiserver→kubelet (exec/logs/metrics)
+# and the address Cilium advertises for VXLAN node-to-node traffic; it must
+# be a real address on the current network. Cilium reads it only when its
+# agent starts, so a change under a running agent also needs an agent
+# restart (next section). Missing flags file = node not initialised/joined
+# yet.
 if [ -f "$FLAGS" ]; then
     new_ip=$(primary_ip)
 {% if node_ip_sync_cp_hostname is not defined %}
@@ -50,13 +67,47 @@ if [ -f "$FLAGS" ]; then
         # job while that job waits for the script's unit to finish, leaving
         # kubelet stopped and the node NotReady.
         systemctl --no-block try-restart kubelet.service 2>/dev/null || true
+        # A running agent keeps advertising the old address; at boot none
+        # runs yet, and the one that starts reads the new address.
+        if pgrep -x cilium-agent >/dev/null 2>&1; then
+            mkdir -p "$STATE_DIR"
+            uptime_seconds > "$CILIUM_RESTART_PENDING"
+        fi
+    fi
+fi
+
+# --- Cilium agent node address ------------------------------------------
+# The agent is restarted only once kubelet has restarted after the change
+# and run long enough to publish the new address; until then the pending
+# marker stays and a later run retries. kubelet's job was queued with
+# --no-block above, so this is never the run that changed the address. The
+# agent is the pod's only container and restartPolicy is Always: kubelet
+# starts it again at once. An agent that started after kubelet settled has
+# already read the new address and is left alone.
+cilium_restarted=0
+if [ -f "$CILIUM_RESTART_PENDING" ] && systemctl is-active --quiet kubelet.service; then
+    marked_at=$(cat "$CILIUM_RESTART_PENDING")
+    now=$(uptime_seconds)
+    kubelet_since=$(( $(systemctl show -p ActiveEnterTimestampMonotonic --value kubelet.service) / 1000000 ))
+    kubelet_up=$(( now - kubelet_since ))
+    agent_pid=$(pgrep -xo cilium-agent)
+    if [ "$kubelet_since" -ge "$marked_at" ] && [ "$kubelet_up" -ge "$CILIUM_SETTLE_SECONDS" ] && [ -n "$agent_pid" ]; then
+        agent_age=$(ps -o etimes= -p "$agent_pid" | tr -d ' ')
+        if [ "$agent_age" -gt $(( kubelet_up - CILIUM_SETTLE_SECONDS )) ]; then
+            kill -TERM "$agent_pid"
+            cilium_restarted=1
+            echo "cilium agent: restarted for node-ip change"
+        fi
+        rm -f "$CILIUM_RESTART_PENDING"
     fi
 fi
 
 # --- Cilium deletion queue ----------------------------------------------
 # Only ever cleared with no agent running: a live agent drains this itself,
-# and entries it still owns are not ours to discard.
-if [ -d "$CILIUM_DELETE_QUEUE" ] && ! pgrep -x cilium-agent >/dev/null 2>&1; then
+# and entries it still owns are not ours to discard. An agent this run just
+# terminated is not running for a moment only; its successor drains the
+# queue, so the queue is left alone in that run.
+if [ "$cilium_restarted" -eq 0 ] && [ -d "$CILIUM_DELETE_QUEUE" ] && ! pgrep -x cilium-agent >/dev/null 2>&1; then
     queued=$(find "$CILIUM_DELETE_QUEUE" -mindepth 1 -maxdepth 1 | wc -l)
     if [ "$queued" -ge "$CILIUM_DELETE_QUEUE_LIMIT" ]; then
         find "$CILIUM_DELETE_QUEUE" -mindepth 1 -maxdepth 1 -delete

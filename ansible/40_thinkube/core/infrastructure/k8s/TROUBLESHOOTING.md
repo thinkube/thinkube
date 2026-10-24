@@ -68,7 +68,7 @@ Correct the cause. Then run `28_test_worker.yaml` to check the worker. Running `
 
 **Cause.** kubelet's `--node-ip` in `/var/lib/kubelet/kubeadm-flags.env` still holds the old address.
 
-**Fix.** `thinkube-node-ip-sync` corrects this at boot and every minute after that. It writes the new address and restarts kubelet. On workers it also points the API proxy at the control plane's new address, which it finds by host name over LLMNR (5355/udp). Check that the timer is active:
+**Fix.** `thinkube-node-ip-sync` corrects this at boot and every minute after that. It writes the new address and restarts kubelet. When the change happens on a running node, it then restarts the node's Cilium agent, after kubelet has run 30 seconds on the new address. The agent reads the node address only when it starts. Without that restart, it keeps advertising the old address, and traffic from other nodes to this one goes to the old address. On workers it also points the API proxy at the control plane's new address, which it finds by host name over LLMNR (5355/udp). Check that the timer is active:
 
 ```
 systemctl status thinkube-node-ip-sync.timer

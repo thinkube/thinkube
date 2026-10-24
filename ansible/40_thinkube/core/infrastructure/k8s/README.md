@@ -58,6 +58,7 @@ The role READMEs explain why the versions are pinned and held:
 
 - `thinkube-node-ip-sync` runs at boot, before kubelet, and every minute after that through a timer.
 - If the node's LAN address changed, it writes the new address into `/var/lib/kubelet/kubeadm-flags.env` and restarts kubelet.
+- If a Cilium agent was running at that moment, it also restarts the agent, because the agent reads the node address only when it starts. It waits until kubelet has run for 30 seconds on the new address, so the restart happens on one of the next runs, within about two minutes of the change.
 - On workers it also looks up the control plane by host name (LLMNR) and points the API proxy at the new address.
 - When no Cilium agent is running and `/var/run/cilium/deleteQueue` holds 200 or more entries, it empties that directory.
 - The playbooks turn on LLMNR in systemd-resolved (`/etc/systemd/resolved.conf.d/10-thinkube-llmnr.conf`) on every node.
