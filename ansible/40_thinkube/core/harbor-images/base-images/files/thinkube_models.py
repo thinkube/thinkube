@@ -4,11 +4,15 @@
 """
 Thinkube model helpers for notebooks.
 
+- mirrored_model_path: the folder of a model mirrored into the cluster, to load
+  it with from_pretrained without downloading it.
 - register_finetuned_model: publish a LoRA fine-tune so the LLM Gateway can
   load it on vLLM.
 
 Usage:
     import thinkube_models as tkm
+
+    model = AutoModelForCausalLM.from_pretrained(tkm.mirrored_model_path("Qwen/Qwen3.5-4B"))
 
     # ... fine-tune, logging to the MLflow run `run_id` ...
     tkm.register_finetuned_model(model, tokenizer, catalog_entry, run_id)
@@ -21,8 +25,14 @@ import requests
 from pathlib import Path
 
 
+# The MLflow JuiceFS volume, as the notebook server mounts it
+MLFLOW_PATH = Path.home() / "thinkube" / "mlflow"
+
 # Staging folder for merged checkpoints, on the MLflow JuiceFS volume
-STAGING_PATH = Path.home() / "thinkube" / "mlflow" / ".staging"
+STAGING_PATH = MLFLOW_PATH / ".staging"
+
+# Where MLflow keeps a run's artifacts on that volume: <experiment>/<run>/artifacts
+ARTIFACTS_PATH = MLFLOW_PATH / "artifacts"
 
 # Environment variables the MLflow helpers read; the notebook server sets them
 MLFLOW_ENV = (
@@ -106,6 +116,35 @@ def _mlflow_client():
     os.environ["MLFLOW_TRACKING_TOKEN"] = get_mlflow_token()
     mlflow.set_tracking_uri(config["tracking_uri"])
     return mlflow.MlflowClient()
+
+
+def mirrored_model_path(model_id: str) -> str:
+    """The folder of a mirrored model's files, for from_pretrained.
+
+    A mirror (thinkube-control: AI > Models, or submit_model_mirror) registers
+    the model in MLflow under its id with "/" as "-", and its files are the
+    "model" artifact of the run of its latest version. Every GPU node reads
+    them from JuiceFS, so loading from this folder downloads nothing.
+
+    Raises if the model is not mirrored, or its files are not on the volume.
+    """
+    registered_name = model_id.replace("/", "-")
+    client = _mlflow_client()
+    versions = client.search_model_versions(f"name='{registered_name}'")
+    if not versions:
+        raise LookupError(
+            f"{model_id} is not mirrored in this cluster. Mirror it in thinkube-control "
+            "(AI > Models), or load it from Hugging Face by its id."
+        )
+    latest = max(versions, key=lambda v: int(v.version))
+    run = client.get_run(latest.run_id)
+    path = ARTIFACTS_PATH / run.info.experiment_id / latest.run_id / "artifacts" / "model"
+    if not (path / "config.json").exists():
+        raise FileNotFoundError(
+            f"{model_id} version {latest.version} is registered, but {path} holds no config.json; "
+            "its mirror may still be running, or failed. Check it in thinkube-control (AI > Models)."
+        )
+    return str(path)
 
 
 def _merge_to_staging(model, tokenizer, name: str, run_id: str) -> Path:
@@ -218,7 +257,8 @@ def register_finetuned_model(model, tokenizer, catalog_entry: dict, run_id: str)
        catalogue again, so the gateway lists the model at once.
 
     Args:
-        model: The Unsloth model with its trained LoRA adapter.
+        model: The PEFT model with its trained LoRA adapter and a
+            save_pretrained_merged method, as llebre and Unsloth give it.
         tokenizer: Its tokenizer.
         catalog_entry: The model's catalogue entry, with every field in
             CATALOG_FIELDS; server_type ["vllm"], quantization "BF16" and
