@@ -80,6 +80,9 @@ describe. A development change does none of that and does not raise a
   and use it from the mirror. Never download a model to a folder of its
   own, and never leave it in a user's catalogue. The entry reaches
   `release-*` with the next release, like any other change.
+- A venv build or update runs inside Thinkube Control's backend pod; a
+  Control deploy while one runs kills it, and the record says so. Deploy
+  Control between venv builds, never during one.
 - Memory of an agent is not a record. What must be kept goes into a
   repository: a rule here, a note in the project's own repository, or
   VERSIONING.md.
