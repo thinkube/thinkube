@@ -14,3 +14,7 @@
   TCP, `iptables -t nat` is not the ruleset, `tail -2` hides the error.
 - Verify the result, not the completion. A step that ran is not a step
   that produced the right state.
+- A run known to be invalid is cancelled at once. When a measurement,
+  build or training prints something that shows it is wrong, stop it,
+  fix the cause, and run it again; never let it finish because part of
+  its result may still be usable. The person is waiting for it.
