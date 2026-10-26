@@ -1,0 +1,97 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Mirror one public container image into Harbor's library project, for an
+# image a user adds through Thinkube Control (register_harbor_image, then a
+# mirror job). The platform's own images come from 13_mirror_public_images.yaml
+# at install; this playbook does the same work for one image, with the
+# container_deployment/image_mirror role: a pull and push per architecture the
+# cluster has and the source provides, and a manifest list in Harbor.
+#
+# Variables (thinkube-control passes them):
+#   - source_image: the image to mirror, with its tag (nvcr.io/nvidia/nemo-automodel:26.08)
+#   - harbor_registry: Harbor's host (registry.<domain>)
+#   - image_description: free text, kept for the log
+#   - kubeconfig: path to the Kubernetes configuration
+# The destination is harbor_registry/library/<name>:<tag>, the name being the
+# last path element of the source.
+
+- name: Mirror a user's container image into Harbor
+  hosts: k8s_control_plane
+  gather_facts: true
+  vars:
+    harbor_robot_user: "robot$thinkube"
+    library_project: "library"
+    harbor_admin_user: "admin"
+    destination_image: "{{ harbor_registry }}/{{ library_project }}/{{ source_image.split('/')[-1] }}"
+  pre_tasks:
+    - name: Check the source image is given
+      ansible.builtin.assert:
+        that:
+          - source_image is defined
+          - source_image | length > 0
+          - harbor_registry is defined
+        fail_msg: "source_image and harbor_registry are required"
+
+    - name: Get robot token from env file
+      ansible.builtin.shell: |
+        grep HARBOR_ROBOT_TOKEN {{ ansible_facts.env.HOME }}/.env | cut -d= -f2
+      register: robot_token_cmd
+      changed_when: false
+      failed_when: robot_token_cmd.rc != 0
+
+    - name: Set robot token and admin password
+      ansible.builtin.set_fact:
+        harbor_robot_token: "{{ robot_token_cmd.stdout | trim }}"
+        admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'ANSIBLE_BECOME_PASSWORD'), true) }}"
+
+    - name: Verify the Harbor credentials are available
+      ansible.builtin.assert:
+        that:
+          - harbor_robot_token | length > 0
+          - admin_password | length > 0
+        fail_msg: "HARBOR_ROBOT_TOKEN in {{ ansible_facts.env.HOME }}/.env and ADMIN_PASSWORD in the environment are required"
+
+    - name: The architectures of the cluster's nodes
+      ansible.builtin.set_fact:
+        build_architectures: "{{ (container_build_platforms | default('linux/' + ('arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64'))).split(',') | map('trim') | map('replace', 'linux/', '') | list }}"
+
+    - name: Check if crane is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/crane
+      register: crane_bin
+
+    - name: Install crane binary
+      ansible.builtin.shell: |
+        curl -sL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'x86_64' }}.tar.gz | tar xz -C /usr/local/bin crane
+        chmod +x /usr/local/bin/crane
+      become: true
+      when: not crane_bin.stat.exists
+
+    - name: The architectures the source image provides
+      ansible.builtin.shell: |
+        /usr/local/bin/crane manifest {{ source_image }} | python3 -c "import json,sys; d=json.load(sys.stdin); print(' '.join(sorted({m['platform']['architecture'] for m in d.get('manifests', []) if m.get('platform', {}).get('os') == 'linux'})) if 'manifests' in d else 'single')"
+      register: source_archs_cmd
+      changed_when: false
+
+    - name: The architectures to mirror
+      ansible.builtin.set_fact:
+        required_architectures: "{{ build_architectures if source_archs_cmd.stdout == 'single' else (source_archs_cmd.stdout.split() | intersect(build_architectures)) }}"
+
+    - name: Stop when the source provides none of the cluster's architectures
+      ansible.builtin.assert:
+        that: required_architectures | length > 0
+        fail_msg: "{{ source_image }} provides {{ source_archs_cmd.stdout }}; the cluster's nodes are {{ build_architectures }}"
+
+  tasks:
+    - name: Mirror the image
+      include_tasks: "{{ playbook_dir }}/../../../roles/container_deployment/image_mirror/tasks/main.yaml"
+      vars:
+        harbor_api_user: "{{ harbor_admin_user }}"
+        harbor_api_password: "{{ admin_password }}"
+        harbor_push_user: "{{ harbor_robot_user }}"
+        harbor_push_password: "{{ harbor_robot_token }}"
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: "Mirrored {{ source_image }} to {{ destination_image }} for {{ required_architectures | join(', ') }}{{ (': ' + image_description) if image_description | default('') | length > 0 else '' }}"
