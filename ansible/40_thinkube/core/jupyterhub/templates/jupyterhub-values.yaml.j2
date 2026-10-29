@@ -376,6 +376,36 @@ hub:
                   spawner.node_selector = {"kubernetes.io/hostname": node}
                   logger.info(f"Set node selector: {node}")
 
+                  # The venvs that need a GPU are set up only on a node with a
+                  # Thinkube GPU; the GPU operator gives nvidia.com/gpu only to those.
+                  resources_response = requests.get(
+                      'http://backend.thinkube-control.svc.cluster.local:8000/api/v1/cluster/resources',
+                      headers={'Accept': 'application/json'},
+                      timeout=10
+                  )
+                  resources_response.raise_for_status()
+                  node_info = next((n for n in resources_response.json() if n['name'] == node), None)
+                  if node_info is None:
+                      raise RuntimeError(f"thinkube-control does not list the node {node}")
+                  node_has_gpu = 'yes' if node_info['capacity']['gpu'] > 0 else 'no'
+                  # The configured init containers are Kubernetes client objects,
+                  # the ones these hooks add are dicts; each is changed on a copy,
+                  # so the configuration shared by every spawn stays as it is. The
+                  # client serializes a dict inside an object's env as it is.
+                  import copy
+                  node_env = {"name": "NODE_HAS_GPU", "value": node_has_gpu}
+                  init_containers = []
+                  for c in (spawner.init_containers or []):
+                      c = copy.deepcopy(c)
+                      if isinstance(c, dict):
+                          if c.get("name") == "setup-venvs":
+                              c["env"] = list(c.get("env") or []) + [node_env]
+                      elif c.name == "setup-venvs":
+                          c.env = list(c.env or []) + [node_env]
+                      init_containers.append(c)
+                  spawner.init_containers = init_containers
+                  logger.info(f"{node} has a Thinkube GPU: {node_has_gpu}")
+
               # Apply CPU and memory (use thinkube-control defaults as fallback)
               cpu = user_options.get('cpu', defaults['cpu'])
               spawner.cpu_limit = float(cpu)
@@ -986,16 +1016,44 @@ singleuser:
           VENVS_BASE="/home/thinkube/venvs"
           VENVS_ARCH_DIR="$VENVS_BASE/$ARCH_DIR"
 
-          # Check if venvs already exist and are the correct version
+          # The spawner says whether this node has a Thinkube GPU. A venv that
+          # needs one (venv_gpu_sections in vars/venvs.yaml) is kept only there:
+          # elsewhere it is not downloaded, and a copy left from before is removed
+          # with its kernel.
+          if [ "$NODE_HAS_GPU" != "yes" ] && [ "$NODE_HAS_GPU" != "no" ]; then
+            echo "ERROR: NODE_HAS_GPU is '$NODE_HAS_GPU'; the spawner sets it to yes or no from the node it chose" >&2
+            exit 1
+          fi
+          GPU_VENVS="{{ venv_gpu_sections | join(' ') }}"
+          SYSTEM_VENVS=""
+          for venv in fine-tuning agent-dev; do
+            if [ "$NODE_HAS_GPU" = "no" ] && [[ " $GPU_VENVS " == *" $venv "* ]]; then
+              echo "No Thinkube GPU on this node: $venv is not set up here"
+              rm -rf "$VENVS_ARCH_DIR/$venv" "$VENVS_BASE/share/jupyter/kernels/$venv"
+            else
+              SYSTEM_VENVS="$SYSTEM_VENVS $venv"
+            fi
+          done
+
+          # A venv is downloaded when the installed version is another one, or
+          # when this node does not have it yet
           VERSION_FILE="$VENVS_ARCH_DIR/.version"
-          if [ -f "$VERSION_FILE" ] && [ "$(cat $VERSION_FILE)" = "$VENVS_VERSION" ]; then
+          CURRENT_VERSION=""
+          [ -f "$VERSION_FILE" ] && CURRENT_VERSION="$(cat $VERSION_FILE)"
+          MISSING_VENVS=""
+          for venv in $SYSTEM_VENVS; do
+            if [ "$CURRENT_VERSION" != "$VENVS_VERSION" ] || [ ! -f "$VENVS_ARCH_DIR/$venv/bin/python" ]; then
+              MISSING_VENVS="$MISSING_VENVS $venv"
+            fi
+          done
+          if [ -z "$MISSING_VENVS" ]; then
             echo "Venvs $VENVS_VERSION already installed for $ARCH_DIR"
           else
-            echo "Downloading venvs $VENVS_VERSION for $ARCH_DIR..."
+            echo "Downloading venvs $VENVS_VERSION for $ARCH_DIR:$MISSING_VENVS"
             mkdir -p "$VENVS_ARCH_DIR"
 
             # Download and extract each system venv directly to local storage (fast!)
-            for venv in fine-tuning agent-dev; do
+            for venv in $MISSING_VENVS; do
               TARBALL_URL="$GITHUB_RELEASE_URL/$ARCH_DIR-$venv.tar.gz"
               echo "  Downloading $venv..."
 
@@ -1004,7 +1062,7 @@ singleuser:
 
               # Extract directly to local storage (hostPath = fast local disk)
               # A failed download stops the server start; the version file is
-              # written only after both venvs are in place, so the next start
+              # written only after every venv is in place, so the next start
               # tries again.
               if ! curl -fsSL "$TARBALL_URL" | tar -xzf - -C "$VENVS_ARCH_DIR/"; then
                 echo "ERROR: could not download and extract $venv from $TARBALL_URL" >&2
@@ -1040,7 +1098,7 @@ singleuser:
             fi
           done
 
-          # Register custom venvs (built via thinkube-control, synced to all GPU nodes)
+          # Register custom venvs (built via thinkube-control, copied to the nodes of its architecture, only GPU nodes for a venv that needs a GPU)
           # Venvs are stored at custom/<name>/<arch>/ for multi-arch support
           # Falls back to custom/<name>/ (legacy flat layout) if no arch subdir exists
           CUSTOM_VENVS_DIR="$VENVS_BASE/custom"
@@ -1187,7 +1245,7 @@ singleuser:
         claimName: jupyterhub-mlflow-artifacts-pvc
 
     # Local node storage for venvs (fast I/O - no JuiceFS small file bottleneck)
-    # Each GPU node has its own copy, synced via rsync after custom venv builds
+    # Each node has its own copy, synced via rsync after custom venv builds
     - name: venvs
       hostPath:
         path: /var/lib/jupyterhub-venvs
@@ -1244,7 +1302,7 @@ singleuser:
     - name: service-config
       mountPath: /home/thinkube/.config/thinkube
 
-    # Local node venvs (fast I/O - hostPath on each GPU node)
+    # Local node venvs (fast I/O - hostPath on each node)
     # Init container downloads system venvs from GitHub releases
     - name: venvs
       mountPath: /home/thinkube/venvs

@@ -50,6 +50,15 @@
 
     eg_version: "v1.8.0"
     eg_namespace: "envoy-gateway-system"
+    # The gateway prefers nodes that are not Thinkube GPU nodes (the baremetal_gpus group): on a GPU node a
+    # training can take the memory the gateway needs, and every platform address goes through it. A preference, so
+    # that an install whose every node is a GPU node still runs the gateway. Without GPU nodes there is nothing to
+    # avoid, and Kubernetes refuses NotIn with no values.
+    eg_gpu_nodes: "{{ groups['baremetal_gpus'] }}"
+    eg_off_gpu_affinity: >-
+      {{ {} if not eg_gpu_nodes else {'nodeAffinity': {'preferredDuringSchedulingIgnoredDuringExecution': [
+           {'weight': 100, 'preference': {'matchExpressions': [
+             {'key': 'kubernetes.io/hostname', 'operator': 'NotIn', 'values': eg_gpu_nodes}]}}]}} }}
     gateway_namespace: "gateway-system"
     gateway_name: "thinkube-gateway"
 
@@ -126,10 +135,12 @@
         label: "{{ item.item.name }}"
       when: item.stdout == ""
       changed_when: true
-      failed_when: false
 
+    # podman save refuses to write over an archive, and a run stopped before
+    # the clean-up below leaves one
     - name: Save pulled images to tar files
       ansible.builtin.shell: |
+        rm -f {{ item.item.file }}
         podman save -o {{ item.item.file }} {{ item.item.name }}
       loop: "{{ containerd_image_checks.results }}"
       loop_control:
@@ -227,6 +238,7 @@
           --set deployment.envoyGateway.imagePullPolicy=IfNotPresent \
           --set deployment.envoyGateway.pod.priorityClassName=thinkube-critical \
           --set config.envoyGateway.extensionApis.enableBackend=true \
+          --set-json 'deployment.pod.affinity={{ eg_off_gpu_affinity | to_json }}' \
           --kubeconfig {{ kubeconfig }}
       register: eg_install
       changed_when: true
@@ -258,14 +270,14 @@
     - name: Build EnvoyProxy provider.kubernetes spec
       ansible.builtin.set_fact:
         envoy_proxy_kubernetes: >-
-          {{ {} if overlay_provider != 'tailscale' else {
+          {{ {'envoyDeployment': {'pod': {'affinity': eg_off_gpu_affinity}}} | combine({} if overlay_provider != 'tailscale' else {
                'envoyService': {
                  'loadBalancerClass': 'tailscale',
                  'annotations': {
                    'tailscale.com/hostname': gateway_hostname,
                  },
                },
-             } }}
+             }) }}
 
     - name: Create EnvoyProxy resource for Thinkube
       kubernetes.core.k8s:
