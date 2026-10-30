@@ -22,6 +22,26 @@
     fail_msg: "agent_bearer_tokens (one token per bearer_token_env) and agent_code_server_pod are required"
     quiet: true
 
+# A server of an extension is configured only while Thinkube Control lists the
+# extension as installed and enabled; a server of one that is not is removed.
+- name: Read the extensions Thinkube Control has installed
+  ansible.builtin.uri:
+    url: "https://control.{{ domain_name }}/api/v1/extensions"
+    headers:
+      Authorization: "Bearer {{ agent_bearer_tokens['THINKUBE_API_TOKEN'] }}"
+  register: agent_extensions
+
+- name: Choose the MCP servers to configure and to remove
+  ansible.builtin.set_fact:
+    agent_mcp_enabled: "{{ agent_mcp_servers | rejectattr('extension', 'defined') | list
+                           + agent_mcp_servers | selectattr('extension', 'defined') | selectattr('extension', 'in', agent_installed) | list }}"
+    agent_mcp_removed: "{{ agent_mcp_servers | selectattr('extension', 'defined') | rejectattr('extension', 'in', agent_installed) | list }}"
+    # Their keys in Pi's mcp.json: ["mcpServers", <name>]
+    agent_mcp_removed_keys: "{{ agent_mcp_servers | selectattr('extension', 'defined') | rejectattr('extension', 'in', agent_installed)
+                                | map(attribute='name') | map('regex_replace', '^', 'mcpServers/') | map('split', '/') | list }}"
+  vars:
+    agent_installed: "{{ agent_extensions.json | map(attribute='name') | list }}"
+
 # Pi --------------------------------------------------------------------------
 
 # The gateway's models reach Pi through the thinkube-models extension, which
@@ -42,6 +62,7 @@
     json_changes:
       merge:
         - ["mcpServers", "{{ lookup('template', 'pi-mcp-managed.json.j2') | from_json }}"]
+      delete: "{{ agent_mcp_removed_keys }}"
 
 - name: Update Pi's settings.json
   ansible.builtin.include_tasks: json_file.yaml
@@ -160,7 +181,15 @@
   vars:
     agent_claude_server: "{{ {'type': 'http', 'url': item.url, 'headers': ({'Authorization': 'Bearer ' ~ agent_bearer_tokens[item.bearer_token_env]} if item.bearer_token_env is defined else {})}
                              if item.transport == 'http' else {'type': 'stdio', 'command': item.command, 'args': item.args} }}"
-  loop: "{{ agent_mcp_servers }}"
+  loop: "{{ agent_mcp_enabled }}"
   loop_control:
     label: "{{ item.name }}"
   no_log: "{{ item.bearer_token_env is defined }}"
+
+- name: Remove from Claude Code the MCP servers of extensions that are not installed
+  ansible.builtin.shell: |
+    {{ kubectl_bin }} exec -n code-server {{ agent_code_server_pod }} -- \
+      bash -l -c 'if claude mcp get "$1" >/dev/null 2>&1; then claude mcp remove "$1" -s user; fi' _ {{ item.name | quote }}
+  loop: "{{ agent_mcp_removed }}"
+  loop_control:
+    label: "{{ item.name }}"
