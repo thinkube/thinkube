@@ -57,7 +57,7 @@ Builds custom base images with pre-installed dependencies for faster application
 
 **AI Bases**:
 - `ai-inference-base:cuda13.0-torch2.9-py3.12` - CUDA 13.0 + PyTorch 2.9 + transformers for Stable Diffusion
-- `vllm-base:<vllm_version>-cuda13.0-py3.12` (today `0.23.0-cuda13.0-py3.12`) - vLLM base image; `vllm_version` is set in `14_build_base_images.yaml`
+- `vllm-base:<vllm_version>-cuda13.0-py3.12` (today `0.32.0-cuda13.0-py3.12`) - vLLM from PyPI with the PyTorch it pins; `vllm_version` and `vllm_torch_version` are set in `14_build_base_images.yaml`
 - `tensorrt-llm-base:1.3.0rc13` - TensorRT-LLM base image
 - `text-embeddings-base:latest` - Text Embeddings Inference base image
 - `mlflow-custom:latest` - MLflow with OIDC auth, PostgreSQL, S3 support
