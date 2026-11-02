@@ -16,6 +16,7 @@
 # - Development: jq, yq, ripgrep, fd, bat, httpie
 # - Database clients: psql, redis-tools
 # - Python tools: mlflow, devpi-client, ansible-lint
+# - Book typesetting: pandoc, Typst, EB Garamond, Crimson Pro, Libertinus Serif
 
 FROM {{ harbor_registry }}/library/ubuntu:24.04
 
@@ -449,6 +450,57 @@ RUN printf '%s\n' \
         'set -gx CARGO_HOME /opt/cargo' \
         'fish_add_path --global --prepend /opt/cargo/bin' \
         > /etc/fish/conf.d/thinkube-tools.fish
+
+###############################################################################
+# Book typesetting: Typst sets the PDF, pandoc writes the EPUB and the Word
+# file, from the same Markdown. The serif families for body text go to
+# /usr/local/share/fonts, outside the home mount, where fontconfig and Typst
+# find them. Every download is pinned so two builds carry the same files.
+###############################################################################
+ARG PANDOC_VERSION=3.13
+ARG TYPST_VERSION=v0.15.1
+ARG EB_GARAMOND_COMMIT=106a4a6d377987459ae5e68673a4570f13b957fb
+ARG CRIMSON_PRO_COMMIT=475ca6a0469ba2bd9c2a3bbf038957099392c04d
+ARG LIBERTINUS_VERSION=7.051
+RUN apt-get update && apt-get install -y fontconfig xz-utils && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-1-${TARGETARCH}.deb" \
+        -o /tmp/pandoc.deb && \
+    dpkg -i /tmp/pandoc.deb && \
+    rm /tmp/pandoc.deb && \
+    pandoc --version | head -1 | grep -qx "pandoc ${PANDOC_VERSION}" && \
+    case "${TARGETARCH}" in \
+        amd64) TYPST_ARCH=x86_64 ;; \
+        arm64) TYPST_ARCH=aarch64 ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/typst/typst/releases/download/${TYPST_VERSION}/typst-${TYPST_ARCH}-unknown-linux-musl.tar.xz" \
+        -o /tmp/typst.tar.xz && \
+    tar -xJf /tmp/typst.tar.xz -C /tmp && \
+    install -m 0755 "/tmp/typst-${TYPST_ARCH}-unknown-linux-musl/typst" /usr/local/bin/typst && \
+    rm -rf /tmp/typst.tar.xz "/tmp/typst-${TYPST_ARCH}-unknown-linux-musl" && \
+    typst --version
+RUN mkdir -p /usr/local/share/fonts/ebgaramond /usr/local/share/fonts/crimsonpro /usr/local/share/fonts/libertinus && \
+    for style in Regular Italic Medium MediumItalic SemiBold SemiBoldItalic Bold BoldItalic; do \
+        curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+            "https://raw.githubusercontent.com/octaviopardo/EBGaramond12/${EB_GARAMOND_COMMIT}/fonts/otf/EBGaramond-${style}.otf" \
+            -o "/usr/local/share/fonts/ebgaramond/EBGaramond-${style}.otf" && \
+        curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+            "https://raw.githubusercontent.com/Fonthausen/CrimsonPro/${CRIMSON_PRO_COMMIT}/fonts/ttf/CrimsonPro-${style}.ttf" \
+            -o "/usr/local/share/fonts/crimsonpro/CrimsonPro-${style}.ttf"; \
+    done && \
+    curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        "https://github.com/alerque/libertinus/releases/download/v${LIBERTINUS_VERSION}/Libertinus-${LIBERTINUS_VERSION}.zip" \
+        -o /tmp/libertinus.zip && \
+    unzip -q -j /tmp/libertinus.zip "Libertinus-${LIBERTINUS_VERSION}/static/OTF/LibertinusSerif-*.otf" -d /usr/local/share/fonts/libertinus && \
+    rm /tmp/libertinus.zip && \
+    fc-cache -f && \
+    for family in "EB Garamond" "Crimson Pro" "Libertinus Serif"; do \
+        typst fonts | grep -qx "${family}" || { echo "❌ ERROR: Typst does not see the ${family} font"; exit 1; }; \
+    done && \
+    echo "✅ Book typesetting: pandoc ${PANDOC_VERSION}, Typst ${TYPST_VERSION}, EB Garamond, Crimson Pro, Libertinus Serif"
 
 ###############################################################################
 # code-server - VSCode in the browser
