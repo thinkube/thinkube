@@ -16,6 +16,12 @@ user's cluster does not have this file.
   Control is pushed before it is deployed.
 - Apps deployed from templates (`~/apps/<app>`) are not part of the
   platform; a push to their Gitea repository is their deploy.
+- An extension of Thinkube Control (Datasets, Forge, Storage, ...) has its
+  source in `thinkube-control/extensions/<name>`. `~/apps/<name>` and its
+  Gitea repository are deployed copies: never edit or commit there. Change
+  the folder, push `thinkube-control` to GitHub, then deploy the extension
+  alone with the tool `deploy_extensions` (`names`: `["<name>"]`). This does
+  not deploy Control, and `12_deploy_dev.yaml` does not deploy extensions.
 - Components built from a template (`~/components/<name>`: vLLM,
   TensorRT-LLM, text-embeddings) are deployed copies. Their source is the
   template repository named in `thinkube-metadata/optional_components.json`

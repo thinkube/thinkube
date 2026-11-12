@@ -1,0 +1,124 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/15_deploy_extensions.yaml
+# Description:
+#   Deploy the extensions of Thinkube Control: the parts of Control that are
+#   built and deployed on their own (Datasets, Forge, Storage, ...). Their
+#   source is the folders of extensions/ in the thinkube-control repository.
+#   Thinkube Control deploys each one from its folder, at the version of the
+#   platform this cluster follows; this playbook asks it to, and waits for
+#   every build to end. An extension that is not on the cluster is created,
+#   one that is there is deployed again from its folder.
+#
+# Requirements:
+#   - thinkube-control deployed and answering (12_deploy.yaml)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/thinkube-control/15_deploy_extensions.yaml
+#   One extension, or several:
+#   ./scripts/tk_ansible ansible/40_thinkube/core/thinkube-control/15_deploy_extensions.yaml -e extensions=forge,datasets
+#
+# Variables from inventory:
+#   - domain_name: Domain name for services
+#   - kubeconfig: Path to kubeconfig file
+
+- name: Deploy the extensions of Thinkube Control
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    control_namespace: "thinkube-control"
+    control_url: "https://control.{{ domain_name }}"
+    # Names of the extensions to deploy, separated by commas; empty is every
+    # extension the repository has
+    extensions: ""
+    # The longest one deploy may take, with its build and its tests
+    deploy_minutes: 40
+
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.fail:
+        msg: "{{ item }} is not defined. Please set it in inventory."
+      when: vars[item] is not defined or vars[item] == ""
+      loop:
+        - domain_name
+        - kubeconfig
+
+    - name: Read Thinkube Control's API token
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ control_namespace }}"
+        name: mcp-default-token
+      register: api_token_secret
+      failed_when: api_token_secret.resources | length == 0
+      no_log: true
+
+    # Thinkube Control may still be starting after its own deploy: the call is
+    # repeated while the gateway has no backend to answer it.
+    - name: Ask Thinkube Control to deploy the extensions
+      ansible.builtin.uri:
+        url: "{{ control_url }}/api/v1/templates/extensions/deploy"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ api_token_secret.resources[0].data.token | b64decode }}"
+        body_format: json
+        body:
+          names: "{{ extensions.split(',') | map('trim') | select | list }}"
+        status_code: [200, 404, 502, 503, 504]
+        return_content: true
+      register: queued
+      until: queued.status not in [503, 504]
+      retries: 30
+      delay: 10
+
+    - name: Stop when Thinkube Control did not queue the deploys
+      ansible.builtin.fail:
+        msg: "Thinkube Control answered {{ queued.status }}: {{ queued.content }}"
+      when: queued.status != 200
+
+    - name: Stop when a deploy was refused
+      ansible.builtin.fail:
+        msg: "{{ item.name }} was not queued: {{ item.message }}"
+      when: not item.deployment_id
+      loop: "{{ queued.json.deployments }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Show what is deployed
+      ansible.builtin.debug:
+        msg: >-
+          Deploying {{ queued.json.deployments | map(attribute='name') | join(', ') }}
+          from {{ queued.json.template_url }} at {{ queued.json.ref }}
+
+    # The deploys run one at a time, in this order.
+    - name: Wait for each deploy and its build to end
+      ansible.builtin.uri:
+        url: "{{ control_url }}/api/v1/templates/deployments/{{ item.deployment_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token_secret.resources[0].data.token | b64decode }}"
+        status_code: 200
+      register: finished
+      until: finished.json.status in ['success', 'failed', 'cancelled']
+      retries: "{{ (deploy_minutes | int) * 4 }}"
+      delay: 15
+      loop: "{{ queued.json.deployments }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Stop when a deploy did not succeed
+      ansible.builtin.fail:
+        msg: "{{ item.item.name }} ended {{ item.json.status }}: {{ item.json.output }}"
+      when: item.json.status != 'success'
+      loop: "{{ finished.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: "Extensions deployed: {{ queued.json.deployments | map(attribute='name') | join(', ') }}"

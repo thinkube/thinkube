@@ -61,8 +61,9 @@ The orchestrator runs playbooks in this sequence:
 2. `11_deploy_webhook_adapter.yaml` - Deploy Harbor webhook adapter (bootstrap mode)
 3. `12_deploy.yaml` - Main thinkube-control deployment
 4. `13_configure_code_server.yaml` - Configure code-server with the API token and the Claude Code MCP integration
-5. `14_deploy_tk_package_version.yaml` - Deploy the tk-package-version MCP server
-6. `16_publish_packages.yaml` - Build the thinkube Python packages and publish them to DevPI
+5. `15_deploy_extensions.yaml` - Deploy the extensions of Thinkube Control (Datasets, Forge, Storage, ...) from the folders of `extensions/` in the thinkube-control repository, and wait for their builds
+6. `14_deploy_tk_package_version.yaml` - Deploy the tk-package-version MCP server
+7. `16_publish_packages.yaml` - Build the thinkube Python packages and publish them to DevPI
 
 Other playbooks in this folder are not run by the installer:
 `12_deploy_dev.yaml` and `12_deploy_dev_test.yaml` (development helpers),
