@@ -121,7 +121,7 @@ def _mlflow_client():
 def mirrored_model_path(model_id: str) -> str:
     """The folder of a mirrored model's files, for from_pretrained.
 
-    A mirror (thinkube-control: AI > Models, or submit_model_mirror) registers
+    A mirror (Thinkube Control: Models, or models_mirror of control-models) registers
     the model in MLflow under its id with "/" as "-", and its files are the
     "model" artifact of the run of its latest version. Every GPU node reads
     them from JuiceFS, so loading from this folder downloads nothing.
@@ -220,10 +220,12 @@ def _upload_checkpoint(staging_dir: Path, artifact_uri: str) -> str:
 
 
 def _publish_through_control(entry: dict) -> dict:
-    """Ask thinkube-control to publish the model: it writes the entry to
-    models.json of <GitHub user>/<GitHub user>-metadata, records the weights
-    as in place and reads the catalogue again, so the gateway lists the model.
-    The notebook server has its address and API token from service discovery."""
+    """Ask the extension Models of thinkube-control, through Control's
+    address, to publish the model: it writes the entry to models.json of
+    <GitHub user>/<GitHub user>-metadata, records the weights as in place and
+    has the gateway read the catalogue again, so the gateway lists the model.
+    The notebook server has Control's address and API token from service
+    discovery."""
     missing = [name for name in ("THINKUBE_CONTROL_URL", "THINKUBE_API_TOKEN") if not os.environ.get(name)]
     if missing:
         raise RuntimeError(
@@ -231,7 +233,7 @@ def _publish_through_control(entry: dict) -> dict:
             "from service discovery. Restart it if they are absent."
         )
     response = requests.post(
-        f"{os.environ['THINKUBE_CONTROL_URL']}/api/v1/models/finetuned",
+        f"{os.environ['THINKUBE_CONTROL_URL']}/api/v1/x/control-models/api/models/finetuned",
         json={"catalog_entry": entry},
         headers={"Authorization": f"Bearer {os.environ['THINKUBE_API_TOKEN']}"},
         timeout=120,
