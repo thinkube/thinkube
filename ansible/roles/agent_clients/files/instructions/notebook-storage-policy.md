@@ -10,9 +10,12 @@ activity.
   Kept, and the same on every node. Models go under `models`.
 - `/home/thinkube/thinkube/mlflow`: the MLflow artifacts. Written by the
   platform's mirror and registry, not by hand.
-- `/home/thinkube/training`: the node's own disk, kept across sessions.
-  Mounted only when the server starts on a node in training mode, which
-  also unloads that node's LLM models. For large files used on one node.
+- `/home/thinkube/training`: the node's own disk, kept across sessions,
+  on every server. Local disk speed, no network. For large files used on
+  one node: conversions, checkpoints, test outputs. A file the cluster
+  keeps is copied once from there to `models` or the MLflow registry.
+- JuiceFS caches reads on each node, not writes: every write goes over
+  the network to the object store.
 - `/home/thinkube/scratch`: deleted when the pod stops. Never hold the
   only copy of a result there. When it is used to avoid network traffic,
   say before starting that the files are lost when the server stops, and
