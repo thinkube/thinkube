@@ -62,6 +62,25 @@ RUN pip3 install --no-cache-dir --break-system-packages \
         psutil \
         vllm==${TK_VLLM_VERSION}
 
+# FlashInfer's prebuilt kernels, so a model load does not compile them. Compiled
+# at load time they need several GB beyond the model's own memory, which a pod
+# sized from the model's calibration does not have. One package per GPU family,
+# at the version of the flashinfer-python vLLM installed: arm64 serves the GB10
+# (sm_121); amd64 serves sm_8x (sm80 kernels run on sm_86), sm_89 and sm_12x.
+# flashinfer-jit-cache is the provider shim the packages register with; its own
+# dependencies name every family, some published for one architecture only.
+RUN FLASHINFER=$(python3 -c "import importlib.metadata as m; print(m.version('flashinfer-python'))") && \
+    case "${TARGETARCH}" in \
+        arm64) FAMILIES="sm121a" ;; \
+        amd64) FAMILIES="sm80 sm89 sm120f" ;; \
+        *) echo "No FlashInfer kernel families are chosen for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    pip3 install --no-cache-dir --break-system-packages --no-deps \
+        --index-url https://flashinfer.ai/whl/cu130 \
+        "flashinfer-jit-cache==${FLASHINFER}+cu130" \
+        $(for f in ${FAMILIES}; do echo "flashinfer-jit-cache-${f}==${FLASHINFER}+cu130"; done) && \
+    python3 -c "import importlib.metadata as m; p = sorted(e.name for e in m.entry_points(group='flashinfer.jit_cache.providers')); assert p, 'no FlashInfer kernel provider is registered'; print('FlashInfer kernel providers:', p)"
+
 # Verify installation — fail the build if torch lost CUDA support
 RUN echo "=== Verifying vLLM Installation ===" && \
     python3 -c "import vllm; print(f'✓ vLLM version: {vllm.__version__}')" && \
