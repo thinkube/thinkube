@@ -128,7 +128,10 @@
         owner: "{{ system_username }}"
         group: "{{ system_username }}"
       become: true
-              
+      register: vscode_settings_written
+
+    # VS Code's extensions read the token and addresses only when code-server
+    # starts, so it restarts when settings.json changed, and only then.
     - name: Restart code-server deployment to pick up new configuration
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig }}"
@@ -141,7 +144,8 @@
             namespace: "{{ code_server_namespace }}"
             annotations:
               kubectl.kubernetes.io/restartedAt: "{{ ansible_facts.date_time.iso8601 }}"
-              
+      when: vscode_settings_written is changed
+
     - name: Wait for code-server to be ready after restart
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
@@ -154,13 +158,14 @@
           type: Progressing
           status: "True"
         wait_timeout: 300
-        
+      when: vscode_settings_written is changed
+
     - name: Display configuration summary
       ansible.builtin.debug:
         msg:
           - "✅ API token successfully configured in code-server"
           - "✅ VS Code settings updated with CI/CD extension configuration"
-          - "✅ code-server deployment restarted to apply changes"
+          - "{{ '✅ code-server deployment restarted to apply changes' if vscode_settings_written is changed else '✅ VS Code settings unchanged: code-server not restarted' }}"
           - ""
           - "The thinkube-cicd VS Code extension will now be able to monitor pipelines"
 
@@ -181,8 +186,8 @@
     code_server_namespace: "code-server"
 
   tasks:
-    # The previous play restarts code-server, so for a while there is either no
-    # pod or a terminating one. Filtering on Running and retrying avoids exec'ing
+    # When the previous play restarts code-server, for a while there is either
+    # no pod or a terminating one. Filtering on Running and retrying avoids exec'ing
     # into a pod on its way out; `{.items[*]}` (not `[0]`) returns an empty
     # string instead of failing with "array index out of bounds" when the list
     # is momentarily empty.
