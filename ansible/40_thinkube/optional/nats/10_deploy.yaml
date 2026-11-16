@@ -107,6 +107,31 @@
       ansible.builtin.command: "{{ helm_bin }} repo update"
       changed_when: false
 
+    # A StatefulSet cannot gain a volume claim in place. A server deployed
+    # with JetStream off has none and keeps no data, so its StatefulSet is
+    # removed and the release creates it again with the volume.
+    - name: Read the NATS StatefulSet
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ k8s_namespace }}"
+        name: nats
+      register: nats_statefulset
+
+    - name: Remove a NATS StatefulSet that has no JetStream volume
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ k8s_namespace }}"
+        name: nats
+        wait: true
+      when:
+        - nats_statefulset.resources | length > 0
+        - nats_statefulset.resources[0].spec.volumeClaimTemplates | default([]) | length == 0
+
     - name: Deploy NATS with JetStream
       kubernetes.core.helm:
         binary_path: "{{ helm_bin }}"
