@@ -6,6 +6,9 @@
 # Description:
 #   Configure code-server to mount JuiceFS storage shared with JupyterHub
 #   Creates static PVs pointing to same JuiceFS paths as JupyterHub dynamic PVs
+#   Also mounts the Mill folder: the folder "mill" at the root of the shared
+#   file system, which holds the user's Mill tasks repository. The Mill
+#   extension of Thinkube Control mounts the same folder.
 #
 # Requirements:
 #   - JupyterHub must be deployed with JuiceFS PVCs
@@ -24,6 +27,8 @@
     code_server_namespace: "code-server"
     jupyterhub_namespace: "jupyterhub"
     juicefs_namespace: "juicefs"
+    # The Mill folder, at the root of the shared file system
+    mill_subpath: "mill"
 
   tasks:
     ###################################################################
@@ -110,6 +115,7 @@
         - code-server-datasets-pv
         - code-server-models-pv
         - code-server-mlflow-pv
+        - code-server-mill-pv
       register: existing_pvs
 
     - name: Set existing PV names
@@ -222,6 +228,33 @@
             volumeMode: Filesystem
       when: "'code-server-mlflow-pv' not in existing_pv_names"
 
+    - name: Create static PV for the code-server Mill folder
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: code-server-mill-pv
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 100Gi
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-secret
+                namespace: "{{ juicefs_namespace }}"
+              volumeAttributes:
+                subPath: "{{ mill_subpath }}"
+              volumeHandle: code-server-mill
+            persistentVolumeReclaimPolicy: Retain
+            volumeMode: Filesystem
+      when: "'code-server-mill-pv' not in existing_pv_names"
+
     ###################################################################
     # 3) Create PVCs in code-server namespace
     ###################################################################
@@ -301,6 +334,93 @@
               requests:
                 storage: 1Ti
 
+    - name: Create PVC for the code-server Mill folder
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: code-server-mill-pvc
+            namespace: "{{ code_server_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: code-server-mill-pv
+            storageClassName: ""
+            resources:
+              requests:
+                storage: 100Gi
+
+    # The driver creates the folder owned by root; the IDE and the Mill pod
+    # write to it as user 1000, group 100, like the other shared folders.
+    - name: Remove an earlier Mill folder ownership pod
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        name: code-server-mill-folder
+        wait: true
+
+    - name: Give the Mill folder to the IDE user
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: code-server-mill-folder
+            namespace: "{{ code_server_namespace }}"
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: own
+                image: "{{ harbor_registry }}/{{ library_project | default('library') }}/busybox:latest"
+                command: ["sh", "-c", "chown 1000:100 /mill && chmod 755 /mill"]
+                securityContext:
+                  runAsUser: 0
+                volumeMounts:
+                  - name: mill
+                    mountPath: /mill
+            volumes:
+              - name: mill
+                persistentVolumeClaim:
+                  claimName: code-server-mill-pvc
+
+    - name: Wait for the Mill folder ownership pod to finish
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        name: code-server-mill-folder
+      register: mill_folder_pod
+      until: >-
+        mill_folder_pod.resources | length > 0 and
+        mill_folder_pod.resources[0].status.phase in ['Succeeded', 'Failed']
+      retries: 60
+      delay: 5
+
+    - name: Fail when the Mill folder could not be given to the IDE user
+      ansible.builtin.fail:
+        msg: >-
+          The pod code-server-mill-folder in {{ code_server_namespace }} failed to set the owner of the
+          Mill folder. Read its log: kubectl logs -n {{ code_server_namespace }} code-server-mill-folder
+      when: mill_folder_pod.resources[0].status.phase != 'Succeeded'
+
+    - name: Remove the Mill folder ownership pod
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: "{{ code_server_namespace }}"
+        name: code-server-mill-folder
+
     ###################################################################
     # 4) Patch code-server deployment to add volumes and mounts
     ###################################################################
@@ -329,6 +449,8 @@
                         mountPath: /home/thinkube/thinkube-ai/models
                       - name: thinkube-ai-mlflow
                         mountPath: /home/thinkube/thinkube-ai/mlflow
+                      - name: thinkube-ai-mill
+                        mountPath: /home/thinkube/thinkube-ai/mill
                 volumes:
                   - name: thinkube-ai-notebooks
                     persistentVolumeClaim:
@@ -342,6 +464,9 @@
                   - name: thinkube-ai-mlflow
                     persistentVolumeClaim:
                       claimName: code-server-mlflow-pvc
+                  - name: thinkube-ai-mill
+                    persistentVolumeClaim:
+                      claimName: code-server-mill-pvc
       register: code_server_patch
 
     ###################################################################
@@ -373,5 +498,6 @@
           - "  /home/thinkube/thinkube-ai/datasets  - Shared datasets"
           - "  /home/thinkube/thinkube-ai/models    - User models"
           - "  /home/thinkube/thinkube-ai/mlflow    - MLflow artifacts"
+          - "  /home/thinkube/thinkube-ai/mill      - Mill tasks repository"
           - ""
           - "These are the same files accessible from JupyterHub at /home/jovyan/thinkube/"

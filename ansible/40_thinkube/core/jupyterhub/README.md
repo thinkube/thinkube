@@ -172,7 +172,9 @@ This builds and pushes `tk-jupyter-base` to Harbor registry.
 - Create the HTTPRoute `jupyterhub-httproute` for `notebooks.<domain_name>`
 
 `16_configure_code_server_storage.yaml` then mounts the same JuiceFS paths in
-code-server, through static PVs.
+code-server, through static PVs. It also mounts the Mill folder (the folder
+`mill` at the root of the shared file system, which holds the user's Mill
+tasks repository) at `/home/thinkube/thinkube-ai/mill`.
 
 ### 3. Examples
 
