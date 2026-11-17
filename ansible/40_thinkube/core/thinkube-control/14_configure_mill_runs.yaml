@@ -1,0 +1,93 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/14_configure_mill_runs.yaml
+# Description:
+#   The namespace where Forge starts the pods of Mill's task runs, each on
+#   the node its run names: mill-runs. It has no namespace-wide quota,
+#   since a run's pod declares the CPU, memory and GPUs Forge gives it, as
+#   the notebook servers' namespace does. It holds the claim of the shared
+#   file system at its root, mounted by every task pod at
+#   /storage/thinkube-shared, where Mill's main pod has it too.
+#
+# Requirements:
+#   - JuiceFS must be deployed (the secret juicefs/juicefs-secret)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/thinkube-control/14_configure_mill_runs.yaml
+
+- name: Configure the namespace of Mill's task runs
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    mill_runs_namespace: "mill-runs"
+    juicefs_namespace: "juicefs"
+
+  tasks:
+    - name: Create the namespace of Mill's task runs
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ mill_runs_namespace }}"
+        tier: "batch"
+        # Each task pod declares its own resources, set by Forge for its node
+        skip_quota: true
+
+    - name: Create the volume of the shared file system's root
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: mill-runs-thinkube-shared
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 1Ti
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-secret
+                namespace: "{{ juicefs_namespace }}"
+              volumeHandle: mill-runs-thinkube-shared
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: ""
+            volumeMode: Filesystem
+
+    - name: Create the claim of the shared file system's root
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: thinkube-shared
+            namespace: "{{ mill_runs_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: mill-runs-thinkube-shared
+            storageClassName: ""
+            resources:
+              requests:
+                storage: 1Ti
+
+    - name: Wait for the claim to be bound
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ mill_runs_namespace }}"
+        name: thinkube-shared
+      register: mill_runs_claim
+      until: mill_runs_claim.resources | length > 0 and mill_runs_claim.resources[0].status.phase == 'Bound'
+      retries: 24
+      delay: 5
