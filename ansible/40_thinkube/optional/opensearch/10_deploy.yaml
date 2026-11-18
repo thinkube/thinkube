@@ -45,6 +45,8 @@
     # passages with vectors takes about 16 GB, and OpenSearch needs about as
     # much again free whenever it merges an index's files, on top of the logs.
     opensearch_storage_size: 100Gi
+    # Sizes are compared as numbers of Gi: Kubernetes writes 30Gi where Ansible's own filter expects 30G.
+    opensearch_storage_gi: "{{ opensearch_storage_size | regex_replace('Gi$', '') | int }}"
     opensearch_statefulset: opensearch-cluster-master
     opensearch_data_claim: opensearch-cluster-master-opensearch-cluster-master-0
     
@@ -597,12 +599,26 @@
         name: "{{ opensearch_data_claim }}"
       register: opensearch_claim
 
+    - name: Read the installed volume's size
+      ansible.builtin.set_fact:
+        opensearch_installed_gi: >-
+          {{ (opensearch_claim.resources[0].spec.resources.requests.storage | regex_replace('Gi$', '') | int)
+             if opensearch_claim.resources | length > 0 else 0 }}
+
+    - name: Refuse a volume size this playbook cannot compare
+      ansible.builtin.fail:
+        msg: >-
+          The data volume sizes must be whole numbers of Gi, such as 100Gi: the playbook is set to
+          {{ opensearch_storage_size }} and the installed volume is
+          {{ opensearch_claim.resources[0].spec.resources.requests.storage if opensearch_claim.resources | length > 0 else 'not there' }}.
+      when: >-
+        opensearch_storage_gi | int < 1 or
+        (opensearch_claim.resources | length > 0 and opensearch_installed_gi | int < 1)
+
     - name: Note whether the data volume must grow
       ansible.builtin.set_fact:
         opensearch_volume_grows: >-
-          {{ opensearch_claim.resources | length > 0 and
-             (opensearch_claim.resources[0].spec.resources.requests.storage | human_to_bytes)
-             < (opensearch_storage_size | human_to_bytes) }}
+          {{ opensearch_installed_gi | int > 0 and opensearch_installed_gi | int < opensearch_storage_gi | int }}
 
     - name: Refuse a data volume larger than the size configured
       ansible.builtin.fail:
@@ -610,9 +626,7 @@
           OpenSearch's data volume is {{ opensearch_claim.resources[0].spec.resources.requests.storage }},
           larger than the {{ opensearch_storage_size }} this playbook is set to. A volume cannot shrink:
           set opensearch_storage_size to its size or more.
-      when:
-        - opensearch_claim.resources | length > 0
-        - (opensearch_claim.resources[0].spec.resources.requests.storage | human_to_bytes) > (opensearch_storage_size | human_to_bytes)
+      when: opensearch_installed_gi | int > opensearch_storage_gi | int
 
     - name: Grow the data volume in place
       kubernetes.core.k8s:
