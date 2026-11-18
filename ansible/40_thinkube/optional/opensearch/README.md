@@ -61,6 +61,10 @@ OpenSearch is an open-source search and analytics engine used for log aggregatio
 - **Resources**:
   - OpenSearch: 1-4 CPU, 6-12Gi memory, of which 4Gi is heap; the rest holds vector search (k-NN) graphs
   - Dashboards: Default Helm chart resources
+- **Models in search**: a search pipeline may call a model served by the
+  platform (a reranker, for example) through the LLM Gateway, the only
+  connector address allowed. The admin user may create an application's own
+  user, limited to its indices, through the security API.
 - **Authentication**:
   - Basic auth: admin user with configurable password
   - OIDC: Integration with Keycloak realm
