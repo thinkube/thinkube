@@ -65,6 +65,9 @@ OpenSearch is an open-source search and analytics engine used for log aggregatio
   platform (a reranker, for example) through the LLM Gateway, the only
   connector address allowed. The admin user may create an application's own
   user, limited to its indices, through the security API.
+  Users and roles made that way are kept when this playbook runs again: the
+  playbook writes the admin user and the base roles on a first install, and
+  only the sign-in configuration after that.
 - **Authentication**:
   - Basic auth: admin user with configurable password
   - OIDC: Integration with Keycloak realm

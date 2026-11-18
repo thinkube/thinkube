@@ -632,6 +632,30 @@
         group: "{{ ansible_user }}"
       become: true
 
+    # securityadmin replaces what it uploads. On a first install it uploads
+    # every file: the admin user, the roles, the sign-in configuration. On an
+    # OpenSearch that already has its security index it uploads the sign-in
+    # configuration alone, so the users and roles made since through the
+    # security API (an application's own user, limited to its indices) are
+    # kept across a redeploy.
+    - name: Ask OpenSearch whether its security index holds the admin user
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ namespace }} opensearch-cluster-master-0 -c opensearch -- \
+          curl -sk -o /dev/null -w '%{http_code}' \
+            --cert /usr/share/opensearch/config/certificates/tls.crt \
+            --key /usr/share/opensearch/config/certificates/tls.key \
+            https://localhost:9200/_plugins/_security/api/internalusers/admin
+      register: security_index_probe
+      until: security_index_probe.rc == 0 and security_index_probe.stdout in ['200', '404', '503']
+      retries: 12
+      delay: 10
+      changed_when: false
+      become: true
+
+    - name: Note whether security is already initialized
+      ansible.builtin.set_fact:
+        opensearch_security_initialized: "{{ security_index_probe.stdout == '200' }}"
+
     - name: Run securityadmin to initialize security
       ansible.builtin.shell: |
         {{ kubectl_bin }} exec -n {{ namespace }} opensearch-cluster-master-0 -c opensearch -- bash -c '
@@ -639,7 +663,7 @@
         export JAVA_HOME=/usr/share/opensearch/jdk
         export OPENSEARCH_JAVA_HOME=/usr/share/opensearch/jdk
         ./securityadmin.sh \
-          -cd /usr/share/opensearch/config/opensearch-security \
+          {% if opensearch_security_initialized %}-f /usr/share/opensearch/config/opensearch-security/config.yml -t config{% else %}-cd /usr/share/opensearch/config/opensearch-security{% endif %} \
           -icl -nhnv \
           -h localhost \
           -p 9200 \
@@ -660,6 +684,33 @@
     - name: Display securityadmin output
       ansible.builtin.debug:
         var: securityadmin_result
+
+    # The admin user is written on a first install. When it is kept, the
+    # password this run was given must still be its password: one that was
+    # changed since is not applied silently.
+    - name: Check that the admin user signs in with the configured password
+      ansible.builtin.shell: |
+        {{ kubectl_bin }} exec -n {{ namespace }} opensearch-cluster-master-0 -c opensearch -- \
+          curl -sk -o /dev/null -w '%{http_code}' -u "admin:${OS_ADMIN_PASSWORD}" https://localhost:9200/_plugins/_security/authinfo
+      environment:
+        OS_ADMIN_PASSWORD: "{{ admin_password }}"
+      register: admin_login
+      until: admin_login.stdout == '200'
+      retries: 6
+      delay: 10
+      changed_when: false
+      # The next task reports a refusal, with what to do about it.
+      failed_when: false
+      no_log: true
+      become: true
+
+    - name: Explain a refused admin sign-in
+      ansible.builtin.fail:
+        msg: >-
+          OpenSearch refused the admin user with the configured password (HTTP {{ admin_login.stdout }}).
+          Its users were kept from before this run. To write the admin user again from this playbook,
+          remove OpenSearch with 19_rollback.yaml and install it again; that also removes its data.
+      when: admin_login.stdout != '200'
 
     - name: Clean up temporary directory
       ansible.builtin.file:
