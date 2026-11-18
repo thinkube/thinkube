@@ -40,6 +40,13 @@
     
     # Namespace configuration
     namespace: opensearch
+
+    # The size of OpenSearch's data volume. An application's search index of
+    # passages with vectors takes about 16 GB, and OpenSearch needs about as
+    # much again free whenever it merges an index's files, on top of the logs.
+    opensearch_storage_size: 100Gi
+    opensearch_statefulset: opensearch-cluster-master
+    opensearch_data_claim: opensearch-cluster-master-opensearch-cluster-master-0
     
     # Service hostnames
     opensearch_hostname: "opensearch.{{ domain_name }}"
@@ -494,7 +501,7 @@
             enabled: true
             accessModes:
               - ReadWriteOnce
-            size: 30Gi
+            size: "{{ opensearch_storage_size }}"
 
           # OpenSearch and its node-local volume stay on the control plane, off
           # the worker nodes whose GPUs and memory go to served models and
@@ -574,6 +581,59 @@
       retries: 5
       delay: 15
       until: pull_opensearch_chart is succeeded
+      become: true
+
+    # An installed OpenSearch whose data volume is smaller than the size above
+    # gets its volume grown in place; its data stays. A StatefulSet's volume
+    # size cannot be changed, so the StatefulSet is then removed without its
+    # pod (which keeps running on the same volume) and Helm creates it again
+    # with the new size.
+    - name: Read the data volume claim of an installed OpenSearch
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ namespace }}"
+        name: "{{ opensearch_data_claim }}"
+      register: opensearch_claim
+
+    - name: Note whether the data volume must grow
+      ansible.builtin.set_fact:
+        opensearch_volume_grows: >-
+          {{ opensearch_claim.resources | length > 0 and
+             (opensearch_claim.resources[0].spec.resources.requests.storage | human_to_bytes)
+             < (opensearch_storage_size | human_to_bytes) }}
+
+    - name: Refuse a data volume larger than the size configured
+      ansible.builtin.fail:
+        msg: >-
+          OpenSearch's data volume is {{ opensearch_claim.resources[0].spec.resources.requests.storage }},
+          larger than the {{ opensearch_storage_size }} this playbook is set to. A volume cannot shrink:
+          set opensearch_storage_size to its size or more.
+      when:
+        - opensearch_claim.resources | length > 0
+        - (opensearch_claim.resources[0].spec.resources.requests.storage | human_to_bytes) > (opensearch_storage_size | human_to_bytes)
+
+    - name: Grow the data volume in place
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: patched
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ namespace }}"
+        name: "{{ opensearch_data_claim }}"
+        definition:
+          spec:
+            resources:
+              requests:
+                storage: "{{ opensearch_storage_size }}"
+      when: opensearch_volume_grows | bool
+
+    - name: Remove the StatefulSet that names the old volume size, leaving its pod
+      ansible.builtin.command: >
+        {{ kubectl_bin }} delete statefulset {{ opensearch_statefulset }}
+        --namespace {{ namespace }} --cascade=orphan --ignore-not-found
+      when: opensearch_volume_grows | bool
       become: true
 
     - name: Deploy OpenSearch via Helm

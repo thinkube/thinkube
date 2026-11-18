@@ -57,7 +57,8 @@ OpenSearch is an open-source search and analytics engine used for log aggregatio
 ### Configuration Details
 
 - **Namespace**: `opensearch`
-- **Storage**: 30Gi for OpenSearch data
+- **Storage**: 100Gi for OpenSearch data (`opensearch_storage_size`). An installed OpenSearch with a smaller
+  volume gets it grown in place when the playbook runs; its data stays
 - **Resources**:
   - OpenSearch: 1-4 CPU, 6-12Gi memory, of which 4Gi is heap; the rest holds vector search (k-NN) graphs
   - Dashboards: Default Helm chart resources
