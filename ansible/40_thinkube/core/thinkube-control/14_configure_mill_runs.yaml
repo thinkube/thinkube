@@ -9,10 +9,14 @@
 #   since a run's pod declares the CPU, memory and GPUs Forge gives it, as
 #   the notebook servers' namespace does. It holds the claim of the shared
 #   file system at its root, mounted by every task pod at
-#   /storage/thinkube-shared, where Mill's main pod has it too.
+#   /storage/thinkube-shared, where Mill's main pod has it too, and the
+#   claim of MLflow's file system at its root, mlflow-root, which a task
+#   that reads mirrored models mounts read-only at
+#   /home/thinkube/thinkube/mlflow, where a notebook server has it.
 #
 # Requirements:
-#   - JuiceFS must be deployed (the secret juicefs/juicefs-secret)
+#   - JuiceFS must be deployed (the secrets juicefs/juicefs-secret and
+#     juicefs/juicefs-mlflow-secret)
 #
 # Usage:
 #   cd ~/thinkube
@@ -89,5 +93,67 @@
         name: thinkube-shared
       register: mill_runs_claim
       until: mill_runs_claim.resources | length > 0 and mill_runs_claim.resources[0].status.phase == 'Bound'
+      retries: 24
+      delay: 5
+
+    - name: Create the volume of MLflow's file system's root
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: mill-runs-mlflow-root
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 1Ti
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-mlflow-secret
+                namespace: "{{ juicefs_namespace }}"
+              volumeHandle: mill-runs-mlflow-root
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: ""
+            volumeMode: Filesystem
+            # A task loads whole models from here; as for the notebook servers' volume of MLflow, the block cache
+            # on the node's disk must hold a model beside what else was read. 512000 MiB is an eviction ceiling,
+            # not an allocation, and free-space-ratio keeps 15% of the node's disk free.
+            mountOptions:
+              - cache-size=512000
+              - free-space-ratio=0.15
+
+    - name: Create the claim of MLflow's file system's root
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: mlflow-root
+            namespace: "{{ mill_runs_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: mill-runs-mlflow-root
+            storageClassName: ""
+            resources:
+              requests:
+                storage: 1Ti
+
+    - name: Wait for the claim of MLflow's file system to be bound
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ mill_runs_namespace }}"
+        name: mlflow-root
+      register: mill_runs_mlflow_claim
+      until: mill_runs_mlflow_claim.resources | length > 0 and mill_runs_mlflow_claim.resources[0].status.phase == 'Bound'
       retries: 24
       delay: 5
