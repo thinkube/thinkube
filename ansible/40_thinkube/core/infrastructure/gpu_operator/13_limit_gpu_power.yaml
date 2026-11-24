@@ -1,0 +1,123 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/infrastructure/gpu_operator/13_limit_gpu_power.yaml
+# Description:
+#   Limits the power of the GPUs named in gpu_power_limits, on every boot.
+#
+#   The heat of a GPU is the power it draws. A GeForce RTX 3090 draws its
+#   whole factory limit, 350 W, under training. Two of them in one case can
+#   heat the machine until its protection switches it off: the fans run at
+#   full speed for some minutes, then the node goes off. Under a lower limit
+#   a card lowers its clock and its voltage only while its draw would pass
+#   the limit, so light work is not slowed.
+#
+#   `nvidia-smi -pl` does not survive a reboot, so a systemd unit sets it on
+#   every boot, before the kubelet starts workloads. Stopping the unit gives
+#   each GPU its factory limit back.
+#
+#   A node gets the limit of the first name in gpu_power_limits that the
+#   names of its GPUs hold. A node with no such GPU is left as it is. The
+#   limit must lie in the range the card reports (power.min_limit to
+#   power.max_limit); nvidia-smi refuses any other, and the play fails.
+#
+#   The play is not part of 00_install.yaml: it is run for a node whose
+#   cooling needs it.
+#
+# Usage:
+#   cd ~/thinkube-platform/core/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/infrastructure/gpu_operator/13_limit_gpu_power.yaml
+#
+# Variables:
+#   - gpu_power_limits: the limit in watts, by a part of the GPU's name
+
+- name: Limit the power of GPUs
+  hosts: baremetal_gpus
+  become: false
+  any_errors_fatal: true
+
+  vars:
+    gpu_power_limits:
+      "GeForce RTX 3090": 280
+
+  tasks:
+    - name: Ask the GPUs their names
+      ansible.builtin.command: nvidia-smi --query-gpu=name --format=csv,noheader
+      register: gpu_name
+      changed_when: false
+
+    - name: Choose the limit of this node's GPUs
+      vars:
+        gpu_power_matches: >-
+          {{ gpu_power_limits | dict2items | selectattr('key', 'in', gpu_name.stdout)
+             | map(attribute='value') | list }}
+      ansible.builtin.set_fact:
+        gpu_power_watts: "{{ gpu_power_matches[0] if gpu_power_matches else 0 }}"
+
+    - name: Find nvidia-smi for the unit
+      ansible.builtin.command: which nvidia-smi
+      register: nvidia_smi_path
+      changed_when: false
+      when: gpu_power_watts | int > 0
+
+    - name: Limit the power on the nodes with a named GPU
+      when: gpu_power_watts | int > 0
+      become: true
+      vars:
+        nvidia_smi: "{{ nvidia_smi_path.stdout | trim }}"
+      block:
+        - name: Install the power-limit unit
+          ansible.builtin.copy:
+            content: |
+              [Unit]
+              Description=Thinkube: limit the power of each GPU to {{ gpu_power_watts }} W, to hold the node's heat down
+              After=local-fs.target nvidia-host-driver-validation.service
+              Before=kubelet.service
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart={{ nvidia_smi }} -pl {{ gpu_power_watts }}
+              ExecStop=/bin/sh -c 'for g in $$({{ nvidia_smi }} --query-gpu=index --format=csv,noheader); do {{ nvidia_smi }} -i $$g -pl $$({{ nvidia_smi }} -i $$g --query-gpu=power.default_limit --format=csv,noheader,nounits); done'
+
+              [Install]
+              WantedBy=multi-user.target
+            dest: /etc/systemd/system/thinkube-gpu-power-limit.service
+            mode: '0644'
+
+        - name: Enable the unit and apply the limit now
+          ansible.builtin.systemd:
+            name: thinkube-gpu-power-limit
+            enabled: true
+            state: restarted
+            daemon_reload: true
+
+        - name: Read the unit's result
+          ansible.builtin.command: systemctl show thinkube-gpu-power-limit -p ActiveState -p Result
+          register: limit_state
+          changed_when: false
+
+        - name: Fail when the limit was not applied
+          ansible.builtin.fail:
+            msg: "thinkube-gpu-power-limit did not apply the limit ({{ limit_state.stdout_lines | join(', ') }}); see journalctl -u thinkube-gpu-power-limit"
+          when: "'ActiveState=active' not in limit_state.stdout_lines or 'Result=success' not in limit_state.stdout_lines"
+
+        - name: Read the limit each GPU enforces
+          ansible.builtin.command: nvidia-smi --query-gpu=enforced.power.limit --format=csv,noheader,nounits
+          register: enforced
+          changed_when: false
+
+        - name: Fail when a GPU enforces another limit
+          ansible.builtin.fail:
+            msg: "the GPUs enforce {{ enforced.stdout_lines | join(' W, ') }} W, not {{ gpu_power_watts }} W"
+          when: enforced.stdout_lines | map('float') | reject('equalto', gpu_power_watts | float) | list | length > 0
+
+        - name: Show the node's GPUs now
+          ansible.builtin.command: nvidia-smi --query-gpu=index,name,power.draw,enforced.power.limit,temperature.gpu --format=csv,noheader
+          register: power_now
+          changed_when: false
+
+        - name: Report
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }}: {{ power_now.stdout_lines | join(' | ') }}; limited to {{ gpu_power_watts }} W on every boot"

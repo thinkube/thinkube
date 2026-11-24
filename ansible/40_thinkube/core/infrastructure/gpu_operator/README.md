@@ -18,6 +18,11 @@ running `00_install.yaml` in this folder
 `16_apply_node_profile.yaml` (the `dedicated-ai` node profile) is not part of
 `00_install.yaml`. The component is not installed on its own.
 
+`13_limit_gpu_power.yaml` is not part of `00_install.yaml` either. It limits
+the power of the GPUs named in `gpu_power_limits` (a GeForce RTX 3090 to
+280 W) on every boot, for a node whose cooling cannot carry its GPUs at their
+factory limit.
+
 ## Description
 
 The NVIDIA GPU Operator is a Kubernetes operator that automates the management of NVIDIA GPUs in Kubernetes clusters. It manages the installation and lifecycle of several components:
