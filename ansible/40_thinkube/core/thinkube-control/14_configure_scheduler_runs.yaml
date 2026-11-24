@@ -1,0 +1,240 @@
+# Copyright Alejandro Martínez Corriá and the Thinkube contributors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# ansible/40_thinkube/core/thinkube-control/14_configure_scheduler_runs.yaml
+# Description:
+#   The namespace where the Scheduler starts the pods of its jobs, each on
+#   the node its job names: scheduler-runs. It has no namespace-wide quota,
+#   since a job's pod declares the CPU and memory the Scheduler gives it.
+#   It holds the claims of the file systems a job may mount:
+#     - thinkube-shared: the shared file system at its root, at
+#       /storage/thinkube-shared, where Mill's main pod has it;
+#     - mlflow-root: MLflow's file system at its root, at
+#       /home/thinkube/thinkube/mlflow, where a notebook server has it;
+#     - models: the notebooks' models folder, at
+#       /home/thinkube/thinkube/models, where a notebook server has it. It
+#       is the folder of the shared file system that the claim
+#       jupyterhub/jupyterhub-models-pvc was given.
+#
+# Requirements:
+#   - JuiceFS must be deployed (the secrets juicefs/juicefs-secret and
+#     juicefs/juicefs-mlflow-secret)
+#   - JupyterHub must be deployed (the claim jupyterhub/jupyterhub-models-pvc)
+#
+# Usage:
+#   cd ~/thinkube
+#   ./scripts/tk_ansible ansible/40_thinkube/core/thinkube-control/14_configure_scheduler_runs.yaml
+
+- name: Configure the namespace of the Scheduler's jobs
+  hosts: k8s_control_plane
+  gather_facts: false
+
+  vars:
+    scheduler_runs_namespace: "scheduler-runs"
+    juicefs_namespace: "juicefs"
+
+  tasks:
+    - name: Create the namespace of the Scheduler's jobs
+      ansible.builtin.include_role:
+        name: thinkube_namespace
+      vars:
+        ns: "{{ scheduler_runs_namespace }}"
+        tier: "batch"
+        # Each job's pod declares its own resources, set by the Scheduler for its node
+        skip_quota: true
+
+    - name: Create the volume of the shared file system's root
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: scheduler-runs-thinkube-shared
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 1Ti
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-secret
+                namespace: "{{ juicefs_namespace }}"
+              volumeHandle: scheduler-runs-thinkube-shared
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: ""
+            volumeMode: Filesystem
+
+    - name: Create the claim of the shared file system's root
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: thinkube-shared
+            namespace: "{{ scheduler_runs_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: scheduler-runs-thinkube-shared
+            storageClassName: ""
+            resources:
+              requests:
+                storage: 1Ti
+
+    - name: Wait for the claim to be bound
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ scheduler_runs_namespace }}"
+        name: thinkube-shared
+      register: scheduler_runs_claim
+      until: scheduler_runs_claim.resources | length > 0 and scheduler_runs_claim.resources[0].status.phase == 'Bound'
+      retries: 24
+      delay: 5
+
+    - name: Create the volume of MLflow's file system's root
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: scheduler-runs-mlflow-root
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 1Ti
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-mlflow-secret
+                namespace: "{{ juicefs_namespace }}"
+              volumeHandle: scheduler-runs-mlflow-root
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: ""
+            volumeMode: Filesystem
+            # A job loads whole models from here; as for the notebook servers' volume of MLflow, the block cache
+            # on the node's disk must hold a model beside what else was read. 512000 MiB is an eviction ceiling,
+            # not an allocation, and free-space-ratio keeps 15% of the node's disk free.
+            mountOptions:
+              - cache-size=512000
+              - free-space-ratio=0.15
+
+    - name: Create the claim of MLflow's file system's root
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: mlflow-root
+            namespace: "{{ scheduler_runs_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: scheduler-runs-mlflow-root
+            storageClassName: ""
+            resources:
+              requests:
+                storage: 1Ti
+
+    - name: Wait for the claim of MLflow's file system to be bound
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ scheduler_runs_namespace }}"
+        name: mlflow-root
+      register: scheduler_runs_mlflow_claim
+      until: scheduler_runs_mlflow_claim.resources | length > 0 and scheduler_runs_mlflow_claim.resources[0].status.phase == 'Bound'
+      retries: 24
+      delay: 5
+
+    - name: Read the claim of the notebooks' models folder
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: jupyterhub
+        name: jupyterhub-models-pvc
+      register: notebooks_models_claim
+
+    - name: Stop when the notebooks' models folder has no volume
+      ansible.builtin.fail:
+        msg: >-
+          The claim jupyterhub/jupyterhub-models-pvc is not bound to a volume. It names the folder of the shared
+          file system that holds the notebooks' models, which the Scheduler's jobs mount. Deploy JupyterHub first.
+      when: >-
+        notebooks_models_claim.resources | length == 0
+        or not (notebooks_models_claim.resources[0].spec.volumeName | default(''))
+
+    - name: Create the volume of the notebooks' models folder
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: scheduler-runs-models
+          spec:
+            accessModes:
+              - ReadWriteMany
+            capacity:
+              storage: 1Ti
+            csi:
+              driver: csi.juicefs.com
+              fsType: juicefs
+              nodePublishSecretRef:
+                name: juicefs-secret
+                namespace: "{{ juicefs_namespace }}"
+              volumeHandle: scheduler-runs-models
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: ""
+            volumeMode: Filesystem
+            # The folder of the shared file system that JuiceFS made for the notebooks' claim, named after its volume
+            mountOptions:
+              - "subdir=/{{ notebooks_models_claim.resources[0].spec.volumeName }}"
+
+    - name: Create the claim of the notebooks' models folder
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: models
+            namespace: "{{ scheduler_runs_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteMany
+            volumeName: scheduler-runs-models
+            storageClassName: ""
+            resources:
+              requests:
+                storage: 1Ti
+
+    - name: Wait for the claim of the notebooks' models folder to be bound
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ scheduler_runs_namespace }}"
+        name: models
+      register: scheduler_runs_models_claim
+      until: scheduler_runs_models_claim.resources | length > 0 and scheduler_runs_models_claim.resources[0].status.phase == 'Bound'
+      retries: 24
+      delay: 5
