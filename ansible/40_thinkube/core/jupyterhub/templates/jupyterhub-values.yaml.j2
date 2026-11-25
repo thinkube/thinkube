@@ -8,6 +8,15 @@
 hub:
   extraPodSpec:
     priorityClassName: thinkube-workload
+  # The hub's database is on one node's disk, so the hub runs on that node
+  # only. Training mode (Thinkube Control) keeps new pods off its node; the
+  # hub is the platform's and is let through, or it could not start again
+  # while a training runs there.
+  tolerations:
+    - key: thinkube.io/training
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
   # Service API token for thinkube-control to proxy Jupyter notebook tool calls
   services:
     thinkube-control:
@@ -114,9 +123,88 @@ hub:
 
     01-dynamic-profile-generator: |
       # Dynamic profile generation with flexible resource selection
+      import asyncio
       import requests
       import sys
       import logging
+
+      # A notebook server's GPUs are asked of the Scheduler, the platform's
+      # service that decides whose turn it is on a node's GPUs. The Hub asks
+      # for a hold: GPUs kept for the server's pod, which takes its turn among
+      # the work on the node with the server's priority. The pod is started on
+      # the GPUs the hold was given, named to it by their ids with the runtime
+      # class that takes ids, and asks Kubernetes for none. The pod carries
+      # the hold's id as a label, with which the Scheduler ends a hold whose
+      # pod is gone; the Hub ends the hold when the server stops.
+      SCHEDULER_URL = 'http://scheduler-backend.thinkube-control.svc.cluster.local:8000/internal/scheduler'
+      HOLD_OWNER = 'jupyterhub'
+      HOLD_LABEL = 'scheduler.thinkube.io/hold'
+      GPU_RUNTIME_CLASS = 'nvidia-legacy'
+      # The form's choice of GPU memory for a server that has its GPUs alone
+      WHOLE_GPU = 'whole'
+      # An interactive server's priority, of 1 (highest) to 5; thinkube-control
+      # names another for an unattended run
+      SERVER_PRIORITY = 1
+      # A start is refused when its hold is given no GPU within GRANT_SECONDS,
+      # with the Scheduler's reason; while the Scheduler stops work of a lower
+      # priority for it, it is waited for up to ROOM_SECONDS.
+      GRANT_SECONDS = 30
+      ROOM_SECONDS = 900
+      POLL_SECONDS = 3
+
+      def scheduler_request(method, path, body=None):
+          try:
+              answer = requests.request(method, SCHEDULER_URL + path, json=body, timeout=30)
+          except requests.RequestException as e:
+              raise RuntimeError(f"the Scheduler did not answer ({method} {path}): {e}")
+          if answer.status_code >= 400:
+              raise RuntimeError(f"the Scheduler refused ({method} {path}): {answer.status_code} {answer.text[:300]}")
+          return answer.json()
+
+      async def scheduler_call(method, path, body=None):
+          """One call to the Scheduler, outside the Hub's event loop."""
+          return await asyncio.get_running_loop().run_in_executor(None, scheduler_request, method, path, body)
+
+      async def end_holds(name):
+          """End the Hub's holds of this name that have not ended."""
+          found = await scheduler_call('GET', f"/jobs?owner={HOLD_OWNER}")
+          for hold in found['jobs']:
+              if hold['name'] == name:
+                  await scheduler_call('POST', f"/jobs/{hold['id']}/stop")
+
+      async def hold_gpus(request):
+          """(the hold's id, the ids of the GPUs it was given). RuntimeError
+          with the Scheduler's reason when it is given none in time; the hold
+          is ended then."""
+          # A hold left by an earlier start of this server
+          await end_holds(request['name'])
+          hold = await scheduler_call('POST', '/holds', request)
+          waited, reason = 0, 'it has not looked at it yet'
+          while True:
+              found = await scheduler_call('GET', f"/jobs/{hold['id']}")
+              if found['status'] == 'running':
+                  return hold['id'], found['gpu_ids']
+              if found['status'] != 'waiting':
+                  raise RuntimeError(f"the Scheduler gave the notebook server no GPU: its hold is {found['status']}: {found.get('error') or 'ended'}")
+              reason = found.get('waiting') or reason
+              if waited >= (ROOM_SECONDS if reason.startswith('making room') else GRANT_SECONDS):
+                  await scheduler_call('POST', f"/jobs/{hold['id']}/stop")
+                  raise RuntimeError(f"the Scheduler gave the notebook server no GPU: {reason}")
+              await asyncio.sleep(POLL_SECONDS)
+              waited += POLL_SECONDS
+
+      async def release_gpus(spawner):
+          """The server has stopped: its hold of GPUs ends."""
+          logger = logging.getLogger(__name__)
+          said = None
+          for attempt in range(3):
+              try:
+                  await end_holds(spawner.pod_name)
+                  return
+              except RuntimeError as e:
+                  said = e
+                  await asyncio.sleep(2)
+          logger.error(f"The hold of GPUs of {spawner.pod_name} was not ended: {said}. The Scheduler ends it once the pod has been gone for 10 minutes.")
 
       def parse_memory_to_gb(memory_str):
           """Convert memory string to GB for comparison"""
@@ -234,12 +322,8 @@ hub:
 
                   # Add GPU info if available
                   if node['gpu_details']:
-                      available_gpus = [g for g in node['gpu_details'] if g['available']]
-                      if available_gpus:
-                          gpu = available_gpus[0]
-                          node_label += f", GPU: {gpu['model']} {gpu['memory_total']}"
-                      else:
-                          node_label += ", GPU: In use"
+                      gpu = node['gpu_details'][0]
+                      node_label += f", GPU: {len(node['gpu_details'])} x {gpu['model']} {gpu['memory_total']}"
                   elif node['capacity']['gpu'] > 0:
                       node_label += f", GPU details unavailable: {node['gpu_error']}"
                   else:
@@ -251,8 +335,10 @@ hub:
                       'default': (node['name'] == first_node)
                   }
 
-              # Build GPU choices based on max available GPUs across nodes
-              max_gpus = max(node['available']['gpu'] for node in resources)
+              # GPU choices: any number of a node's GPUs, up to the node that
+              # has the most. The Scheduler says whether they are free, when
+              # the server starts.
+              max_gpus = max(n['capacity']['gpus'] for n in node_defaults.values())
               gpu_choices = {}
               for i in range(0, max_gpus + 1):
                   gpu_choices[str(i)] = {
@@ -260,17 +346,27 @@ hub:
                       'default': (i == int(opening['gpus']))
                   }
 
-              # Build per-node resource limits for the dynamic form.
-              # effective_gpu is thinkube-control's limit: one GPU on a
-              # time-sliced node.
+              # GPU memory choices: the memory the server takes on each GPU,
+              # with which it shares the GPU with other work that fits beside
+              # it; or the whole GPU, which the server then has alone.
+              gpu_memory_choices = {WHOLE_GPU: {
+                  'display_name': 'The whole GPU (other work on it is stopped or waited for)',
+                  'default': True
+              }}
+              for gb in sorted({gb for n in node_defaults.values() for gb in n['choices']['gpu_memory_gb']}):
+                  gpu_memory_choices[str(gb)] = {'display_name': f"{gb} GB of each GPU, shared", 'default': False}
+
+              # Build per-node resource limits for the dynamic form, from
+              # thinkube-control's capacity and choices of each node.
               import json
               node_limits = {}
               for node in resources:
                   node_limits[node['name']] = {
                       'cpu': int(node['capacity']['cpu']),
                       'memory': parse_memory_to_gb(node['capacity']['memory']),
-                      'gpu': node['capacity']['effective_gpu'],
-                      'defaults': node_defaults.get(node['name'])
+                      'gpu': node_defaults[node['name']]['capacity']['gpus'],
+                      'gpu_memory': max(node_defaults[node['name']]['choices']['gpu_memory_gb'], default=0),
+                      'defaults': node_defaults[node['name']]
                   }
               logger.info(f"Node limits for form: {node_limits}")
 
@@ -297,9 +393,13 @@ hub:
                           'display_name': 'Memory',
                           'choices': memory_choices
                       },
-                      'enable_gpu': {
+                      'gpus': {
                           'display_name': 'Number of GPUs',
                           'choices': gpu_choices
+                      },
+                      'gpu_memory': {
+                          'display_name': 'GPU memory',
+                          'choices': gpu_memory_choices
                       }
                   },
                   'kubespawner_override': {
@@ -427,33 +527,61 @@ hub:
                   spawner.mem_guarantee = int(mem_bytes * 0.25)
               logger.info(f"Set memory: limit={memory}, guarantee={spawner.mem_guarantee}")
 
-              # Apply GPU allocation
-              gpu_count = user_options.get('enable_gpu', defaults['gpu'])
-              if gpu_count != '0':
-                  spawner.extra_resource_limits = {"nvidia.com/gpu": gpu_count}
-                  spawner.extra_resource_guarantees = {"nvidia.com/gpu": gpu_count}
-                  logger.info(f"Set GPU count: {gpu_count}")
+              # The server's GPUs: a hold asked of the Scheduler. What an
+              # earlier start of this server set is taken out first, so a
+              # server started again without a GPU has none.
+              gpu_count = int(user_options.get('gpus', defaults['gpu']))
+              pod_config = {k: v for k, v in (spawner.extra_pod_config or {}).items() if k != 'runtimeClassName'}
+              environment = {k: v for k, v in (spawner.environment or {}).items() if k != 'NVIDIA_VISIBLE_DEVICES'}
+              labels = {k: v for k, v in (spawner.extra_labels or {}).items() if k != HOLD_LABEL}
+              if gpu_count:
+                  if not node:
+                      raise RuntimeError("a notebook server with a GPU names its node")
+                  gpu_memory = user_options.get('gpu_memory', WHOLE_GPU)
+                  hold_id, gpu_ids = await hold_gpus({
+                      'name': spawner.pod_name,
+                      'owner': HOLD_OWNER,
+                      'node': node,
+                      'gpus': gpu_count,
+                      'gpu_memory_gb': None if gpu_memory == WHOLE_GPU else float(gpu_memory),
+                      'memory_gb': int(float(memory.replace('G', ''))),
+                      'priority': int(user_options.get('priority', SERVER_PRIORITY)),
+                      'pods_in': spawner.namespace,
+                  })
+                  pod_config['runtimeClassName'] = GPU_RUNTIME_CLASS
+                  environment['NVIDIA_VISIBLE_DEVICES'] = ','.join(gpu_ids)
+                  labels[HOLD_LABEL] = hold_id
+                  logger.info(f"Hold {hold_id} of the Scheduler gave the GPUs {gpu_ids} of {node}")
+              spawner.extra_pod_config = pod_config
+              spawner.environment = environment
+              spawner.extra_labels = labels
 
               # Training mode (Thinkube Control) keeps new pods off its node;
               # a job Thinkube Control starts for that node is the training's
               # own and tolerates the mark.
+              training_toleration = {
+                  "key": "thinkube.io/training", "operator": "Equal",
+                  "value": "true", "effect": "NoSchedule"}
+              tolerations = [t for t in (spawner.tolerations or []) if t != training_toleration]
               if user_options.get('training_node') == 'yes':
-                  spawner.tolerations = list(spawner.tolerations or []) + [{
-                      "key": "thinkube.io/training", "operator": "Equal",
-                      "value": "true", "effect": "NoSchedule"}]
+                  tolerations.append(training_toleration)
                   logger.info("Tolerates training mode on its node")
+              spawner.tolerations = tolerations
 
               # Every server mounts the node's own disk, kept across sessions,
               # at /home/thinkube/training: a training's checkpoints and any
               # large file used on one node, written at local disk speed (the
               # pod's scratch is an emptyDir, deleted with the pod; the shared
               # folders write through the network to the object store).
-              spawner.volumes = list(spawner.volumes or []) + [{
+              def without(items, name):
+                  # What an earlier start of this server added under this name is taken out
+                  return [i for i in (items or []) if not (isinstance(i, dict) and i.get("name") == name)]
+              spawner.volumes = without(spawner.volumes, "training") + [{
                   "name": "training",
                   "hostPath": {"path": "/var/lib/thinkube-training", "type": "DirectoryOrCreate"}}]
-              spawner.volume_mounts = list(spawner.volume_mounts or []) + [{
+              spawner.volume_mounts = without(spawner.volume_mounts, "training") + [{
                   "name": "training", "mountPath": "/home/thinkube/training"}]
-              spawner.init_containers = list(spawner.init_containers or []) + [{
+              spawner.init_containers = without(spawner.init_containers, "training-permissions") + [{
                   "name": "training-permissions",
                   "image": "{{ harbor_registry }}/library/busybox:latest",
                   "imagePullPolicy": "IfNotPresent",
@@ -464,6 +592,7 @@ hub:
 
       c.KubeSpawner.profile_list = get_profile_list
       c.KubeSpawner.pre_spawn_hook = resource_selector_hook
+      c.KubeSpawner.post_stop_hook = release_gpus
 
     02-thinkube-branding: |
       # Thinkube branding - logo and custom templates
@@ -611,12 +740,14 @@ hub:
             } catch(e) {}
 
             var $nodeSelect = $('select[data-option-key="node"]');
-            var $gpuSelect = $('select[data-option-key="enable_gpu"]');
+            var $gpuSelect = $('select[data-option-key="gpus"]');
+            var $gpuMemSelect = $('select[data-option-key="gpu_memory"]');
             var $cpuSelect = $('select[data-option-key="cpu"]');
             var $memSelect = $('select[data-option-key="memory"]');
 
             // Store all original options
             var allGpuOptions = $gpuSelect.find('option').clone();
+            var allGpuMemOptions = $gpuMemSelect.find('option').clone();
             var allCpuOptions = $cpuSelect.find('option').clone();
             var allMemOptions = $memSelect.find('option').clone();
 
@@ -637,6 +768,21 @@ hub:
                 $gpuSelect.val(String(limits.gpu));
               } else {
                 $gpuSelect.val(currentGpu);
+              }
+
+              // Filter GPU memory options: the whole GPU, or less than one of
+              // this node's GPUs has
+              var currentGpuMem = $gpuMemSelect.val();
+              $gpuMemSelect.empty();
+              allGpuMemOptions.each(function() {
+                if ($(this).val() === 'whole' || parseInt($(this).val()) <= limits.gpu_memory) {
+                  $gpuMemSelect.append($(this).clone());
+                }
+              });
+              if (currentGpuMem !== 'whole' && parseInt(currentGpuMem) > limits.gpu_memory) {
+                $gpuMemSelect.val('whole');
+              } else {
+                $gpuMemSelect.val(currentGpuMem);
               }
 
               // Filter CPU options
