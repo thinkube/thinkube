@@ -16,6 +16,9 @@
 #       /home/thinkube/thinkube/models, where a notebook server has it. It
 #       is the folder of the shared file system that the claim
 #       jupyterhub/jupyterhub-models-pvc was given.
+#   And the account the jobs' pods run with, scheduler-job, which may read
+#   one secret: mlflow/mlflow-s3-secret, the key of MLflow's storage, with
+#   which a job that registers a model uploads it (thinkube_models).
 #
 # Requirements:
 #   - JuiceFS must be deployed (the secrets juicefs/juicefs-secret and
@@ -33,6 +36,8 @@
   vars:
     scheduler_runs_namespace: "scheduler-runs"
     juicefs_namespace: "juicefs"
+    mlflow_namespace: "mlflow"
+    scheduler_job_account: "scheduler-job"
 
   tasks:
     - name: Create the namespace of the Scheduler's jobs
@@ -238,3 +243,49 @@
       until: scheduler_runs_models_claim.resources | length > 0 and scheduler_runs_models_claim.resources[0].status.phase == 'Bound'
       retries: 24
       delay: 5
+
+    - name: Create the account the jobs' pods run with
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "{{ scheduler_job_account }}"
+            namespace: "{{ scheduler_runs_namespace }}"
+
+    - name: Let the jobs read the key of MLflow's storage, and nothing else of its namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: scheduler-jobs-mlflow-storage
+            namespace: "{{ mlflow_namespace }}"
+          rules:
+            - apiGroups: [""]
+              resources: [secrets]
+              resourceNames: [mlflow-s3-secret]
+              verbs: [get]
+
+    - name: Bind the jobs' account to it
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: scheduler-jobs-mlflow-storage
+            namespace: "{{ mlflow_namespace }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: scheduler-jobs-mlflow-storage
+          subjects:
+            - kind: ServiceAccount
+              name: "{{ scheduler_job_account }}"
+              namespace: "{{ scheduler_runs_namespace }}"
