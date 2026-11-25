@@ -142,9 +142,11 @@ hub:
       GPU_RUNTIME_CLASS = 'nvidia-legacy'
       # The form's choice of GPU memory for a server that has its GPUs alone
       WHOLE_GPU = 'whole'
-      # An interactive server's priority, of 1 (highest) to 5; thinkube-control
-      # names another for an unattended run
-      SERVER_PRIORITY = 1
+      # The kinds of work a server is, whose priority (1, highest, to 5) a
+      # person sets at the Scheduler: an unattended run, which thinkube-control
+      # names in user_options["kind"], or an interactive server, as is every
+      # server started from the form
+      SERVER_KINDS = ('notebook_server', 'notebook_job')
       # A start is refused when its hold is given no GPU within GRANT_SECONDS,
       # with the Scheduler's reason; while the Scheduler stops work of a lower
       # priority for it, it is waited for up to ROOM_SECONDS.
@@ -164,6 +166,12 @@ hub:
       async def scheduler_call(method, path, body=None):
           """One call to the Scheduler, outside the Hub's event loop."""
           return await asyncio.get_running_loop().run_in_executor(None, scheduler_request, method, path, body)
+
+      async def server_priority(kind):
+          """The priority of the server's kind of work, as a person set it at the Scheduler."""
+          if kind not in SERVER_KINDS:
+              raise RuntimeError(f"a notebook server's kind is one of {SERVER_KINDS}, not {kind!r}")
+          return (await scheduler_call('GET', '/priorities'))[kind]
 
       async def end_holds(name):
           """End the Hub's holds of this name that have not ended."""
@@ -545,7 +553,7 @@ hub:
                       'gpus': gpu_count,
                       'gpu_memory_gb': None if gpu_memory == WHOLE_GPU else float(gpu_memory),
                       'memory_gb': int(float(memory.replace('G', ''))),
-                      'priority': int(user_options.get('priority', SERVER_PRIORITY)),
+                      'priority': await server_priority(user_options.get('kind', 'notebook_server')),
                       'pods_in': spawner.namespace,
                   })
                   pod_config['runtimeClassName'] = GPU_RUNTIME_CLASS
