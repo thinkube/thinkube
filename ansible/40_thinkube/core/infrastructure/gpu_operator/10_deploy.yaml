@@ -8,6 +8,14 @@
 #   Supports multi-node: host-level setup runs on all baremetal_gpus nodes,
 #   cluster-wide helm install runs once on the control plane.
 #
+#   The operator's device plugin is off: Kubernetes hands out no GPU
+#   (nvidia.com/gpu). The platform's Scheduler gives each GPU to a pod by
+#   its id, which the pod reads with the runtime class nvidia-legacy, from
+#   the operator's container toolkit. GPU feature discovery stays on: its
+#   node labels (nvidia.com/gpu.count, .product, .memory) are how the
+#   platform counts a node's GPUs. Time slicing, which the device plugin
+#   did, is gone with it; a cluster that had it is cleared of it here.
+#
 # Requirements:
 #   - Thinkube Kubernetes Cluster (kubeadm) >= 1.34
 #   - NVIDIA-compatible GPU (Volta or newer)
@@ -330,7 +338,11 @@
         namespace: {{ cuda_test_namespace }}
       spec:
         restartPolicy: OnFailure
-        runtimeClassName: nvidia
+        # The GPUs are given by their ids, as the Scheduler gives them; the
+        # pod asks Kubernetes for none
+        runtimeClassName: nvidia-legacy
+        nodeSelector:
+          kubernetes.io/hostname: "{{ (supported_gpu_nodes | default(['none']))[0] }}"
         # New nodes are cordoned by the add-node flow until arch-specific
         # images are rebuilt; this validation pod must still run there, so
         # it alone tolerates the cordon taint (the nvcr image is multi-arch).
@@ -341,11 +353,9 @@
         containers:
         - name: cuda-vectoradd
           image: "nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0-ubuntu22.04"
-          resources:
-            limits:
-              nvidia.com/gpu: 1
-            requests:
-              nvidia.com/gpu: 1
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: "all"
 
   pre_tasks:
     - name: Verify required variables exist
@@ -416,6 +426,8 @@
           --wait \
           --timeout 15m \
           --set driver.enabled=false \
+          --set devicePlugin.enabled=false \
+          --set gfd.enabled=true \
           --set toolkit.env[0].name=CONTAINERD_CONFIG \
           --set toolkit.env[0].value=/etc/containerd/config.toml \
           --set toolkit.env[1].name=CONTAINERD_SOCKET \
@@ -509,6 +521,50 @@
 # ===========================
 # Play 4: Verify GPU availability
 # ===========================
+- name: Clear GPU time slicing
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+
+  # Time slicing was the device plugin's: its config, the label that chose a
+  # node's profile, and the ClusterPolicy's reference to it. With the plugin
+  # off, GPU feature discovery reads its default config again, and labels
+  # each GPU once (nvidia.com/gpu.replicas=1).
+  tasks:
+    - name: Remove the time-slicing profile label from the nodes
+      ansible.builtin.command: >-
+        {{ kubectl_bin }} label nodes --all nvidia.com/device-plugin.config-
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: profile_labels
+      changed_when: "'unlabeled' in profile_labels.stdout"
+
+    - name: Read the ClusterPolicy's device plugin config
+      ansible.builtin.command: >-
+        {{ kubectl_bin }} get clusterpolicy cluster-policy -o jsonpath='{.spec.devicePlugin.config}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: plugin_config
+      changed_when: false
+
+    - name: Remove the ClusterPolicy's reference to the time-slicing config
+      ansible.builtin.command: >-
+        {{ kubectl_bin }} patch clusterpolicy cluster-policy --type=json
+        -p='[{"op": "remove", "path": "/spec/devicePlugin/config"}]'
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      when: plugin_config.stdout | length > 0
+      changed_when: true
+
+    - name: Delete the time-slicing config
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: ConfigMap
+        name: time-slicing-config
+        namespace: "{{ gpu_operator_namespace }}"
+
 - name: Verify GPU Operator deployment
   hosts: k8s_control_plane
   become: false
@@ -524,7 +580,11 @@
         namespace: {{ cuda_test_namespace }}
       spec:
         restartPolicy: OnFailure
-        runtimeClassName: nvidia
+        # The GPUs are given by their ids, as the Scheduler gives them; the
+        # pod asks Kubernetes for none
+        runtimeClassName: nvidia-legacy
+        nodeSelector:
+          kubernetes.io/hostname: "{{ (supported_gpu_nodes | default(['none']))[0] }}"
         # New nodes are cordoned by the add-node flow until arch-specific
         # images are rebuilt; this validation pod must still run there, so
         # it alone tolerates the cordon taint (the nvcr image is multi-arch).
@@ -535,11 +595,9 @@
         containers:
         - name: cuda-vectoradd
           image: "nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0-ubuntu22.04"
-          resources:
-            limits:
-              nvidia.com/gpu: 1
-            requests:
-              nvidia.com/gpu: 1
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: "all"
 
   tasks:
     - name: Skip GPU verification (no supported GPU nodes)
@@ -550,17 +608,17 @@
       ansible.builtin.shell: |
         expected={{ supported_gpu_nodes | length }}
 
-        device_ready=false
+        gfd_ready=false
         i=1
         while [ $i -le 60 ]; do
           count=$({{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} \
-            -l app=nvidia-device-plugin-daemonset \
+            -l app=gpu-feature-discovery \
             --field-selector=status.phase=Running -o json | jq '.items | length')
           if [ "$count" -ge "$expected" ]; then
-            device_ready=true
+            gfd_ready=true
             break
           fi
-          echo "Waiting for device-plugin... $count/$expected (attempt $i/60)"
+          echo "Waiting for GPU feature discovery... $count/$expected (attempt $i/60)"
           sleep 5
           i=$((i + 1))
         done
@@ -580,7 +638,7 @@
           i=$((i + 1))
         done
 
-        if [ "$device_ready" = "true" ] && [ "$toolkit_ready" = "true" ]; then
+        if [ "$gfd_ready" = "true" ] && [ "$toolkit_ready" = "true" ]; then
           echo "✓ All critical GPU operator pods running on $expected node(s)"
           exit 0
         else
@@ -598,12 +656,12 @@
         i=1
         max_attempts=60
         while [ $i -le $max_attempts ]; do
-          gpu_count=$({{ kubectl_bin }} get nodes -o json | jq '[.items[].status.allocatable."nvidia.com/gpu" // "0" | tonumber] | add')
+          gpu_count=$({{ kubectl_bin }} get nodes -o json | jq '[.items[].metadata.labels."nvidia.com/gpu.count" // "0" | tonumber] | add')
 
           if [ "$gpu_count" -gt 0 ]; then
-            echo "✓ GPUs are now available in the cluster (count: $gpu_count)"
+            echo "✓ GPU feature discovery counts $gpu_count GPUs in the cluster"
             echo "GPU-enabled nodes:"
-            {{ kubectl_bin }} get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu | grep -v "<none>" || true
+            {{ kubectl_bin }} get nodes -o custom-columns=NAME:.metadata.name,GPU:.metadata.labels.nvidia\\.com/gpu\\.count | grep -v "<none>" || true
             exit 0
           fi
 
@@ -621,9 +679,9 @@
           i=$((i + 1))
         done
 
-        echo "ERROR: No GPUs detected after waiting 10 minutes."
+        echo "ERROR: GPU feature discovery counted no GPU after waiting 10 minutes."
         echo "Current node status:"
-        {{ kubectl_bin }} get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu
+        {{ kubectl_bin }} get nodes -o custom-columns=NAME:.metadata.name,GPU:.metadata.labels.nvidia\\.com/gpu\\.count
         echo ""
         echo "GPU operator pod status:"
         {{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} --no-headers
@@ -634,7 +692,7 @@
 
     - name: Check if we should run CUDA test
       ansible.builtin.shell: |
-        gpu_count=$({{ kubectl_bin }} get nodes -o json | jq '[.items[].status.allocatable."nvidia.com/gpu" // "0" | tonumber] | add')
+        gpu_count=$({{ kubectl_bin }} get nodes -o json | jq '[.items[].metadata.labels."nvidia.com/gpu.count" // "0" | tonumber] | add')
         existing_pod=$({{ kubectl_bin }} get pod cuda-vectoradd -n {{ cuda_test_namespace }} 2>/dev/null || echo "not found")
 
         if [ "$gpu_count" -eq 0 ]; then
@@ -719,14 +777,14 @@
         echo "=== GPU Operator Deployment Summary ==="
         echo ""
         echo "GPU-enabled nodes:"
-        {{ kubectl_bin }} get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu,GPU-PRODUCT:.metadata.labels.nvidia\\.com/gpu\\.product
+        {{ kubectl_bin }} get nodes -o custom-columns=NAME:.metadata.name,GPU:.metadata.labels.nvidia\\.com/gpu\\.count,GPU-PRODUCT:.metadata.labels.nvidia\\.com/gpu\\.product
         echo ""
         echo "GPU operator pods:"
         {{ kubectl_bin }} get pods -n {{ gpu_operator_namespace }} --no-headers | awk '{print $1 "\t" $3}' | column -t
         echo ""
-        gpu_count=$({{ kubectl_bin }} get nodes -o json | jq '[.items[].status.allocatable."nvidia.com/gpu" // "0" | tonumber] | add')
+        gpu_count=$({{ kubectl_bin }} get nodes -o json | jq '[.items[].metadata.labels."nvidia.com/gpu.count" // "0" | tonumber] | add')
         if [ "$gpu_count" -gt 0 ]; then
-          echo "✓ Total GPUs available in cluster: $gpu_count"
+          echo "✓ GPUs in the cluster, as GPU feature discovery counts them: $gpu_count"
           exit 0
         else
           echo "✗ No GPUs detected in cluster"

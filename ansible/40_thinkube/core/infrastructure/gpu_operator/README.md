@@ -12,7 +12,6 @@ running `00_install.yaml` in this folder
 |---|---|
 | `10_deploy.yaml` | Host setup on every `baremetal_gpus` node (NVIDIA driver on non-DGX nodes, Docker NVIDIA runtime on DGX Spark), then the GPU Operator Helm install |
 | `12_cap_gb10_clock.yaml` | Caps the GPU clock of GB10 (DGX Spark) nodes on every boot, to stop sudden power-offs under load |
-| `15_configure_time_slicing.yaml` | GPU time-slicing: 4 virtual GPUs per GPU on DGX Spark, 2 on discrete GPUs |
 | `17_configure_discovery.yaml` | Service-discovery ConfigMap |
 
 `16_apply_node_profile.yaml` (the `dedicated-ai` node profile) is not part of
@@ -137,8 +136,8 @@ If the deployment fails, check the following:
    ```
 
    Expected pods:
-   - `nvidia-device-plugin-daemonset-*`: Running (critical for GPU discovery)
-   - `nvidia-container-toolkit-daemonset-*`: Running (critical for runtime config)
+   - `gpu-feature-discovery-*`: Running (labels each node with its GPUs: `nvidia.com/gpu.count`, `.product`, `.memory`)
+   - `nvidia-container-toolkit-daemonset-*`: Running (critical for runtime config, and the `nvidia-legacy` runtime class)
    - `nvidia-dcgm-exporter-*`: Running
    - `nvidia-operator-validator-*`: Completed or Running
    - `gpu-operator-*`: Running
@@ -166,12 +165,16 @@ from `ansible/roles/containerd_install/templates/config.toml.j2`.
 
 ### GPUs Not Detected in Cluster
 
-**Symptom**: `kubectl describe node` shows no `nvidia.com/gpu` resources.
+Kubernetes hands out no GPU: the device plugin is off, and nodes show no
+`nvidia.com/gpu` resource. The platform's Scheduler gives each GPU to a pod
+by its id, and counts a node's GPUs by GPU feature discovery's label.
+
+**Symptom**: a node with GPUs has no `nvidia.com/gpu.count` label.
 
 **Check**:
-1. **Verify nvidia-device-plugin-daemonset is running**:
+1. **Verify GPU feature discovery is running on the node**:
    ```bash
-   kubectl get pods -n gpu-operator -l app=nvidia-device-plugin-daemonset
+   kubectl get pods -n gpu-operator -l app=gpu-feature-discovery -o wide
    ```
 
 2. **Check nvidia-container-toolkit-daemonset created runtime config**:
@@ -187,10 +190,10 @@ from `ansible/roles/containerd_install/templates/config.toml.j2`.
    grep imports /etc/containerd/config.toml
    ```
 
-4. **Check containerd is using configs**:
+4. **Check the labels and the runtime class**:
    ```bash
-   kubectl get nodes -o json | jq '.items[].status.allocatable'
-   # Should show "nvidia.com/gpu": "1" or higher
+   kubectl get nodes -L nvidia.com/gpu.count,nvidia.com/gpu.product
+   kubectl get runtimeclass nvidia-legacy
    ```
 
 ### Docker GPU Access Not Working

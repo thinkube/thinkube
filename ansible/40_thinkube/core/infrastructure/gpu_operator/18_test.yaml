@@ -50,6 +50,8 @@
       spec:
         restartPolicy: OnFailure
         nodeName: {NODE_NAME}
+        # The GPUs are given by their ids, as the Scheduler gives them; the pod asks Kubernetes for none
+        runtimeClassName: nvidia-legacy
         securityContext:
           runAsNonRoot: true
           runAsUser: 1000
@@ -61,11 +63,9 @@
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-          resources:
-            limits:
-              nvidia.com/gpu: 1
-            requests:
-              nvidia.com/gpu: 1
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: "all"
 
   tasks:
     - name: Check that GPU Operator namespace exists
@@ -102,28 +102,33 @@
         kind: Pod
         namespace: "{{ gpu_operator_namespace }}"
         label_selectors:
-          - "app in (nvidia-device-plugin-daemonset,nvidia-container-toolkit-daemonset)"
+          - "app in (gpu-feature-discovery,nvidia-container-toolkit-daemonset)"
         field_selectors:
           - status.phase=Running
       register: critical_pods
       failed_when: critical_pods.resources | length < 2
 
-    # GPU pods may ask for runtimeClassName: nvidia; the operator creates it.
-    - name: Check the nvidia RuntimeClass exists with the nvidia handler
+    # A GPU pod runs with runtimeClassName nvidia-legacy, which takes the GPUs' ids; the operator creates it.
+    - name: Check the nvidia-legacy RuntimeClass exists
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig }}"
         api_version: node.k8s.io/v1
         kind: RuntimeClass
-        name: nvidia
+        name: nvidia-legacy
       register: nvidia_runtime_class
-      failed_when: >-
-        nvidia_runtime_class.resources | length == 0
-        or nvidia_runtime_class.resources[0].handler != 'nvidia'
+      failed_when: nvidia_runtime_class.resources | length == 0
+
+    - name: Check Kubernetes hands out no GPU
+      ansible.builtin.shell: >
+        {{ kubectl_bin }} get nodes -o json | jq '[.items[].status.allocatable."nvidia.com/gpu" // "0" | tonumber] | add'
+      register: handed_out
+      changed_when: false
+      failed_when: handed_out.stdout | int != 0
 
     # Identify all GPU nodes in the cluster
-    - name: Get nodes with GPU resources
+    - name: Get the nodes whose GPUs GPU feature discovery counts
       ansible.builtin.shell: >
-        {{ kubectl_bin }} get nodes -o=custom-columns=NAME:.metadata.name,GPU:.status.capacity.'nvidia\.com/gpu' --no-headers | 
+        {{ kubectl_bin }} get nodes -o=custom-columns=NAME:.metadata.name,GPU:.metadata.labels.'nvidia\.com/gpu\.count' --no-headers |
         grep -v '<none>' | awk '{print $1}'
       register: gpu_nodes_result
       changed_when: false
